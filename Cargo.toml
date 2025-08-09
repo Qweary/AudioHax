@@ -8,3 +8,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 midir = "0.8"
 rand = "0.8"
+opencv = { version = "0.92", features = ["contrib"] }   # version may vary; pick a recent one
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }     # if you want to serialize features later
