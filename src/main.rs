@@ -27,7 +27,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Instrument count set to {}", instrument_count);
 
     // --- Image selection ---
-    let src = ImageSource::Preselected("example.jpg".to_string());
+    let src = if let Some(img_path) = args.get(1) {
+        ImageSource::Preselected(img_path.clone())
+    } else {
+        ImageSource::Preselected("assets/example.jpg".to_string())
+    };
     let img = load_image_from_source(&src)?;
     println!("Image loaded from source.");
 
