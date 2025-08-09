@@ -1,65 +1,56 @@
-use midir::{MidiOutput, MidiOutputPort};
-use std::{time::Duration, io::{stdin, stdout, Write}};
-use std::thread::sleep;
+mod mapping_loader;
+mod chord_engine;
+mod midi_output;
 
-fn main() {
-    match run() {
-        Ok(()) => (),
-        Err(e) => eprintln!("Error: {}", e),
+use mapping_loader::{load_mappings, lookup_range_map};
+use chord_engine::ChordEngine;
+use midi_output::MidiOut;
+use std::env;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load mappings
+    let mappings = load_mappings("assets/mappings.json")?;
+    println!("Mappings loaded.");
+
+    // --- Simulated image-derived features (replace with real analysis)
+    let hue: f32 = 100.0; // 0..360
+    let edge_complexity: f32 = 0.8; // 0.0..1.0
+    let brightness_drop: f32 = 0.3; // 0.0..1.0
+
+    // Lookup mode from hue map
+    let mode = lookup_range_map(&mappings.global.hue_to_mode, hue)
+        .unwrap_or_else(|| "Ionian".to_string());
+    println!("Chosen mode from hue {} -> {}", hue, mode);
+
+    // Build chord engine
+    let engine = ChordEngine::new(mappings);
+
+    // Pick progression
+    let progression = engine.pick_progression(&mode);
+    println!("Picked progression (Roman): {:?}", progression);
+
+    // Generate chords (root = C4 = 60) - later make root dependent on global analysis
+    let chords = engine.generate_chords(&progression, 60, &mode, edge_complexity, brightness_drop);
+
+    println!("Generated chords:");
+    for ch in &chords {
+        println!("{:?}", ch);
     }
-}
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize the MIDI output
-    let midi_out = MidiOutput::new("MIDI Output").expect("Failed to create MIDI output");
-    let out_ports: Vec<MidiOutputPort> = midi_out.ports();
-
-    let out_port: &MidiOutputPort = match out_ports.len() {
-        0 => {
-            println!("No MIDI output ports available");
-            return Err("No MIDI output ports available".into());
-        },
-        1 => {
-            println!("Using the only available MIDI output port");
-            &out_ports[0]
-        },
-        _ => {
-            print!("Please select output port: ");
-            stdout().flush()?;
-            let mut input = String::new();
-            stdin().read_line(&mut input)?;
-            out_ports
-                .get(input.trim().parse::<usize>()?)
-                .ok_or("invalid output port selected")?
+    // If user passes "play" arg, open MIDI and play chords
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|a| a == "play") {
+        let mut midi = MidiOut::open_first(None)?;
+        // set program for channel 0 to Acoustic Grand Piano (program 0)
+        midi.program_change(0, 0)?;
+        for ch in chords {
+            println!("Playing chord {}", ch.name);
+            // simple velocity mapping
+            midi.play_chord_arpeggio(0, &ch.notes, 90, 250)?;
         }
-    };
-
-    let mut conn_out = midi_out.connect(out_port, "midir-test")?;
-    println!("Connection open. Listen!");
-    {
-        // Define a new scope in which the closure `play_note` borrows conn_out, so it can be called easily
-        let mut play_note = |note: u8, duration: u64| {
-            const NOTE_ON_MSG: u8 = 0x90;
-            const NOTE_OFF_MSG: u8 = 0x80;
-            const VELOCITY: u8 = 0x64;
-            // We're ignoring errors in here
-            let _ = conn_out.send(&[NOTE_ON_MSG, note, VELOCITY]);
-            sleep(Duration::from_millis(duration * 15));
-            let _ = conn_out.send(&[NOTE_OFF_MSG, note, VELOCITY]);
-        };
-
-        sleep(Duration::from_millis(4 * 150));
-
-        play_note(66, 4);
-        play_note(65, 3);
-        play_note(63, 1);
-        play_note(61, 6);
-        play_note(59, 2);
-        play_note(58, 4);
-        play_note(56, 4);
-        play_note(54, 4);
+    } else {
+        println!("Run with `cargo run --release -- play` to send chords to a MIDI port.");
     }
-    sleep(Duration::from_millis(150));
+
     Ok(())
 }
-
