@@ -312,3 +312,64 @@ fn compute_hue_histogram(image: &Mat, bins: i32) -> Result<Vec<f32>> {
     }
     Ok(out)
 }
+
+/// Draws an overlay showing the scan bar and its instrument subdivisions.
+/// - `vertical`: if true, scan bar is vertical, split into vertical strips
+/// - `num_bars`: how many instrument subdivisions
+/// Returns: a cloned Mat with overlays drawn.
+pub fn draw_scan_bar_overlay(image: &Mat, num_bars: usize, vertical: bool) -> Result<Mat> {
+    if image.empty() {
+        return Err(anyhow!("Empty image passed to draw_scan_bar_overlay"));
+    }
+    if num_bars == 0 {
+        return Err(anyhow!("num_bars must be > 0"));
+    }
+
+    let mut overlay = image.clone()?;
+    let (width, height) = (overlay.cols(), overlay.rows());
+
+    // Draw outer rectangle for scan bar
+    let scan_bar_rect = if vertical {
+        core::Rect::new(0, 0, width, height)
+    } else {
+        core::Rect::new(0, 0, width, height)
+    };
+    imgproc::rectangle(
+        &mut overlay,
+        scan_bar_rect,
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0), // green
+        2,
+        imgproc::LINE_8,
+        0,
+    )?;
+
+    // Draw subdivisions
+    for i in 1..num_bars {
+        if vertical {
+            let x = (i * width) / num_bars;
+            imgproc::line(
+                &mut overlay,
+                core::Point::new(x, 0),
+                core::Point::new(x, height),
+                core::Scalar::new(0.0, 0.0, 255.0, 0.0), // red
+                1,
+                imgproc::LINE_8,
+                0,
+            )?;
+        } else {
+            let y = (i * height) / num_bars;
+            imgproc::line(
+                &mut overlay,
+                core::Point::new(0, y),
+                core::Point::new(width, y),
+                core::Scalar::new(0.0, 0.0, 255.0, 0.0), // red
+                1,
+                imgproc::LINE_8,
+                0,
+            )?;
+        }
+    }
+
+    Ok(overlay)
+}
+
