@@ -4,12 +4,7 @@ use opencv::{
     core,
     imgproc,
     prelude::*,
-    types,
-    imgcodecs,
 };
-
-// use core AlgorithmHint (required as 5th arg for cvt_color in this opencv crate)
-use opencv::core::AlgorithmHint;
 
 /// The set of features we extract at three levels:
 /// - GlobalFeatures: entire image
@@ -38,9 +33,13 @@ pub struct ScanBarFeatures {
     pub hue_hist: Vec<f32>, // optional small histogram for fingerprinting
 }
 
+/// Local features returned for a small region.  Enhanced to include
+/// saturation/brightness so scan-bar aggregation can compute those cleanly.
 #[derive(Debug, Clone)]
 pub struct LocalFeatures {
     pub avg_hue: f32,
+    pub avg_saturation: f32,
+    pub avg_brightness: f32,
     pub hue_delta_from_bar: f32,
     pub brightness_delta_from_bar: f32,
     pub edge_sharpness: f32,
@@ -55,13 +54,14 @@ pub fn analyze_global(image: &Mat) -> Result<GlobalFeatures> {
         return Err(anyhow!("Empty image passed to analyze_global"));
     }
 
-    // Convert to HSV — AlgorithmHint required by this crate binding
+    // Convert to HSV (current opencv crate uses 4-arg cvt_color)
     let mut hsv = Mat::default();
-    imgproc::cvt_color(image, &mut hsv, imgproc::COLOR_BGR2HSV, 0, AlgorithmHint::None)?;
+    imgproc::cvt_color(image, &mut hsv, imgproc::COLOR_BGR2HSV, 0)?;
 
-    // Split channels
-    let mut channels = core::Vector::<core::Mat>::new();
+    // Split channels into a core::Vector<Mat>
+    let mut channels = core::Vector::<Mat>::new();
     core::split(&hsv, &mut channels)?;
+
     let h = channels.get(0)?;
     let s = channels.get(1)?;
     let v = channels.get(2)?;
@@ -86,7 +86,7 @@ pub fn analyze_global(image: &Mat) -> Result<GlobalFeatures> {
 
     // Edge density using Canny
     let mut gray = Mat::default();
-    imgproc::cvt_color(image, &mut gray, imgproc::COLOR_BGR2GRAY, 0, AlgorithmHint::None)?;
+    imgproc::cvt_color(image, &mut gray, imgproc::COLOR_BGR2GRAY, 0)?;
     let mut edges = Mat::default();
     imgproc::canny(&gray, &mut edges, 50.0, 150.0, 3, false)?;
     let edge_count = core::count_non_zero(&edges)?;
@@ -104,7 +104,6 @@ pub fn analyze_global(image: &Mat) -> Result<GlobalFeatures> {
     // Contour count and largest contour circularity
     let mut thresh = Mat::default();
     imgproc::threshold(&gray, &mut thresh, 0.0, 255.0, imgproc::THRESH_OTSU | imgproc::THRESH_BINARY)?;
-    // Use core::Vector<core::Vector<core::Point>> to avoid fragile type alias imports
     let mut contours = core::Vector::<core::Vector::<core::Point>>::new();
     imgproc::find_contours(
         &thresh,
@@ -149,6 +148,9 @@ pub fn analyze_global(image: &Mat) -> Result<GlobalFeatures> {
 }
 
 /// Analyze the full scan bar by slicing the image along the chosen axis.
+///
+/// - `num_bars`: number of instrument subdivisions in the bar
+/// - `vertical`: if true, bar runs top->bottom and slices are vertical strips; if false, horizontal bar slices
 pub fn analyze_scan_bar(image: &Mat, num_bars: usize, vertical: bool) -> Result<Vec<ScanBarFeatures>> {
     if image.empty() {
         return Err(anyhow!("Empty image passed to analyze_scan_bar"));
@@ -176,18 +178,19 @@ pub fn analyze_scan_bar(image: &Mat, num_bars: usize, vertical: bool) -> Result<
             core::Rect::new(0, y0, width, h)
         };
 
-        // Mat::roi returns a BoxedRef; convert it to an owned Mat with to_mat()
-        let sub_box = Mat::roi(image, roi)?;
-        let sub = sub_box.to_mat()?; // now an owned Mat we can pass as &Mat
+        // Mat::roi returns an owned Mat (or a BoxedRef that implements Clone); clone to get an owned Mat
+        let sub_roi = Mat::roi(image, roi)?;
+        let sub = sub_roi.clone();
 
+        // Use the enhanced local analysis to get saturation/brightness and other metrics
         let lf = analyze_local_basic(&sub)?;
         let hue_hist = compute_hue_histogram(&sub, 8)?;
 
         results.push(ScanBarFeatures {
             bar_index: i,
             avg_hue: lf.avg_hue,
-            avg_saturation: 0.0, // not currently calculated per-scan-bar (could be added)
-            avg_brightness: 0.0, // same as above
+            avg_saturation: lf.avg_saturation,
+            avg_brightness: lf.avg_brightness,
             edge_density: lf.edge_sharpness,
             texture_laplacian_var: lf.texture_complexity,
             hue_hist,
@@ -197,15 +200,16 @@ pub fn analyze_scan_bar(image: &Mat, num_bars: usize, vertical: bool) -> Result<
     Ok(results)
 }
 
-/// Analyze a small region and return LocalFeatures.
+/// Analyze a small region and return LocalFeatures (enhanced to include sat/bright).
 pub fn analyze_local_basic(region: &Mat) -> Result<LocalFeatures> {
     if region.empty() {
         return Err(anyhow!("Empty region passed to analyze_local_basic"));
     }
 
+    // Convert to HSV and compute means
     let mut hsv = Mat::default();
-    imgproc::cvt_color(region, &mut hsv, imgproc::COLOR_BGR2HSV, 0, AlgorithmHint::None)?;
-    let mut channels = core::Vector::<core::Mat>::new();
+    imgproc::cvt_color(region, &mut hsv, imgproc::COLOR_BGR2HSV, 0)?;
+    let mut channels = core::Vector::<Mat>::new();
     core::split(&hsv, &mut channels)?;
     let h = channels.get(0)?;
     let s = channels.get(1)?;
@@ -225,14 +229,16 @@ pub fn analyze_local_basic(region: &Mat) -> Result<LocalFeatures> {
     let avg_saturation = (mean_s[0] as f32) * (100.0 / 255.0);
     let avg_brightness = (mean_v[0] as f32) * (100.0 / 255.0);
 
+    // Edge density
     let mut gray = Mat::default();
-    imgproc::cvt_color(region, &mut gray, imgproc::COLOR_BGR2GRAY, 0, AlgorithmHint::None)?;
+    imgproc::cvt_color(region, &mut gray, imgproc::COLOR_BGR2GRAY, 0)?;
     let mut edges = Mat::default();
     imgproc::canny(&gray, &mut edges, 50.0, 150.0, 3, false)?;
     let edge_count = core::count_non_zero(&edges)?;
     let total_pixels = (edges.rows() * edges.cols()) as f32;
     let edge_density = if total_pixels > 0.0 { (edge_count as f32) / total_pixels } else { 0.0 };
 
+    // Edge orientation bias using Sobel gradients: compute mean of gradients
     let mut grad_x = Mat::default();
     let mut grad_y = Mat::default();
     imgproc::sobel(&gray, &mut grad_x, core::CV_32F, 1, 0, 3, 1.0, 0.0, core::BORDER_DEFAULT)?;
@@ -243,9 +249,10 @@ pub fn analyze_local_basic(region: &Mat) -> Result<LocalFeatures> {
     let mut mean_gy = core::Scalar::default();
     let mut std_gy = core::Scalar::default();
     core::mean_std_dev(&grad_y, &mut mean_gy, &mut std_gy, &core::no_array())?;
-    let edge_orientation_bias = (mean_gx[0] as f32 - mean_gy[0] as f32)
-        / ((mean_gx[0].abs() + mean_gy[0].abs()) as f32 + 1e-6f32);
+    // If |gx| > |gy| -> horizontal bias, else vertical
+    let edge_orientation_bias = (mean_gx[0] as f32 - mean_gy[0] as f32) / ((mean_gx[0].abs() + mean_gy[0].abs()) as f32 + 1e-6);
 
+    // Laplacian variance
     let mut lap = Mat::default();
     imgproc::laplacian(&gray, &mut lap, core::CV_64F, 3, 1.0, 0.0, core::BORDER_DEFAULT)?;
     let mut mean_lap = core::Scalar::default();
@@ -253,6 +260,7 @@ pub fn analyze_local_basic(region: &Mat) -> Result<LocalFeatures> {
     core::mean_std_dev(&lap, &mut mean_lap, &mut stddev_lap, &core::no_array())?;
     let lap_var = stddev_lap[0] as f32 * stddev_lap[0] as f32;
 
+    // Contours -> circularity of largest contour (estimate)
     let mut thresh = Mat::default();
     imgproc::threshold(&gray, &mut thresh, 0.0, 255.0, imgproc::THRESH_OTSU | imgproc::THRESH_BINARY)?;
     let mut contours = core::Vector::<core::Vector::<core::Point>>::new();
@@ -280,7 +288,9 @@ pub fn analyze_local_basic(region: &Mat) -> Result<LocalFeatures> {
 
     Ok(LocalFeatures {
         avg_hue,
-        hue_delta_from_bar: 0.0,
+        avg_saturation,
+        avg_brightness,
+        hue_delta_from_bar: 0.0, // caller will compute real deltas if desired
         brightness_delta_from_bar: 0.0,
         edge_sharpness: edge_density,
         edge_orientation_bias,
@@ -291,24 +301,28 @@ pub fn analyze_local_basic(region: &Mat) -> Result<LocalFeatures> {
 
 /// Helper: compute small hue histogram (N bins) normalized to 0..1
 fn compute_hue_histogram(image: &Mat, bins: i32) -> Result<Vec<f32>> {
+    // convert to HSV
     let mut hsv = Mat::default();
-    imgproc::cvt_color(image, &mut hsv, imgproc::COLOR_BGR2HSV, 0, AlgorithmHint::None)?;
-    let mut channels = core::Vector::<core::Mat>::new();
+    imgproc::cvt_color(image, &mut hsv, imgproc::COLOR_BGR2HSV, 0)?;
+    let mut channels = core::Vector::<Mat>::new();
     core::split(&hsv, &mut channels)?;
     let h = channels.get(0)?;
 
-    // prepare histogram parameters using core::Vector
+    // Prepare histogram parameters
     let mut hist_size = core::Vector::<i32>::new();
     hist_size.push(bins);
-    let mut ranges = core::Vector::<f64>::new();
-    ranges.push(0.0);
-    ranges.push(180.0);
+
+    // ranges must be Vector<f32> for calc_hist in this binding
+    let mut ranges = core::Vector::<f32>::new();
+    ranges.push(0.0f32);
+    ranges.push(180.0f32); // OpenCV H range
 
     let mut hist = Mat::default();
-    let mut images = core::Vector::<core::Mat>::new();
-    images.push(h.clone()?); // clone the Mat into the vector
+    let mut images = core::Vector::<Mat>::new();
+    // clone() returns Mat (not Result)
+    images.push(h.clone());
 
-    // channels for calc_hist: vector of ints [0]
+    // channels for calc_hist: vector with single element 0
     let mut chs = core::Vector::<i32>::new();
     chs.push(0);
 
@@ -322,12 +336,10 @@ fn compute_hue_histogram(image: &Mat, bins: i32) -> Result<Vec<f32>> {
         false,
     )?;
 
-    // read histogram bins
-    let bins_usize = bins as usize;
-    let mut out = Vec::with_capacity(bins_usize);
+    // read histogram bins as f32
+    let mut out: Vec<f32> = Vec::with_capacity(bins as usize);
     let mut sum = 0f32;
     for b in 0..bins {
-        // hist should be a single-column float matrix where row b is the bin value
         let val = match hist.at_2d::<f32>(b, 0) {
             Ok(v) => *v,
             Err(_) => 0.0,
@@ -341,10 +353,14 @@ fn compute_hue_histogram(image: &Mat, bins: i32) -> Result<Vec<f32>> {
             *v /= sum;
         }
     }
+
     Ok(out)
 }
 
 /// Draws an overlay showing the scan bar and its instrument subdivisions.
+/// - `vertical`: if true, scan bar is vertical, split into vertical strips
+/// - `num_bars`: how many instrument subdivisions
+/// Returns: a cloned Mat with overlays drawn.
 pub fn draw_scan_bar_overlay(image: &Mat, num_bars: usize, vertical: bool) -> Result<Mat> {
     if image.empty() {
         return Err(anyhow!("Empty image passed to draw_scan_bar_overlay"));
@@ -353,7 +369,7 @@ pub fn draw_scan_bar_overlay(image: &Mat, num_bars: usize, vertical: bool) -> Re
         return Err(anyhow!("num_bars must be > 0"));
     }
 
-    // clone returns Mat (not Result), so don't use ? here
+    // clone returns Mat (not Result)
     let mut overlay = image.clone();
     let (width, height) = (overlay.cols(), overlay.rows());
     let nb = num_bars as i32;
