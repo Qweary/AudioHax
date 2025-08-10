@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let src = if let Some(img_path) = args.get(1) {
         // If they explicitly passed "play" (no image param), fall back to example
         if img_path == "play" {
-            ImageSource::UserPath("assets/example.jpg".to_string())
+            ImageSource::UserPath("assets/images/example.jpg".to_string())
         } else {
             ImageSource::UserPath(img_path.clone())
         }
