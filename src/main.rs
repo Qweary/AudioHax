@@ -1,3 +1,4 @@
+// src/main.rs
 mod mapping_loader;
 mod chord_engine;
 mod midi_output;
@@ -27,11 +28,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Instrument count set to {}", instrument_count);
 
     // --- Image selection ---
+    // If user passed an image path as first argument, treat it as a UserPath:
     let src = if let Some(img_path) = args.get(1) {
-        ImageSource::Preselected(img_path.clone())
+        // If they explicitly passed "play" (no image param), fall back to example
+        if img_path == "play" {
+            ImageSource::UserPath("assets/example.jpg".to_string())
+        } else {
+            ImageSource::UserPath(img_path.clone())
+        }
     } else {
-        ImageSource::Preselected("assets/example.jpg".to_string())
+        // default: use the provided example.jpg in assets/
+        ImageSource::UserPath("assets/example.jpg".to_string())
     };
+
     let img = load_image_from_source(&src)?;
     println!("Image loaded from source.");
 
@@ -39,14 +48,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let global_features = analyze_global(&img)?;
     println!("Global features: {:?}", global_features);
 
-    // Analyze scan bar into user-specified instrument count
+    // Analyze scan bar into user-specified instrument count (vertical = true default)
     let scan_features = analyze_scan_bar(&img, instrument_count, true)?;
     println!("Scan bar features: {:?}", scan_features);
 
-    // Draw overlay for debug/display
+    // Draw overlay for debug/display and save it
     let overlay_img = draw_scan_bar_overlay(&img, instrument_count, true)?;
-    opencv::highgui::imshow("Scan Bar Overlay", &overlay_img)?;
-    opencv::highgui::wait_key(0)?; // wait for key press before continuing
+    // Save overlay to a file we can inspect.
+    // If your OpenCV build supports imwrite, this should work.
+    let overlay_path = "assets/overlay.png";
+    match opencv::imgcodecs::imwrite(overlay_path, &overlay_img, &opencv::core::Vector::new()) {
+        Ok(_) => println!("Wrote overlay image to {}", overlay_path),
+        Err(e) => println!("Warning: failed to write overlay image: {}", e),
+    }
+    // Try to show it if GUI support is present; ignore errors (headless friendly)
+    if let Err(e) = (|| -> opencv::Result<()> {
+        opencv::highgui::named_window("Scan Bar Overlay", opencv::highgui::WINDOW_AUTOSIZE)?;
+        opencv::highgui::imshow("Scan Bar Overlay", &overlay_img)?;
+        opencv::highgui::wait_key(1)?;
+        Ok(())
+    })() {
+        println!("Note: could not show overlay with highgui (this may be normal): {}", e);
+    }
 
     // --- Feature extraction for chord engine ---
     let hue: f32 = global_features.avg_hue;
@@ -58,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Derived edge_complexity: {}", edge_complexity);
     println!("Derived brightness_drop: {}", brightness_drop);
 
-    // Lookup mode from hue map
+    // Lookup mode from hue map (mapping_loader::lookup_range_map expects hue)
     let mode = lookup_range_map(&mappings.global.hue_to_mode, hue)
         .unwrap_or_else(|| "Ionian".to_string());
     println!("Chosen mode from hue {} -> {}", hue, mode);
@@ -68,27 +91,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let progression = engine.pick_progression(&mode);
     println!("Picked progression (Roman): {:?}", progression);
 
-    // Generate chords
+    // Generate chords (root 60 = Middle C)
     let chords = engine.generate_chords(&progression, 60, &mode, edge_complexity, brightness_drop);
     println!("Generated chords: {:?}", chords);
 
-    // Per-instrument note mapping from scan features
+    // Per-instrument note mapping from scan features (debug print)
     for (i, section) in scan_features.iter().enumerate() {
         println!("Instrument {} section features: {:?}", i + 1, section);
-        // TODO: map section features to actual instrument note events
-        // Example: use hue delta to choose chord tone, brightness to set velocity, edge density for rhythm
+        // TODO: map section features to actual instrument note events (fine granularity)
     }
 
-    // Play if requested
+    // --- Send to MIDI if requested ---
+    // Program accepts literal arg "play" (no dashes). Example: `cargo run -- play`
     if args.iter().any(|a| a == "play") {
-        let mut midi = MidiOut::open_first(None)?;
+        // Try to get preferred port name from environment or default to "AudioHaxOut"
+        let preferred = std::env::var("AUDIOHAX_MIDI_PORT").ok();
+        let preferred_ref = preferred.as_deref().or(Some("AudioHaxOut"));
+
+        println!("Attempting to open MIDI port (preferred = {:?})", preferred_ref);
+
+        // Open MIDI with a preference, falling back to first available.
+        let mut midi = MidiOut::open_first(preferred_ref)?;
+
+        // Play chords (each chord on its own channel, rotate channels)
         for (i, ch) in chords.iter().enumerate() {
-            let channel = i % 16;
-            midi.program_change(channel as u8, (i * 5 % 128) as u8)?; // rotate instrument patches
-            midi.play_chord_arpeggio(channel as u8, &ch.notes, 90, 250)?;
+            let channel = (i % 16) as u8;
+            // pick a program/patch heuristically
+            let prog = ((i * 5) % 128) as u8;
+            midi.program_change(channel as u8, prog)?;
+            // Play chord notes with moderate velocity
+            midi.play_chord_arpeggio(channel, &ch.notes, 90, 350)?;
         }
+        println!("Finished sending MIDI events.");
     } else {
-        println!("Run with `cargo run --release -- play` to send chords to a MIDI port.");
+        println!("Run with `cargo run -- play` to send chords to a MIDI port.");
+        println!("Or set env AUDIOHAX_MIDI_PORT to select a specific port name.");
     }
 
     Ok(())
