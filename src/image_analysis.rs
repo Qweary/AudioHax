@@ -1,10 +1,7 @@
 // src/image_analysis.rs
 use anyhow::{anyhow, Result};
-use opencv::{
-    core,
-    imgproc,
-    prelude::*,
-};
+use opencv::{core, imgproc, prelude::*};
+use std::mem;
 
 /// The set of features we extract at three levels:
 /// - GlobalFeatures: entire image
@@ -48,15 +45,29 @@ pub struct LocalFeatures {
     pub contour_circularity: f32, // 0..1 for dominant contour
 }
 
+/// Helper to produce a "zero" AlgorithmHint value expected by some opencv bindings.
+/// This uses zeroed memory for the enum-like FFI type; it's a pragmatic minimal approach
+/// for passing a neutral hint value to functions like cvt_color.
+fn default_algorithm_hint() -> core::AlgorithmHint {
+    // NOTE: AlgorithmHint is an FFI enum-like POD; zeroed works here as a neutral hint.
+    unsafe { mem::zeroed() }
+}
+
 /// High-level: analyze entire image and return GlobalFeatures.
 pub fn analyze_global(image: &Mat) -> Result<GlobalFeatures> {
     if image.empty() {
         return Err(anyhow!("Empty image passed to analyze_global"));
     }
 
-    // Convert to HSV (current opencv crate uses 4-arg cvt_color)
+    // Convert to HSV (this binding expects 5 args; last is AlgorithmHint)
     let mut hsv = Mat::default();
-    imgproc::cvt_color(image, &mut hsv, imgproc::COLOR_BGR2HSV, 0)?;
+    imgproc::cvt_color(
+        image,
+        &mut hsv,
+        imgproc::COLOR_BGR2HSV,
+        0,
+        default_algorithm_hint(),
+    )?;
 
     // Split channels into a core::Vector<Mat>
     let mut channels = core::Vector::<Mat>::new();
@@ -86,7 +97,13 @@ pub fn analyze_global(image: &Mat) -> Result<GlobalFeatures> {
 
     // Edge density using Canny
     let mut gray = Mat::default();
-    imgproc::cvt_color(image, &mut gray, imgproc::COLOR_BGR2GRAY, 0)?;
+    imgproc::cvt_color(
+        image,
+        &mut gray,
+        imgproc::COLOR_BGR2GRAY,
+        0,
+        default_algorithm_hint(),
+    )?;
     let mut edges = Mat::default();
     imgproc::canny(&gray, &mut edges, 50.0, 150.0, 3, false)?;
     let edge_count = core::count_non_zero(&edges)?;
@@ -103,7 +120,13 @@ pub fn analyze_global(image: &Mat) -> Result<GlobalFeatures> {
 
     // Contour count and largest contour circularity
     let mut thresh = Mat::default();
-    imgproc::threshold(&gray, &mut thresh, 0.0, 255.0, imgproc::THRESH_OTSU | imgproc::THRESH_BINARY)?;
+    imgproc::threshold(
+        &gray,
+        &mut thresh,
+        0.0,
+        255.0,
+        imgproc::THRESH_OTSU | imgproc::THRESH_BINARY,
+    )?;
     let mut contours = core::Vector::<core::Vector::<core::Point>>::new();
     imgproc::find_contours(
         &thresh,
@@ -120,10 +143,13 @@ pub fn analyze_global(image: &Mat) -> Result<GlobalFeatures> {
     for i in 0..contours.len() {
         let cnt = contours.get(i)?;
         let area = imgproc::contour_area(&cnt, false)?;
-        if area <= 0.0 { continue; }
+        if area <= 0.0 {
+            continue;
+        }
         let perimeter = imgproc::arc_length(&cnt, true)?;
         if perimeter > 0.0 {
-            let circularity = (4.0 * std::f64::consts::PI * (area as f64)) / (perimeter * perimeter);
+            let circularity =
+                (4.0 * std::f64::consts::PI * (area as f64)) / (perimeter * perimeter);
             if circularity as f32 > max_circularity {
                 max_circularity = circularity as f32;
             }
@@ -178,9 +204,9 @@ pub fn analyze_scan_bar(image: &Mat, num_bars: usize, vertical: bool) -> Result<
             core::Rect::new(0, y0, width, h)
         };
 
-        // Mat::roi returns an owned Mat (or a BoxedRef that implements Clone); clone to get an owned Mat
+        // Mat::roi returns a BoxedRef; use try_clone() to obtain an owned Mat
         let sub_roi = Mat::roi(image, roi)?;
-        let sub = sub_roi.clone();
+        let sub = sub_roi.try_clone()?; // owned Mat
 
         // Use the enhanced local analysis to get saturation/brightness and other metrics
         let lf = analyze_local_basic(&sub)?;
@@ -208,7 +234,13 @@ pub fn analyze_local_basic(region: &Mat) -> Result<LocalFeatures> {
 
     // Convert to HSV and compute means
     let mut hsv = Mat::default();
-    imgproc::cvt_color(region, &mut hsv, imgproc::COLOR_BGR2HSV, 0)?;
+    imgproc::cvt_color(
+        region,
+        &mut hsv,
+        imgproc::COLOR_BGR2HSV,
+        0,
+        default_algorithm_hint(),
+    )?;
     let mut channels = core::Vector::<Mat>::new();
     core::split(&hsv, &mut channels)?;
     let h = channels.get(0)?;
@@ -231,7 +263,13 @@ pub fn analyze_local_basic(region: &Mat) -> Result<LocalFeatures> {
 
     // Edge density
     let mut gray = Mat::default();
-    imgproc::cvt_color(region, &mut gray, imgproc::COLOR_BGR2GRAY, 0)?;
+    imgproc::cvt_color(
+        region,
+        &mut gray,
+        imgproc::COLOR_BGR2GRAY,
+        0,
+        default_algorithm_hint(),
+    )?;
     let mut edges = Mat::default();
     imgproc::canny(&gray, &mut edges, 50.0, 150.0, 3, false)?;
     let edge_count = core::count_non_zero(&edges)?;
@@ -250,7 +288,8 @@ pub fn analyze_local_basic(region: &Mat) -> Result<LocalFeatures> {
     let mut std_gy = core::Scalar::default();
     core::mean_std_dev(&grad_y, &mut mean_gy, &mut std_gy, &core::no_array())?;
     // If |gx| > |gy| -> horizontal bias, else vertical
-    let edge_orientation_bias = (mean_gx[0] as f32 - mean_gy[0] as f32) / ((mean_gx[0].abs() + mean_gy[0].abs()) as f32 + 1e-6);
+    let edge_orientation_bias =
+        (mean_gx[0] as f32 - mean_gy[0] as f32) / ((mean_gx[0].abs() + mean_gy[0].abs()) as f32 + 1e-6);
 
     // Laplacian variance
     let mut lap = Mat::default();
@@ -262,7 +301,13 @@ pub fn analyze_local_basic(region: &Mat) -> Result<LocalFeatures> {
 
     // Contours -> circularity of largest contour (estimate)
     let mut thresh = Mat::default();
-    imgproc::threshold(&gray, &mut thresh, 0.0, 255.0, imgproc::THRESH_OTSU | imgproc::THRESH_BINARY)?;
+    imgproc::threshold(
+        &gray,
+        &mut thresh,
+        0.0,
+        255.0,
+        imgproc::THRESH_OTSU | imgproc::THRESH_BINARY,
+    )?;
     let mut contours = core::Vector::<core::Vector::<core::Point>>::new();
     imgproc::find_contours(
         &thresh,
@@ -276,10 +321,13 @@ pub fn analyze_local_basic(region: &Mat) -> Result<LocalFeatures> {
     for i in 0..contours.len() {
         let cnt = contours.get(i)?;
         let area = imgproc::contour_area(&cnt, false)?;
-        if area <= 0.0 { continue; }
+        if area <= 0.0 {
+            continue;
+        }
         let perimeter = imgproc::arc_length(&cnt, true)?;
         if perimeter > 0.0 {
-            let circularity = (4.0 * std::f64::consts::PI * (area as f64)) / (perimeter * perimeter);
+            let circularity =
+                (4.0 * std::f64::consts::PI * (area as f64)) / (perimeter * perimeter);
             if circularity as f32 > max_circularity {
                 max_circularity = circularity as f32;
             }
@@ -303,7 +351,13 @@ pub fn analyze_local_basic(region: &Mat) -> Result<LocalFeatures> {
 fn compute_hue_histogram(image: &Mat, bins: i32) -> Result<Vec<f32>> {
     // convert to HSV
     let mut hsv = Mat::default();
-    imgproc::cvt_color(image, &mut hsv, imgproc::COLOR_BGR2HSV, 0)?;
+    imgproc::cvt_color(
+        image,
+        &mut hsv,
+        imgproc::COLOR_BGR2HSV,
+        0,
+        default_algorithm_hint(),
+    )?;
     let mut channels = core::Vector::<Mat>::new();
     core::split(&hsv, &mut channels)?;
     let h = channels.get(0)?;
