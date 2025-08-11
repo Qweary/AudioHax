@@ -173,7 +173,7 @@ pub fn analyze_global(image: &Mat) -> Result<GlobalFeatures> {
     })
 }
 
-/// Analyze the full scan bar by slicing the image along the chosen axis.
+/// Analyze the full scan bar by slicing the image along the chosen axis (static bar used for older code).
 ///
 /// - `num_bars`: number of instrument subdivisions in the bar
 /// - `vertical`: if true, bar runs top->bottom and slices are vertical strips; if false, horizontal bar slices
@@ -411,10 +411,189 @@ fn compute_hue_histogram(image: &Mat, bins: i32) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// Draws an overlay showing the scan bar and its instrument subdivisions.
-/// - `vertical`: if true, scan bar is vertical, split into vertical strips
-/// - `num_bars`: how many instrument subdivisions
+/// Scan the image by moving a strip (thickness fraction) across the dominant axis.
+/// Returns a vector of steps; each step is a Vec<ScanBarFeatures> (one per instrument).
+///
+/// - `num_bars` : how many instrument subdivisions (e.g., 4)
+/// - `bar_thickness_frac` : 0.10 means strip thickness is 10% of the orthogonal image dimension
+/// - `num_steps` : how many positions the strip will take (duration resolution)
+/// - `vertical_hint` : if Some(true/false) forces orientation; if None, we choose based on image aspect ratio
+pub fn scan_image(
+    image: &Mat,
+    num_bars: usize,
+    bar_thickness_frac: f32,
+    num_steps: usize,
+    vertical_hint: Option<bool>,
+) -> Result<Vec<Vec<ScanBarFeatures>>> {
+    if image.empty() {
+        return Err(anyhow!("Empty image passed to scan_image"));
+    }
+    if num_bars == 0 {
+        return Err(anyhow!("num_bars must be > 0"));
+    }
+    let (width, height) = (image.cols(), image.rows());
+    let vertical_default = vertical_hint.unwrap_or(width > height);
+
+    // compute strip dimensions
+    let bar_w = if vertical_default {
+        ((width as f32) * bar_thickness_frac).max(1.0).round() as i32
+    } else {
+        width
+    };
+    let bar_h = if vertical_default {
+        height
+    } else {
+        ((height as f32) * bar_thickness_frac).max(1.0).round() as i32
+    };
+
+    let steps_count = if num_steps == 0 { 1 } else { num_steps };
+    let travel_x = (width - bar_w).max(0);
+    let travel_y = (height - bar_h).max(0);
+
+    let mut steps: Vec<Vec<ScanBarFeatures>> = Vec::with_capacity(steps_count);
+
+    for s in 0..steps_count {
+        // compute bar top-left (x0,y0) for this step
+        let x0 = if vertical_default {
+            if steps_count == 1 {
+                0
+            } else {
+                ((s as f32) * (travel_x as f32) / ((steps_count - 1) as f32)).round() as i32
+            }
+        } else {
+            0
+        };
+        let y0 = if !vertical_default {
+            if steps_count == 1 {
+                0
+            } else {
+                ((s as f32) * (travel_y as f32) / ((steps_count - 1) as f32)).round() as i32
+            }
+        } else {
+            0
+        };
+
+        let bar_rect = core::Rect::new(x0, y0, if vertical_default { bar_w } else { width }, if vertical_default { height } else { bar_h });
+
+        // divide the bar rect into `num_bars` sections *perpendicular* to the scan direction:
+        // - vertical scan strip (moves L->R): split the strip across its height (horizontal slices)
+        // - horizontal scan strip (moves T->B): split the strip across its width (vertical slices)
+        let mut sections: Vec<ScanBarFeatures> = Vec::with_capacity(num_bars);
+
+        for i in 0..num_bars {
+            let section_roi = if vertical_default {
+                // split height into horizontal stripes
+                let per_h = (bar_rect.height / (num_bars as i32)).max(1);
+                let y_i = bar_rect.y + i as i32 * per_h;
+                let h = if i + 1 == num_bars {
+                    // last section absorbs remainder
+                    (bar_rect.y + bar_rect.height) - y_i
+                } else {
+                    per_h
+                }.max(1);
+                core::Rect::new(bar_rect.x, y_i, bar_rect.width, h)
+            } else {
+                // split width into vertical slices
+                let per_w = (bar_rect.width / (num_bars as i32)).max(1);
+                let x_i = bar_rect.x + i as i32 * per_w;
+                let w = if i + 1 == num_bars {
+                    (bar_rect.x + bar_rect.width) - x_i
+                } else {
+                    per_w
+                }.max(1);
+                core::Rect::new(x_i, bar_rect.y, w, bar_rect.height)
+            };
+
+            // ROI -> analyze
+            let sub_roi = Mat::roi(image, section_roi)?;
+            let sub = sub_roi.try_clone()?;
+            let lf = analyze_local_basic(&sub)?;
+            let hue_hist = compute_hue_histogram(&sub, 8)?;
+
+            sections.push(ScanBarFeatures {
+                bar_index: i,
+                avg_hue: lf.avg_hue,
+                avg_saturation: lf.avg_saturation,
+                avg_brightness: lf.avg_brightness,
+                edge_density: lf.edge_sharpness,
+                texture_laplacian_var: lf.texture_complexity,
+                hue_hist,
+            });
+        }
+
+        steps.push(sections);
+    }
+
+    Ok(steps)
+}
+
+/// Draws an overlay for a *given* bar rectangle. The rectangle may be anywhere in the image;
+/// subdivisions are drawn perpendicular to the scan orientation so they match the instrument sections.
+///
+/// - `bar_rect`: the scanning strip rect (x,y,width,height)
+/// - `num_bars`: how many instrument subdivisions inside the strip
+/// - `vertical`: whether the strip is vertical (true=vertical strip moving left->right)
 /// Returns: a cloned Mat with overlays drawn.
+pub fn draw_scan_bar_overlay_for_rect(image: &Mat, bar_rect: core::Rect, num_bars: usize, vertical: bool) -> Result<Mat> {
+    if image.empty() {
+        return Err(anyhow!("Empty image passed to draw_scan_bar_overlay_for_rect"));
+    }
+    if num_bars == 0 {
+        return Err(anyhow!("num_bars must be > 0"));
+    }
+
+    // clone returns Mat
+    let mut overlay = image.clone();
+
+    // outer rect (green)
+    imgproc::rectangle(
+        &mut overlay,
+        bar_rect,
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+        2,
+        imgproc::LINE_8,
+        0,
+    )?;
+
+    // subdivisions *perpendicular* to scan direction:
+    for i in 1..num_bars {
+        let ii = i as i32;
+        if vertical {
+            // split height into horizontal lines at section boundaries
+            let per_h = (bar_rect.height / (num_bars as i32)).max(1);
+            let y = bar_rect.y + ii * per_h;
+            // clamp inside rect
+            let y_clamped = y.min(bar_rect.y + bar_rect.height - 1);
+            imgproc::line(
+                &mut overlay,
+                core::Point::new(bar_rect.x, y_clamped),
+                core::Point::new(bar_rect.x + bar_rect.width, y_clamped),
+                core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+                1,
+                imgproc::LINE_8,
+                0,
+            )?;
+        } else {
+            // split width into vertical lines
+            let per_w = (bar_rect.width / (num_bars as i32)).max(1);
+            let x = bar_rect.x + ii * per_w;
+            let x_clamped = x.min(bar_rect.x + bar_rect.width - 1);
+            imgproc::line(
+                &mut overlay,
+                core::Point::new(x_clamped, bar_rect.y),
+                core::Point::new(x_clamped, bar_rect.y + bar_rect.height),
+                core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+                1,
+                imgproc::LINE_8,
+                0,
+            )?;
+        }
+    }
+
+    Ok(overlay)
+}
+
+/// The old helper to draw a scan bar across the *whole image* (kept for compatibility with other code).
 pub fn draw_scan_bar_overlay(image: &Mat, num_bars: usize, vertical: bool) -> Result<Mat> {
     if image.empty() {
         return Err(anyhow!("Empty image passed to draw_scan_bar_overlay"));
@@ -428,7 +607,7 @@ pub fn draw_scan_bar_overlay(image: &Mat, num_bars: usize, vertical: bool) -> Re
     let (width, height) = (overlay.cols(), overlay.rows());
     let nb = num_bars as i32;
 
-    // Draw outer rectangle for scan bar
+    // Draw outer rectangle for scan bar (whole image boundary)
     let scan_bar_rect = core::Rect::new(0, 0, width, height);
     imgproc::rectangle(
         &mut overlay,
@@ -439,7 +618,7 @@ pub fn draw_scan_bar_overlay(image: &Mat, num_bars: usize, vertical: bool) -> Re
         0,
     )?;
 
-    // Draw subdivisions
+    // Draw subdivisions (across whole image)
     for i in 1..num_bars {
         let ii = i as i32;
         if vertical {
