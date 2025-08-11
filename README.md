@@ -200,12 +200,14 @@ cargo run --release -- --play
 ### Threaded Scan Flow (multi-instrument)
 
 Time →
+
     Instrument 1: ████░░░░░░░░░░░░░░░░░░
     Instrument 2: ░░████░░░░░░░░░░░░░░░░
     Instrument 3: ░░░░████░░░░░░░░░░░░░░
     Instrument 4: ░░░░░░████░░░░░░░░░░░░
 
 Legend:
+
     - ████ = Active scanning & MIDI note output
     - ░░   = Waiting / scanning other segment
 
