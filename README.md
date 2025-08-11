@@ -200,14 +200,14 @@ cargo run --release -- --play
 ### Threaded Scan Flow (multi-instrument)
 
 Time →
-Instrument 1: ████░░░░░░░░░░░░░░░░░░
-Instrument 2: ░░████░░░░░░░░░░░░░░░░
-Instrument 3: ░░░░████░░░░░░░░░░░░░░
-Instrument 4: ░░░░░░████░░░░░░░░░░░░
+    Instrument 1: ████░░░░░░░░░░░░░░░░░░
+    Instrument 2: ░░████░░░░░░░░░░░░░░░░
+    Instrument 3: ░░░░████░░░░░░░░░░░░░░
+    Instrument 4: ░░░░░░████░░░░░░░░░░░░
 
 Legend:
-- ████ = Active scanning & MIDI note output
-- ░░   = Waiting / scanning other segment
+    - ████ = Active scanning & MIDI note output
+    - ░░   = Waiting / scanning other segment
 
 Each instrument runs in its own thread, scanning a portion of the image concurrently and outputting to the same MIDI port in real time.
 
