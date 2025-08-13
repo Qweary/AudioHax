@@ -123,13 +123,25 @@ AudioHax/
 
 ## Running
 
+---
+
+### Start loopMIDI
+
+Set "New port-name:" as "AudioHaxOut"
+
+Click + to add port
+
+Leave running
+
+---
+
 ### Start FluidSynth
 
 Replace PATH_TO_SF2 with your .sf2 file:
 
 Windows:
 
-   fluidsynth -a dsound -m winmidi "PATH_TO_SF2"
+   fluidsynth -a dsound -p AudioHaxOut -m winmidi "PATH_TO_SF2"
 
 macOS:
 
