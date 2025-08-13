@@ -129,9 +129,7 @@ Replace PATH_TO_SF2 with your .sf2 file:
 
 Windows:
 
-  fluidsynth -a dsound -o audio.period-size=64 -o audio.periods=2 `
-  -o midi.driver=winmidi -o midi.winmidi.device=AudioHaxOut `
-  "PATH_TO_SF2"
+   fluidsynth -a dsound -m winmidi "PATH_TO_SF2"
 
 macOS:
 
@@ -145,7 +143,7 @@ Linux:
 
 ### Run AudioHax
 
-cargo run --release -- --play
+cargo run --release -- play
 
 ---
 
@@ -200,26 +198,6 @@ cargo run --release -- --play
                     │
                     ▼
          FluidSynth → Audio Output
-
----
-
-## Concurrent Instrument Timeline
-
-### Threaded Scan Flow (multi-instrument)
-
-Time →
-
-    Instrument 1: ████░░░░░░░░░░░░░░░░░░
-    Instrument 2: ░░████░░░░░░░░░░░░░░░░
-    Instrument 3: ░░░░████░░░░░░░░░░░░░░
-    Instrument 4: ░░░░░░████░░░░░░░░░░░░
-
-Legend:
-
-    - ████ = Active scanning & MIDI note output
-    - ░░   = Waiting / scanning other segment
-
-Each instrument runs in its own thread, scanning a portion of the image concurrently and outputting to the same MIDI port in real time.
 
 ---
 
