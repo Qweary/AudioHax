@@ -105,6 +105,14 @@ AudioHax/
 
     sudo apt install fluidsynth
 
+5. Install libclang:
+
+   sudo apt install llvm-dev libclang-dev clang
+
+6. Install ALSA:
+
+   sudo apt install libasound2-dev
+
 ---
 
 ## Building
