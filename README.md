@@ -117,6 +117,8 @@ AudioHax/
 
 ## Building
 
+   cargo clean
+   cargo update
    cargo build --release
 
 ---
