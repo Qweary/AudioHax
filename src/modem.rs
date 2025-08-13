@@ -5,19 +5,18 @@
 //! - optional AES-GCM encryption (key supplied as 32-byte hex)
 //! - bitpacking into symbols (base-m_tones) and round-robin channel splitting
 //! - MFSK rendering (sum of sine carriers for simultaneous channels)
-//! - simple Goertzel-based energy detection for decoding
+//! - simple Goertzel detector + helpers for decoding
 //!
-//! NOTE: this is a demo-oriented modem, not a production SDR stack. Tune params
-//! (symbol_ms, tone spacing, channel spacing) to suit your acoustic environment.
+//! NOTE: demo-oriented; tune params (symbol_ms, tone spacing, channel spacing) to suit acoustic environment.
 
 use std::error::Error;
 
 use crc32fast::Hasher as Crc32;
 use flate2::{write::GzEncoder, Compression};
-use rand_core::OsRng;
 use std::io::Write;
 
-/// Re-exports for bins
+use rand_core::{OsRng, RngCore};
+
 pub use hound;
 pub use hex;
 
@@ -32,13 +31,13 @@ pub struct ModemParams {
     pub sample_rate: usize,
     pub symbol_ms: f32,
     pub m_tones: usize,
-    pub channels: usize,            // parallel instrument channels
+    pub channels: usize,            // parallel channels
     pub amplitude: f32,             // per-channel amplitude scale (0..1)
     pub base_freq_hz: f32,          // base freq for channel 0
     pub channel_spacing_hz: f32,    // spacing between channel bands
     pub tone_spacing_hz: f32,       // spacing between tones in a band
-    pub preamble_repeats: usize,    // repeats of preamble
-    pub preamble_symbols: Vec<u8>,  // pattern
+    pub preamble_repeats: usize,    // repeats of preamble (not fully used here)
+    pub preamble_symbols: Vec<u8>,  // small pattern, relative to m_tones
 }
 
 impl Default for ModemParams {
@@ -53,59 +52,64 @@ impl Default for ModemParams {
             channel_spacing_hz: 400.0,
             tone_spacing_hz: 30.0,
             preamble_repeats: 6,
-            preamble_symbols: vec![0,  (32/2) as u8], // will be truncated/used relative to m_tones
+            preamble_symbols: vec![0, (32/2) as u8],
         }
     }
 }
 
-/// Build a full "frame" from a file payload:
-/// header + (maybe gzipped, maybe encrypted) payload
+/// Build a frame: header + optional compression/encryption payload.
 ///
-/// Header format (all big-endian):
-/// 4 bytes magic = b"AHX1"
-/// 1 byte flags: bit0 = compressed, bit1 = encrypted
-/// 2 bytes filename_len (u16)
-/// filename bytes (utf-8)
-/// 4 bytes payload_len (u32) <-- length of body after gzip/encrypt
-/// 4 bytes crc32 (crc of post-compression, pre-encryption payload)  <-- helpful to verify after decrypt/decompress
-/// Then the payload bytes follow (if encrypted, the ciphertext includes a 12-byte nonce prefix)
+/// Header layout (big-endian):
+/// - 4 bytes magic: b"AHX1"
+/// - 1 byte flags: bit0 = compressed, bit1 = encrypted
+/// - 2 bytes filename_len (u16)
+/// - filename bytes
+/// - 4 bytes payload_len (u32) -- length of payload after compression/encryption
+/// - 4 bytes crc32 (crc of compressed payload BEFORE encryption)
+/// - payload bytes
 pub fn build_frame(
     filename: &str,
     data: &[u8],
     compress: bool,
     encrypt_key_hex: Option<&str>,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
-    // 1) optionally compress
+    // compress if requested
     let compressed_bytes = if compress {
-        let mut e = GzEncoder::new(Vec::new(), Compression::default());
-        e.write_all(data)?;
-        let out = e.finish()?;
-        out
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(data)?;
+        enc.finish()?
     } else {
         data.to_vec()
     };
 
-    // crc of the compressed (or raw) payload (we store it in header)
+    // compute CRC of compressed_bytes (useful to verify after decrypt/decompress)
     let mut hasher = Crc32::new();
     hasher.update(&compressed_bytes);
     let crc = hasher.finalize();
 
-    // 2) optionally encrypt (AES-GCM-256). ciphertext = nonce|cipher
+    // optional encryption: AES-GCM-256. final_payload = nonce || ciphertext
     let (final_payload, encrypted_flag) = if let Some(khex) = encrypt_key_hex {
-        // key must be 64 hex chars (32 bytes)
-        let key_bytes = hex::decode(khex)?;
+        let key_bytes = hex::decode(khex).map_err(|e| {
+            Box::<dyn Error>::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Invalid hex key: {}", e)))
+        })?;
         if key_bytes.len() != 32 {
-            return Err("Encryption key must be 32 bytes (64 hex chars)".into());
+            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Encryption key must be 32 bytes (64 hex chars)")));
         }
         let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
         let cipher = Aes256Gcm::new(key);
 
-        // random nonce 12 bytes
+        // fill nonce using OsRng
+        let mut rng = OsRng;
         let mut nonce_bytes = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
+        rng.fill_bytes(&mut nonce_bytes);
+
         let nonce = Nonce::from_slice(&nonce_bytes);
-        // encrypt: additional data = empty
-        let cipher_text = cipher.encrypt(nonce, compressed_bytes.as_ref())?;
+
+        // encrypt
+        let cipher_text = cipher
+            .encrypt(nonce, compressed_bytes.as_ref())
+            .map_err(|e| Box::<dyn Error>::from(std::io::Error::new(std::io::ErrorKind::Other, format!("encrypt error: {}", e))))?;
+
         // final payload = nonce || ciphertext
         let mut v = Vec::with_capacity(12 + cipher_text.len());
         v.extend_from_slice(&nonce_bytes);
@@ -115,9 +119,9 @@ pub fn build_frame(
         (compressed_bytes, false)
     };
 
-    // 3) assemble header + payload
+    // assemble header + payload
     let mut out = Vec::new();
-    out.extend_from_slice(b"AHX1"); // magic
+    out.extend_from_slice(b"AHX1");
     let mut flags: u8 = 0;
     if compress { flags |= 1; }
     if encrypted_flag { flags |= 2; }
@@ -138,14 +142,13 @@ pub fn build_frame(
     Ok(out)
 }
 
-/// Try to parse frame header and return (filename, flags, payload_bytes_start_index, payload_len, crc)
-/// Does NOT decrypt or decompress here — just parses header and returns offset where payload begins.
+/// Parse header and return (filename, compressed_flag, encrypted_flag, payload_start_index, payload_len, crc)
 pub fn parse_frame_header(buf: &[u8]) -> Result<(String, bool, bool, usize, usize, u32), Box<dyn Error>> {
     if buf.len() < 4 + 1 + 2 + 4 + 4 {
-        return Err("Buffer too small for header".into());
+        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Buffer too small")));
     }
     if &buf[0..4] != b"AHX1" {
-        return Err("Invalid magic".into());
+        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid magic")));
     }
     let flags = buf[4];
     let compressed = (flags & 1) != 0;
@@ -154,9 +157,10 @@ pub fn parse_frame_header(buf: &[u8]) -> Result<(String, bool, bool, usize, usiz
     let fname_len = u16::from_be_bytes([buf[idx], buf[idx+1]]) as usize;
     idx += 2;
     if buf.len() < idx + fname_len + 4 + 4 {
-        return Err("Buffer too small for filename and lengths".into());
+        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Buffer too small for filename and lengths")));
     }
-    let fname = String::from_utf8(buf[idx .. idx + fname_len].to_vec())?;
+    let fname = String::from_utf8(buf[idx .. idx + fname_len].to_vec())
+        .map_err(|e| Box::<dyn Error>::from(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid filename utf8: {}", e))))?;
     idx += fname_len;
     let payload_len = u32::from_be_bytes([buf[idx], buf[idx+1], buf[idx+2], buf[idx+3]]) as usize;
     idx += 4;
@@ -164,48 +168,47 @@ pub fn parse_frame_header(buf: &[u8]) -> Result<(String, bool, bool, usize, usiz
     idx += 4;
     let payload_start = idx;
     if buf.len() < payload_start + payload_len {
-        return Err("Buffer does not contain full payload".into());
+        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Buffer does not contain full payload")));
     }
     Ok((fname, compressed, encrypted, payload_start, payload_len, crc))
 }
 
-/// Reverse frame: decrypt (if key provided) and decompress (if compressed flag)
-/// Returns (filename, recovered_bytes)
-pub fn extract_frame(
-    frame: &[u8],
-    decrypt_key_hex: Option<&str>,
-) -> Result<(String, Vec<u8>), Box<dyn Error>> {
+/// Extract frame: decrypt if needed (requires decrypt key), verify CRC, decompress if needed.
+pub fn extract_frame(frame: &[u8], decrypt_key_hex: Option<&str>) -> Result<(String, Vec<u8>), Box<dyn Error>> {
     let (fname, compressed, encrypted, payload_start, payload_len, crc) = parse_frame_header(frame)?;
     let payload = &frame[payload_start .. payload_start + payload_len];
 
-    // 1) decrypt if needed
+    // decrypt if needed
     let decrypted: Vec<u8> = if encrypted {
-        let khex = decrypt_key_hex.ok_or("Frame is encrypted but no decryption key provided")?;
-        let key_bytes = hex::decode(khex)?;
-        if key_bytes.len() != 32 { return Err("Decryption key must be 32 bytes (64 hex)".into()); }
+        let khex = decrypt_key_hex.ok_or_else(|| Box::<dyn Error>::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Frame is encrypted but no decryption key provided")))?;
+        let key_bytes = hex::decode(khex).map_err(|e| Box::<dyn Error>::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Invalid hex key: {}", e))))?;
+        if key_bytes.len() != 32 {
+            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Decryption key must be 32 bytes (64 hex)")));
+        }
         let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
         let cipher = Aes256Gcm::new(key);
         if payload.len() < 12 {
-            return Err("Encrypted payload too short".into());
+            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "Encrypted payload too short")));
         }
         let (nonce_bytes, ciphertext) = payload.split_at(12);
         let nonce = Nonce::from_slice(nonce_bytes);
-        let plain = cipher.decrypt(nonce, ciphertext.as_ref())?;
+        let plain = cipher.decrypt(nonce, ciphertext.as_ref())
+            .map_err(|e| Box::<dyn Error>::from(std::io::Error::new(std::io::ErrorKind::Other, format!("decrypt error: {}", e))))?;
         plain
     } else {
         payload.to_vec()
     };
 
-    // verify CRC
+    // CRC check
     let mut h = Crc32::new();
     h.update(&decrypted);
     let computed_crc = h.finalize();
     if computed_crc != crc {
-        // warn but continue; caller can decide
         eprintln!("Warning: CRC mismatch: header {} != computed {}", crc, computed_crc);
+        // continue; caller may verify contents
     }
 
-    // 2) decompress if needed
+    // decompress if needed
     let recovered = if compressed {
         use flate2::read::GzDecoder;
         use std::io::Read;
@@ -220,9 +223,8 @@ pub fn extract_frame(
     Ok((fname, recovered))
 }
 
-/// bit packing helpers: compute bits per symbol for given m_tones
+/// Compute bits per symbol given m_tones (largest power-of-two bits)
 pub fn bits_per_symbol(m_tones: usize) -> usize {
-    // choose largest bits such that (1<<bits) <= m_tones
     let mut bits = 0usize;
     let mut val = 1usize;
     while val * 2 <= m_tones {
@@ -232,12 +234,10 @@ pub fn bits_per_symbol(m_tones: usize) -> usize {
     bits
 }
 
-/// Convert bytes -> symbol stream (symbols in range [0, m_tones-1]) using bit grouping.
-/// This packs MSB-first across bytes.
+/// Pack bytes into symbol stream using bits_per_symbol (MSB-first).
 pub fn bytes_to_symbols(payload: &[u8], m_tones: usize) -> Vec<u8> {
     let bps = bits_per_symbol(m_tones);
     if bps == 0 {
-        // fallback: treat each byte as a symbol mod m_tones
         return payload.iter().map(|b| (*b % (m_tones as u8))).collect();
     }
     let mut out: Vec<u8> = Vec::new();
@@ -255,7 +255,6 @@ pub fn bytes_to_symbols(payload: &[u8], m_tones: usize) -> Vec<u8> {
             bitbuf &= (1u64 << bits_in_buf) - 1;
         }
     }
-    // pad remaining bits into a final symbol (left aligned)
     if bits_in_buf > 0 {
         let symbol = ((bitbuf << (bps - bits_in_buf)) & ((1u64 << bps) - 1)) as u8;
         out.push(symbol);
@@ -263,7 +262,7 @@ pub fn bytes_to_symbols(payload: &[u8], m_tones: usize) -> Vec<u8> {
     out
 }
 
-/// Convert symbol stream -> bytes (inverse of bytes_to_symbols).
+/// Convert symbol stream back to bytes (inverse).
 pub fn symbols_to_bytes(symbols: &[u8], m_tones: usize) -> Vec<u8> {
     let bps = bits_per_symbol(m_tones);
     if bps == 0 {
@@ -284,12 +283,10 @@ pub fn symbols_to_bytes(symbols: &[u8], m_tones: usize) -> Vec<u8> {
             bitbuf &= (1u64 << bits_in_buf) - 1;
         }
     }
-    // any leftover bits are ignored (they were padding)
     out
 }
 
-/// Split a symbol stream into `channels` channels via round-robin distribution.
-/// Returns Vec of per-channel symbol streams.
+/// Round-robin split of symbols into `channels` channels.
 pub fn split_round_robin(symbols: &[u8], channels: usize) -> Vec<Vec<u8>> {
     let mut out: Vec<Vec<u8>> = vec![Vec::new(); channels];
     for (i, &s) in symbols.iter().enumerate() {
@@ -298,42 +295,31 @@ pub fn split_round_robin(symbols: &[u8], channels: usize) -> Vec<Vec<u8>> {
     out
 }
 
-/// Render N channel symbol streams into interleaved audio samples (mono mix)
-/// Each channel contributes one sine tone per symbol; tones are placed in distinct bands
-/// separated by `channel_spacing_hz`, with each tone's index mapped to `tone_spacing_hz`.
-///
-/// Windowing: simple Hann window per-symbol to reduce clicks.
+/// Render channels' symbol streams into mono i16 samples.
+/// Each channel contributes a single sine per-symbol. Tones are placed in separated bands.
 pub fn render_symbols_to_samples(channels_symbols: &Vec<Vec<u8>>, params: &ModemParams) -> Vec<i16> {
     let sample_rate = params.sample_rate as f32;
     let samples_per_symbol = ((params.sample_rate as f32) * (params.symbol_ms / 1000.0)).round() as usize;
     let mut out_samples: Vec<f32> = Vec::new();
 
-    // maximum symbol stream length
     let max_len = channels_symbols.iter().map(|v| v.len()).max().unwrap_or(0);
-
-    // per-channel amplitude normalization
     let per_chan_amp = params.amplitude / (params.channels as f32).max(1.0);
 
-    // precompute hann window
+    // Hann window
     let mut hann: Vec<f32> = vec![0.0; samples_per_symbol];
     for n in 0..samples_per_symbol {
-        hann[n] = (PI * 2.0 * (n as f32) / (samples_per_symbol as f32)).sin() * 0.5 + 0.5;
-        // simpler Hann alternative: 0.5*(1 - cos(2pi*n/(N-1)))
-        // but current formula gives a smooth envelope
+        let x = (n as f32) / (samples_per_symbol as f32);
+        hann[n] = 0.5 * (1.0 - (2.0 * PI * x).cos());
     }
 
     for symbol_index in 0..max_len {
-        // for each sample in symbol window, sum contributions from each channel
         for n in 0..samples_per_symbol {
-            let t = n as f32 / sample_rate; // relative time within symbol
+            let t = n as f32 / sample_rate;
             let mut s = 0f32;
             for (ch, ch_symbols) in channels_symbols.iter().enumerate() {
                 let sym = if symbol_index < ch_symbols.len() {
                     ch_symbols[symbol_index]
-                } else {
-                    0u8
-                } as usize;
-                // frequency for this channel & symbol
+                } else { 0u8 } as usize;
                 let tone_freq = params.base_freq_hz
                     + (ch as f32) * params.channel_spacing_hz
                     + (sym as f32) * params.tone_spacing_hz;
@@ -344,8 +330,7 @@ pub fn render_symbols_to_samples(channels_symbols: &Vec<Vec<u8>>, params: &Modem
         }
     }
 
-    // scale to i16
-    // find max amplitude
+    // normalize to i16
     let maxv = out_samples.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-6);
     let scale = (i16::MAX as f32 * 0.9) / maxv;
     let mut out_i16: Vec<i16> = Vec::with_capacity(out_samples.len());
@@ -355,8 +340,7 @@ pub fn render_symbols_to_samples(channels_symbols: &Vec<Vec<u8>>, params: &Modem
     out_i16
 }
 
-/// Build a list of tone frequencies across the whole multi-channel layout
-/// (for decoder to scan). This returns Vec of Vec: outer by channel, inner by tone index.
+/// Build frequencies table (outer channel, inner tone)
 pub fn build_tone_frequencies(params: &ModemParams) -> Vec<Vec<f32>> {
     let mut out: Vec<Vec<f32>> = Vec::with_capacity(params.channels);
     for ch in 0..params.channels {
@@ -372,18 +356,19 @@ pub fn build_tone_frequencies(params: &ModemParams) -> Vec<Vec<f32>> {
     out
 }
 
-/// Goertzel detector: returns magnitude-squared for target frequency on the given slice of i16 samples.
+/// Goertzel: magnitude-squared for target frequency on slice of i16 samples.
 pub fn goertzel_mag_squared(samples: &[i16], target_freq: f32, sample_rate: usize) -> f32 {
     let n = samples.len();
     if n == 0 { return 0.0; }
     let sr = sample_rate as f32;
-    let k = (0.5 + (n as f32 * target_freq / sr)).floor() as usize;
+    let kf = target_freq * (n as f32) / sr;
+    let k = kf.round() as usize;
     let omega = 2.0 * PI * (k as f32) / (n as f32);
     let coeff = 2.0 * omega.cos();
     let mut s_prev = 0.0f32;
     let mut s_prev2 = 0.0f32;
     for &x in samples {
-        let s = x as f32 + coeff * s_prev - s_prev2;
+        let s = (x as f32) + coeff * s_prev - s_prev2;
         s_prev2 = s_prev;
         s_prev = s;
     }

@@ -12,7 +12,7 @@ fn detect_and_write_file(bytes: &[u8], out_basename: &str) -> std::io::Result<()
         ext = "png";
     } else if bytes.len() >= 3 && bytes[0..3] == [0xFF, 0xD8, 0xFF] {
         ext = "jpg";
-    } else if bytes.len() >= 6 && (&bytes[0..6] == b"GIF87a"[..] || &bytes[0..6] == b"GIF89a"[..]) {
+    } else if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
         ext = "gif";
     } else if bytes.len() >= 2 && &bytes[0..2] == [0x42, 0x4D] {
         ext = "bmp";
@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let maybe_key = args.iter().position(|a| a == "--decrypt").and_then(|i| args.get(i+1)).map(|s| s.as_str());
 
     // params must match encoder
-    let mut params = ModemParams::default();
+    let params = ModemParams::default();
     // You can extend to parse optional params like symbol-ms/mtones/channels from CLI
 
     let reader = hound::WavReader::open(in_wav)?;
