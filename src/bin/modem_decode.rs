@@ -4,9 +4,9 @@ use std::fs::File;
 use std::io::Write;
 
 use audiohax::modem::{self, ModemParams};
+use hound;
 
 fn detect_and_write_file(bytes: &[u8], out_basename: &str) -> std::io::Result<()> {
-    // simple magic detection
     let mut ext = "bin";
     if bytes.len() >= 8 && &bytes[0..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
         ext = "png";
@@ -27,27 +27,64 @@ fn detect_and_write_file(bytes: &[u8], out_basename: &str) -> std::io::Result<()
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <in.wav> [out_basename] [--decrypt KEYHEX]", args[0]);
+        eprintln!("Usage: {} <in.wav> [out_basename] [--decrypt KEYHEX] [--channels N] [--mtones M] [--symbol-ms MS]", args[0]);
         std::process::exit(1);
     }
     let in_wav = &args[1];
     let out_basename = args.get(2).map(|s| s.as_str()).unwrap_or("payload");
     let maybe_key = args.iter().position(|a| a == "--decrypt").and_then(|i| args.get(i+1)).map(|s| s.as_str());
 
-    // params must match encoder
-    let params = ModemParams::default();
-    // You can extend to parse optional params like symbol-ms/mtones/channels from CLI
+    // Parse optional params
+    let mut params = ModemParams::default();
+    let mut i = 2usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--channels" => {
+                if let Some(v) = args.get(i+1) {
+                    if let Ok(c) = v.parse::<usize>() {
+                        params.channels = c;
+                    }
+                }
+                i += 2;
+            }
+            "--mtones" => {
+                if let Some(v) = args.get(i+1) {
+                    if let Ok(m) = v.parse::<usize>() {
+                        params.m_tones = m;
+                    }
+                }
+                i += 2;
+            }
+            "--symbol-ms" => {
+                if let Some(v) = args.get(i+1) {
+                    if let Ok(ms) = v.parse::<f32>() {
+                        params.symbol_ms = ms;
+                    }
+                }
+                i += 2;
+            }
+            _ => { i += 1; }
+        }
+    }
+
+    println!("Using params: channels={}, m_tones={}, symbol_ms={}, sample_rate={}",
+             params.channels, params.m_tones, params.symbol_ms, params.sample_rate);
 
     let reader = hound::WavReader::open(in_wav)?;
     let samples_i16: Vec<i16> = reader.into_samples::<i16>().filter_map(Result::ok).collect();
     println!("Read {} samples", samples_i16.len());
 
     let samples_per_symbol = ((params.sample_rate as f32) * (params.symbol_ms / 1000.0)).round() as usize;
+    println!("Samples per symbol (computed) = {}", samples_per_symbol);
 
-    // Build tone frequency map per channel
+    // Build tone frequency map (and print it)
     let tone_freqs = modem::build_tone_frequencies(&params);
+    println!("Tone frequencies per channel:");
+    for (ch, freqs) in tone_freqs.iter().enumerate() {
+        println!(" Ch {}: {:?}", ch, freqs);
+    }
 
-    // For each symbol window, compute energy across each channel's tones and select index of max energy per channel
+    // detection
     let mut detected_by_channel: Vec<Vec<u8>> = vec![Vec::new(); params.channels];
 
     for window_start in (0..samples_i16.len()).step_by(samples_per_symbol) {
@@ -68,7 +105,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Now reinterleave round-robin into a single symbols stream
+    // debug print (first few)
+    for (ch, vec) in detected_by_channel.iter().enumerate() {
+        println!("Channel {} detected (first 20): {:?}", ch, &vec[..std::cmp::min(20, vec.len())]);
+    }
+
+    // round-robin reinterleave
     let mut symbols: Vec<u8> = Vec::new();
     let max_len = detected_by_channel.iter().map(|v| v.len()).max().unwrap_or(0);
     for i in 0..max_len {
@@ -80,12 +122,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("Detected {} symbols", symbols.len());
-
-    // Convert symbols -> bytes
     let bytes = modem::symbols_to_bytes(&symbols, params.m_tones);
     println!("Recovered {} bytes from symbols", bytes.len());
+    // debug: show head
+    let head_len = std::cmp::min(64, bytes.len());
+    print!("Head of recovered bytes (first {}):", head_len);
+    for b in &bytes[..head_len] { print!(" {:02X}", b); }
+    println!();
 
-    // Try to find frame header (we're tolerant: header may start at index 0)
+    // parse frame
     match modem::parse_frame_header(&bytes) {
         Ok((_fname, _compr, _enc, start, plen, _crc)) => {
             println!("Frame header parsed. payload start {} len {}", start, plen);
@@ -102,7 +147,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) => {
             eprintln!("Could not parse frame header from recovered bytes: {}", e);
-            // still try writing raw bytes
             detect_and_write_file(&bytes, out_basename)?;
         }
     }
