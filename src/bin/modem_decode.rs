@@ -27,7 +27,7 @@ fn detect_and_write_file(bytes: &[u8], out_basename: &str) -> std::io::Result<()
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <in.wav> [out_basename] [--decrypt KEYHEX] [--channels N] [--mtones M] [--symbol-ms MS]", args[0]);
+        eprintln!("Usage: {} <in.wav> [out_basename] [--decrypt KEYHEX] [--channels N] [--mtones M] [--symbol-ms MS] [--repeats N]", args[0]);
         std::process::exit(1);
     }
     let in_wav = &args[1];
@@ -36,6 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse optional params
     let mut params = ModemParams::default();
+    let mut expected_repeats: usize = 3;
     let mut i = 2usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -63,12 +64,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 i += 2;
             }
+            "--repeats" => {
+                if let Some(v) = args.get(i+1) {
+                    if let Ok(r) = v.parse::<usize>() {
+                        expected_repeats = r;
+                    }
+                }
+                i += 2;
+            }
             _ => { i += 1; }
         }
     }
 
-    println!("Using params: channels={}, m_tones={}, symbol_ms={}, sample_rate={}",
-             params.channels, params.m_tones, params.symbol_ms, params.sample_rate);
+    println!("Using params: channels={}, m_tones={}, symbol_ms={}, sample_rate={}, expected_repeats={}",
+             params.channels, params.m_tones, params.symbol_ms, params.sample_rate, expected_repeats);
 
     let reader = hound::WavReader::open(in_wav)?;
     let samples_i16: Vec<i16> = reader.into_samples::<i16>().filter_map(Result::ok).collect();
@@ -113,10 +122,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // round-robin reinterleave
     let mut symbols: Vec<u8> = Vec::new();
     let max_len = detected_by_channel.iter().map(|v| v.len()).max().unwrap_or(0);
-    for i in 0..max_len {
+    for idx in 0..max_len {
         for ch in 0..params.channels {
-            if i < detected_by_channel[ch].len() {
-                symbols.push(detected_by_channel[ch][i]);
+            if idx < detected_by_channel[ch].len() {
+                symbols.push(detected_by_channel[ch][idx]);
             }
         }
     }
@@ -130,24 +139,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for b in &bytes[..head_len] { print!(" {:02X}", b); }
     println!();
 
-    // parse frame
-    match modem::parse_frame_header(&bytes) {
-        Ok((_fname, _compr, _enc, start, plen, _crc)) => {
-            println!("Frame header parsed. payload start {} len {}", start, plen);
-            let frame = bytes;
-            match modem::extract_frame(&frame, maybe_key) {
-                Ok((fname, recovered_bytes)) => {
-                    println!("Recovered filename: {}", fname);
-                    detect_and_write_file(&recovered_bytes, out_basename)?;
+    // NOTE: do not move `bytes` (Vec<u8>) if we want to reuse it later.
+    // First try to depacketize (we expect the encoder used packetize_stream)
+    match modem::depacketize_stream(&bytes, expected_repeats) {
+        Ok(recovered_frame) => {
+            println!("Depacketize succeeded: {} bytes", recovered_frame.len());
+            // Try to parse frame header from recovered_frame
+            match modem::parse_frame_header(&recovered_frame) {
+                Ok((_fname, _compr, _enc, start, plen, _crc)) => {
+                    println!("Frame header parsed. payload start {} len {}", start, plen);
+                    match modem::extract_frame(&recovered_frame, maybe_key) {
+                        Ok((fname, recovered_bytes)) => {
+                            println!("Recovered filename: {}", fname);
+                            detect_and_write_file(&recovered_bytes, out_basename)?;
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to extract frame from depacketized data: {}", e);
+                            // fallback: write the raw recovered frame for inspection
+                            let mut f = File::create(format!("{}_raw_frame.bin", out_basename))?;
+                            f.write_all(&recovered_frame)?;
+                        }
+                    }
                 }
                 Err(e) => {
-                    eprintln!("Failed to extract frame: {}", e);
+                    eprintln!("Could not parse frame header from depacketized bytes: {}", e);
+                    let mut f = File::create(format!("{}_raw_frame_fail.bin", out_basename))?;
+                    f.write_all(&recovered_frame)?;
                 }
             }
         }
         Err(e) => {
-            eprintln!("Could not parse frame header from recovered bytes: {}", e);
-            detect_and_write_file(&bytes, out_basename)?;
+            eprintln!("Depacketize failed or no packets found: {}. Falling back to trying raw frame parsing.", e);
+            // try parsing header directly from raw `bytes`
+            match modem::parse_frame_header(&bytes) {
+                Ok((_fname, _compr, _enc, start, plen, _crc)) => {
+                    println!("Frame header parsed (raw). payload start {} len {}", start, plen);
+                    // pass a reference to bytes (don't move it)
+                    match modem::extract_frame(&bytes, maybe_key) {
+                        Ok((fname, recovered_bytes)) => {
+                            println!("Recovered filename: {}", fname);
+                            detect_and_write_file(&recovered_bytes, out_basename)?;
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to extract frame: {}", e);
+                            detect_and_write_file(&bytes, out_basename)?;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Could not parse frame header from raw recovered bytes: {}", e);
+                    // still write raw bytes for inspection
+                    detect_and_write_file(&bytes, out_basename)?;
+                }
+            }
         }
     }
 
