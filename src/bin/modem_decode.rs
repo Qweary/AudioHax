@@ -6,6 +6,7 @@ use std::io::Write;
 use audiohax::modem::{self, ModemParams};
 use hound;
 
+/// helper: write recovered file to disk and pick extension
 fn detect_and_write_file(bytes: &[u8], out_basename: &str) -> std::io::Result<()> {
     let mut ext = "bin";
     if bytes.len() >= 8 && &bytes[0..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
@@ -24,10 +25,124 @@ fn detect_and_write_file(bytes: &[u8], out_basename: &str) -> std::io::Result<()
     Ok(())
 }
 
+/// convert symbol stream -> bit vector (MSB-first per symbol)
+fn symbols_to_bitvec(symbols: &[u8], m_tones: usize) -> Vec<u8> {
+    let bps = modem::bits_per_symbol(m_tones);
+    let mut bits: Vec<u8> = Vec::with_capacity(symbols.len() * bps);
+    for &s in symbols {
+        let mut val = s as usize;
+        // mask to bps bits
+        val &= (1usize << bps) - 1;
+        // produce MSB-first bits
+        for i in (0..bps).rev() {
+            let bit = ((val >> i) & 1) as u8;
+            bits.push(bit);
+        }
+    }
+    bits
+}
+
+/// take a bit vector and produce bytes starting at given bit offset
+fn bitvec_to_bytes_with_offset(bits: &[u8], bit_offset: usize) -> Vec<u8> {
+    if bit_offset >= 8 {
+        return Vec::new();
+    }
+    if bits.len() <= bit_offset {
+        return Vec::new();
+    }
+    let mut out: Vec<u8> = Vec::with_capacity((bits.len() - bit_offset + 7) / 8);
+    let mut i = bit_offset;
+    while i + 8 <= bits.len() {
+        let mut b = 0u8;
+        for j in 0..8 {
+            b = (b << 1) | bits[i + j];
+        }
+        out.push(b);
+        i += 8;
+    }
+    out
+}
+
+fn try_all_bit_alignments_and_depacketize(
+    symbols: &[u8],
+    m_tones: usize,
+    expected_repeats: Option<usize>,
+    rs_opts: Option<(usize, usize)>,
+    maybe_key: Option<&str>,
+    out_basename: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bits = symbols_to_bitvec(symbols, m_tones);
+    let max_offset = 8usize; // try 0..7
+    println!("Trying bit-alignment search (0..7) on bitstream length {} bits", bits.len());
+    for off in 0..max_offset {
+        let candidate = bitvec_to_bytes_with_offset(&bits, off);
+        if candidate.is_empty() { continue; }
+        // Quick head print for diagnostics
+        let head_len = std::cmp::min(32, candidate.len());
+        print!("Try offset {} head:", off);
+        for b in &candidate[..head_len] { print!(" {:02X}", b); }
+        println!();
+
+        // If RS options requested, try RS depacketize first
+        let packetized_result = if rs_opts.is_some() {
+            match modem::depacketize_stream_rs(&candidate) {
+                Ok(v) => {
+                    println!("Offset {}: RS depacketize succeeded ({} bytes)", off, v.len());
+                    Some(v)
+                }
+                Err(e) => {
+                    // RS failed (no packets or reconstruct failure)
+                    // continue falling back to repeats/raw parsing
+                    //print!("Offset {}: RS depacketize failed: {}\n", off, e);
+                    None
+                }
+            }
+        } else if let Some(r) = expected_repeats {
+            match modem::depacketize_stream(&candidate, r) {
+                Ok(v) => {
+                    println!("Offset {}: repetition depacketize succeeded ({} bytes)", off, v.len());
+                    Some(v)
+                }
+                Err(_e) => None,
+            }
+        } else {
+            None
+        };
+
+        let frame_bytes = if let Some(v) = packetized_result { v } else { candidate };
+
+        // Try to parse AHX1 header
+        match modem::parse_frame_header(&frame_bytes) {
+            Ok((_fname, _compr, _enc, start, plen, _crc)) => {
+                println!("Offset {}: Parsed frame header: payload start {} len {}", off, start, plen);
+                // attempt extract
+                match modem::extract_frame(&frame_bytes, maybe_key) {
+                    Ok((fname, recovered_bytes)) => {
+                        println!("Recovered filename: {} ({} bytes) at offset {}", fname, recovered_bytes.len(), off);
+                        detect_and_write_file(&recovered_bytes, out_basename)?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        eprintln!("Offset {}: Failed to extract frame: {}", off, e);
+                        // fallback to writing frame_bytes raw later
+                        detect_and_write_file(&frame_bytes, out_basename)?;
+                        return Ok(());
+                    }
+                }
+            }
+            Err(_e) => {
+                // Not a valid AHX1 at this offset; continue trying other offsets
+            }
+        }
+    }
+
+    Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Bit-alignment search failed to find a valid frame")))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <in.wav> [out_basename] [--decrypt KEYHEX] [--channels N] [--mtones M] [--symbol-ms MS] [--repeats N]", args[0]);
+        eprintln!("Usage: {} <in.wav> [out_basename] [--decrypt KEYHEX] [--channels N] [--mtones M] [--symbol-ms MS] [--repeats R] [--rs-data D --rs-parity P]", args[0]);
         std::process::exit(1);
     }
     let in_wav = &args[1];
@@ -36,7 +151,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse optional params
     let mut params = ModemParams::default();
-    let mut expected_repeats: usize = 3;
+    let mut expected_repeats: Option<usize> = None;
+    let mut rs_data_shards: Option<usize> = None;
+    let mut rs_parity_shards: Option<usize> = None;
+
     let mut i = 2usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -66,9 +184,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--repeats" => {
                 if let Some(v) = args.get(i+1) {
-                    if let Ok(r) = v.parse::<usize>() {
-                        expected_repeats = r;
-                    }
+                    if let Ok(r) = v.parse::<usize>() { expected_repeats = Some(r); }
+                }
+                i += 2;
+            }
+            "--rs-data" => {
+                if let Some(v) = args.get(i+1) {
+                    if let Ok(n) = v.parse::<usize>() { rs_data_shards = Some(n); }
+                }
+                i += 2;
+            }
+            "--rs-parity" => {
+                if let Some(v) = args.get(i+1) {
+                    if let Ok(n) = v.parse::<usize>() { rs_parity_shards = Some(n); }
                 }
                 i += 2;
             }
@@ -76,8 +204,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("Using params: channels={}, m_tones={}, symbol_ms={}, sample_rate={}, expected_repeats={}",
-             params.channels, params.m_tones, params.symbol_ms, params.sample_rate, expected_repeats);
+    println!("Using params: channels={}, m_tones={}, symbol_ms={}, sample_rate={}{}",
+             params.channels, params.m_tones, params.symbol_ms, params.sample_rate,
+             match expected_repeats { Some(r) => format!(", expected_repeats={}", r), None => String::new() });
 
     let reader = hound::WavReader::open(in_wav)?;
     let samples_i16: Vec<i16> = reader.into_samples::<i16>().filter_map(Result::ok).collect();
@@ -122,76 +251,89 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // round-robin reinterleave
     let mut symbols: Vec<u8> = Vec::new();
     let max_len = detected_by_channel.iter().map(|v| v.len()).max().unwrap_or(0);
-    for idx in 0..max_len {
+    for i in 0..max_len {
         for ch in 0..params.channels {
-            if idx < detected_by_channel[ch].len() {
-                symbols.push(detected_by_channel[ch][idx]);
+            if i < detected_by_channel[ch].len() {
+                symbols.push(detected_by_channel[ch][i]);
             }
         }
     }
 
     println!("Detected {} symbols", symbols.len());
+
+    // First attempt: the straightforward convert to bytes and standard flow
     let bytes = modem::symbols_to_bytes(&symbols, params.m_tones);
     println!("Recovered {} bytes from symbols", bytes.len());
-    // debug: show head
     let head_len = std::cmp::min(64, bytes.len());
     print!("Head of recovered bytes (first {}):", head_len);
     for b in &bytes[..head_len] { print!(" {:02X}", b); }
     println!();
 
-    // NOTE: do not move `bytes` (Vec<u8>) if we want to reuse it later.
-    // First try to depacketize (we expect the encoder used packetize_stream)
-    match modem::depacketize_stream(&bytes, expected_repeats) {
-        Ok(recovered_frame) => {
-            println!("Depacketize succeeded: {} bytes", recovered_frame.len());
-            // Try to parse frame header from recovered_frame
-            match modem::parse_frame_header(&recovered_frame) {
-                Ok((_fname, _compr, _enc, start, plen, _crc)) => {
-                    println!("Frame header parsed. payload start {} len {}", start, plen);
-                    match modem::extract_frame(&recovered_frame, maybe_key) {
-                        Ok((fname, recovered_bytes)) => {
-                            println!("Recovered filename: {}", fname);
-                            detect_and_write_file(&recovered_bytes, out_basename)?;
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to extract frame from depacketized data: {}", e);
-                            // fallback: write the raw recovered frame for inspection
-                            let mut f = File::create(format!("{}_raw_frame.bin", out_basename))?;
-                            f.write_all(&recovered_frame)?;
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Could not parse frame header from depacketized bytes: {}", e);
-                    let mut f = File::create(format!("{}_raw_frame_fail.bin", out_basename))?;
-                    f.write_all(&recovered_frame)?;
-                }
+    // If RS options were provided, attempt RS depacketize; otherwise, repetition depacketize if requested.
+    let rs_opts = if rs_data_shards.is_some() && rs_parity_shards.is_some() {
+        Some((rs_data_shards.unwrap(), rs_parity_shards.unwrap()))
+    } else { None };
+
+    // Try direct RS/repetition/fallback parsing on the straightforward bytes first
+    let mut packetized_result: Option<Vec<u8>> = None;
+
+    if let Some((d, p)) = rs_opts {
+        println!("Attempting Reed-Solomon depacketize on straightforward bytes...");
+        match modem::depacketize_stream_rs(&bytes) {
+            Ok(v) => {
+                println!("Depacketize RS succeeded: {} bytes", v.len());
+                packetized_result = Some(v);
+            }
+            Err(e) => {
+                eprintln!("Depacketize RS failed: {}. Will try bit-alignment fallback...", e);
             }
         }
-        Err(e) => {
-            eprintln!("Depacketize failed or no packets found: {}. Falling back to trying raw frame parsing.", e);
-            // try parsing header directly from raw `bytes`
-            match modem::parse_frame_header(&bytes) {
-                Ok((_fname, _compr, _enc, start, plen, _crc)) => {
-                    println!("Frame header parsed (raw). payload start {} len {}", start, plen);
-                    // pass a reference to bytes (don't move it)
-                    match modem::extract_frame(&bytes, maybe_key) {
-                        Ok((fname, recovered_bytes)) => {
-                            println!("Recovered filename: {}", fname);
-                            detect_and_write_file(&recovered_bytes, out_basename)?;
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to extract frame: {}", e);
-                            detect_and_write_file(&bytes, out_basename)?;
-                        }
+    } else if let Some(r) = expected_repeats {
+        println!("Attempting repetition depacketize (expected repeats = {}) on straightforward bytes", r);
+        match modem::depacketize_stream(&bytes, r) {
+            Ok(v) => {
+                println!("Depacketize succeeded: {} bytes", v.len());
+                packetized_result = Some(v);
+            }
+            Err(e) => {
+                eprintln!("Depacketize failed or no packets found on straightforward bytes: {}. Will try bit-alignment fallback.", e);
+            }
+        }
+    }
+
+    // Decide what to parse as frame bytes: prefer depacketized result if available, else raw bytes.
+    if let Some(v) = packetized_result {
+        let frame_bytes = v;
+        match modem::parse_frame_header(&frame_bytes) {
+            Ok((_fname, _compr, _enc, start, plen, _crc)) => {
+                println!("Frame header parsed. payload start {} len {}", start, plen);
+                match modem::extract_frame(&frame_bytes, maybe_key) {
+                    Ok((fname, recovered_bytes)) => {
+                        println!("Recovered filename: {}", fname);
+                        detect_and_write_file(&recovered_bytes, out_basename)?;
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to extract frame: {}", e);
+                        detect_and_write_file(&frame_bytes, out_basename)?;
                     }
                 }
-                Err(e) => {
-                    eprintln!("Could not parse frame header from raw recovered bytes: {}", e);
-                    // still write raw bytes for inspection
-                    detect_and_write_file(&bytes, out_basename)?;
-                }
             }
+            Err(e) => {
+                eprintln!("Could not parse frame header from depacketized bytes: {}. Saving them raw.", e);
+                detect_and_write_file(&frame_bytes, out_basename)?;
+            }
+        }
+        return Ok(());
+    }
+
+    // If we reach here, straightforward path failed. Try bit-alignment search (0..7)
+    match try_all_bit_alignments_and_depacketize(&symbols, params.m_tones, expected_repeats, rs_opts, maybe_key, out_basename) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            eprintln!("Bit-alignment fallback failed: {}", e);
+            // As a last resort write the straightforward bytes to disk
+            eprintln!("Writing raw straightforward bytes to disk as last resort.");
+            detect_and_write_file(&bytes, out_basename)?;
         }
     }
 

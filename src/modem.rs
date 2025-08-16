@@ -3,13 +3,14 @@
 //! - header (magic, flags, filename length + name, payload len, crc32)
 //! - optional gzip compression
 //! - optional AES-GCM encryption (key supplied as 32-byte hex)
-//! - bitpacking into symbols (base-m_tones) and round-robin channel splitting
+//! - bitpacking into symbols (base-m_tones)
 //! - simple packetization + repetition-based FEC (for prototyping robustness)
+//! - optional Reed-Solomon FEC packetization
 //! - MFSK rendering (sum of sine carriers for simultaneous channels)
 //! - simple Goertzel detector + helpers for decoding
 //!
 //! NOTE: demo-oriented; tune params (symbol_ms, tone spacing, channel spacing,
-//! packet size and repetition) to suit acoustic environment.
+//! packet size, and FEC) to suit the acoustic environment.
 
 use std::error::Error;
 use std::collections::HashMap;
@@ -27,6 +28,9 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 
 use std::f32::consts::PI;
+
+/// Reed-Solomon crate (keep the same import style you used)
+use reed_solomon_erasure::galois_8::ReedSolomon;
 
 /// Modem params and defaults (sane demo defaults)
 #[derive(Debug, Clone)]
@@ -55,7 +59,7 @@ impl Default for ModemParams {
             channel_spacing_hz: 400.0,
             tone_spacing_hz: 30.0,
             preamble_repeats: 8,
-            preamble_symbols: vec![ (32/2) as u8 ], // use middle tone as pilot
+            preamble_symbols: vec![ (32/2) as u8 ], // middle tone as pilot
         }
     }
 }
@@ -380,171 +384,310 @@ pub fn goertzel_mag_squared(samples: &[i16], target_freq: f32, sample_rate: usiz
 }
 
 /* -----------------------------
-   Packetization + improved depacketization (majority / scanning)
+   Packetization + simple repetition FEC
    ----------------------------- */
 
-/// Packetize a frame into repeated packets.
-/// Packet header:
-///  - 4 bytes magic: b"PKT1"
-///  - 2 bytes payload_len (u16 BE)
-///  - 4 bytes seq (u32 BE)
-///  - 4 bytes total_packets (u32 BE)
-///  - 4 bytes payload_crc (u32 BE)
-///  - payload bytes
+/// Packetize an arbitrary byte stream into small packets with header and repeat each packet `repeats` times.
+/// Old (repeat-based) Packet format:
+/// [4 bytes magic "PKT1"] [4 bytes seq (BE)] [2 bytes len (BE)] [4 bytes crc32 (BE)] [payload bytes]
 pub fn packetize_stream(data: &[u8], pkt_payload_size: usize, repeats: usize) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::new();
-    if pkt_payload_size == 0 {
-        return out;
-    }
-    let total = ((data.len() + pkt_payload_size - 1) / pkt_payload_size) as u32;
+    let mut out = Vec::new();
     let mut seq: u32 = 0;
-    for start in (0..data.len()).step_by(pkt_payload_size) {
-        let end = std::cmp::min(start + pkt_payload_size, data.len());
-        let payload = &data[start..end];
-        let payload_len = payload.len() as u16;
-
-        // compute crc of payload
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let end = std::cmp::min(offset + pkt_payload_size, data.len());
+        let payload = &data[offset..end];
+        // crc of payload
         let mut h = Crc32::new();
         h.update(payload);
         let crc = h.finalize();
-
-        for _r in 0..repeats.max(1) {
-            out.extend_from_slice(b"PKT1");
-            out.extend_from_slice(&payload_len.to_be_bytes());
-            out.extend_from_slice(&seq.to_be_bytes());
-            out.extend_from_slice(&total.to_be_bytes());
-            out.extend_from_slice(&crc.to_be_bytes());
-            out.extend_from_slice(payload);
+        // build a single packet
+        let mut pkt = Vec::with_capacity(4 + 4 + 2 + 4 + payload.len());
+        pkt.extend_from_slice(b"PKT1");
+        pkt.extend_from_slice(&seq.to_be_bytes());
+        pkt.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        pkt.extend_from_slice(&crc.to_be_bytes());
+        pkt.extend_from_slice(payload);
+        // repeat it
+        for _ in 0..repeats {
+            out.extend_from_slice(&pkt);
         }
-
         seq = seq.wrapping_add(1);
+        offset = end;
     }
     out
 }
 
-/// Depacketize a raw recovered byte stream into the original frame.
-/// Scans for PKT1 headers anywhere in the stream, validates CRC, groups payloads by seq,
-/// selects majority/first valid payload per seq, and then assembles in sequence order.
-/// If no CRC-valid copies exist, falls back to majority-selection among the observed (possibly corrupted)
-/// copies for each seq. Missing sequences are filled with zero-bytes of the most-common payload length.
-pub fn depacketize_stream(buf: &[u8], _expected_repeats: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    // minimum header size = 4 (magic) + 2 (len) + 4 (seq) + 4 (total) + 4 (crc)
-    const HDR_LEN: usize = 18;
-    if buf.len() < HDR_LEN {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Buffer too small to contain packets")));
-    }
-
+/// Attempt to depacketize a stream produced by packetize_stream using majority voting across repeated packet instances.
+/// Returns Err if no packets found at all.
+pub fn depacketize_stream(buf: &[u8], _expected_repeats: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+    let magic = b"PKT1";
+    let mut map: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
+    let mut max_seq: i64 = -1;
     let mut i = 0usize;
-    // map: seq -> Vec<(payload, crc_ok)>
-    let mut map_all: HashMap<u32, Vec<(Vec<u8>, bool)>> = HashMap::new();
-    let mut totals_seen: HashMap<u32, u32> = HashMap::new();
-
-    while i + HDR_LEN <= buf.len() {
-        if &buf[i..i+4] == b"PKT1" {
-            // read header fields
-            let payload_len = u16::from_be_bytes([buf[i+4], buf[i+5]]) as usize;
-            let seq = u32::from_be_bytes([buf[i+6], buf[i+7], buf[i+8], buf[i+9]]);
-            let total = u32::from_be_bytes([buf[i+10], buf[i+11], buf[i+12], buf[i+13]]);
-            let crc = u32::from_be_bytes([buf[i+14], buf[i+15], buf[i+16], buf[i+17]]);
-
-            let end = i + HDR_LEN + payload_len;
-            if end > buf.len() {
-                // partial packet at tail — stop scanning here
-                break;
-            }
-
-            let payload = buf[i + HDR_LEN .. end].to_vec();
-
-            // compute crc
-            let mut h = Crc32::new();
-            h.update(&payload);
-            let computed = h.finalize();
-            let crc_ok = computed == crc;
-
-            // store payload and crc_ok
-            map_all.entry(seq).or_default().push((payload.clone(), crc_ok));
-            totals_seen.entry(seq).or_insert(total);
-
-            // advance cursor past this packet
-            i = end;
+    while i + 4 + 4 + 2 + 4 <= buf.len() {
+        if &buf[i..i+4] == magic {
+            // try to parse packet header
+            if i + 4 + 4 + 2 + 4 > buf.len() { break; }
+            let seq = u32::from_be_bytes([buf[i+4], buf[i+5], buf[i+6], buf[i+7]]);
+            let len = u16::from_be_bytes([buf[i+8], buf[i+9]]) as usize;
+            let _crc = u32::from_be_bytes([buf[i+10], buf[i+11], buf[i+12], buf[i+13]]);
+            let pkt_total = 4 + 4 + 2 + 4 + len;
+            if i + pkt_total > buf.len() { break; }
+            let payload = &buf[i + 14 .. i + 14 + len];
+            // store the payload (copy)
+            map.entry(seq).or_insert_with(Vec::new).push(payload.to_vec());
+            if (seq as i64) > max_seq { max_seq = seq as i64; }
+            // advance index by 1 to allow overlapping detection
+            i += 1;
         } else {
-            // not aligned - advance by 1 and scan again (resilient to noise/preamble)
             i += 1;
         }
     }
 
-    if map_all.is_empty() {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "No PKT1 packets found in buffer")));
+    if map.is_empty() {
+        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No packets found")));
     }
 
-    // Determine total packets (prefer the maximum total seen)
-    let mut total_candidates: Vec<u32> = totals_seen.values().copied().collect();
-    total_candidates.sort();
-    total_candidates.dedup();
-    let total = if !total_candidates.is_empty() {
-        *total_candidates.last().unwrap()
-    } else {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "Could not determine total packets")));
-    };
+    // reconstruct by sequence order
+    let mut seqs: Vec<u32> = map.keys().cloned().collect();
+    seqs.sort_unstable();
 
-    // determine the global-most-common payload length (used to fill missing sequences)
-    let mut len_counts: HashMap<usize, usize> = HashMap::new();
-    for v in map_all.values() {
-        for (p, _ok) in v.iter() {
-            *len_counts.entry(p.len()).or_insert(0) += 1;
+    let mut out: Vec<u8> = Vec::new();
+
+    // For each sequence, majority-vote bytes across the observed copies.
+    for &seq in &seqs {
+        let copies = &map[&seq];
+        // find most common length among copies
+        let mut len_counts: HashMap<usize, usize> = HashMap::new();
+        for c in copies.iter() { *len_counts.entry(c.len()).or_insert(0) += 1; }
+        let (&chosen_len, _cnt) = len_counts.iter().max_by_key(|kv| kv.1).unwrap();
+        // prepare vector of byte-majority for each position
+        let mut rec = vec![0u8; chosen_len];
+        for pos in 0..chosen_len {
+            let mut counts: HashMap<u8, usize> = HashMap::new();
+            for c in copies.iter() {
+                if pos < c.len() {
+                    *counts.entry(c[pos]).or_insert(0) += 1;
+                }
+            }
+            // pick majority value
+            if counts.is_empty() {
+                rec[pos] = 0u8;
+            } else {
+                let (&val, _c) = counts.iter().max_by_key(|kv| kv.1).unwrap();
+                rec[pos] = val;
+            }
         }
+        out.extend_from_slice(&rec);
     }
-    let global_fill_len = if !len_counts.is_empty() {
-        *len_counts.iter().max_by_key(|kv| kv.1).unwrap().0
-    } else {
-        0usize
-    };
 
-    // assemble packets in order, choosing best candidate for each seq
-    let mut assembled: Vec<u8> = Vec::new();
-    let mut missing_seqs: Vec<u32> = Vec::new();
+    Ok(out)
+}
 
-    for seq in 0u32..total {
-        if let Some(cands) = map_all.get(&seq) {
-            // If any cands have crc_ok==true, consider only those and majority-select among them.
-            let mut chosen_payload: Option<Vec<u8>> = None;
+/* -----------------------------
+   Reed-Solomon Packetization (RS)
+   -----------------------------
+   RS packet format used here (header):
+   [4 bytes magic "RS01"]
+   [8 bytes orig_len (BE u64)]   <- original total stream length (so we can trim padding)
+   [4 bytes block_seq (BE u32)]
+   [2 bytes data_shards (BE u16)]
+   [2 bytes parity_shards (BE u16)]
+   [2 bytes shard_idx (BE u16)]
+   [2 bytes shard_size (BE u16)]
+   [4 bytes crc32 (BE u32) - crc of shard payload]
+   [shard payload - exactly shard_size bytes]
+   ----------------------------- */
 
-            let mut crc_good_count = 0usize;
-            for (_p, ok) in cands.iter() { if *ok { crc_good_count += 1 } }
+/// Packetize using Reed-Solomon shards. `shard_size` is bytes per shard.
+/// For a block we pack `data_shards * shard_size` bytes (pad last block with zeros),
+/// then create `data_shards + parity_shards` shards and emit each as a packet.
+pub fn packetize_stream_rs(data: &[u8], shard_size: usize, data_shards: usize, parity_shards: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+    if data_shards == 0 || parity_shards == 0 || shard_size == 0 {
+        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "RS params must be > 0")));
+    }
+    let total_shards = data_shards + parity_shards;
+    let block_size = data_shards * shard_size;
+    let orig_len = data.len() as u64;
 
-            let candidates_to_consider: Vec<Vec<u8>> = if crc_good_count > 0 {
-                cands.iter().filter(|(_,ok)| *ok).map(|(p,_)| p.clone()).collect()
-            } else {
-                cands.iter().map(|(p,_)| p.clone()).collect()
-            };
+    let mut out: Vec<u8> = Vec::new();
+    let mut block_seq: u32 = 0;
+    let mut offset = 0usize;
 
-            // majority-select the most frequent payload among candidates_to_consider
-            let mut freq: HashMap<Vec<u8>, usize> = HashMap::new();
-            for p in candidates_to_consider {
-                *freq.entry(p).or_insert(0) += 1;
+    while offset < data.len() {
+        // prepare block bytes (pad with zeros)
+        let end = std::cmp::min(offset + block_size, data.len());
+        let mut block = vec![0u8; block_size];
+        block[..(end - offset)].copy_from_slice(&data[offset..end]);
+
+        // split into data shards
+        let mut shards: Vec<Vec<u8>> = Vec::with_capacity(total_shards);
+        for d in 0..data_shards {
+            let start = d * shard_size;
+            shards.push(block[start .. start + shard_size].to_vec());
+        }
+        // parity placeholders
+        for _ in 0..parity_shards {
+            shards.push(vec![0u8; shard_size]);
+        }
+
+        // RS encode
+        let rs = ReedSolomon::new(data_shards, parity_shards)?;
+        // create mutable slice refs
+        let mut shard_refs: Vec<&mut [u8]> = shards.iter_mut().map(|v| v.as_mut_slice()).collect();
+        rs.encode(&mut shard_refs)?;
+
+        // emit per-shard packets with header (include orig_len so decoder can trim)
+        for shard_idx in 0..total_shards {
+            let payload = &shards[shard_idx];
+            let mut hdr = Vec::with_capacity(4 + 8 + 4 + 2 + 2 + 2 + 2 + 4);
+            hdr.extend_from_slice(b"RS01");
+            hdr.extend_from_slice(&orig_len.to_be_bytes());
+            hdr.extend_from_slice(&block_seq.to_be_bytes());
+            hdr.extend_from_slice(&(data_shards as u16).to_be_bytes());
+            hdr.extend_from_slice(&(parity_shards as u16).to_be_bytes());
+            hdr.extend_from_slice(&(shard_idx as u16).to_be_bytes());
+            hdr.extend_from_slice(&(shard_size as u16).to_be_bytes());
+            let mut h = Crc32::new();
+            h.update(payload);
+            hdr.extend_from_slice(&h.finalize().to_be_bytes());
+
+            out.extend_from_slice(&hdr);
+            out.extend_from_slice(payload);
+        }
+
+        block_seq = block_seq.wrapping_add(1);
+        offset += block_size;
+    }
+
+    Ok(out)
+}
+
+/// Depacketize RS stream produced by `packetize_stream_rs`.
+/// Scans stream for RS packets, groups shards by block, attempts to reconstruct when at least `data_shards` present.
+/// Returns reconstructed original stream trimmed to original length (using orig_len).
+pub fn depacketize_stream_rs(buf: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    let magic = b"RS01";
+    #[derive(Debug, Clone)]
+    struct BlockState {
+        orig_len: u64,
+        data_shards: usize,
+        parity_shards: usize,
+        shard_size: usize,
+        shards: Vec<Option<Vec<u8>>>,
+    }
+
+    let mut map: HashMap<u32, BlockState> = HashMap::new();
+    let header_min = 4 + 8 + 4 + 2 + 2 + 2 + 2 + 4; // 28 bytes
+
+    let mut i = 0usize;
+    while i + header_min <= buf.len() {
+        if &buf[i..i+4] == magic {
+            // ensure full header available
+            if i + header_min > buf.len() { break; }
+            let base = i + 4;
+            let orig_len = u64::from_be_bytes([
+                buf[base], buf[base+1], buf[base+2], buf[base+3],
+                buf[base+4], buf[base+5], buf[base+6], buf[base+7],
+            ]);
+            let seq = u32::from_be_bytes([buf[base+8], buf[base+9], buf[base+10], buf[base+11]]);
+            let data_shards = u16::from_be_bytes([buf[base+12], buf[base+13]]) as usize;
+            let parity_shards = u16::from_be_bytes([buf[base+14], buf[base+15]]) as usize;
+            let shard_idx = u16::from_be_bytes([buf[base+16], buf[base+17]]) as usize;
+            let shard_size = u16::from_be_bytes([buf[base+18], buf[base+19]]) as usize;
+            let crc = u32::from_be_bytes([buf[base+20], buf[base+21], buf[base+22], buf[base+23]]);
+            let pkt_len = header_min + shard_size;
+            if i + pkt_len > buf.len() {
+                // incomplete packet at end
+                break;
             }
-            if !freq.is_empty() {
-                let (best_payload, _count) = freq.into_iter().max_by_key(|kv| kv.1).unwrap();
-                chosen_payload = Some(best_payload);
+            let payload = buf[i + header_min .. i + header_min + shard_size].to_vec();
+
+            // check or create blockstate
+            let entry = map.entry(seq).or_insert_with(|| BlockState {
+                orig_len,
+                data_shards,
+                parity_shards,
+                shard_size,
+                shards: vec![None; data_shards + parity_shards],
+            });
+
+            // header consistency check
+            if entry.data_shards != data_shards || entry.parity_shards != parity_shards || entry.shard_size != shard_size {
+                // inconsistent -> skip packet
+                i += 1;
+                continue;
             }
 
-            if let Some(payload) = chosen_payload {
-                assembled.extend_from_slice(&payload);
-            } else {
-                // unexpected: no candidate payload (shouldn't happen), fill zeros
-                assembled.extend_from_slice(&vec![0u8; global_fill_len]);
-                missing_seqs.push(seq);
+            // store shard if missing
+            if shard_idx < entry.shards.len() {
+                if entry.shards[shard_idx].is_none() {
+                    // optionally check CRC
+                    let mut h = Crc32::new();
+                    h.update(&payload);
+                    let computed = h.finalize();
+                    // store anyway (we could discard if crc != computed)
+                    entry.shards[shard_idx] = Some(payload);
+                }
             }
+
+            // jump forward by whole packet (we have a valid header+payload)
+            i += pkt_len;
         } else {
-            // no copies at all for this sequence
-            assembled.extend_from_slice(&vec![0u8; global_fill_len]);
-            missing_seqs.push(seq);
+            i += 1;
         }
     }
 
-    if !missing_seqs.is_empty() {
-        eprintln!("Warning: missing {} sequences (examples): {:?}", missing_seqs.len(), &missing_seqs[..std::cmp::min(8, missing_seqs.len())]);
-        // continue with best-effort assembled buffer
+    if map.is_empty() {
+        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No RS packets found")));
+    }
+
+    // reconstruct blocks in ascending seq order
+    let mut seqs: Vec<u32> = map.keys().cloned().collect();
+    seqs.sort_unstable();
+    let mut assembled: Vec<u8> = Vec::new();
+    let mut overall_orig_len: Option<u64> = None;
+
+    for seq in seqs {
+        let state = map.remove(&seq).unwrap();
+        if overall_orig_len.is_none() { overall_orig_len = Some(state.orig_len); }
+
+        let data_shards = state.data_shards;
+        let parity_shards = state.parity_shards;
+        let total_shards = data_shards + parity_shards;
+        let shard_size = state.shard_size;
+
+        // count present shards
+        let present = state.shards.iter().filter(|s| s.is_some()).count();
+        if present < data_shards {
+            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Not enough shards for block {}: have {}, need {}", seq, present, data_shards))));
+        }
+
+        // Convert to Vec<Option<Vec<u8>>> for crate
+        let mut shards_opt = state.shards.clone();
+
+        // reconstruct
+        let rs = ReedSolomon::new(data_shards, parity_shards)?;
+        rs.reconstruct(&mut shards_opt)?;
+
+        // append first data_shards to assembled bytes
+        for d in 0..data_shards {
+            if let Some(sh) = &shards_opt[d] {
+                assembled.extend_from_slice(sh);
+            } else {
+                // shouldn't happen
+                assembled.extend_from_slice(&vec![0u8; shard_size]);
+            }
+        }
+    }
+
+    // trim to original length (orig_len came from packet headers)
+    if let Some(olen) = overall_orig_len {
+        let olen_usz = olen as usize;
+        if assembled.len() > olen_usz {
+            assembled.truncate(olen_usz);
+        }
     }
 
     Ok(assembled)

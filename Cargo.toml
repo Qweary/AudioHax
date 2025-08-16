@@ -19,3 +19,4 @@ crc32fast = "1.3"        # CRC32 checks
 aes-gcm = "0.10"         # AES-GCM encryption (optional)
 rand_core = "0.6"        # for secure random nonce
 twoway = "0.2"
+reed-solomon-erasure = "6"	# Reed-Solomon erasure coding (used for FEC)
