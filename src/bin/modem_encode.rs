@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(m) = mtones_override { params.m_tones = m; }
 
     // choose packetization: RS if options provided, otherwise repeats
-    let packetized_bytes = if let (Some(d), Some(p)) = (rs_data_shards, rs_parity_shards) {
+    let mut packetized_bytes = if let (Some(d), Some(p)) = (rs_data_shards, rs_parity_shards) {
         println!("Using Reed-Solomon FEC: data_shards={} parity_shards={} shard_size={}", d, p, rs_shard_size);
         modem::packetize_stream_rs(&frame, rs_shard_size, d, p)?
     } else {
@@ -119,11 +119,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // symbolization -> symbols
-    let symbols = modem::bytes_to_symbols(&packetized_bytes, params.m_tones);
-    println!("Symbols total: {}", symbols.len());
+    let mut symbols = modem::bytes_to_symbols(&packetized_bytes, params.m_tones);
+    println!("Symbols total (before preamble): {}", symbols.len());
 
     // split into channels round-robin
-    let channels_syms = modem::split_round_robin(&symbols, params.channels);
+    let mut channels_syms = modem::split_round_robin(&symbols, params.channels);
+
+    // --- PREAMBLE: prepend per-channel preamble symbols to each channel's stream
+    // This helps the decoder find symbol/frame boundaries quickly.
+    if params.preamble_symbols.len() > 0 && params.preamble_repeats > 0 {
+        let mut pre_vec: Vec<u8> = Vec::with_capacity(params.preamble_symbols.len() * params.preamble_repeats);
+        for _ in 0..params.preamble_repeats {
+            pre_vec.extend_from_slice(&params.preamble_symbols);
+        }
+        for ch_syms in channels_syms.iter_mut() {
+            let mut newv = pre_vec.clone();
+            newv.extend_from_slice(ch_syms);
+            *ch_syms = newv;
+        }
+        println!("Prepended preamble ({} symbols per channel)", pre_vec.len());
+    }
 
     // render to samples
     let samples_i16 = modem::render_symbols_to_samples(&channels_syms, &params);
