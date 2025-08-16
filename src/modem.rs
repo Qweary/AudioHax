@@ -880,3 +880,63 @@ pub fn estimate_duration_seconds(
         seconds,
     }
 }
+
+/// Simple channel simulator operating on the serialized packet-bytes stream.
+/// - `random_flip_prob`: per-byte probability to flip a single random bit (0.0..1.0)
+/// - `burst_erase_prob`: per-byte probability to start a burst erase (remove bytes)
+/// - `avg_burst_len`: average length (bytes) of a burst erase
+///
+/// This is intentionally simple and byte-oriented. Removing bytes simulates lost/erased packets
+/// or continuous loss. The RS depacketizer is tolerant because it scans for RS headers.
+/// Use this in tests to quantify the benefit of interleaving + RS over burst losses.
+pub fn simulate_channel_bytes(
+    input: &[u8],
+    random_flip_prob: f64,
+    burst_erase_prob: f64,
+    avg_burst_len: usize,
+) -> Vec<u8> {
+    // Safety clamp params
+    let rf = if random_flip_prob < 0.0 { 0.0 } else if random_flip_prob > 1.0 { 1.0 } else { random_flip_prob };
+    let bp = if burst_erase_prob < 0.0 { 0.0 } else if burst_erase_prob > 1.0 { 1.0 } else { burst_erase_prob };
+    let avg_burst = if avg_burst_len == 0 { 1usize } else { avg_burst_len };
+
+    // copy input
+    let mut out: Vec<u8> = input.to_vec();
+
+    // Flip random bits
+    if rf > 0.0 {
+        let mut rng = OsRng;
+        let thresh = ((u64::MAX as f64) * rf) as u64;
+        for i in 0..out.len() {
+            let r = rng.next_u64();
+            if r <= thresh {
+                // flip a single random bit in this byte
+                let bit = (rng.next_u32() % 8) as u8;
+                out[i] ^= 1u8 << bit;
+            }
+        }
+    }
+
+    // Burst erasures: iterate with index; when a burst starts, remove a random length around avg_burst
+    if bp > 0.0 && out.len() > 0 {
+        let mut rng = OsRng;
+        let thresh = ((u64::MAX as f64) * bp) as u64;
+        let mut i = 0usize;
+        while i < out.len() {
+            let r = rng.next_u64();
+            if r <= thresh {
+                // start a burst erase here
+                // length: 1 .. (2 * avg_burst)
+                let len = 1usize + ((rng.next_u32() as usize) % (avg_burst * 2));
+                let end = std::cmp::min(i + len, out.len());
+                // remove bytes i..end
+                out.drain(i..end);
+                // continue at same index (which now points to next byte after erased region)
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    out
+}
