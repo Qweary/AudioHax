@@ -1,206 +1,211 @@
 // src/bin/channel_sim.rs
-//
-// Simple simulator harness:
-//  - Builds a frame from input file (uses modem::build_frame)
-//  - Packetizes with RS interleaving (modem::packetize_stream_rs_interleaved)
-//  - Repeatedly simulates channel corruption using modem::simulate_channel_bytes
-//  - Attempts RS depacketize (modem::depacketize_stream_rs) on the corrupted bytes
-//  - Records success/failure to CSV
-//
-// Usage:
-//   cargo run --bin channel_sim -- <input_file> --rs-data D --rs-parity P --rs-shard-size S [options]
-//
-// Options:
-//   --trials N                 number of trials per param combo (default 100)
-//   --burst-prob-start F       burst start prob (default 0.000)
-//   --burst-prob-end F         burst end prob (default 0.010)
-//   --burst-steps N            number of burst prob values between start/end (default 6)
-//   --flip-prob-start F        random flip start prob (default 0.0)
-//   --flip-prob-end F          random flip end prob (default 0.01)
-//   --flip-steps N             number of flip prob values between start/end (default 6)
-//   --avg-burst-len N          average burst length in bytes (default 128)
-//   --out-csv PATH             output CSV path (default: sim_results.csv)
-//   --no-interleave            use plain packetize_stream_rs (no interleave)
-//   --compress                 compress payload before RS (default off)
-//
-// Example:
-//   cargo run --bin channel_sim -- test.jpg --rs-data 4 --rs-parity 5 --rs-shard-size 128 --trials 200
-//
-
 use std::env;
-use std::fs;
-use std::io::Write;
-use std::path::Path;
+use std::fs::File;
+use std::io::{Read, Write};
 
+use rand::prelude::*;
 use audiohax::modem;
-use audiohax::modem::ModemParams;
+use audiohax::modem::{depacketize_stream, depacketize_stream_rs};
 
-fn parse_f64(s: &str, default: f64) -> f64 {
-    s.parse().ok().unwrap_or(default)
-}
-fn parse_usize(s: &str, default: usize) -> usize {
-    s.parse().ok().unwrap_or(default)
-}
-
-fn frange(start: f64, end: f64, steps: usize) -> Vec<f64> {
-    if steps <= 1 {
-        return vec![start];
-    }
-    let mut v = Vec::with_capacity(steps);
-    for i in 0..steps {
-        let t = (i as f64) / ((steps - 1) as f64);
-        v.push(start + (end - start) * t);
-    }
-    v
-}
-
-fn print_usage(bin: &str) {
+fn print_usage(name: &str) {
     eprintln!("Usage:");
-    eprintln!("  {} <input_file> --rs-data D --rs-parity P --rs-shard-size S [options]", bin);
-    eprintln!("Options (defaults shown):");
-    eprintln!("  --trials N (100)");
-    eprintln!("  --burst-prob-start F (0.0)");
-    eprintln!("  --burst-prob-end F (0.01)");
-    eprintln!("  --burst-steps N (6)");
-    eprintln!("  --flip-prob-start F (0.0)");
-    eprintln!("  --flip-prob-end F (0.01)");
-    eprintln!("  --flip-steps N (6)");
-    eprintln!("  --avg-burst-len N (128)");
-    eprintln!("  --out-csv PATH (sim_results.csv)");
-    eprintln!("  --no-interleave (use plain RS serialization)");
-    eprintln!("  --compress (compress payload before RS)");
+    eprintln!("  {} <in_bytes.bin> <out_sim.bin> [--mode bitflip|byteburst|packet] [--flip_prob P] [--burst_prob P] [--burst_len L] [--packet_size N] [--repeats R] [--rs-data D --rs-parity P]", name);
+    eprintln!();
+    eprintln!("Examples:");
+    eprintln!("  {} packetized.bin sim_bytes.bin --mode packet --packet_size 152 --burst_prob 0.05 --flip_prob 0.001 --rs-data 4 --rs-parity 2", name);
+    eprintln!("  {} packetized.bin sim_bytes.bin --mode bitflip --flip_prob 0.0005", name);
+}
+
+fn detect_and_write_file(bytes: &[u8], out_basename: &str) -> std::io::Result<()> {
+    let mut ext = "bin";
+    if bytes.len() >= 8 && &bytes[0..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+        ext = "png";
+    } else if bytes.len() >= 3 && bytes[0..3] == [0xFF, 0xD8, 0xFF] {
+        ext = "jpg";
+    } else if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        ext = "gif";
+    } else if bytes.len() >= 2 && &bytes[0..2] == [0x42, 0x4D] {
+        ext = "bmp";
+    }
+    let out_path = format!("{}_sim_recovered.{}", out_basename, ext);
+    println!("Writing {} ({} bytes)", out_path, bytes.len());
+    let mut f = File::create(&out_path)?;
+    f.write_all(bytes)?;
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
+    if args.len() < 3 {
         print_usage(&args[0]);
         std::process::exit(1);
     }
-
-    let input_path = args[1].clone();
+    let in_path = &args[1];
+    let out_path = &args[2];
 
     // defaults
+    let mut mode = "bitflip".to_string();
+    let mut flip_prob: f64 = 0.0;
+    let mut burst_prob: f64 = 0.0;
+    let mut burst_len: usize = 16;
+    let mut packet_size: usize = 128;
+    let mut repeats_opt: Option<usize> = None;
     let mut rs_data: Option<usize> = None;
     let mut rs_parity: Option<usize> = None;
-    let mut rs_shard_size: Option<usize> = None;
-
-    let mut trials: usize = 100;
-    let mut burst_start: f64 = 0.0;
-    let mut burst_end: f64 = 0.01;
-    let mut burst_steps: usize = 6;
-    let mut flip_start: f64 = 0.0;
-    let mut flip_end: f64 = 0.01;
-    let mut flip_steps: usize = 6;
-    let mut avg_burst_len: usize = 128;
-    let mut out_csv = "sim_results.csv".to_string();
-    let mut interleave = true;
-    let mut compress = false;
 
     // parse args
-    let mut i = 2usize;
+    let mut i = 3usize;
     while i < args.len() {
         match args[i].as_str() {
-            "--rs-data" => { rs_data = args.get(i+1).and_then(|s| s.parse().ok()); i += 2; }
-            "--rs-parity" => { rs_parity = args.get(i+1).and_then(|s| s.parse().ok()); i += 2; }
-            "--rs-shard-size" => { rs_shard_size = args.get(i+1).and_then(|s| s.parse().ok()); i += 2; }
-            "--trials" => { trials = args.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(trials); i += 2; }
-            "--burst-prob-start" => { burst_start = parse_f64(&args[i+1], burst_start); i += 2; }
-            "--burst-prob-end" => { burst_end = parse_f64(&args[i+1], burst_end); i += 2; }
-            "--burst-steps" => { burst_steps = parse_usize(&args[i+1], burst_steps); i += 2; }
-            "--flip-prob-start" => { flip_start = parse_f64(&args[i+1], flip_start); i += 2; }
-            "--flip-prob-end" => { flip_end = parse_f64(&args[i+1], flip_end); i += 2; }
-            "--flip-steps" => { flip_steps = parse_usize(&args[i+1], flip_steps); i += 2; }
-            "--avg-burst-len" => { avg_burst_len = parse_usize(&args[i+1], avg_burst_len); i += 2; }
-            "--out-csv" => { out_csv = args.get(i+1).cloned().unwrap_or(out_csv); i += 2; }
-            "--no-interleave" => { interleave = false; i += 1; }
-            "--compress" => { compress = true; i += 1; }
-            _ => { eprintln!("Unknown arg: {}", args[i]); print_usage(&args[0]); std::process::exit(1); }
+            "--mode" => { if let Some(v) = args.get(i+1) { mode = v.clone(); } i += 2; }
+            "--flip_prob" => { if let Some(v) = args.get(i+1) { flip_prob = v.parse::<f64>().unwrap_or(0.0); } i += 2; }
+            "--burst_prob" => { if let Some(v) = args.get(i+1) { burst_prob = v.parse::<f64>().unwrap_or(0.0); } i += 2; }
+            "--burst_len" => { if let Some(v) = args.get(i+1) { burst_len = v.parse::<usize>().unwrap_or(16); } i += 2; }
+            "--packet_size" => { if let Some(v) = args.get(i+1) { packet_size = v.parse::<usize>().unwrap_or(128); } i += 2; }
+            "--repeats" => { if let Some(v) = args.get(i+1) { repeats_opt = v.parse::<usize>().ok(); } i += 2; }
+            "--rs-data" => { if let Some(v) = args.get(i+1) { rs_data = v.parse::<usize>().ok(); } i += 2; }
+            "--rs-parity" => { if let Some(v) = args.get(i+1) { rs_parity = v.parse::<usize>().ok(); } i += 2; }
+            _ => { eprintln!("Unknown arg {}", args[i]); i += 1; }
         }
     }
 
-    if rs_data.is_none() || rs_parity.is_none() || rs_shard_size.is_none() {
-        eprintln!("RS parameters are required: --rs-data, --rs-parity, --rs-shard-size");
-        print_usage(&args[0]);
-        std::process::exit(1);
-    }
+    // read input bytes
+    let mut f = File::open(in_path)?;
+    let mut bytes: Vec<u8> = Vec::new();
+    f.read_to_end(&mut bytes)?;
+    println!("Read {} bytes from {}", bytes.len(), in_path);
 
-    let d = rs_data.unwrap();
-    let p = rs_parity.unwrap();
-    let s = rs_shard_size.unwrap();
+    // RNG
+    let mut rng = StdRng::from_entropy();
 
-    println!("Simulator harness:");
-    println!(" input: {}", input_path);
-    println!(" RS data/parity/shard_size = {}/{}/{}", d, p, s);
-    println!(" trials per combo = {}", trials);
-    println!(" burst prob range = {} -> {} (steps {})", burst_start, burst_end, burst_steps);
-    println!(" flip prob range = {} -> {} (steps {})", flip_start, flip_end, flip_steps);
-    println!(" avg burst len = {}", avg_burst_len);
-    println!(" interleave = {}", interleave);
-    println!(" compress frame = {}", compress);
-    println!(" output csv = {}", out_csv);
+    // simulate
+    let mut sim = bytes.clone();
 
-    // read payload
-    let payload = fs::read(&input_path)?;
-    let filename = Path::new(&input_path).file_name().and_then(|s| s.to_str()).unwrap_or("payload");
-
-    // build frame
-    let frame = modem::build_frame(filename, &payload, compress, None)?;
-    println!("Built frame {} bytes", frame.len());
-
-    // packetize with RS (interleaved or not)
-    let serialized = if interleave {
-        modem::packetize_stream_rs_interleaved(&frame, d, p, s)
-    } else {
-        // packetize_stream_rs returns Result<Vec<u8>,_>
-        match modem::packetize_stream_rs(&frame, s, d, p) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("packetize_stream_rs failed: {}", e);
-                std::process::exit(1);
+    match mode.as_str() {
+        "bitflip" => {
+            if flip_prob <= 0.0 {
+                println!("flip_prob <= 0, nothing to do.");
+            } else {
+                println!("Applying bitflip channel: flip_prob={}", flip_prob);
+                for b in sim.iter_mut() {
+                    for bit in 0..8 {
+                        if rng.gen_bool(flip_prob) {
+                            *b ^= 1u8 << bit;
+                        }
+                    }
+                }
             }
         }
+        "byteburst" => {
+            println!("Applying byte-burst erasure model: burst_prob={}, burst_len={}", burst_prob, burst_len);
+            let mut i = 0usize;
+            while i < sim.len() {
+                if rng.gen_bool(burst_prob) {
+                    let len = burst_len; // fixed length; could be randomized
+                    let end = std::cmp::min(i+len, sim.len());
+                    for j in i..end { sim[j] = 0u8; } // erase -> zeros
+                    i = end;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        "packet" => {
+            println!("Packet-aware mode: packet_size={}, burst_prob={}, flip_prob={}", packet_size, burst_prob, flip_prob);
+            let mut idx = 0usize;
+            while idx < sim.len() {
+                let end = std::cmp::min(idx + packet_size, sim.len());
+                if rng.gen_bool(burst_prob) {
+                    // drop whole packet -> zero it
+                    for j in idx..end { sim[j] = 0u8; }
+                } else {
+                    // surviving packet: optionally flip bits inside
+                    if flip_prob > 0.0 {
+                        for b in &mut sim[idx..end] {
+                            for bit in 0..8 {
+                                if rng.gen_bool(flip_prob) {
+                                    *b ^= 1u8 << bit;
+                                }
+                            }
+                        }
+                    }
+                }
+                idx = end;
+            }
+        }
+        other => {
+            eprintln!("Unknown mode: {}. Supported: bitflip, byteburst, packet", other);
+            std::process::exit(1);
+        }
+    }
+
+    // write simulated bytes to out_path
+    let mut of = File::create(out_path)?;
+    of.write_all(&sim)?;
+    println!("Wrote simulated bytes to {}", out_path);
+
+    // Attempt depacketize (RS if rs_data/rs_parity set, otherwise repetition with repeats)
+    let recovered = if let (Some(d), Some(p)) = (rs_data, rs_parity) {
+        println!("Attempting RS depacketize: data={} parity={}", d, p);
+        match depacketize_stream_rs(&sim) {
+            Ok(v) => {
+                println!("RS depacketize succeeded: {} bytes", v.len());
+                Some(v)
+            }
+            Err(e) => {
+                eprintln!("RS depacketize failed: {}", e);
+                None
+            }
+        }
+    } else if let Some(r) = repeats_opt {
+        println!("Attempting repetition depacketize (expected repeats = {})", r);
+        match depacketize_stream(&sim, r) {
+            Ok(v) => {
+                println!("Repetition depacketize succeeded: {} bytes", v.len());
+                Some(v)
+            }
+            Err(e) => {
+                eprintln!("Repetition depacketize failed: {}", e);
+                None
+            }
+        }
+    } else {
+        println!("No depacketize options provided (no RS & no repeats); skipping depacketize attempt.");
+        None
     };
 
-    println!("Serialized RS bytes = {} bytes", serialized.len());
-
-    // prepare sweep arrays
-    let burst_values = frange(burst_start, burst_end, burst_steps);
-    let flip_values = frange(flip_start, flip_end, flip_steps);
-
-    // CSV file
-    let mut f = fs::File::create(&out_csv)?;
-    writeln!(f, "burst_prob,flip_prob,trial,success,recovered_len,expected_len")?;
-
-    // run sweep
-    let mut total_runs = 0usize;
-    for &bp in &burst_values {
-        for &fp in &flip_values {
-            println!("Testing burst_prob={:.6}, flip_prob={:.6} ...", bp, fp);
-            for tnum in 0..trials {
-                total_runs += 1;
-                // simulate
-                let sim_bytes = modem::simulate_channel_bytes(&serialized, fp, bp, avg_burst_len);
-                // attempt RS depacketize
-                match modem::depacketize_stream_rs(&sim_bytes) {
-                    Ok(recovered) => {
-                        let success = if recovered == frame { 1 } else { 0 };
-                        writeln!(f, "{:.6},{:.6},{},{},{},{}", bp, fp, tnum, success, recovered.len(), frame.len())?;
+    // If we recovered bytes, try parsing/extracting frame
+    if let Some(frame_bytes) = recovered {
+        println!("Attempting to parse frame header from recovered bytes ({} bytes)...", frame_bytes.len());
+        match modem::parse_frame_header(&frame_bytes) {
+            Ok((_fname, _compr, _enc, start, plen, _crc)) => {
+                println!("Frame header parsed. payload start {} len {}", start, plen);
+                match modem::extract_frame(&frame_bytes, None) {
+                    Ok((fname, recovered_payload)) => {
+                        println!("Successfully extracted file '{}' ({} bytes)", fname, recovered_payload.len());
+                        detect_and_write_file(&recovered_payload, "sim_out")?;
                     }
-                    Err(_e) => {
-                        // failed to reconstruct
-                        writeln!(f, "{:.6},{:.6},{},{},{},{}", bp, fp, tnum, 0, 0, frame.len())?;
+                    Err(e) => {
+                        eprintln!("Failed to extract frame: {}", e);
+                        // write full frame for inspection
+                        let mut dump = File::create("sim_frame_dump.bin")?;
+                        dump.write_all(&frame_bytes)?;
+                        println!("Wrote sim_frame_dump.bin for inspection.");
                     }
-                }
-                // flush occasionally
-                if tnum % 50 == 0 {
-                    f.flush().ok();
                 }
             }
-            println!("  done.");
+            Err(e) => {
+                eprintln!("Could not parse frame header from recovered bytes: {}", e);
+                // write recovered bytes to file for inspection
+                let mut dump = File::create("sim_recovered_raw.bin")?;
+                dump.write_all(&frame_bytes)?;
+                println!("Wrote sim_recovered_raw.bin for inspection.");
+            }
         }
+    } else {
+        println!("No recovered bytes (depacketize failed or not attempted).");
     }
 
-    println!("Finished {} runs. Results written to {}", total_runs, out_csv);
+    println!("Simulation complete.");
     Ok(())
 }
