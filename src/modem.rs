@@ -626,7 +626,7 @@ pub fn depacketize_stream_rs(buf: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
                     // optionally check CRC
                     let mut h = Crc32::new();
                     h.update(&payload);
-                    let computed = h.finalize();
+                    let _computed = h.finalize();
                     // store anyway (we could discard if crc != computed)
                     entry.shards[shard_idx] = Some(payload);
                 }
@@ -691,4 +691,192 @@ pub fn depacketize_stream_rs(buf: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     }
 
     Ok(assembled)
+}
+
+/// Small wrapper describing a single RS shard "packet" as bytes plus addressing metadata.
+#[derive(Clone)]
+pub struct ShardPacket {
+    pub block_idx: u32,
+    pub shard_idx: u32,
+    pub total_shards: u32,
+    pub data_shards: u32,
+    pub shard_size: u32,
+    pub bytes: Vec<u8>, // header (28 bytes) + shard payload
+}
+
+/// Interleave order: 0..total_shards across all blocks, then next shard index, etc.
+fn interleave_packets(blocks: &Vec<Vec<ShardPacket>>) -> Vec<u8> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+    let total_shards = blocks[0].len();
+    let mut out = Vec::with_capacity(blocks.iter().map(|b| b.iter().map(|s| s.bytes.len()).sum::<usize>()).sum());
+    for s in 0..total_shards {
+        for b in 0..blocks.len() {
+            if s < blocks[b].len() {
+                out.extend_from_slice(&blocks[b][s].bytes);
+            }
+        }
+    }
+    out
+}
+
+/// Interleaved RS packetizer that emits the *same per-shard header format* as packetize_stream_rs,
+/// but reorders (interleaves) shards across blocks to spread burst losses.
+pub fn packetize_stream_rs_interleaved(
+    payload: &[u8],
+    data_shards: usize,
+    parity_shards: usize,
+    shard_size: usize,
+) -> Vec<u8> {
+    // Validate a few things early (silently return empty on bad params)
+    if data_shards == 0 || parity_shards == 0 || shard_size == 0 {
+        return Vec::new();
+    }
+
+    let d = data_shards;
+    let p = parity_shards;
+    let t = d + p;
+    let block_bytes = d * shard_size;
+    let orig_len = payload.len() as u64;
+
+    // Split payload into blocks (pad last block)
+    let mut blocks_payloads: Vec<Vec<u8>> = Vec::new();
+    let mut offset = 0usize;
+    while offset < payload.len() {
+        let end = std::cmp::min(offset + block_bytes, payload.len());
+        let mut block = vec![0u8; block_bytes];
+        block[..(end - offset)].copy_from_slice(&payload[offset..end]);
+        blocks_payloads.push(block);
+        offset += end - offset;
+    }
+    // If payload was empty, still create one empty block so we encode headers
+    if blocks_payloads.is_empty() {
+        blocks_payloads.push(vec![0u8; block_bytes]);
+    }
+
+    // Prepare ReedSolomon instance once
+    let rs = match ReedSolomon::new(d, p) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    // For each block, create t shards, RS-encode, then serialize each shard using the SAME header
+    // format as packetize_stream_rs (28-byte header: RS01 + orig_len(u64) + block_seq(u32) + data_shards(u16) +
+    // parity_shards(u16) + shard_idx(u16) + shard_size(u16) + crc(u32) )
+    let mut per_block_packets: Vec<Vec<ShardPacket>> = Vec::with_capacity(blocks_payloads.len());
+
+    for (block_seq, block_payload) in blocks_payloads.iter().enumerate() {
+        // Build shard buffers (t shards of shard_size bytes)
+        let mut shards: Vec<Vec<u8>> = (0..t).map(|_| vec![0u8; shard_size]).collect();
+
+        // fill data shards from block payload
+        for s in 0..d {
+            let start = s * shard_size;
+            let end = start + shard_size;
+            shards[s][..].copy_from_slice(&block_payload[start..end]);
+        }
+
+        // compute parity in-place
+        {
+            let mut refs: Vec<&mut [u8]> = shards.iter_mut().map(|v| v.as_mut_slice()).collect();
+            if rs.encode(&mut refs).is_err() {
+                // encoding error: skip block
+                continue;
+            }
+        }
+
+        // serialize shards with matching header
+        let mut shard_packets: Vec<ShardPacket> = Vec::with_capacity(t);
+        for shard_idx in 0..t {
+            let payload_bytes = &shards[shard_idx];
+
+            // build header exactly like packetize_stream_rs
+            let mut hdr = Vec::with_capacity(28);
+            hdr.extend_from_slice(b"RS01");
+            hdr.extend_from_slice(&orig_len.to_be_bytes());
+            hdr.extend_from_slice(&(block_seq as u32).to_be_bytes());
+            hdr.extend_from_slice(&(d as u16).to_be_bytes());
+            hdr.extend_from_slice(&(p as u16).to_be_bytes());
+            hdr.extend_from_slice(&((shard_idx as u16)).to_be_bytes());
+            hdr.extend_from_slice(&((shard_size as u16)).to_be_bytes());
+            let mut hcrc = Crc32::new();
+            hcrc.update(&payload_bytes);
+            hdr.extend_from_slice(&hcrc.finalize().to_be_bytes());
+
+            let mut pkt_bytes = hdr;
+            pkt_bytes.extend_from_slice(payload_bytes);
+
+            shard_packets.push(ShardPacket {
+                block_idx: block_seq as u32,
+                shard_idx: shard_idx as u32,
+                total_shards: t as u32,
+                data_shards: d as u32,
+                shard_size: shard_size as u32,
+                bytes: pkt_bytes,
+            });
+        }
+
+        per_block_packets.push(shard_packets);
+    }
+
+    // Interleave across blocks and return concatenated serialized packets
+    interleave_packets(&per_block_packets)
+}
+
+/// Estimate duration (seconds) given payload length and modem params.
+/// This matches the math you’ve been logging so estimates are very close to real output.
+pub struct DurationEstimate {
+    pub encoded_bytes: usize,
+    pub symbols_total: usize,
+    pub seconds: f64,
+}
+
+pub fn estimate_duration_seconds(
+    payload_len: usize,
+    rs_data: usize,
+    rs_parity: usize,
+    rs_shard_size: usize,
+    m_tones: usize,
+    channels: usize,
+    symbol_ms: usize,
+    preamble_symbols_per_channel: usize, // pass your real preamble (e.g., 8)
+) -> DurationEstimate {
+    let d = rs_data;
+    let p = rs_parity;
+    let t = d + p;
+    let block_bytes = d * rs_shard_size;
+
+    // number of blocks
+    let mut blocks = payload_len / block_bytes;
+    if payload_len % block_bytes != 0 {
+        blocks += 1;
+    }
+
+    // shard packet size (your observed was 28 bytes header + shard_size)
+    let shard_packet_bytes = 28 + rs_shard_size;
+
+    // encoded bytes (headers + data + parity)
+    let encoded_bytes = blocks * t * shard_packet_bytes;
+
+    // bits per symbol
+    let bps = bits_per_symbol(m_tones);
+    let bits_per_symbol = if bps == 0 { 1 } else { bps };
+
+    // symbols for payload
+    let symbols_payload = (encoded_bytes * 8 + bits_per_symbol - 1) / bits_per_symbol;
+
+    // add preamble (per channel; encoder adds the same count on each)
+    let symbols_total = symbols_payload + preamble_symbols_per_channel * channels;
+
+    // samples per symbol and total seconds
+    let samples_per_symbol = (48_000usize * symbol_ms) / 1000; // your default SR = 48 kHz
+    let total_samples = symbols_total * samples_per_symbol;
+    let seconds = total_samples as f64 / 48_000f64;
+
+    DurationEstimate {
+        encoded_bytes,
+        symbols_total,
+        seconds,
+    }
 }
