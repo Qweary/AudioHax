@@ -10,5 +10,9 @@ pub mod mapping_loader;
 // WS-4 Phase 1 (S9) — pure-Rust shared core + CLI. Both build & unit-test under
 // `cargo test --lib --no-default-features` (no system libs). The engine holds NO
 // OpenCV/image/midir type; the CLI is the headless-testable clap grammar.
-pub mod engine;
 pub mod cli;
+pub mod engine;
+
+// WS-4 Phase 3 (S10) — pure-Rust ratatui TUI front-end, a pure OBSERVER over the S9
+// engine seam. Builds & unit-tests under `cargo test --lib --no-default-features`.
+pub mod tui;

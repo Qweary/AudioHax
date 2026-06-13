@@ -59,5 +59,12 @@ reed-solomon-erasure = "6"	# Reed-Solomon erasure coding (used for FEC)
 
 image = { version = "0.24", optional = true }           # image loading/resizing and JPEG encoding
 
+# ── WS-4 Phase 3 (S10) — TUI front-end, pure-Rust (build --no-default-features) ──
+# Both are pure-Rust (no system libs) and compile under --no-default-features; they
+# are REGULAR (non-optional) deps so the headless `audiohax-tui` bin builds with the
+# default feature set off. crossterm is ratatui's default backend; pinned explicitly.
+ratatui = "0.29"                                   # terminal UI widgets (tui.rs render path)
+crossterm = "0.28"                                 # terminal backend / event loop (audiohax-tui bin)
+
 [dev-dependencies]
 rand_chacha = "0.3"

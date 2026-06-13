@@ -43,6 +43,26 @@ pub enum Command {
     /// MFSK data modem operations (unifies the four legacy modem bins).
     #[command(subcommand)]
     Modem(ModemCommand),
+    /// Run the headless ratatui TUI over a synthetic (no-OpenCV) feature source —
+    /// the WS-4 Phase 3 seam-proof front-end. NOTE: the main `audiohax` binary links
+    /// OpenCV and only builds with the default features; the standalone
+    /// `audiohax-tui` bin is what actually runs this headlessly under
+    /// `--no-default-features`. This arm exists for grammar completeness so the
+    /// unified `audiohax` CLI advertises the subcommand.
+    Tui(TuiArgs),
+}
+
+/// Args for `audiohax tui` (and the standalone `audiohax-tui` bin). Minimal: the
+/// synthetic source spans `--steps` scan steps over `--instruments` instruments,
+/// paralleling the [`PipelineArgs`] knobs of the same name.
+#[derive(Debug, Args, PartialEq, Clone)]
+pub struct TuiArgs {
+    /// Number of synthetic scan steps to span (default matches the pipeline default).
+    #[arg(long, default_value_t = 40)]
+    pub steps: usize,
+    /// Number of instruments in the ensemble.
+    #[arg(long, default_value_t = 4)]
+    pub instruments: usize,
 }
 
 /// Shared image-pipeline knobs (replaces the five legacy `parse_cli_arg` flags).
