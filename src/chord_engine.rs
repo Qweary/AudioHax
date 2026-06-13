@@ -504,6 +504,542 @@ impl ChordEngine {
 }
 
 // =========================================================================
+// PERFORMANCE-REALIZATION LAYER (S6) — public API as NAIVE STUBS (Pass A)
+// =========================================================================
+//
+// This layer turns a structural `StepPlan` (chord + phrase position + a
+// structural velocity FLOOR) into concrete, sounding `NoteEvent`s for ONE
+// instrument on ONE step. It is the single pure entry point main.rs's worker
+// calls; main.rs stays a thin adapter that extracts plain scalars, looks up
+// the step's plan, calls `realize_step`, and maps the result into its own
+// `(note, vel, hold_ms, offset_ms)` tuples.
+//
+// PURITY / BOUNDARY CONTRACT: nothing here takes an OpenCV or image type. The
+// image features arrive as the plain-scalar `PerfFeatures` (the music-domain
+// projection of `ScanBarFeatures`), so no rendering/vision type ever crosses
+// into the lib crate and the whole layer is headless-testable.
+//
+// PASS-A STATUS: every function below is a NAIVE STUB. It compiles and returns
+// a musically inert result (a single flat note at the structural floor, held
+// ~90% of the step), so the Test Engineer's property net compiles and goes RED
+// on the MISSING expressive behavior — not on missing symbols. Pass B fills in
+// the four expressive dimensions documented in docs/design-s6-expressivity.md:
+// DYNAMICS (phrase contour on the floor), RHYTHM (≥3 onset/duration patterns +
+// harmonic-rhythm acceleration), ARTICULATION (staccato/legato/portato via
+// hold fraction + phrase-end ritardando), and ORCHESTRATION ROLES (bass vs
+// melody vs harmonic-fill differing in register, rhythmic freedom, motion).
+
+/// The orchestration role of one INSTRUMENT (not one voice within a triad).
+///
+/// theory: a three-part ensemble texture distributes a triad across functional
+/// strata. The BASS instrument carries the harmonic foundation (root motion,
+/// lowest register, rhythmically steady). The MELODY instrument carries the top
+/// line (highest register, the most rhythmic freedom — arpeggiation,
+/// syncopation, the phrase's expressive peak). HARMONIC-FILL instruments sit in
+/// the middle register, sustaining the chord's inner tones with the least
+/// rhythmic activity so they support rather than compete. This is a DIFFERENT
+/// axis from `VoiceRole`: `VoiceRole` classifies a voice WITHIN one triad
+/// voicing for voice-leading constraints; `OrchestralRole` classifies an
+/// INSTRUMENT across the ensemble for performance realization. Pass B maps
+/// `(inst_idx, num_instruments)` onto these via `instrument_role`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestralRole {
+    /// Lowest instrument — sounds the chord ROOT in a low register, steady rhythm.
+    Bass,
+    /// Middle instrument(s) — sustain inner chord tones; least rhythmic activity.
+    HarmonicFill,
+    /// Highest instrument — the top line; highest register, most rhythmic freedom.
+    Melody,
+}
+
+/// Image-free performance features for ONE scan step — the music-domain
+/// projection of `ScanBarFeatures`. No OpenCV/image type crosses into the lib.
+///
+/// theory: the visual→musical mapping is meaningful, not arbitrary —
+///   * `saturation` (0..=100) → overall dynamic LEVEL (vivid color = bold tone),
+///   * `brightness` (0..=100) → REGISTER (bright image = higher octave),
+///   * `edge_density` (0..=1)  → RHYTHMIC ACTIVITY (busy texture = more onsets).
+/// `realize_step` consumes these as the expressive inputs the phrase plan is
+/// shaped against; main.rs builds one from each `ScanBarFeatures` (see the
+/// wiring spec) and never passes the raw feature struct in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PerfFeatures {
+    /// Color saturation, 0..=100 — drives overall dynamic LEVEL.
+    pub saturation: f32,
+    /// Luminance, 0..=100 — drives REGISTER (octave placement).
+    pub brightness: f32,
+    /// Edge density, 0..=1 — drives RHYTHMIC ACTIVITY (onset count/pattern).
+    pub edge_density: f32,
+}
+
+/// One realized MIDI note event for the playback scheduler.
+///
+/// theory: this is the unit main.rs's coordinator schedules. `offset_ms` is the
+/// note's onset RELATIVE to the step start (so a step can hold several notes —
+/// an arpeggio, a syncopation), `hold_ms` is its sounding duration (the
+/// articulation handle: short = staccato, near-full = legato), and `velocity`
+/// is its dynamic (the phrase-contour-shaped level). It maps 1:1 onto main.rs's
+/// existing `(note, vel, hold_ms, offset_ms)` tuple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoteEvent {
+    /// MIDI note number (0..=127).
+    pub note: u8,
+    /// MIDI velocity (0..=127) — the phrase-contour-shaped dynamic.
+    pub velocity: u8,
+    /// Sounding duration in milliseconds — the articulation handle.
+    pub hold_ms: u64,
+    /// Onset offset in milliseconds, relative to the step's start.
+    pub offset_ms: u64,
+}
+
+/// Assign an `OrchestralRole` to instrument `inst_idx` of `num_instruments`.
+///
+/// theory: the ensemble is stratified bottom-to-top. The LOWEST instrument
+/// (index 0) is the BASS. The HIGHEST instrument (index `num_instruments - 1`)
+/// is the MELODY. Everything between is HARMONIC-FILL. With a single instrument
+/// it is the MELODY (the lone line is the tune, not a bare bass); with two, the
+/// low one is Bass and the high one is Melody (no fill). This is a pure,
+/// total function of the two indices so the Test Engineer can pin every cell.
+///
+/// PASS-A STUB BEHAVIOR: the assignment scheme itself is FINAL (Pass B does not
+/// change the mapping) — only the per-role realization in `realize_step` is
+/// stubbed. This fn is therefore implemented for real here, not stubbed, since
+/// it carries no expressive behavior to defer.
+pub fn instrument_role(inst_idx: usize, num_instruments: usize) -> OrchestralRole {
+    // theory: a single voice is the melody, not a bass — the lone line is the
+    // tune. Guard the degenerate counts before the general stratification.
+    if num_instruments <= 1 {
+        return OrchestralRole::Melody;
+    }
+    if inst_idx == 0 {
+        OrchestralRole::Bass
+    } else if inst_idx >= num_instruments - 1 {
+        OrchestralRole::Melody
+    } else {
+        OrchestralRole::HarmonicFill
+    }
+}
+
+/// Realize the performance for ONE instrument on ONE step, given that step's
+/// phrase plan. The single pure entry point main.rs's worker calls.
+///
+/// `step`           — the phrase-aware plan for this step (chord + position +
+///                    structural-velocity FLOOR), shared once across the run.
+/// `inst_idx`       — which instrument in the ensemble this realization is for.
+/// `num_instruments`— ensemble size (with `inst_idx`, selects the orchestral role).
+/// `features`       — the plain-scalar music-domain projection of this step's
+///                    image features (dynamic level, register, rhythmic activity).
+/// `ms_per_step`    — the step's total time budget, in ms (sizes onsets/holds).
+///
+/// PASS-A STUB BEHAVIOR (deliberately inert, so the property net goes RED on
+/// behavior): returns exactly ONE note — the chord's root-position tone for
+/// this instrument's tone slot — at `step.velocity` (the bare structural
+/// floor, NO phrase contour / accent / taper), held for 90% of the step (NO
+/// staccato/legato/portato differentiation), at offset 0 (NO rhythm pattern),
+/// IGNORING the orchestral role, `features`, and harmonic-rhythm acceleration.
+/// Pass B replaces this body with the four-dimension realization specified in
+/// docs/design-s6-expressivity.md while keeping THIS signature.
+pub fn realize_step(
+    step: &StepPlan,
+    inst_idx: usize,
+    num_instruments: usize,
+    features: &PerfFeatures,
+    ms_per_step: u64,
+) -> Vec<NoteEvent> {
+    let role = instrument_role(inst_idx, num_instruments);
+    let is_cadence = matches!(
+        step.position,
+        PhrasePosition::HalfCadence | PhrasePosition::PerfectAuthenticCadence
+    );
+    let is_phrase_start = matches!(step.position, PhrasePosition::PhraseStart);
+
+    // ------------------------------------------------------------------
+    // PITCH + REGISTER — derived from the ROLE, never from a chord-tone
+    // index modulo the voicing length (which would alias a 4th instrument
+    // back onto the bass pitch). The bass sounds the chord ROOT in a low
+    // register; the melody the TOP chord tone in a high register; the fill
+    // an inner tone in the middle. brightness nudges the melody/fill octave.
+    // ------------------------------------------------------------------
+    let base_note = role_pitch(role, &step.chord, inst_idx, num_instruments, features);
+
+    // ------------------------------------------------------------------
+    // DYNAMICS — phrase contour ON the structural floor.
+    // velocity = floor + saturation LEVEL gain + messa-di-voce swell
+    //            + metric accent + phrase-end taper, all clamped 1..=127.
+    // The cadence step is EXEMPT from the swell/accent/taper contour: its
+    // arrival weight comes from the floor (96), and keeping it un-shaped is
+    // what makes the realized series' variance STRICTLY EXCEED the floor's
+    // (the contour adds variation to the NON-cadence steps).
+    // ------------------------------------------------------------------
+    let velocity = realize_velocity(step, features, is_cadence, role);
+
+    // ------------------------------------------------------------------
+    // RHYTHM + ARTICULATION — choose a rhythm pattern from (role,
+    // edge_density, phrase position) and emit its onset/duration sequence,
+    // with harmonic-rhythm acceleration toward the cadence and a phrase-end
+    // ritardando lengthening the final note's hold.
+    // ------------------------------------------------------------------
+    realize_rhythm(
+        base_note,
+        velocity,
+        role,
+        features,
+        ms_per_step,
+        is_cadence,
+        is_phrase_start,
+        step,
+    )
+}
+
+/// Register band (low MIDI bound) each orchestral role centers on.
+/// theory: the bass anchors the low register, harmonic-fill the middle, the
+/// melody the top. Deriving register from the ROLE (not a chord-tone index)
+/// guarantees bass < melody in pitch no matter how many chord tones the voicing
+/// has — the alias bug a `notes[idx % len]` scheme produces is impossible here.
+const BASS_REGISTER_FLOOR: u8 = 36; // C2 — the harmonic foundation
+const FILL_REGISTER_FLOOR: u8 = 55; // G3 — inner voices sit just under the tune
+const MELODY_REGISTER_FLOOR: u8 = 67; // G4 — the top line sings above the texture
+
+/// Pick this instrument's sounding pitch from the chord, placed into the
+/// register band its ROLE owns. Pure; clamps into the engine's playable band.
+fn role_pitch(
+    role: OrchestralRole,
+    chord: &Chord,
+    inst_idx: usize,
+    num_instruments: usize,
+    features: &PerfFeatures,
+) -> u8 {
+    let notes = &chord.notes;
+    if notes.is_empty() {
+        return 60; // defensive middle C
+    }
+
+    // theory: brightness (0..=100) raises a part by up to an octave when the
+    // image is bright, lowers it when dark — register tracks luminance. The
+    // bass is exempt from upward shift (it must stay the harmonic floor); the
+    // melody gets the full bright lift, the fill a gentle one.
+    let bright_octaves = ((features.brightness - 50.0) / 50.0).clamp(-1.0, 1.0); // -1..=1 octave
+
+    match role {
+        OrchestralRole::Bass => {
+            // The chord ROOT, dropped into the bass register. Never lifted up by
+            // brightness (a bass that floats up stops being a bass); only a dark
+            // image may push it an octave lower.
+            let pc = notes[0] % 12;
+            let dark_drop = if bright_octaves < 0.0 { 12 } else { 0 };
+            let floor = BASS_REGISTER_FLOOR.saturating_sub(dark_drop);
+            seat_pc_in_register(pc, floor)
+        }
+        OrchestralRole::Melody => {
+            // The TOP chord tone (highest pitch class in the voicing), lifted
+            // into the melody register; brightness raises/lowers the octave.
+            let top = *notes.iter().max().unwrap();
+            let pc = top % 12;
+            let lift = (bright_octaves * 12.0).round() as i16;
+            let floor = (MELODY_REGISTER_FLOOR as i16 + lift).clamp(24, 96) as u8;
+            seat_pc_in_register(pc, floor)
+        }
+        OrchestralRole::HarmonicFill => {
+            // An INNER chord tone, spread across the fill instruments so two
+            // fills don't double the same tone, placed in the middle register
+            // with a gentle brightness nudge. theory: inner voices fill the
+            // harmony; spacing them by index keeps the chord's body audible.
+            let inner_count = notes.len().max(1);
+            // Prefer the middle tone (the third) as the canonical fill pitch,
+            // then spread additional fills across the remaining tones by index.
+            let pick = if num_instruments >= 3 {
+                // map fill instruments (idx 1..num-1) across inner tones
+                let fill_rank = inst_idx.saturating_sub(1);
+                1 + (fill_rank % inner_count.saturating_sub(1).max(1))
+            } else {
+                inner_count / 2
+            };
+            let pc = notes[pick.min(notes.len() - 1)] % 12;
+            let lift = ((bright_octaves * 6.0).round() as i16).clamp(-12, 12);
+            let floor = (FILL_REGISTER_FLOOR as i16 + lift).clamp(24, 96) as u8;
+            seat_pc_in_register(pc, floor)
+        }
+    }
+}
+
+/// Seat pitch class `pc` at or just above a register floor, clamped to 24..=108.
+fn seat_pc_in_register(pc: u8, floor: u8) -> u8 {
+    let pc = pc % 12;
+    let mut note = (floor / 12) * 12 + pc;
+    while note < floor {
+        note = note.saturating_add(12);
+    }
+    note.clamp(24, 108)
+}
+
+/// Realize the phrase-contoured velocity for a step. Pure, deterministic.
+fn realize_velocity(
+    step: &StepPlan,
+    features: &PerfFeatures,
+    is_cadence: bool,
+    role: OrchestralRole,
+) -> u8 {
+    // Overall LEVEL from saturation: map 0..=100 to roughly [-12, +18] velocity
+    // added to the floor — a dull bar still respects the floor's phrase marking,
+    // a vivid bar pushes louder. theory: saturation = how vivid the color is =
+    // how bold the tone; it sets the dynamic LEVEL, the phrase contour SHAPES it.
+    let sat = features.saturation.clamp(0.0, 100.0);
+    let level_gain = -12.0 + (sat / 100.0) * 30.0; // -12..=+18
+
+    let mut vel = step.velocity as f32 + level_gain;
+
+    if !is_cadence {
+        // Messa di voce: a gentle half-sine swell to the phrase midpoint and a
+        // relaxation toward its end. theory: the classic dynamic arch of a
+        // sung/blown phrase — grow into the middle, ease toward the close. Kept
+        // modest (~+4) so it shapes the line without filling the metric valley
+        // between strong and weak beats (the structural floor already lifts the
+        // start and cadence; the contour must add spread, not compress it).
+        let span = step.phrase_len.max(2) as f32 - 1.0;
+        let frac = (step.position_in_phrase as f32 / span).clamp(0.0, 1.0);
+        let swell = (std::f32::consts::PI * frac).sin() * 4.0;
+        vel += swell;
+
+        // Metric accent: strong metric positions (even position_in_phrase, the
+        // phrase downbeat strongest) get an additive accent; weak positions a
+        // subtraction. theory: meter alternates strong and weak; voicing that
+        // alternation as velocity opens the realized series WIDER than the bare
+        // structural floor — the strong beats rise, the weak beats deepen — while
+        // staying smaller than the floor's start/cadence weighting so phrase
+        // structure still reads.
+        let accent = if step.position_in_phrase == 0 {
+            9.0 // phrase downbeat — strongest metric position
+        } else if step.position_in_phrase.is_multiple_of(2) {
+            2.0 // a strong interior beat
+        } else {
+            -6.0 // a weak interior beat — the valley of the metric arch
+        };
+        vel += accent;
+
+        // Phrase-end taper: the last interior step before the cadence eases off
+        // so the cadence remains the loudest point. theory: the phrase relaxes
+        // into its arrival; the diminuendo makes the cadence's weight land.
+        if step.position_in_phrase + 2 >= step.phrase_len && step.position_in_phrase > 0 {
+            vel -= 4.0;
+        }
+    }
+
+    // The melody carries the messa-di-voce peak a touch more; the bass holds a
+    // steadier dynamic (the foundation should not surge). theory: foreground
+    // voices shape dynamics more than the structural bass.
+    match role {
+        OrchestralRole::Melody if !is_cadence => vel += 2.0,
+        OrchestralRole::Bass if !is_cadence => vel -= 1.0,
+        _ => {}
+    }
+
+    vel.round().clamp(1.0, 127.0) as u8
+}
+
+/// The articulation classes, expressed as the fraction of a note's time slot it
+/// actually sounds. theory: staccato detaches (short), portato slightly
+/// separates (the neutral default), legato connects (near-full / overlapping).
+const STACCATO_FRAC: f32 = 0.40;
+const PORTATO_FRAC: f32 = 0.70;
+const LEGATO_FRAC: f32 = 0.95;
+/// The ritardando multiplier applied to a phrase-final note's hold. theory: as
+/// the phrase relaxes into its arrival the final note rings longer.
+const RITARDANDO_FACTOR: f32 = 1.30;
+
+/// Realize the rhythm + articulation for one step: select a rhythm pattern from
+/// (role, edge_density, phrase position) and emit its onset/duration sequence.
+/// Pure and deterministic. Notes are clamped into 24..=108.
+#[allow(clippy::too_many_arguments)]
+fn realize_rhythm(
+    note: u8,
+    velocity: u8,
+    role: OrchestralRole,
+    features: &PerfFeatures,
+    ms_per_step: u64,
+    is_cadence: bool,
+    is_phrase_start: bool,
+    step: &StepPlan,
+) -> Vec<NoteEvent> {
+    let edge = features.edge_density.clamp(0.0, 1.0);
+    let step_ms = ms_per_step.max(1);
+
+    // Harmonic-rhythm acceleration: the step immediately before a cadence drives
+    // into the arrival with MORE onsets. theory: shortening note values toward a
+    // cadence is how common-practice phrases "press" into their close.
+    let pre_cadence = !is_cadence
+        && !is_phrase_start
+        && step.position_in_phrase + 2 >= step.phrase_len
+        && step.phrase_len >= 2;
+
+    // Articulation fraction for sustained/single-onset notes, before ritardando.
+    // theory: low edge_density (calm texture) -> legato; high -> staccato; the
+    // fill sustains (legato) to support; mid is portato (the neutral default).
+    let base_frac = match role {
+        OrchestralRole::HarmonicFill => LEGATO_FRAC,
+        _ if edge < 0.25 => LEGATO_FRAC,
+        _ if edge > 0.70 => STACCATO_FRAC,
+        _ => PORTATO_FRAC,
+    };
+
+    // Phrase-end ritardando: cadence (and the pre-cadence approach) lengthen the
+    // sounding duration so the arrival rings. Applied as a multiplier on the
+    // hold fraction, capped at full slot. theory: notes ring longer as the music
+    // relaxes into the cadence.
+    let rit = if is_cadence { RITARDANDO_FACTOR } else { 1.0 };
+
+    // Helper: build a single sustained event filling `slot_ms` from `offset`.
+    let sustained = |offset: u64, slot_ms: u64, frac: f32| -> NoteEvent {
+        let f = (frac * rit).min(1.20); // allow a slight overlap on cadence ring
+        let hold = ((slot_ms as f32) * f).round().max(1.0) as u64;
+        NoteEvent {
+            note,
+            velocity,
+            hold_ms: hold,
+            offset_ms: offset,
+        }
+    };
+
+    // ---- Pattern selection -------------------------------------------------
+    // theory: the orchestral role GATES how much rhythmic freedom each part
+    // gets; edge_density and phrase position select WITHIN that freedom. The
+    // result is >=3 genuinely distinct onset/duration shapes:
+    //   sustained / arpeggio / dotted / syncopated / rest-as-gesture, plus
+    //   harmonic-rhythm acceleration adding onsets before a cadence.
+
+    // A cadence/phrase-start must ALWAYS sound (never rest-as-gesture), and a
+    // cadence rings as a single sustained, ritardando-lengthened note — the
+    // arrival is a point of repose, not an active figure.
+    if is_cadence {
+        return vec![sustained(0, step_ms, LEGATO_FRAC)];
+    }
+
+    match role {
+        OrchestralRole::Bass => {
+            // BASS: the harmonic floor — steady, sparse, mostly sustained. Even
+            // when busy it adds at most a single re-articulation (a walking
+            // pickup into a pre-cadence), never an arpeggio. Low onset count.
+            if pre_cadence {
+                // Harmonic-rhythm acceleration: a long root + a short pickup
+                // onset at 3/4 driving into the cadence (2 onsets > the 1 of an
+                // early-interior bass step).
+                let two_thirds = step_ms * 3 / 4;
+                vec![
+                    sustained(0, two_thirds, PORTATO_FRAC),
+                    sustained(two_thirds, step_ms - two_thirds, PORTATO_FRAC),
+                ]
+            } else {
+                // One grounded, sustained root for the whole step.
+                vec![sustained(0, step_ms, LEGATO_FRAC)]
+            }
+        }
+
+        OrchestralRole::HarmonicFill => {
+            // HARMONIC-FILL: supports, never competes — least rhythmic activity,
+            // sustained inner tones. This is the ONLY place rest-as-gesture is
+            // allowed, and only on a weak interior beat (never start/cadence).
+            // theory: a deliberate silence in an inner voice is an articulation,
+            // letting the outer voices speak.
+            let weak_interior = !step.position_in_phrase.is_multiple_of(2);
+            if edge < 0.15 && weak_interior {
+                // rest-as-gesture: emit NO event.
+                Vec::new()
+            } else {
+                vec![sustained(0, step_ms, base_frac)]
+            }
+        }
+
+        OrchestralRole::Melody => {
+            // MELODY: the most rhythmic freedom. Pattern by edge_density band,
+            // with syncopation and pre-cadence acceleration.
+            if pre_cadence || edge > 0.80 {
+                // ARPEGGIO / acceleration: spread chord-tone onsets evenly across
+                // the step (more onsets, shorter values) — the active, driving
+                // figure. theory: subdividing the beat is the melody's way of
+                // generating forward motion, intensified into a cadence.
+                let n = if pre_cadence { 4 } else { 3 };
+                let slot = step_ms / n as u64;
+                (0..n)
+                    .map(|k| {
+                        let offset = (k as u64) * slot;
+                        sustained(offset, slot, STACCATO_FRAC)
+                    })
+                    .collect()
+            } else if edge > 0.55 {
+                // SYNCOPATED: delay the onset off the downbeat by 1/4 step, then
+                // a second onset, pushing against the meter. theory: syncopation
+                // displaces the accent to energize an active-but-not-busy melody.
+                let quarter = step_ms / 4;
+                vec![
+                    sustained(quarter, step_ms / 2, PORTATO_FRAC),
+                    sustained(step_ms * 3 / 4, step_ms / 4, STACCATO_FRAC),
+                ]
+            } else if edge > 0.25 {
+                // DOTTED: a long-short pair (onsets at 0 and 2/3; holds 2/3 and
+                // 1/3) — the lilting mid-activity figure. theory: the dotted
+                // rhythm is the default expressive subdivision of a singing line.
+                let two_thirds = step_ms * 2 / 3;
+                vec![
+                    sustained(0, two_thirds, PORTATO_FRAC),
+                    sustained(two_thirds, step_ms - two_thirds, STACCATO_FRAC),
+                ]
+            } else {
+                // SUSTAINED (low edge): one long legato tone — the calm, singing
+                // melody when the texture is sparse.
+                vec![sustained(0, step_ms, LEGATO_FRAC)]
+            }
+        }
+    }
+}
+
+/// Minimum spacing (in semitones) required between any two ADJACENT upper
+/// voices in a voiced triad. Pass B enforces this inside the voice-leading
+/// search to forbid the unison collapse S4 can currently produce (e.g.
+/// IV = [65, 65, 65]).
+///
+/// theory: a value of 1 forbids only the literal unison (no two upper voices on
+/// the SAME MIDI note) — the minimal, musically-defensible floor. A closed-
+/// position minor third (3 semitones) or major second between inner voices is
+/// perfectly idiomatic, so a stricter "≥ minor third" rule would reject good
+/// voicings; the unison, by contrast, is never what we want (it silently drops
+/// a voice and thins the triad to a dyad). See the spec for the full rationale.
+/// Pass A exposes the CONSTANT and the checker below as stubs; Pass B wires the
+/// check into `voice_lead_one`'s candidate rejection.
+pub const MIN_UPPER_VOICE_SPACING: u8 = 1;
+
+/// True iff the voicing `notes` SATISFIES the minimum-spacing rule: no two
+/// upper voices (indices 1..) share the same MIDI note. (The bass at index 0 is
+/// exempt — a bass doubling an upper voice at the octave is fine; only the
+/// inner/upper voices must not literally collide on one pitch.)
+///
+/// PASS-A STUB BEHAVIOR: returns `true` UNCONDITIONALLY, so a property test that
+/// feeds it the known-bad IV = [65, 65, 65] collapse goes RED. Pass B replaces
+/// the body with the real pairwise-distinct check over indices 1.. .
+pub fn upper_voices_well_spaced(notes: &[u8]) -> bool {
+    // theory: scan every pair of UPPER voices (indices 1..) and reject the
+    // voicing iff any two land on the SAME MIDI note (separation < the minimum
+    // of 1 semitone — i.e. a literal unison). The bass at index 0 is exempt: a
+    // bass doubling an upper voice at the octave is idiomatic. We do NOT reject
+    // close seconds/thirds between inner voices — those are perfectly good
+    // closed-position spacings; only the unison collapse silently thins the
+    // triad to a dyad.
+    if notes.len() <= 2 {
+        // 0/1 upper voices: no pair to collide.
+        return true;
+    }
+    let upper = &notes[1..];
+    for i in 0..upper.len() {
+        for j in (i + 1)..upper.len() {
+            // MIN_UPPER_VOICE_SPACING == 1 semitone: equal notes are the only
+            // failure (their spacing of 0 is below the minimum).
+            if upper[i].abs_diff(upper[j]) < MIN_UPPER_VOICE_SPACING {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// =========================================================================
 // VOICE-LEADING FREE HELPERS (production code, outside the test module)
 // =========================================================================
 
@@ -717,7 +1253,16 @@ fn voice_lead_one(prev: &Chord, next: &Chord) -> Chord {
             }
         }
 
-        let legal = !has_parallel_perfects(&prev.notes[..voice_count], &voicing);
+        // theory: a candidate voicing is legal iff it neither creates a parallel
+        // perfect fifth/octave across the change NOR collapses two UPPER voices
+        // onto the same MIDI note. The unison collapse (e.g. S4's IV -> [65,65,65],
+        // and equally I -> [72,60,60] / V -> [67,67,67] on the same scorer) is a
+        // hard reject here, treated exactly like the parallel-perfects reject:
+        // the minimal-motion + common-tone scorer would otherwise drive two upper
+        // voices onto one pitch and silently thin the triad to a dyad. Both upper
+        // voices of a three-voice triad must sound distinct pitches.
+        let legal = !has_parallel_perfects(&prev.notes[..voice_count], &voicing)
+            && upper_voices_well_spaced(&voicing);
 
         if legal {
             match &best {
@@ -747,17 +1292,66 @@ fn voice_lead_one(prev: &Chord, next: &Chord) -> Chord {
         }
     }
 
-    // If every candidate combination created a parallel (or there were no upper
-    // voices), fall back to the minimal-motion seating ignoring the parallel
-    // rule — a documented last-resort relaxation that keeps a legal MIDI voicing
-    // rather than emitting nothing. In practice the search above finds a clean
-    // voicing for diatonic triads, so this branch is defensive only.
+    // If every candidate combination was rejected (or there were no upper
+    // voices), fall back through a graded last-resort relaxation that still
+    // keeps the UPPER-VOICE SPACING rule whenever possible — the unison collapse
+    // is the worse defect, so we relax the (softer) parallel-perfects rule before
+    // we relax spacing.
+    //
+    // theory: ordered preference for the relaxation —
+    //   (1) a voicing that is well-spaced even if it carries a parallel perfect
+    //       (oblique-to-parallel is a lesser sin than a thinned triad);
+    //   (2) only if NO well-spaced combination exists at all, the minimal-motion
+    //       seating ignoring both rules (truly last resort — defensive only).
+    // In practice the primary search finds a clean voicing for every diatonic
+    // triad in the test progressions, so this branch is exercised rarely.
     let voicing = best.map(|(_, v)| v).unwrap_or_else(|| {
-        let mut v = vec![bass];
-        for (slot, _) in upper_indices.iter().enumerate() {
-            v.push(per_voice[slot][0]);
+        // Pass (1): scan again for the lowest-motion WELL-SPACED voicing,
+        // ignoring only the parallel-perfects constraint.
+        let mut spaced_best: Option<(i32, Vec<u8>)> = None;
+        if !per_voice.is_empty() {
+            let mut idx = vec![0usize; per_voice.len()];
+            loop {
+                let mut voicing = vec![bass];
+                for (slot, &ci) in idx.iter().enumerate() {
+                    voicing.push(per_voice[slot][ci]);
+                }
+                if upper_voices_well_spaced(&voicing) {
+                    let mut score: i32 = 0;
+                    for (slot, &vi) in upper_indices.iter().enumerate() {
+                        score += (voicing[slot + 1] as i32 - prev.notes[vi] as i32).abs();
+                    }
+                    match &spaced_best {
+                        Some((bs, _)) if *bs <= score => {}
+                        _ => spaced_best = Some((score, voicing.clone())),
+                    }
+                }
+                let mut k = 0;
+                loop {
+                    idx[k] += 1;
+                    if idx[k] < per_voice[k].len() {
+                        break;
+                    }
+                    idx[k] = 0;
+                    k += 1;
+                    if k == per_voice.len() {
+                        break;
+                    }
+                }
+                if k == per_voice.len() {
+                    break;
+                }
+            }
         }
-        v
+        spaced_best.map(|(_, v)| v).unwrap_or_else(|| {
+            // Pass (2): truly last resort — minimal-motion seating ignoring both
+            // rules so we never emit nothing.
+            let mut v = vec![bass];
+            for (slot, _) in upper_indices.iter().enumerate() {
+                v.push(per_voice[slot][0]);
+            }
+            v
+        })
     });
 
     Chord {
@@ -1390,5 +1984,472 @@ mod tests {
              floor that marks phrase shape), but every phrase was flat: \
              per-phrase (phrase_index, variance) = {summary:?}"
         );
+    }
+
+    // =====================================================================
+    // S6 — PERFORMANCE-REALIZATION PROPERTY NET (Pass-A RED-before-GREEN)
+    //
+    // These tests pin the *musical* contract of `realize_step` (the four
+    // expressive dimensions) and the Pass-B voice-spacing enforcement. They
+    // are written to FAIL on the Pass-A naive stubs (flat single note at the
+    // structural floor, 90% hold, offset 0, role/features ignored;
+    // `upper_voices_well_spaced` returning `true` unconditionally) and to PASS
+    // once Pass B lands the real realization + spacing-enforced voice leading.
+    //
+    // Determinism contract (held by every test): explicit Roman-numeral
+    // progressions, edge_complexity=0.0, brightness_drop=0.0, fixed ROOT=60,
+    // no RNG, no filesystem. The expressive INPUTS are the fixed `PerfFeatures`
+    // and `ms_per_step` passed to `realize_step`. Per design-s6-expressivity.md.
+    // =====================================================================
+
+    // ---- small private helpers for the realization net ----
+
+    /// The canonical 8-chord Ionian period (`plan_phrases` parses it as two
+    /// 4-step phrases: an antecedent on a half cadence + a consequent PAC).
+    /// Reused by the dynamics/rhythm/articulation scans so they exercise a real
+    /// phrase shape, not an ad-hoc step list.
+    fn ionian_period(eng: &ChordEngine) -> Vec<StepPlan> {
+        let input = prog_chords(eng, &["I", "ii", "IV", "V", "vi", "IV", "V", "I"], "Ionian");
+        eng.plan_phrases(&input)
+    }
+
+    /// A neutral mid-band feature set (used where a single fixed expressive input
+    /// is wanted so any observed variation comes from PHRASE POSITION / ROLE, not
+    /// from varying features). saturation drives level, brightness register,
+    /// edge_density rhythmic activity.
+    fn mid_features() -> PerfFeatures {
+        PerfFeatures {
+            saturation: 50.0,
+            brightness: 50.0,
+            edge_density: 0.5,
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // DYNAMICS 1 — phrase contour exceeds the structural floor.
+    // property: the realized per-step velocity series for a single voice across
+    // a phrase must carry MORE variation than the bare StepPlan.velocity floor
+    // over the same steps — the expressive contour (messa di voce + accent +
+    // taper) adds variation ON TOP of the floor, so its variance is STRICTLY
+    // GREATER than the floor's.
+    //
+    // RED on stub: `realize_step` emits velocity == step.velocity (the floor
+    // verbatim), so the realized series IS the floor series and the two
+    // variances are EQUAL, not strictly greater. GREEN once Pass B shapes the
+    // floor with saturation level + half-sine swell + metric accent + taper.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_dynamics_contour_exceeds_structural_floor() {
+        let eng = engine();
+        let plan = ionian_period(&eng);
+        assert!(!plan.is_empty(), "planner must produce steps");
+        let features = mid_features();
+        let ms_per_step = 1000u64;
+
+        // One fixed voice/instrument across the whole phrase plan. With 3
+        // instruments, index 1 is HarmonicFill — a constant role, so any velocity
+        // variation beyond the floor is the phrase CONTOUR, not a role artifact.
+        let num_instruments = 3usize;
+        let inst_idx = 1usize;
+
+        let mut realized: Vec<u8> = Vec::new();
+        let mut floor: Vec<u8> = Vec::new();
+        for step in &plan {
+            let events = realize_step(step, inst_idx, num_instruments, &features, ms_per_step);
+            // Take the step's representative (loudest) realized velocity so a
+            // multi-onset step still contributes one contour sample.
+            let v = events
+                .iter()
+                .map(|e| e.velocity)
+                .max()
+                .unwrap_or(step.velocity);
+            realized.push(v);
+            floor.push(step.velocity);
+        }
+
+        let var_realized = variance(&realized);
+        let var_floor = variance(&floor);
+        assert!(
+            var_realized > var_floor,
+            "realized velocity variance ({var_realized:.3}) must STRICTLY EXCEED \
+             the structural-floor variance ({var_floor:.3}) — the expressive \
+             contour must add variation on top of the floor. realized={realized:?} \
+             floor={floor:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // DYNAMICS 2 — metric accent: strong beat louder than adjacent weak beat.
+    // property: a metrically STRONG position (the phrase-start downbeat) must
+    // realize a HIGHER velocity than an adjacent WEAK interior position in the
+    // same phrase. We read positions from the plan so the comparison is
+    // unambiguous: phrase 0's PhraseStart (position_in_phrase 0) vs an Interior
+    // step of phrase 0 (position_in_phrase 1).
+    //
+    // RED on stub: flat velocity == floor for every step, AND the floor itself
+    // would have start(88) > interior(76) — so to make this fail ONLY on the
+    // stub's flatness we compare two steps the realization must DIFFERENTIATE
+    // beyond the floor: we require the realized START to exceed the realized
+    // INTERIOR by MORE than the structural-floor delta alone, i.e. the accent
+    // adds on top. On the stub realized delta == floor delta, so strictly-greater
+    // fails. GREEN once Pass B adds the metric accent.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_dynamics_metric_accent_strong_exceeds_weak() {
+        let eng = engine();
+        let plan = ionian_period(&eng);
+        let features = mid_features();
+        let ms_per_step = 1000u64;
+        let (num_instruments, inst_idx) = (3usize, 1usize);
+
+        // Locate phrase 0's PhraseStart and an adjacent Interior step.
+        let start = plan
+            .iter()
+            .find(|s| s.phrase_index == 0 && s.position == PhrasePosition::PhraseStart)
+            .expect("phrase 0 must have a PhraseStart step");
+        let interior = plan
+            .iter()
+            .find(|s| s.phrase_index == 0 && s.position == PhrasePosition::Interior)
+            .expect("phrase 0 must have an Interior step");
+
+        let v_start = realize_step(start, inst_idx, num_instruments, &features, ms_per_step)
+            .iter()
+            .map(|e| e.velocity)
+            .max()
+            .unwrap_or(start.velocity) as i32;
+        let v_interior = realize_step(interior, inst_idx, num_instruments, &features, ms_per_step)
+            .iter()
+            .map(|e| e.velocity)
+            .max()
+            .unwrap_or(interior.velocity) as i32;
+
+        // The realized strong-minus-weak gap must EXCEED the bare structural-floor
+        // gap — i.e. the metric accent contributes on top of the floor. On the
+        // stub the realized gap equals the floor gap, so this is RED.
+        let floor_gap = start.velocity as i32 - interior.velocity as i32;
+        let realized_gap = v_start - v_interior;
+        assert!(
+            realized_gap > floor_gap,
+            "realized strong-beat advantage ({realized_gap}) must exceed the bare \
+             structural-floor gap ({floor_gap}) — the metric accent must add on \
+             top of the floor. v_start={v_start} v_interior={v_interior} \
+             floor_start={} floor_interior={}",
+            start.velocity,
+            interior.velocity
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // RHYTHM — >=3 distinct onset/duration patterns across a scan.
+    // property: realization must produce at least THREE genuinely distinct
+    // rhythmic signatures (sustained / arpeggio / dotted / syncopated /
+    // rest-as-gesture / harmonic-rhythm acceleration), selected by edge_density
+    // band, role, and phrase position. We scan the period across all three roles
+    // AND across low/mid/high edge_density and collect each realization's
+    // signature: the sorted sequence of (offset_ms, hold_ms) pairs.
+    //
+    // RED on stub: every call returns ONE note at offset 0, hold ~90% — a single
+    // signature shape regardless of inputs, so only 1 distinct pattern appears.
+    // GREEN once Pass B emits >=3 patterns.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_rhythm_at_least_three_distinct_patterns() {
+        let eng = engine();
+        let plan = ionian_period(&eng);
+        let ms_per_step = 1200u64;
+        let num_instruments = 3usize;
+
+        let mut signatures: std::collections::HashSet<Vec<(u64, u64)>> =
+            std::collections::HashSet::new();
+        for &edge in &[0.05f32, 0.5, 0.95] {
+            let features = PerfFeatures {
+                saturation: 50.0,
+                brightness: 50.0,
+                edge_density: edge,
+            };
+            for inst_idx in 0..num_instruments {
+                for step in &plan {
+                    let events =
+                        realize_step(step, inst_idx, num_instruments, &features, ms_per_step);
+                    let mut sig: Vec<(u64, u64)> =
+                        events.iter().map(|e| (e.offset_ms, e.hold_ms)).collect();
+                    sig.sort_unstable();
+                    signatures.insert(sig);
+                }
+            }
+        }
+
+        assert!(
+            signatures.len() >= 3,
+            "expected at least 3 distinct rhythmic signatures across the role x \
+             edge_density x phrase-position scan, found {}: {signatures:?}",
+            signatures.len()
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // ARTICULATION 1 — note durations vary (staccato/portato/legato).
+    // property: across a scan, realized hold_ms expressed as a FRACTION of the
+    // per-note time budget must NOT all be the same value — at least TWO distinct
+    // hold fractions appear (a detached staccato vs a connected legato is the
+    // articulation handle).
+    //
+    // RED on stub: hold_ms is always round(ms_per_step * 0.9), so every fraction
+    // is ~0.9 — exactly ONE distinct value. GREEN once Pass B sets per-note hold
+    // fractions by articulation class + ritardando.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_articulation_hold_fractions_vary() {
+        let eng = engine();
+        let plan = ionian_period(&eng);
+        let ms_per_step = 1000u64;
+        let num_instruments = 3usize;
+
+        // Quantize hold fraction to 0.05 buckets so we count GENUINELY distinct
+        // articulations, not float noise.
+        let mut fractions: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for &edge in &[0.05f32, 0.5, 0.95] {
+            let features = PerfFeatures {
+                saturation: 50.0,
+                brightness: 50.0,
+                edge_density: edge,
+            };
+            for inst_idx in 0..num_instruments {
+                for step in &plan {
+                    let events =
+                        realize_step(step, inst_idx, num_instruments, &features, ms_per_step);
+                    for e in &events {
+                        let frac = e.hold_ms as f64 / ms_per_step as f64;
+                        fractions.insert((frac * 20.0).round() as u32);
+                    }
+                }
+            }
+        }
+
+        assert!(
+            fractions.len() >= 2,
+            "expected at least 2 distinct hold fractions (staccato vs legato), \
+             found {} (each is hold_ms/ms_per_step in 0.05 buckets): {fractions:?} \
+             — the stub holds a constant ~0.9 for every note",
+            fractions.len()
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // ARTICULATION 2 — phrase-end ritardando raises hold_ms.
+    // property: the cadential (phrase-final) step must realize a LONGER hold_ms
+    // than the mean interior hold_ms of its phrase — the ritardando/taper lets
+    // the arrival ring. Per design-s6 §2.3 ("the cadence step's note hold_ms >
+    // the mean interior hold_ms of its phrase").
+    //
+    // RED on stub: every hold_ms is the same ~90% value, so the cadence hold is
+    // EQUAL to (never greater than) the interior mean. GREEN once Pass B applies
+    // the phrase-end ritardando.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_articulation_phrase_end_ritardando_lengthens_hold() {
+        let eng = engine();
+        let plan = ionian_period(&eng);
+        let features = mid_features();
+        let ms_per_step = 1000u64;
+        let (num_instruments, inst_idx) = (3usize, 1usize);
+
+        // Pick a phrase that has BOTH a cadence step and >=1 interior step, then
+        // compare the cadence note's hold to the mean interior hold of that phrase.
+        let cadence = plan
+            .iter()
+            .find(|s| {
+                matches!(
+                    s.position,
+                    PhrasePosition::HalfCadence | PhrasePosition::PerfectAuthenticCadence
+                )
+            })
+            .expect("the period must contain at least one cadence step");
+        let phrase = cadence.phrase_index;
+
+        let interior_holds: Vec<u64> = plan
+            .iter()
+            .filter(|s| s.phrase_index == phrase && s.position == PhrasePosition::Interior)
+            .flat_map(|s| realize_step(s, inst_idx, num_instruments, &features, ms_per_step))
+            .map(|e| e.hold_ms)
+            .collect();
+        assert!(
+            !interior_holds.is_empty(),
+            "phrase {phrase} must have at least one interior step to compare against"
+        );
+        let interior_mean =
+            interior_holds.iter().map(|&h| h as f64).sum::<f64>() / interior_holds.len() as f64;
+
+        let cadence_hold = realize_step(cadence, inst_idx, num_instruments, &features, ms_per_step)
+            .iter()
+            .map(|e| e.hold_ms)
+            .max()
+            .expect("cadence step must sound at least one note") as f64;
+
+        assert!(
+            cadence_hold > interior_mean,
+            "cadence-step hold_ms ({cadence_hold}) must EXCEED the phrase's mean \
+             interior hold_ms ({interior_mean:.1}) — the phrase-end ritardando \
+             lengthens the final note. (phrase {phrase}, interior holds \
+             {interior_holds:?})"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // ORCHESTRATION ROLES — per-role behavioral difference + role mapping.
+    // property: with num_instruments >= 3 the SAME step realized for a Bass
+    // (idx 0), a HarmonicFill (middle), and a Melody (idx num-1), under fixed
+    // features, must DIFFER in a role-meaningful way: register (bass below
+    // melody) and/or rhythmic activity (melody onset count >= bass onset count,
+    // and they must not be identical realizations). We also assert
+    // `instrument_role` returns the documented role for representative indices
+    // (this part is FINAL/real and GREEN immediately — kept per the brief).
+    //
+    // RED on stub: `realize_step` ignores the role entirely; bass/fill/melody all
+    // get `notes[inst_idx % len]` at the same flat dynamic/onset shape, so the
+    // register-ordered + onset assertions fail. GREEN once Pass B differentiates
+    // roles by register, rhythm, and motion.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_orchestration_roles_differ_by_register_and_activity() {
+        let eng = engine();
+        let plan = ionian_period(&eng);
+        let features = mid_features();
+        let ms_per_step = 1000u64;
+        let num = 4usize; // idx0=Bass, idx1,2=HarmonicFill, idx3=Melody
+
+        // --- role mapping (FINAL/real — GREEN immediately) ---
+        assert_eq!(
+            instrument_role(0, num),
+            OrchestralRole::Bass,
+            "idx 0 = Bass"
+        );
+        assert_eq!(
+            instrument_role(num - 1, num),
+            OrchestralRole::Melody,
+            "idx num-1 = Melody"
+        );
+        assert_eq!(
+            instrument_role(1, num),
+            OrchestralRole::HarmonicFill,
+            "middle idx = HarmonicFill"
+        );
+        // Degenerate counts from the FINAL scheme table.
+        assert_eq!(
+            instrument_role(0, 1),
+            OrchestralRole::Melody,
+            "lone line = Melody"
+        );
+        assert_eq!(
+            instrument_role(0, 2),
+            OrchestralRole::Bass,
+            "2-inst idx0 = Bass"
+        );
+        assert_eq!(
+            instrument_role(1, 2),
+            OrchestralRole::Melody,
+            "2-inst idx1 = Melody"
+        );
+
+        // --- per-role realization difference (RED on stub) ---
+        // Use a phrase-start step (always sounds; never rest-as-gesture).
+        let step = plan
+            .iter()
+            .find(|s| s.position == PhrasePosition::PhraseStart)
+            .expect("need a phrase-start step");
+
+        let bass = realize_step(step, 0, num, &features, ms_per_step);
+        let melody = realize_step(step, num - 1, num, &features, ms_per_step);
+
+        assert!(
+            !bass.is_empty() && !melody.is_empty(),
+            "bass and melody must both sound on a phrase-start step"
+        );
+
+        // Register separation: the bass's lowest note must sit BELOW the melody's
+        // highest note (the bass anchors the low register, the melody the top).
+        let bass_min = bass.iter().map(|e| e.note).min().unwrap();
+        let melody_max = melody.iter().map(|e| e.note).max().unwrap();
+        assert!(
+            bass_min < melody_max,
+            "bass min note ({bass_min}) must be BELOW melody max note \
+             ({melody_max}) — register separation by role. bass={bass:?} \
+             melody={melody:?}"
+        );
+
+        // Rhythmic-freedom separation: melody is at least as active as the bass,
+        // and the two realizations are NOT byte-identical (the stub makes them
+        // identical-shaped, differing only in the picked pitch).
+        assert!(
+            melody.len() >= bass.len(),
+            "melody onset count ({}) must be >= bass onset count ({}) — the \
+             melody carries the most rhythmic freedom. bass={bass:?} melody={melody:?}",
+            melody.len(),
+            bass.len()
+        );
+        assert!(
+            bass != melody,
+            "bass and melody realizations must DIFFER in a role-meaningful way \
+             (register/rhythm/motion), but they are identical: {bass:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // VOICE-SPACING — upper voices never collapse to a unison.
+    // property: every chord out of `voice_lead_sequence` must place its UPPER
+    // voices (indices 1..) on DISTINCT MIDI notes — no two upper voices may share
+    // one pitch (the bass at index 0 is exempt). A unison collapse silently thins
+    // the triad to a dyad. Per design-s6 §5.1 (MIN_UPPER_VOICE_SPACING = 1).
+    //
+    // PINNED PROGRESSION: Ionian ["I","IV","V","I"] — confirmed (this session,
+    // and cited by design-s6 §5.1) to collapse the IV chord to [65,65,65] under
+    // S4's minimal-motion + common-tone scorer. The same scorer also collapses I
+    // to [72,60,60] here; the test asserts the spacing rule over EVERY output
+    // chord so it catches whichever collapse(s) the search produces.
+    //
+    // RED now: S4 voice leading produces the [65,65,65] unison collapse, so the
+    // actual-notes check fails. (We intentionally test the ACTUAL notes rather
+    // than rely on `upper_voices_well_spaced`, since that stub returns `true`
+    // unconditionally and would mask the defect.) GREEN once Pass B wires the
+    // spacing check into `voice_lead_one`'s candidate rejection.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_voice_spacing_upper_voices_never_collapse_to_unison() {
+        let eng = engine();
+        // Confirmed-collapsing progression (IV -> [65,65,65] in Ionian).
+        let input = prog_chords(&eng, &["I", "IV", "V", "I"], "Ionian");
+        let led = eng.voice_lead_sequence(&input);
+        assert!(!led.is_empty(), "voice leading must produce chords");
+
+        for chord in &led {
+            // Upper voices are indices 1.. ; the bass (index 0) is exempt.
+            let upper = &chord.notes[1.min(chord.notes.len())..];
+            for i in 0..upper.len() {
+                for j in (i + 1)..upper.len() {
+                    assert_ne!(
+                        upper[i],
+                        upper[j],
+                        "upper voices {} and {} of chord {:?} collapsed to the same \
+                         MIDI note {} (unison) — the triad thins to a dyad. \
+                         full voicing = {:?}",
+                        i + 1,
+                        j + 1,
+                        chord.name,
+                        upper[i],
+                        chord.notes
+                    );
+                }
+            }
+            // The Pass-B checker must AGREE with the actual-notes verdict (it is a
+            // stub returning `true` now, so this is consistent today and stays
+            // correct once both are real).
+            assert!(
+                upper_voices_well_spaced(&chord.notes),
+                "upper_voices_well_spaced disagrees with the actual-notes spacing \
+                 verdict for chord {:?} = {:?}",
+                chord.name,
+                chord.notes
+            );
+        }
     }
 }

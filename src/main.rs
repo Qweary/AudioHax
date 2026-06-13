@@ -19,16 +19,6 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn clamp_u8(v: i32) -> u8 {
-    if v < 0 {
-        0
-    } else if v > 127 {
-        127
-    } else {
-        v as u8
-    }
-}
-
 /// Single instrument action for a step: one or more note events (arpeggio or single note)
 #[derive(Clone, Debug)]
 struct InstrumentAction {
@@ -54,87 +44,52 @@ fn parse_cli_arg<T: std::str::FromStr>(args: &[String], key: &str, default: T) -
         .unwrap_or(default)
 }
 
-/// Map simple features -> velocity (0..127)
-fn velocity_from_saturation(sat: f32) -> u8 {
-    let v = ((sat.clamp(0.0, 100.0) / 100.0) * 90.0 + 30.0).round() as i32;
-    clamp_u8(v)
-}
-
-/// Worker mapping: decides per-instrument InstrumentAction given its ScanBarFeatures and chord context.
-/// - `ms_per_step` used to size arpeggio durations.
-/// - arpeggio if edge_density > edge_threshold.
+/// Thin playback adapter for one instrument on one step: extract → lookup → realize → map.
+///
+/// Makes NO musical decision. All musical logic — voicing, dynamics, rhythm,
+/// articulation, orchestration roles — lives in `chord_engine.rs`. This function
+/// only: (1) looks up THIS step's `StepPlan` (wrapping by `step_idx`), (2) projects
+/// the image-domain `ScanBarFeatures` into the plain-scalar `PerfFeatures` the lib
+/// consumes (no OpenCV/image type crosses into the lib), (3) calls the single pure
+/// entry point `chord_engine::realize_step`, and (4) maps each returned `NoteEvent`
+/// onto the existing `(note, velocity, hold_ms, offset_ms)` tuple the coordinator
+/// schedules.
+///
+/// `_edge_threshold` is retained for call-site compatibility but unused — the worker
+/// no longer branches on edge density itself; `realize_step` owns that decision.
 fn worker_decide_action(
     f: &image_analysis::ScanBarFeatures,
     inst_idx: usize,
     step_idx: usize,
-    chords: &Vec<chord_engine::Chord>,
+    num_instruments: usize,
+    plan: &[chord_engine::StepPlan],
     ms_per_step: u64,
-    edge_threshold: f32,
+    _edge_threshold: f32,
 ) -> InstrumentAction {
-    let mut events: Vec<(u8, u8, u64, u64)> = Vec::new();
-    // choose chord for this step (wrap)
-    let chord = if !chords.is_empty() {
-        &chords[step_idx % chords.len()]
-    } else {
-        // fallback: simple major triad C
-        &chord_engine::Chord {
-            name: "C".to_string(),
-            notes: vec![60, 64, 67],
-        }
+    // 1) Look up THIS step's plan, wrapping like the old chords[step_idx % len].
+    //    Empty-plan guard: emit no events (a silent step) — the minimal safe choice
+    //    that never panics and makes no musical decision here.
+    if plan.is_empty() {
+        return InstrumentAction { events: Vec::new() };
+    }
+    let step = &plan[step_idx % plan.len()];
+
+    // 2) Project the image features into the plain-scalar PerfFeatures.
+    //    ScanBarFeatures fields are all f32 and units already match PerfFeatures
+    //    (saturation/brightness 0..=100, edge_density 0..=1) — no cast needed.
+    let features = chord_engine::PerfFeatures {
+        saturation: f.avg_saturation,
+        brightness: f.avg_brightness,
+        edge_density: f.edge_density,
     };
 
-    // velocity from saturation
-    let vel = velocity_from_saturation(f.avg_saturation);
-
-    // decide arpeggio vs single note
-    if f.edge_density > edge_threshold {
-        // make a short arpeggio. create sequence of chord tones across 1-2 octaves.
-        // number of notes depends on ms_per_step (keep each note >= 30ms)
-        let max_notes = (ms_per_step / 40).max(2) as usize; // heuristic
-        let mut ar_notes: Vec<u8> = Vec::new();
-        // build ascending arpeggio picking chord tones and then octave-up tones
-        for rep in 0..2 {
-            for &n in &chord.notes {
-                let base = n;
-                let note = if rep == 0 {
-                    base
-                } else {
-                    base.saturating_add(12)
-                };
-                ar_notes.push(note);
-                if ar_notes.len() >= max_notes {
-                    break;
-                }
-            }
-            if ar_notes.len() >= max_notes {
-                break;
-            }
-        }
-        // offset each note evenly across ms_per_step
-        let per_note = ((ms_per_step as f32) / (ar_notes.len() as f32)).round() as u64;
-        let mut offset = 0u64;
-        for &note in &ar_notes {
-            // hold slightly shorter than spacing so there's small separation
-            let hold = per_note.saturating_sub(10).max(10);
-            events.push((note, vel, hold, offset));
-            offset += per_note;
-        }
-    } else {
-        // single chord-tone choice: instrument index picks tone from chord
-        let tone_idx = inst_idx % chord.notes.len();
-        let mut note = chord.notes[tone_idx];
-        // brightness influence (raise by up to one octave for bright bars)
-        let brightness_norm = (f.avg_brightness.clamp(0.0, 100.0) / 100.0) as f32;
-        if brightness_norm > 0.75 {
-            note = note.saturating_add(12);
-        } else if brightness_norm < 0.25 {
-            note = note.saturating_sub(12);
-        }
-        // default hold time nearly full step
-        let hold = (ms_per_step as f32 * 0.9).round() as u64;
-        events.push((note, vel, hold, 0));
-    }
-
+    // 3) Call the single pure entry point and map NoteEvent -> the existing tuple.
+    let note_events =
+        chord_engine::realize_step(step, inst_idx, num_instruments, &features, ms_per_step);
+    let events = note_events
+        .into_iter()
+        .map(|e| (e.note, e.velocity, e.hold_ms, e.offset_ms))
+        .collect();
     InstrumentAction { events }
 }
 
@@ -145,7 +100,7 @@ fn play_scanned_steps_concurrent(
     steps: Vec<Vec<image_analysis::ScanBarFeatures>>,
     ms_per_step: u64,
     jitter_percent: f32,
-    chords: Arc<Vec<chord_engine::Chord>>,
+    plan: Arc<Vec<chord_engine::StepPlan>>,
     preferred_midi_port_hint: Option<&str>,
     img_for_overlay: &opencv::prelude::Mat,
     bar_thickness_frac: f32,
@@ -192,7 +147,7 @@ fn play_scanned_steps_concurrent(
         let steps_clone = steps.clone();
         let acts = actions.clone();
         let bar = barrier.clone();
-        let chords_cl = chords.clone();
+        let plan_cl = plan.clone();
         let ms_per_step_local = ms_per_step;
         let h_threshold = edge_threshold;
 
@@ -203,7 +158,8 @@ fn play_scanned_steps_concurrent(
                     f,
                     inst_idx,
                     step_idx,
-                    &*chords_cl,
+                    num_instruments,
+                    &plan_cl,
                     ms_per_step_local,
                     h_threshold,
                 );
@@ -421,7 +377,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chords_vec =
         engine.generate_chords(&progression, 60, &mode, global_features.edge_density, 0.0);
     println!("Generated chords: {:?}", chords_vec);
-    let chords_arc = Arc::new(chords_vec);
+    // Plan the phrases once from the generated chords and share the PLAN (not the
+    // raw chords). plan_phrases runs voice_lead_sequence internally, so the shared
+    // plan carries the voice-led chords — no separate voice-leading call needed.
+    let plan_vec = engine.plan_phrases(&chords_vec); // Vec<chord_engine::StepPlan>
+    let plan_arc = Arc::new(plan_vec); // Arc<Vec<StepPlan>>
 
     // Run full scan producing steps (each step -> per-instrument ScanBarFeatures)
     let steps = scan_image(&img, instrument_count, bar_thickness_frac, num_steps, None)?;
@@ -495,7 +455,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             steps,
             ms_per_step,
             jitter_percent,
-            chords_arc,
+            plan_arc,
             preferred_ref,
             &img,
             bar_thickness_frac,
