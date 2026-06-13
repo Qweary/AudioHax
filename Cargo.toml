@@ -3,6 +3,29 @@ name = "audiohax"       # changed to snake case
 version = "0.1.0"
 edition = "2021"
 
+# ── Explicit bin tables for the IMAGE-dependent targets ──────────────────────
+# These three targets import the `image`/`opencv` crates UNCONDITIONALLY, so they
+# only compile under the default feature set. Declaring `required-features` lets
+# `cargo build --no-default-features` (and `cargo test --no-default-features`)
+# SKIP them instead of failing to compile them — which is what previously forced
+# the modem integration test to be run via a manual rustc invocation. The
+# modem-only bins (channel_sim, make_packetized, modem_encode, modem_decode) are
+# left to autodiscovery so they still build with --no-default-features.
+[[bin]]
+name = "audiohax"          # src/main.rs — the image-to-music app (opencv + image)
+path = "src/main.rs"
+required-features = ["opencv", "image"]
+
+[[bin]]
+name = "make_tiled_payload"
+path = "src/bin/make_tiled_payload.rs"
+required-features = ["image"]
+
+[[bin]]
+name = "unpack_tiled_payload"
+path = "src/bin/unpack_tiled_payload.rs"
+required-features = ["image"]
+
 [features]
 # Default build pulls in the system-library-backed deps (opencv/midir/image) so a
 # normal `cargo build`/`cargo build --release` behaves exactly as before. Building

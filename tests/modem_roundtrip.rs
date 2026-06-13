@@ -553,28 +553,33 @@ fn test_full_pipeline_rs_interleaved_plain() {
 }
 
 // ----------------------------------------------------------------------------
-// BUG PIN — default-params acoustic round trip is currently LOSSY (zero noise).
+// BUG PIN — default-params acoustic round trip must be BYTE-EXACT (zero noise).
 //
-// This is NOT a passing round-trip test; it is a characterization test that
-// PINS a discovered defect so the regression net stays green AND the defect
-// stays visible. With the library DEFAULT ModemParams (4 channels, 32 tones,
-// 30 Hz tone spacing, 400 Hz channel spacing) the per-channel tone bands
-// overlap, so even with NO channel noise the Goertzel decoder mis-detects the
-// preamble pilot and ~half the data symbols, and extract_frame fails to find
-// the "AHX1" magic. We assert that the default-params pipeline does NOT recover
-// the payload on CURRENT code.
+// This is the WS-2 acoustic-hardening DONE-SIGNAL. The library DEFAULT
+// ModemParams must, on a CLEAN (noise-free) in-memory signal, drive a payload
+// all the way through the rendered i16 samples and back via Goertzel and recover
+// it byte-for-byte — exactly as `well_separated_params()` already does.
 //
-// When a future phase fixes tone-band separation (e.g. widening channel_spacing
-// / tone_spacing or reducing channels/tones in the defaults, or adding a
-// per-symbol normalization to the detector), THIS TEST WILL FAIL — which is the
-// intended signal that the defect is fixed. At that point, flip it into a real
-// positive round-trip assertion. It is deliberately NOT #[ignore]-d so it cannot
-// silently rot.
+// HISTORY (the defect this test now pins the FIX of): the HEAD default
+// ModemParams (4 channels, 32 tones, 30 Hz tone spacing, 400 Hz channel spacing,
+// 400 Hz base) lays out per-channel tone bands that overlap heavily — ch0 spans
+// 400..1330 Hz, ch1 spans 800..1730 Hz, etc. Summed into one mono stream the
+// bands collide, so Goertzel on one channel's band picks up adjacent channels'
+// energy: the preamble pilot is never reliably detected and ~54% of data symbols
+// are mis-detected even with ZERO channel noise, and extract_frame fails to find
+// the "AHX1" magic. (Distinct from the FluidSynth music-band collision — this is
+// an INTERNAL self-collision of the default frequency plan.)
 //
-// Discovered while building the WS-2 Phase A net; flagged in the handoff report.
+// RED NOW / GREEN AT FIX: on HEAD this test FAILS (the default plan is broken).
+// The Signal Processing Specialist fixes the default frequency plan / detector so
+// the default-params round trip becomes byte-exact; THIS TEST GOING GREEN is the
+// session's done-signal. It is deliberately NOT #[ignore]-d so it cannot rot.
+//
+// Discovered while building the WS-2 Phase A net; flipped to its positive form in
+// the WS-2 acoustic-hardening RED pass (S5).
 #[test]
-fn test_full_pipeline_default_params_is_currently_lossy() {
-    let params = ModemParams::default(); // 4ch / 32 tones / 30 Hz spacing — overlapping bands
+fn test_full_pipeline_default_params_roundtrip() {
+    let params = ModemParams::default(); // post-fix: a non-overlapping, music-clear plan
     let filename = "pipe_default.bin";
     let payload = seeded_payload(40, 300);
     let pkt_size = 200usize;
@@ -586,22 +591,251 @@ fn test_full_pipeline_default_params_is_currently_lossy() {
         modem::packetize_stream(f, pkt_size, repeats)
     });
 
-    let decoded = decode_samples_to_frame(&samples, &params, None, |bytes| {
+    let (fname_out, payload_out) = decode_samples_to_frame(&samples, &params, None, |bytes| {
         modem::depacketize_stream(bytes, repeats).unwrap_or_else(|_| bytes.to_vec())
+    })
+    .expect(
+        "default-params acoustic round trip must extract Ok on a clean signal \
+         (RED until the default frequency plan is fixed — see BUG PIN above)",
+    );
+
+    assert_eq!(
+        fname_out, filename,
+        "filename must survive the default-params full pipeline on a clean signal"
+    );
+    assert_eq!(
+        payload_out, payload,
+        "DEFAULT-PARAMS DONE-SIGNAL: payload must round-trip byte-exactly under \
+         ModemParams::default() on a clean signal (RED until the overlapping default \
+         frequency plan is fixed — see BUG PIN above)"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// PREAMBLE / PILOT DETECTION on the default params (clean signal).
+//
+// Property (RED NOW): under ModemParams::default(), the per-channel preamble
+// pilot tone must be reliably detected at the correct symbol offset so the
+// decoder can strip the preamble and align to the true frame start. We drive a
+// known payload through the encode mirror (which prepends `preamble_repeats`
+// copies of `preamble_symbols` per channel), run the Goertzel detector per
+// channel, and assert that the FULL preamble pattern is found at offset 0 of
+// every channel's detected-symbol stream (the encoder prepends it first, so a
+// correctly-separated plan detects it at the very start).
+//
+// On HEAD the overlapping default bands cause the pilot to be mis-detected, so
+// the pattern is NOT found at offset 0 (often not found at all) — RED. Once the
+// frequency plan is fixed, the pilot detects cleanly at offset 0 — GREEN. This
+// isolates the PREAMBLE-ALIGNMENT half of the defect from the data-symbol half
+// pinned by the round-trip test above.
+#[test]
+fn test_preamble_pilot_detected_on_default_params() {
+    let params = ModemParams::default();
+    assert!(
+        !params.preamble_symbols.is_empty() && params.preamble_repeats > 0,
+        "default params must carry a preamble for this test to be meaningful"
+    );
+
+    let filename = "pre_default.bin";
+    let payload = seeded_payload(41, 200);
+    let frame = modem::build_frame(filename, &payload, false, None).expect("build_frame");
+
+    // Encode with the same preamble-prepend the decoder expects.
+    let samples = encode_frame_to_samples(&frame, &params, |f| modem::packetize_stream(f, 200, 3));
+
+    // Re-run the raw Goertzel detection (no preamble stripping) so we can inspect
+    // the per-channel detected-symbol streams directly.
+    let samples_per_symbol =
+        ((params.sample_rate as f32) * (params.symbol_ms / 1000.0)).round() as usize;
+    let tone_freqs = modem::build_tone_frequencies(&params);
+    let mut detected_by_channel: Vec<Vec<u8>> = vec![Vec::new(); params.channels];
+    let mut window_start = 0usize;
+    while window_start + samples_per_symbol <= samples.len() {
+        let slice = &samples[window_start..window_start + samples_per_symbol];
+        for ch in 0..params.channels {
+            let freqs = &tone_freqs[ch];
+            let mut max_idx = 0usize;
+            let mut max_val = 0f32;
+            for (i, &f) in freqs.iter().enumerate() {
+                let mag = modem::goertzel_mag_squared(slice, f, params.sample_rate);
+                if mag > max_val {
+                    max_val = mag;
+                    max_idx = i;
+                }
+            }
+            detected_by_channel[ch].push(max_idx as u8);
+        }
+        window_start += samples_per_symbol;
+    }
+
+    // Build the expected preamble pattern (repeated pilot symbols), one per channel.
+    let mut pattern: Vec<u8> = Vec::new();
+    for _ in 0..params.preamble_repeats {
+        pattern.extend_from_slice(&params.preamble_symbols);
+    }
+
+    for ch in 0..params.channels {
+        let detected = &detected_by_channel[ch];
+        let idx = find_subslice(detected, &pattern);
+        assert_eq!(
+            idx,
+            Some(0),
+            "channel {ch}: preamble pilot pattern {:?} must be detected at symbol offset 0 \
+             on a clean default-params signal (got {:?}; detected head = {:?}). RED until the \
+             overlapping default frequency plan is fixed.",
+            pattern,
+            idx,
+            &detected[..detected.len().min(pattern.len() + 2)]
+        );
+    }
+}
+
+// ----------------------------------------------------------------------------
+// FEC RECOVERY under noise + bounded burst loss (DEFAULT params, deterministic).
+//
+// Property (RED NOW for default params): with the default frequency plan fixed,
+// a payload packetized with INTERLEAVED Reed-Solomon, rendered to audio, then
+// passed through a SEEDED channel model that (a) applies moderate AWGN across the
+// whole audio stream and (b) ZEROES one bounded contiguous run of audio samples (a
+// dropout — the audio-domain analogue of channel_sim.rs's byte-burst erasure),
+// must still RECOVER the payload byte-exactly. The dropout spans only a few symbol
+// windows; with INTERLEAVED RS those lost symbols spread across many blocks so each
+// block stays within its parity capacity and is reconstructible. AWGN is moderate
+// so residual symbol errors stay sparse.
+//
+// On HEAD this is RED because the default plan does not even round-trip on a CLEAN
+// signal — so it certainly cannot under impairment. Once the plan is fixed (clean
+// round-trip green), the RS+interleave FEC carries the bounded burst and this goes
+// GREEN. Determinism comes from a seeded ChaCha8Rng so the noise is reproducible
+// and the dropout placement is fixed.
+//
+// The channel model here replicates channel_sim.rs's primitives — AWGN and a
+// fixed-length contiguous erasure — at the audio (i16) layer, which is the layer
+// the real decode path consumes; channel_sim's primitives live only in the bin, so
+// we keep a minimal SEEDED model inline.
+#[test]
+fn test_fec_recovers_bounded_burst_default_params() {
+    let params = ModemParams::default();
+    let filename = "fec_default.bin";
+    let payload = seeded_payload(42, 256);
+    // Strong RS: 4 data + 4 parity, interleaved, spreads a burst across blocks.
+    let (d, p, shard_size) = (4usize, 4usize, 128usize);
+
+    let frame = modem::build_frame(filename, &payload, false, None).expect("build_frame");
+
+    // Encode to audio via interleaved RS.
+    let mut samples = encode_frame_to_samples(&frame, &params, |f| {
+        modem::packetize_stream_rs_interleaved(f, d, p, shard_size)
     });
 
-    // CURRENT behavior: the default-params round trip does not recover the
-    // payload. Either extract_frame errors (lost AHX1 magic / bad header), or in
-    // the unlikely event it parses, the recovered payload is not byte-identical.
-    match decoded {
-        Err(_) => { /* expected: frame extraction fails on the corrupted symbol stream */ }
-        Ok((_fname, recovered_payload)) => {
-            assert_ne!(
-                recovered_payload, payload,
-                "DEFECT FIXED? default-params acoustic round trip now recovers the payload \
-                 byte-exactly. Convert this characterization test into a real positive \
-                 round-trip assertion (see the BUG PIN comment above)."
-            );
+    // (a) Moderate AWGN across the whole stream — seeded for determinism.
+    let mut rng = ChaCha8Rng::seed_from_u64(2025);
+    add_awgn_i16(&mut samples, 200.0, &mut rng);
+
+    // (b) One BOUNDED contiguous dropout (burst erasure): zero a run spanning a
+    // few symbol windows, placed deterministically a third of the way in (clear of
+    // the preamble). Interleaving spreads the lost symbols across RS blocks so the
+    // burst stays within per-block parity capacity.
+    let samples_per_symbol =
+        ((params.sample_rate as f32) * (params.symbol_ms / 1000.0)).round() as usize;
+    let burst_symbols = 3usize; // a few symbol windows — within interleaved-RS capacity
+    let burst_len = burst_symbols * samples_per_symbol;
+    if samples.len() > burst_len {
+        let start = samples.len() / 3;
+        let end = (start + burst_len).min(samples.len());
+        for s in &mut samples[start..end] {
+            *s = 0;
         }
+    }
+
+    // Decode through the real audio path under both impairments.
+    let (fname_out, payload_out) = decode_samples_to_frame(&samples, &params, None, |bytes| {
+        modem::depacketize_stream_rs(bytes).unwrap_or_else(|_| bytes.to_vec())
+    })
+    .expect(
+        "default-params interleaved-RS pipeline must recover under moderate AWGN + a \
+         bounded dropout on a clean plan (RED until the default frequency plan is fixed)",
+    );
+
+    assert_eq!(
+        fname_out, filename,
+        "filename must survive default-params RS pipeline under AWGN + bounded burst"
+    );
+    assert_eq!(
+        payload_out, payload,
+        "payload must be RECOVERED byte-exact under moderate AWGN + a bounded burst \
+         within interleaved-RS capacity (default params; RED until the frequency plan is fixed)"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// FEC GRACEFUL FAILURE beyond capacity (packet-byte layer, deterministic).
+//
+// Property: when damage EXCEEDS the FEC's correction capacity, depacketize +
+// extract must produce a typed Err (or non-identical bytes that fail the CRC and
+// thus surface as Err at extract) — NEVER silently-wrong bytes, never a panic.
+// We packetize with interleaved RS, then ERASE far more than `parity_shards`
+// worth of shards via a long seeded byte-burst, and assert the recovery path
+// returns Err at depacketize OR at extract_frame (CRC enforcement).
+//
+// This is largely PLAN-INDEPENDENT (it operates on the packet byte stream, not
+// the audio), so it may already be green — it guards the graceful-failure
+// contract regardless of the frequency-plan fix.
+#[test]
+fn test_fec_graceful_failure_beyond_capacity_default_params() {
+    let params = ModemParams::default();
+    let filename = "fec_fail.bin";
+    let payload = seeded_payload(43, 256);
+    let (d, p, shard_size) = (4usize, 2usize, 128usize);
+
+    let frame = modem::build_frame(filename, &payload, false, None).expect("build_frame");
+    let mut packetized = modem::packetize_stream_rs_interleaved(frame.as_slice(), d, p, shard_size);
+    assert!(!packetized.is_empty(), "interleaved RS produced no packets");
+
+    // Erase a HUGE contiguous burst — far beyond parity capacity — deterministically.
+    // Zeroing wrecks the RS01 magic of many shards across blocks so depacketize
+    // either errors (too few shards) or yields bytes that fail the frame CRC.
+    let burst_len = (packetized.len() * 3) / 4; // 75% of the stream
+    for b in packetized.iter_mut().take(burst_len) {
+        *b = 0u8;
+    }
+
+    let depacked = modem::depacketize_stream_rs(&packetized);
+    match depacked {
+        Err(_) => { /* graceful typed Err at depacketize — acceptable */ }
+        Ok(bytes) => {
+            // If depacketize somehow produced bytes, extract_frame MUST reject them
+            // (bad magic / truncation / CRC) rather than emit silently-wrong data.
+            match modem::extract_frame(&bytes, None) {
+                Err(_) => { /* graceful typed Err at extract — acceptable */ }
+                Ok((_f, recovered)) => {
+                    // The only non-error outcome that is acceptable is exact recovery;
+                    // anything else (silent garbage) is a contract violation.
+                    assert_eq!(
+                        recovered, payload,
+                        "beyond-capacity damage produced SILENTLY-WRONG bytes — \
+                         FEC/CRC must fail gracefully, not emit garbage"
+                    );
+                }
+            }
+        }
+    }
+    let _ = params;
+}
+
+/// Add seeded additive white Gaussian-ish noise to an i16 sample buffer in place.
+/// Uses a Box-Muller transform over the seeded ChaCha8Rng for deterministic,
+/// reproducible noise. `sigma` is the noise standard deviation in i16 LSBs.
+/// (Replicates the AWGN primitive intent of channel_sim.rs, which only lives in
+/// the bin, kept minimal + seeded here for the test.)
+fn add_awgn_i16(samples: &mut [i16], sigma: f32, rng: &mut ChaCha8Rng) {
+    for s in samples.iter_mut() {
+        // Box-Muller: two uniforms in (0,1] -> one standard normal.
+        let u1 = ((rng.next_u32() as f32) + 1.0) / (u32::MAX as f32 + 1.0);
+        let u2 = (rng.next_u32() as f32) / (u32::MAX as f32 + 1.0);
+        let mag = (-2.0 * u1.ln()).sqrt();
+        let z = mag * (2.0 * std::f32::consts::PI * u2).cos();
+        let noisy = (*s as f32) + z * sigma;
+        *s = noisy.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
     }
 }

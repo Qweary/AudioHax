@@ -117,17 +117,56 @@ pub struct ModemParams {
 
 impl Default for ModemParams {
     fn default() -> Self {
+        // ── Default frequency plan (WS-2 acoustic-hardening, S5) ──────────────
+        //
+        // The previous default (base 400, channel_spacing 400, tone_spacing 30,
+        // symbol_ms 30) was internally broken on TWO counts: (a) each per-channel
+        // tone band was 31*30 = 930 Hz wide but channels were only 400 Hz apart,
+        // so the four bands overlapped heavily — Goertzel on one channel picked up
+        // adjacent-channel energy (~54% symbol error, pilot never detected even on
+        // a clean signal); and (b) the whole plan sat inside the ~65–2000 Hz
+        // FluidSynth MIDI music band, so the modem and the music engine collided
+        // acoustically.
+        //
+        // This plan fixes both, while KEEPING channels = 4 and m_tones = 32 (the
+        // test net's pilot = m_tones/2 = 16 and the channel/tone counts depend on
+        // these). The three signal knobs are chosen so every tone lands exactly on
+        // a Goertzel bin center and the four bands are non-overlapping with a guard:
+        //
+        //   sample_rate      = 48_000 Hz  → Nyquist 24_000 Hz
+        //   symbol_ms        = 40.0       → N = 1920 samples/symbol
+        //                                  → Goertzel bin resolution = 48000/1920
+        //                                    = 25.0 Hz
+        //   tone_spacing_hz  = 50.0       = 2 bins  (each tone on its own bin pair,
+        //                                   well above the 25 Hz resolution floor)
+        //   channel_spacing  = 2000.0     = 80 bins
+        //   base_freq_hz     = 3000.0     = 120 bins (≥ 2500 Hz music-clear floor,
+        //                                   with margin)
+        //
+        // Per-channel band width = (m_tones-1)*tone_spacing = 31*50 = 1550 Hz.
+        // Bands (base + ch*channel_spacing .. +1550):
+        //   ch0: 3000..4550   ch1: 5000..6550   ch2: 7000..8550   ch3: 9000..10550
+        // Each pair has a 450 Hz guard band (e.g. 4550→5000), so adjacent-channel
+        // tone frequencies never coincide and Goertzel stays selective.
+        //
+        // Top tone (ch3, tone31) = 3000 + 3*2000 + 31*50 = 10_550 Hz, which is well
+        // below Nyquist (24_000 Hz) — ~44% of Nyquist, no aliasing risk.
+        //
+        // Music separability: the lowest tone (3000 Hz) sits above the music-clear
+        // floor of 2500 Hz and the whole band (3000..10_550 Hz) lives entirely
+        // above the ~65–2000 Hz FluidSynth MIDI range, so the modem and the
+        // image-to-music engine coexist in a shared acoustic channel.
         ModemParams {
             sample_rate: 48_000,
-            symbol_ms: 30.0,
+            symbol_ms: 40.0,
             m_tones: 32,
             channels: 4,
             amplitude: 0.55,
-            base_freq_hz: 400.0,
-            channel_spacing_hz: 400.0,
-            tone_spacing_hz: 30.0,
+            base_freq_hz: 3000.0,
+            channel_spacing_hz: 2000.0,
+            tone_spacing_hz: 50.0,
             preamble_repeats: 8,
-            preamble_symbols: vec![(32 / 2) as u8], // middle tone as pilot
+            preamble_symbols: vec![(32 / 2) as u8], // middle tone (index 16) as pilot
         }
     }
 }
@@ -442,11 +481,19 @@ pub fn render_symbols_to_samples(
             let t = n as f32 / sample_rate;
             let mut s = 0f32;
             for (ch, ch_symbols) in channels_symbols.iter().enumerate() {
-                let sym = if symbol_index < ch_symbols.len() {
-                    ch_symbols[symbol_index]
-                } else {
-                    0u8
-                } as usize;
+                // A channel that has no symbol at this index (it is SHORTER than the
+                // longest channel) must contribute SILENCE for this window — NOT a
+                // real tone. The previous code substituted symbol 0, which rendered
+                // that channel's tone-0 carrier (e.g. 5000 Hz for ch1 under the
+                // default plan) at full amplitude. That injected spurious in-band
+                // energy into every trailing window of a ragged-length transmission
+                // and made an "only channel 0 active" render leak a strong adjacent-
+                // channel tone. Skipping the carrier entirely keeps each channel's
+                // band clean when that channel has nothing to send.
+                let sym = match ch_symbols.get(symbol_index) {
+                    Some(&v) => v as usize,
+                    None => continue, // no symbol here -> emit silence for this channel
+                };
                 let tone_freq = params.base_freq_hz
                     + (ch as f32) * params.channel_spacing_hz
                     + (sym as f32) * params.tone_spacing_hz;
@@ -547,7 +594,10 @@ pub fn packetize_stream(data: &[u8], pkt_payload_size: usize, repeats: usize) ->
 /// Returns Err if no packets found at all.
 pub fn depacketize_stream(buf: &[u8], _expected_repeats: usize) -> Result<Vec<u8>, ModemError> {
     let magic = b"PKT1";
-    let mut map: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
+    // Per seq, keep ALL observed copies but tag each with whether its payload CRC
+    // matched the header CRC. CRC-valid copies are trusted absolutely; CRC-invalid
+    // copies are only a fallback for the majority vote when NO clean copy survived.
+    let mut map: HashMap<u32, Vec<(Vec<u8>, bool)>> = HashMap::new();
     let mut max_seq: i64 = -1;
     let mut i = 0usize;
     while i + 4 + 4 + 2 + 4 <= buf.len() {
@@ -558,16 +608,20 @@ pub fn depacketize_stream(buf: &[u8], _expected_repeats: usize) -> Result<Vec<u8
             }
             let seq = u32::from_be_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]);
             let len = u16::from_be_bytes([buf[i + 8], buf[i + 9]]) as usize;
-            let _crc = u32::from_be_bytes([buf[i + 10], buf[i + 11], buf[i + 12], buf[i + 13]]);
+            let hdr_crc = u32::from_be_bytes([buf[i + 10], buf[i + 11], buf[i + 12], buf[i + 13]]);
             let pkt_total = 4 + 4 + 2 + 4 + len;
             if i + pkt_total > buf.len() {
                 break;
             }
             let payload = &buf[i + 14..i + 14 + len];
-            // store the payload (copy)
+            // Validate this copy's CRC so the reconstruction step can prefer clean copies.
+            let mut h = Crc32::new();
+            h.update(payload);
+            let crc_ok = h.finalize() == hdr_crc;
+            // store the payload (copy) with its CRC-validity tag
             map.entry(seq)
                 .or_insert_with(Vec::new)
-                .push(payload.to_vec());
+                .push((payload.to_vec(), crc_ok));
             if (seq as i64) > max_seq {
                 max_seq = seq as i64;
             }
@@ -592,7 +646,24 @@ pub fn depacketize_stream(buf: &[u8], _expected_repeats: usize) -> Result<Vec<u8
 
     // For each sequence, majority-vote bytes across the observed copies.
     for &seq in &seqs {
-        let copies = &map[&seq];
+        let all_copies = &map[&seq];
+        // Prefer CRC-VALID copies: a copy whose payload CRC matched its header is
+        // known-intact, so if any clean copy survived we vote ONLY among clean
+        // copies (a single clean copy is authoritative — it beats any number of
+        // corrupt ones). Only when EVERY copy is corrupt do we fall back to voting
+        // over all of them (best-effort majority). On a clean channel all copies
+        // pass, so this is identical to plain majority voting — it strictly adds
+        // robustness without changing clean-path behavior.
+        let clean: Vec<&Vec<u8>> = all_copies
+            .iter()
+            .filter(|(_, ok)| *ok)
+            .map(|(p, _)| p)
+            .collect();
+        let copies: Vec<&Vec<u8>> = if clean.is_empty() {
+            all_copies.iter().map(|(p, _)| p).collect()
+        } else {
+            clean
+        };
         // find most common length among copies
         let mut len_counts: HashMap<usize, usize> = HashMap::new();
         for c in copies.iter() {
@@ -789,16 +860,25 @@ pub fn depacketize_stream_rs(buf: &[u8]) -> Result<Vec<u8>, ModemError> {
                 continue;
             }
 
-            // store shard if missing
-            if shard_idx < entry.shards.len() {
-                if entry.shards[shard_idx].is_none() {
-                    // optionally check CRC
-                    let mut h = Crc32::new();
-                    h.update(&payload);
-                    let _computed = h.finalize();
-                    // store anyway (we could discard if crc != computed)
+            // store shard if missing — ENFORCING the per-shard CRC.
+            //
+            // Reed-Solomon erasure coding reconstructs from a subset of KNOWN-GOOD
+            // shards: a shard whose payload CRC does not match its header CRC is
+            // CORRUPT, and feeding a corrupt shard into rs.reconstruct() as if it
+            // were intact produces a silently-wrong block (RS cannot tell a lie
+            // from the truth — it trusts every shard it is given). The previous code
+            // stored every shard "anyway", so a corrupt-but-header-intact shard
+            // poisoned reconstruction. We now DROP CRC-mismatched shards, leaving the
+            // slot `None` (a clean erasure) so RS can correct it from parity instead
+            // of trusting bad data. This is what makes the interleaved-RS burst-
+            // recovery path actually recover rather than reconstruct garbage.
+            if shard_idx < entry.shards.len() && entry.shards[shard_idx].is_none() {
+                let mut h = Crc32::new();
+                h.update(&payload);
+                if h.finalize() == crc {
                     entry.shards[shard_idx] = Some(payload);
                 }
+                // CRC mismatch -> leave as None (erasure); RS recovers from parity.
             }
 
             // jump forward by whole packet (we have a valid header+payload)
@@ -1310,5 +1390,131 @@ mod tests {
                 "clean payload must round-trip (compress={compress})"
             );
         }
+    }
+
+    // ========================================================================
+    // WS-2 ACOUSTIC-HARDENING RED PASS (S5) — frequency-plan property tests.
+    //
+    // These pin POST-FIX behavior of the default frequency plan and are RED on
+    // HEAD. They use only `pub` fns (build_tone_frequencies, render_symbols_to_samples,
+    // goertzel_mag_squared) — no internal API exposure is required from the
+    // Signal Processing Specialist for these two. Everything is in-memory.
+    // ========================================================================
+
+    /// Render a single channel's single tone (one symbol, no preamble) into i16
+    /// samples by zeroing every other channel. Returns the i16 buffer for one
+    /// symbol window. Helper for the band-isolation test.
+    fn render_single_tone(params: &ModemParams, channel: usize, tone: u8) -> Vec<i16> {
+        // Build a per-channel symbol stream where only `channel` carries `tone`
+        // for a single symbol; all other channels carry nothing (empty), so
+        // render_symbols_to_samples emits silence for them.
+        let mut channels_symbols: Vec<Vec<u8>> = vec![Vec::new(); params.channels];
+        channels_symbols[channel] = vec![tone];
+        render_symbols_to_samples(&channels_symbols, params)
+    }
+
+    /// Property (RED NOW): the per-channel tone bands must be ISOLATED — energy
+    /// rendered into ONE channel's band must NOT register strongly in an ADJACENT
+    /// channel's detector. The decode-time failure mode is concrete: the ch1
+    /// detector scans ALL of ch1's tone frequencies and picks the max-energy one;
+    /// if ch0's emitted tone frequency coincides with (or sits very close to) ANY
+    /// ch1 tone frequency, ch1 falsely detects strong energy and mis-decodes.
+    ///
+    /// We render ONLY channel 0's upper-range tone, then compute the STRONGEST
+    /// Goertzel response that the adjacent channel's detector would see across all
+    /// of ch1's tone frequencies, and compare it to ch0's own in-band response.
+    /// Band isolation requires the adjacent channel's best response be a small
+    /// fraction of the in-band response.
+    ///
+    /// On HEAD the default plan (base 400, channel_spacing 400, tone_spacing 30,
+    /// 32 tones) makes ch0's band (400..1330 Hz) overlap ch1's band (800..1730 Hz):
+    /// ch0's upper tones land exactly on ch1 tone frequencies, so ch1's best
+    /// response RIVALS the in-band one — RED. Once the plan separates the bands,
+    /// ch1's best response collapses — GREEN.
+    #[test]
+    fn test_channel_band_isolation_default_params() {
+        let params = ModemParams::default();
+        assert!(
+            params.channels >= 2,
+            "need >= 2 channels to test adjacent-band isolation"
+        );
+
+        let freqs = build_tone_frequencies(&params);
+        // Use an upper-range tone of channel 0 so on HEAD it falls inside ch1's band.
+        let tone: u8 = (params.m_tones as u8) * 3 / 4; // upper quartile tone index
+        let tone = tone.min((params.m_tones - 1) as u8);
+
+        let samples = render_single_tone(&params, 0, tone);
+        assert!(!samples.is_empty(), "render produced no samples");
+
+        // In-band: Goertzel of ch0 at the emitted tone's own frequency.
+        let f_inband = freqs[0][tone as usize];
+        let mag_inband = goertzel_mag_squared(&samples, f_inband, params.sample_rate);
+        assert!(
+            mag_inband > 0.0,
+            "in-band Goertzel response must be positive (got {mag_inband})"
+        );
+
+        // Adjacent: the STRONGEST response the ch1 detector would see across ALL
+        // of ch1's tone frequencies (this is exactly what the decoder does).
+        let mut mag_adjacent_best = 0f32;
+        let mut f_adjacent_best = 0f32;
+        for &f in &freqs[1] {
+            let mag = goertzel_mag_squared(&samples, f, params.sample_rate);
+            if mag > mag_adjacent_best {
+                mag_adjacent_best = mag;
+                f_adjacent_best = f;
+            }
+        }
+
+        // Require strong isolation: adjacent channel's BEST response < 10% of in-band.
+        assert!(
+            mag_adjacent_best < 0.10 * mag_inband,
+            "adjacent-channel band must isolate ch0 energy: ch0 tone {tone} (f={f_inband:.1} Hz) \
+             leaks into ch1 — ch1's strongest detector response is at f={f_adjacent_best:.1} Hz \
+             with mag={mag_adjacent_best:.3e} vs in-band mag={mag_inband:.3e} \
+             ({:.1}% of in-band). RED until the default frequency plan separates the \
+             per-channel bands.",
+            100.0 * mag_adjacent_best / mag_inband
+        );
+    }
+
+    /// Property (RED NOW): every tone frequency produced by the DEFAULT plan must
+    /// sit CLEAR of the FluidSynth MIDI music band so the modem does not collide
+    /// with the image-to-music engine in a shared acoustic environment. We assert
+    /// every tone frequency is >= a stated spec floor of 2500 Hz (above the
+    /// ~65–2000 Hz MIDI music band, with margin). The Signal Processing Specialist
+    /// chooses the actual plan; this only pins the clearance requirement.
+    ///
+    /// On HEAD the default plan starts at base_freq_hz=400 Hz and tones run up
+    /// through ~1730 Hz — squarely INSIDE the music band — so this is RED until
+    /// the plan is moved above the floor.
+    #[test]
+    fn test_default_tones_clear_of_music_band() {
+        // Spec floor: modem tones must live at or above this to clear the
+        // FluidSynth MIDI music band (~65..2000 Hz) with margin.
+        const MUSIC_CLEAR_FLOOR_HZ: f32 = 2500.0;
+
+        let params = ModemParams::default();
+        let freqs = build_tone_frequencies(&params);
+        let mut min_freq = f32::INFINITY;
+        for (ch, ch_freqs) in freqs.iter().enumerate() {
+            for (tone, &f) in ch_freqs.iter().enumerate() {
+                if f < min_freq {
+                    min_freq = f;
+                }
+                assert!(
+                    f >= MUSIC_CLEAR_FLOOR_HZ,
+                    "default tone (ch {ch}, tone {tone}) = {f:.1} Hz is BELOW the music-band \
+                     clearance floor of {MUSIC_CLEAR_FLOOR_HZ} Hz — it would collide with the \
+                     FluidSynth MIDI music band. RED until the default frequency plan is moved \
+                     clear of the music band."
+                );
+            }
+        }
+        assert!(
+            min_freq >= MUSIC_CLEAR_FLOOR_HZ,
+            "lowest default tone {min_freq:.1} Hz must be >= {MUSIC_CLEAR_FLOOR_HZ} Hz"
+        );
     }
 }
