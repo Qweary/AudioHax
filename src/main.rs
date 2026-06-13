@@ -1,25 +1,32 @@
 // src/main.rs
-mod mapping_loader;
-mod chord_engine;
-mod midi_output;
-mod image_source;
 mod image_analysis;
+mod image_source;
+mod midi_output;
 
-use mapping_loader::{load_mappings, lookup_range_map};
+use audiohax::{chord_engine, mapping_loader};
 use chord_engine::ChordEngine;
+use image_analysis::{
+    analyze_global, analyze_scan_bar, draw_scan_bar_overlay_for_rect, scan_image,
+};
+use image_source::{load_image_from_source, ImageSource};
+use mapping_loader::{load_mappings, lookup_range_map};
 use midi_output::MidiOut;
+use opencv::core;
+use opencv::prelude::MatTraitConst; // needed for .cols()/.rows()
+use rand::Rng;
 use std::env;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use image_source::{load_image_from_source, ImageSource};
-use image_analysis::{analyze_global, analyze_scan_bar, scan_image, draw_scan_bar_overlay_for_rect};
-use opencv::prelude::MatTraitConst; // needed for .cols()/.rows()
-use opencv::core;
-use rand::Rng;
 
 fn clamp_u8(v: i32) -> u8 {
-    if v < 0 { 0 } else if v > 127 { 127 } else { v as u8 }
+    if v < 0 {
+        0
+    } else if v > 127 {
+        127
+    } else {
+        v as u8
+    }
 }
 
 /// Single instrument action for a step: one or more note events (arpeggio or single note)
@@ -33,10 +40,10 @@ struct InstrumentAction {
 #[derive(Clone, Debug)]
 struct ScheduledEvent {
     at: Instant,
-    on: bool,         // true = note_on, false = note_off
+    on: bool, // true = note_on, false = note_off
     channel: u8,
     note: u8,
-    vel: u8,          // used only for note_on (note_off vel ignored)
+    vel: u8, // used only for note_on (note_off vel ignored)
 }
 
 fn parse_cli_arg<T: std::str::FromStr>(args: &[String], key: &str, default: T) -> T {
@@ -64,14 +71,16 @@ fn worker_decide_action(
     ms_per_step: u64,
     edge_threshold: f32,
 ) -> InstrumentAction {
-
-    let mut events: Vec<(u8,u8,u64,u64)> = Vec::new();
+    let mut events: Vec<(u8, u8, u64, u64)> = Vec::new();
     // choose chord for this step (wrap)
     let chord = if !chords.is_empty() {
         &chords[step_idx % chords.len()]
     } else {
         // fallback: simple major triad C
-        &chord_engine::Chord { name: "C".to_string(), notes: vec![60,64,67] }
+        &chord_engine::Chord {
+            name: "C".to_string(),
+            notes: vec![60, 64, 67],
+        }
     };
 
     // velocity from saturation
@@ -87,11 +96,19 @@ fn worker_decide_action(
         for rep in 0..2 {
             for &n in &chord.notes {
                 let base = n;
-                let note = if rep == 0 { base } else { base.saturating_add(12) };
+                let note = if rep == 0 {
+                    base
+                } else {
+                    base.saturating_add(12)
+                };
                 ar_notes.push(note);
-                if ar_notes.len() >= max_notes { break; }
+                if ar_notes.len() >= max_notes {
+                    break;
+                }
             }
-            if ar_notes.len() >= max_notes { break; }
+            if ar_notes.len() >= max_notes {
+                break;
+            }
         }
         // offset each note evenly across ms_per_step
         let per_note = ((ms_per_step as f32) / (ar_notes.len() as f32)).round() as u64;
@@ -133,10 +150,14 @@ fn play_scanned_steps_concurrent(
     img_for_overlay: &opencv::prelude::Mat,
     bar_thickness_frac: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if steps.is_empty() { return Ok(()); }
+    if steps.is_empty() {
+        return Ok(());
+    }
     let num_steps = steps.len();
     let num_instruments = steps[0].len();
-    if num_instruments == 0 { return Ok(()); }
+    if num_instruments == 0 {
+        return Ok(());
+    }
 
     // Validate consistent instrument count
     for (i, s) in steps.iter().enumerate() {
@@ -178,7 +199,14 @@ fn play_scanned_steps_concurrent(
         let handle = thread::spawn(move || {
             for step_idx in 0..num_steps {
                 let f = &steps_clone[step_idx][inst_idx];
-                let action = worker_decide_action(f, inst_idx, step_idx, &*chords_cl, ms_per_step_local, h_threshold);
+                let action = worker_decide_action(
+                    f,
+                    inst_idx,
+                    step_idx,
+                    &*chords_cl,
+                    ms_per_step_local,
+                    h_threshold,
+                );
                 {
                     let mut g = acts.lock().unwrap();
                     g[inst_idx] = Some(action);
@@ -203,19 +231,46 @@ fn play_scanned_steps_concurrent(
         let width = img_for_overlay.cols();
         let height = img_for_overlay.rows();
         let vertical_default = width > height;
-        let bar_w = if vertical_default { ((width as f32) * bar_thickness_frac).max(1.0).round() as i32 } else { width };
-        let bar_h = if !vertical_default { ((height as f32) * bar_thickness_frac).max(1.0).round() as i32 } else { height };
+        let bar_w = if vertical_default {
+            ((width as f32) * bar_thickness_frac).max(1.0).round() as i32
+        } else {
+            width
+        };
+        let bar_h = if !vertical_default {
+            ((height as f32) * bar_thickness_frac).max(1.0).round() as i32
+        } else {
+            height
+        };
         let travel_x = (width - bar_w).max(0);
         let travel_y = (height - bar_h).max(0);
         let x0 = if vertical_default {
-            if num_steps == 1 { 0 } else { ((step_idx as f32) * (travel_x as f32) / ((num_steps - 1) as f32)).round() as i32 }
-        } else { 0 };
+            if num_steps == 1 {
+                0
+            } else {
+                ((step_idx as f32) * (travel_x as f32) / ((num_steps - 1) as f32)).round() as i32
+            }
+        } else {
+            0
+        };
         let y0 = if !vertical_default {
-            if num_steps == 1 { 0 } else { ((step_idx as f32) * (travel_y as f32) / ((num_steps - 1) as f32)).round() as i32 }
-        } else { 0 };
-        let rect = core::Rect::new(x0, y0, if vertical_default { bar_w } else { width }, if vertical_default { height } else { bar_h });
+            if num_steps == 1 {
+                0
+            } else {
+                ((step_idx as f32) * (travel_y as f32) / ((num_steps - 1) as f32)).round() as i32
+            }
+        } else {
+            0
+        };
+        let rect = core::Rect::new(
+            x0,
+            y0,
+            if vertical_default { bar_w } else { width },
+            if vertical_default { height } else { bar_h },
+        );
 
-        if let Ok(overlay) = draw_scan_bar_overlay_for_rect(img_for_overlay, rect, num_instruments, vertical_default) {
+        if let Ok(overlay) =
+            draw_scan_bar_overlay_for_rect(img_for_overlay, rect, num_instruments, vertical_default)
+        {
             let _ = opencv::highgui::imshow("ScanBar Live", &overlay);
             let _ = opencv::highgui::wait_key(1);
         }
@@ -236,13 +291,28 @@ fn play_scanned_steps_concurrent(
                 let channel = (inst_idx % 16) as u8;
                 for (note, vel, hold_ms, offset_ms) in &action.events {
                     // apply jitter_percent on hold_ms
-                    let jitter = rng.gen_range(-(jitter_percent*100.0) as i32 ..= (jitter_percent*100.0) as i32) as f32 / 100.0;
+                    let jitter = rng.gen_range(
+                        -(jitter_percent * 100.0) as i32..=(jitter_percent * 100.0) as i32,
+                    ) as f32
+                        / 100.0;
                     let base_hold = *hold_ms as f32;
                     let hold_ms_f = (base_hold * (1.0 + jitter)).max(8.0).round() as u64;
 
-                    let start_instant = t0 + Duration::from_millis(*offset_ms) ;
-                    let on_event = ScheduledEvent { at: start_instant, on: true, channel, note: *note, vel: *vel };
-                    let off_event = ScheduledEvent { at: start_instant + Duration::from_millis(hold_ms_f), on: false, channel, note: *note, vel: 0 };
+                    let start_instant = t0 + Duration::from_millis(*offset_ms);
+                    let on_event = ScheduledEvent {
+                        at: start_instant,
+                        on: true,
+                        channel,
+                        note: *note,
+                        vel: *vel,
+                    };
+                    let off_event = ScheduledEvent {
+                        at: start_instant + Duration::from_millis(hold_ms_f),
+                        on: false,
+                        channel,
+                        note: *note,
+                        vel: 0,
+                    };
                     events.push(on_event);
                     events.push(off_event);
                 }
@@ -294,7 +364,6 @@ fn play_scanned_steps_concurrent(
     Ok(())
 }
 
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load mappings
     let mappings = load_mappings("assets/mappings.json")?;
@@ -310,8 +379,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let jitter_percent: f32 = parse_cli_arg(&args, "--jitter-percent", 15.0f32); // percent (e.g., 15 -> ±15%)
 
     println!("Instrument count: {}", instrument_count);
-    println!("Scan bar thickness = {:.2}, steps = {}, ms/step = {}, jitter% = {}",
-             bar_thickness_frac, num_steps, ms_per_step, jitter_percent);
+    println!(
+        "Scan bar thickness = {:.2}, steps = {}, ms/step = {}, jitter% = {}",
+        bar_thickness_frac, num_steps, ms_per_step, jitter_percent
+    );
 
     // Image source (first arg unless it's "play" or flags)
     // If first arg looks like a path and doesn't start with "--", use it
@@ -339,14 +410,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // pick mode and make chord progression
     let hue = global_features.avg_hue;
-    let mode = lookup_range_map(&mappings.global.hue_to_mode, hue).unwrap_or_else(|| "Ionian".to_string());
+    let mode =
+        lookup_range_map(&mappings.global.hue_to_mode, hue).unwrap_or_else(|| "Ionian".to_string());
     println!("Chosen mode from hue {} -> {}", hue, mode);
 
     let engine = ChordEngine::new(mappings);
     let progression = engine.pick_progression(&mode);
     println!("Picked progression: {:?}", progression);
 
-    let chords_vec = engine.generate_chords(&progression, 60, &mode, global_features.edge_density, 0.0);
+    let chords_vec =
+        engine.generate_chords(&progression, 60, &mode, global_features.edge_density, 0.0);
     println!("Generated chords: {:?}", chords_vec);
     let chords_arc = Arc::new(chords_vec);
 
@@ -358,23 +431,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let width = img.cols();
     let height = img.rows();
     let vertical_default = width > height;
-    let bar_w = if vertical_default { ((width as f32) * bar_thickness_frac).max(1.0).round() as i32 } else { width };
-    let bar_h = if !vertical_default { ((height as f32) * bar_thickness_frac).max(1.0).round() as i32 } else { height };
+    let bar_w = if vertical_default {
+        ((width as f32) * bar_thickness_frac).max(1.0).round() as i32
+    } else {
+        width
+    };
+    let bar_h = if !vertical_default {
+        ((height as f32) * bar_thickness_frac).max(1.0).round() as i32
+    } else {
+        height
+    };
     let indices = vec![0usize, steps.len() / 2, steps.len().saturating_sub(1)];
     for &si in &indices {
         let travel_x = (width - bar_w).max(0);
         let travel_y = (height - bar_h).max(0);
         let x0 = if vertical_default {
-            if steps.len() == 1 { 0 } else { ((si as f32) * (travel_x as f32) / ((steps.len() - 1) as f32)).round() as i32 }
-        } else { 0 };
+            if steps.len() == 1 {
+                0
+            } else {
+                ((si as f32) * (travel_x as f32) / ((steps.len() - 1) as f32)).round() as i32
+            }
+        } else {
+            0
+        };
         let y0 = if !vertical_default {
-            if steps.len() == 1 { 0 } else { ((si as f32) * (travel_y as f32) / ((steps.len() - 1) as f32)).round() as i32 }
-        } else { 0 };
-        let rect = core::Rect::new(x0, y0, if vertical_default { bar_w } else { width }, if vertical_default { height } else { bar_h });
+            if steps.len() == 1 {
+                0
+            } else {
+                ((si as f32) * (travel_y as f32) / ((steps.len() - 1) as f32)).round() as i32
+            }
+        } else {
+            0
+        };
+        let rect = core::Rect::new(
+            x0,
+            y0,
+            if vertical_default { bar_w } else { width },
+            if vertical_default { height } else { bar_h },
+        );
 
-        if let Ok(overlay) = draw_scan_bar_overlay_for_rect(&img, rect, instrument_count, vertical_default) {
+        if let Ok(overlay) =
+            draw_scan_bar_overlay_for_rect(&img, rect, instrument_count, vertical_default)
+        {
             let out = format!("assets/overlay_step_{}.png", si);
-            if let Err(e) = opencv::imgcodecs::imwrite(&out, &overlay, &opencv::core::Vector::new()) {
+            if let Err(e) = opencv::imgcodecs::imwrite(&out, &overlay, &opencv::core::Vector::new())
+            {
                 println!("Warning: failed to write overlay {}: {}", out, e);
             } else {
                 println!("Wrote overlay for step {} to {}", si, out);
