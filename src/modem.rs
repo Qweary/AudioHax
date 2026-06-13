@@ -21,6 +21,12 @@ use std::io::Write;
 
 use rand_core::{OsRng, RngCore};
 
+// Seeded, deterministic RNG for the S7 real-air acoustic-channel model. ChaCha8
+// gives reproducible impairment streams so the Test Engineer's failing tests
+// (Pass B) and the eventual implementation (Pass C) are bit-for-bit repeatable.
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
+
 pub use hex;
 pub use hound;
 
@@ -87,6 +93,25 @@ pub enum ModemError {
     /// survived, so there are no copies to majority-vote over).
     #[error("repetition depacketize failed: {0}")]
     Depacketize(String),
+
+    /// Synchronization / start-of-burst detection failed: no correlation peak
+    /// crossed threshold, or the buffer was too short to contain a preamble.
+    /// (S7 real-air sync path.)
+    #[error("burst sync failed: {0}")]
+    Sync(String),
+
+    /// Symbol-timing recovery could not produce a usable set of window
+    /// boundaries (e.g. the drift estimate diverged or the buffer ran out).
+    /// (S7 real-air timing-recovery path.)
+    #[error("symbol-timing recovery failed: {0}")]
+    Timing(String),
+
+    /// The in-band coding-rate header ("CDG1") was present but malformed
+    /// (e.g. an unknown profile tag or inconsistent triplicate copies).
+    /// A *missing* header is NOT this error — that is the legacy/default path.
+    /// (S7 rate-selectable-coding path.)
+    #[error("coding-rate header invalid: {0}")]
+    CodingHeader(String),
 
     /// Catch-all for a lower-level error that does not map cleanly to a variant
     /// above; the message is owned so the error stays `Send + Sync + 'static`.
@@ -533,16 +558,20 @@ pub fn build_tone_frequencies(params: &ModemParams) -> Vec<Vec<f32>> {
     out
 }
 
-/// Goertzel: magnitude-squared for target frequency on slice of i16 samples.
-pub fn goertzel_mag_squared(samples: &[i16], target_freq: f32, sample_rate: usize) -> f32 {
+/// Single-frequency generalized Goertzel power at an EXACT (fractional) frequency.
+///
+/// `omega = 2π·target_freq/sr` is set directly and NOT rounded to an integer DFT bin,
+/// so the response is faithful for off-bin (frequency-offset) tones. For a tone on a
+/// bin center the fractional `omega` equals the legacy integer-`k` `omega`, so on-bin
+/// behaviour is unchanged. This is the narrowband primitive used by the band-energy
+/// detector [`goertzel_mag_squared`].
+fn goertzel_point(samples: &[i16], target_freq: f32, sample_rate: usize) -> f32 {
     let n = samples.len();
     if n == 0 {
         return 0.0;
     }
     let sr = sample_rate as f32;
-    let kf = target_freq * (n as f32) / sr;
-    let k = kf.round() as usize;
-    let omega = 2.0 * PI * (k as f32) / (n as f32);
+    let omega = 2.0 * PI * target_freq / sr;
     let coeff = 2.0 * omega.cos();
     let mut s_prev = 0.0f32;
     let mut s_prev2 = 0.0f32;
@@ -551,8 +580,47 @@ pub fn goertzel_mag_squared(samples: &[i16], target_freq: f32, sample_rate: usiz
         s_prev2 = s_prev;
         s_prev = s;
     }
-    let power = s_prev2 * s_prev2 + s_prev * s_prev - coeff * s_prev * s_prev2;
-    power
+    s_prev2 * s_prev2 + s_prev * s_prev - coeff * s_prev * s_prev2
+}
+
+/// Goertzel tone-energy detector for `target_freq` on a slice of i16 samples.
+///
+/// Returns the energy in a NARROW BAND centered on `target_freq` — the sum of three
+/// generalized-Goertzel probes at `target_freq` and `target_freq ± ½·bin`, where
+/// `bin = sample_rate / N` is the DFT bin resolution of this slice. Integrating over
+/// ±½ bin (rather than a single point) is what makes the detector tolerant of a
+/// **carrier frequency offset**: under an S7 `freq_offset_hz` the channel's real-cosine
+/// mix splits a tone's energy into sidebands a few Hz off the nominal bin center
+/// (and a point probe at the nominal frequency then scallops down far enough that an
+/// *adjacent* tone's point probe can win the arg-max — the exact failure the real-air
+/// freq-offset test exercises). The ±½-bin band recaptures that displaced energy for
+/// the *true* tone while staying well inside the tone spacing (the modem's tones are a
+/// full bin or more apart), so it does not blur neighbouring tones and preserves the
+/// per-tone / per-band selectivity the existing isolation tests assert. For a clean
+/// on-bin tone the center probe dominates and the band sum is monotone in the true
+/// tone energy, so on-bin arg-max decisions (and every existing on-bin test) are
+/// unchanged.
+pub fn goertzel_mag_squared(samples: &[i16], target_freq: f32, sample_rate: usize) -> f32 {
+    let n = samples.len();
+    if n == 0 {
+        return 0.0;
+    }
+    // DFT bin resolution for this window. The band spans ±0.75 bin around the target,
+    // sampled at five points (target and ±0.375, ±0.75 bin). A ±0.75-bin span is wide
+    // enough to recapture a tone's energy when a carrier offset AND a multipath comb
+    // (the S7 echo) together displace/notch it off the nominal bin — a ±0.5-bin span
+    // left a notched tone losing the arg-max to a neighbour — yet it stays inside the
+    // modem's tone spacing (tones are ≥ 2 bins apart), so it does not blur adjacent
+    // tones and preserves per-tone / per-band selectivity. For a clean on-bin tone the
+    // center probe dominates and the band sum stays monotone in the true tone energy.
+    let bin = (sample_rate as f32) / (n as f32);
+    let q = 0.375 * bin;
+    let h = 0.75 * bin;
+    goertzel_point(samples, target_freq - h, sample_rate)
+        + goertzel_point(samples, target_freq - q, sample_rate)
+        + goertzel_point(samples, target_freq, sample_rate)
+        + goertzel_point(samples, target_freq + q, sample_rate)
+        + goertzel_point(samples, target_freq + h, sample_rate)
 }
 
 /* -----------------------------
@@ -1222,6 +1290,1011 @@ pub fn simulate_channel_bytes(
     out
 }
 
+/* ============================================================================
+ * S7 — REAL-AIR ROBUSTNESS
+ *
+ * Pass A deliverables (this block):
+ *   1. AcousticChannelParams + simulate_acoustic_channel — REAL working code,
+ *      a seeded acoustic-channel model used as unit-test scaffolding. It injects
+ *      the four textbook speaker->mic impairments (start offset, clock drift,
+ *      frequency offset, multipath echo) plus optional timing jitter, all driven
+ *      by a deterministic ChaCha8Rng.
+ *   2. The sync / timing-recovery API and the rate-selectable-coding API as
+ *      COMPILING STUBS — `///`-documented signatures with minimal bodies that
+ *      compile and keep the existing tests green, but do NOT yet implement real
+ *      offset tolerance. Each stub body is tagged `// TODO(s7-passC): real impl`.
+ *
+ * See docs/design-s7-realair.md for the full design and the 3-pass migration.
+ * ============================================================================ */
+
+// ────────────────────────────────────────────────────────────────────────────
+// 1. ACOUSTIC-CHANNEL MODEL (REAL — not a stub)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Tunable parameters for the S7 acoustic-channel model.
+///
+/// Each field is an *independently dialable* knob for one real speaker→microphone
+/// impairment, so a test can isolate exactly one effect at a time. All randomness
+/// derives from `seed` via a `ChaCha8Rng`, so identical params produce identical
+/// output (no `OsRng`, no wall clock).
+#[derive(Debug, Clone)]
+pub struct AcousticChannelParams {
+    /// Seed for the deterministic `ChaCha8Rng` driving start-offset noise and jitter.
+    pub seed: u64,
+    /// Start offset: `> 0` prepends this many samples of low-level noise (the burst
+    /// no longer begins at sample 0); `< 0` trims that many leading samples.
+    pub start_offset_samples: isize,
+    /// Sample-clock offset in parts-per-million. Implemented as fractional linear
+    /// resampling by factor `1 + clock_ppm*1e-6`, so fixed-length receiver windows
+    /// slowly slide over the burst (clock-drift impairment).
+    pub clock_ppm: f32,
+    /// Carrier frequency offset in Hz. Mixes the signal with `cos(2π f_off t)` so
+    /// tone energy nudges off the exact Goertzel bin centers (frequency-offset impairment).
+    pub freq_offset_hz: f32,
+    /// Multipath echo tap delay in samples (the delayed copy's lag).
+    pub echo_delay_samples: usize,
+    /// Multipath echo tap gain (0..1): amplitude of the delayed, attenuated copy.
+    /// `0.0` disables the echo (no inter-symbol interference).
+    pub echo_gain: f32,
+    /// Per-sample timing-jitter std-dev (in samples), folded into the resampling
+    /// read position as a seeded Gaussian. `0.0` is exact (no jitter).
+    pub jitter_samples: f32,
+}
+
+impl AcousticChannelParams {
+    /// A zero-impairment configuration: the model is a near-identity passthrough
+    /// (only the final i16 renormalization touches the samples, within tolerance).
+    /// Useful as a baseline and as the control arm of impairment tests.
+    pub fn identity() -> Self {
+        AcousticChannelParams {
+            seed: 0,
+            start_offset_samples: 0,
+            clock_ppm: 0.0,
+            freq_offset_hz: 0.0,
+            echo_delay_samples: 0,
+            echo_gain: 0.0,
+            jitter_samples: 0.0,
+        }
+    }
+}
+
+impl Default for AcousticChannelParams {
+    fn default() -> Self {
+        AcousticChannelParams::identity()
+    }
+}
+
+/// Draw one standard-normal sample (Box–Muller) from a `ChaCha8Rng`.
+/// Deterministic for a given RNG state; used for start-offset noise and jitter.
+fn next_gaussian(rng: &mut ChaCha8Rng) -> f32 {
+    let u1 = ((rng.next_u32() as f32) + 1.0) / (u32::MAX as f32 + 1.0);
+    let u2 = (rng.next_u32() as f32) / (u32::MAX as f32 + 1.0);
+    (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
+}
+
+/// Apply the seeded acoustic-channel model to an i16 burst, producing a new i16
+/// burst with the configured impairments. **Real working code** (not a stub) —
+/// the Test Engineer's failing tests depend on it producing genuine impairments.
+///
+/// Pipeline (applied in order):
+/// 1. **Start offset** — prepend seeded low-level noise (or trim leading samples).
+/// 2. **Clock drift + jitter** — fractional linear resampling by `1+ppm*1e-6`,
+///    with the read position perturbed by a seeded Gaussian of std-dev `jitter_samples`.
+/// 3. **Frequency offset** — mix with `cos(2π f_off n / sr)` (first-order shift).
+/// 4. **Multipath echo** — 2-tap FIR `y[n] = x[n] + g·x[n−D]`.
+///
+/// The result is renormalized to the i16 range to avoid clipping. A zero-impairment
+/// (`identity()`) config returns a near-identity copy of the input. Determinism is
+/// total: same `seed` + same params ⇒ same output.
+pub fn simulate_acoustic_channel(samples: &[i16], params: &AcousticChannelParams) -> Vec<i16> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let sample_rate = 48_000.0f32; // modem default SR; the model is SR-agnostic in shape.
+
+    let mut rng = ChaCha8Rng::seed_from_u64(params.seed);
+
+    // Work in f32 throughout, renormalize to i16 once at the end.
+    let mut x: Vec<f32> = samples.iter().map(|&s| s as f32).collect();
+
+    // ── (1) Start offset ────────────────────────────────────────────────────
+    if params.start_offset_samples > 0 {
+        let n = params.start_offset_samples as usize;
+        // Low-level seeded noise floor before the burst (a few i16 LSBs).
+        let mut prefix: Vec<f32> = Vec::with_capacity(n);
+        for _ in 0..n {
+            prefix.push(next_gaussian(&mut rng) * 8.0);
+        }
+        prefix.extend_from_slice(&x);
+        x = prefix;
+    } else if params.start_offset_samples < 0 {
+        let trim = (-params.start_offset_samples) as usize;
+        if trim < x.len() {
+            x.drain(0..trim);
+        } else {
+            x.clear();
+        }
+    }
+    if x.is_empty() {
+        return Vec::new();
+    }
+
+    // ── (2) Clock drift (fractional resampling) + timing jitter ─────────────
+    // Resample factor: a positive ppm STRETCHES the signal (more output samples),
+    // so fixed-length receiver windows slide late across the burst.
+    let r = 1.0f32 + params.clock_ppm * 1e-6;
+    let resampled: Vec<f32> = if (r - 1.0).abs() > f32::EPSILON || params.jitter_samples > 0.0 {
+        let out_len = ((x.len() as f32) * r).round().max(1.0) as usize;
+        let mut out = Vec::with_capacity(out_len);
+        for i in 0..out_len {
+            // Source read position for output sample i; jitter perturbs it.
+            let jitter = if params.jitter_samples > 0.0 {
+                next_gaussian(&mut rng) * params.jitter_samples
+            } else {
+                0.0
+            };
+            let src = (i as f32) / r + jitter;
+            // Linear interpolation between floor(src) and floor(src)+1, clamped.
+            let s0 = src.floor();
+            let frac = src - s0;
+            let i0 = s0 as isize;
+            let a = if i0 >= 0 && (i0 as usize) < x.len() {
+                x[i0 as usize]
+            } else {
+                0.0
+            };
+            let b = if i0 + 1 >= 0 && ((i0 + 1) as usize) < x.len() {
+                x[(i0 + 1) as usize]
+            } else {
+                a
+            };
+            out.push(a + (b - a) * frac);
+        }
+        out
+    } else {
+        x
+    };
+
+    // ── (3) Frequency offset (mixing) ──────────────────────────────────────
+    let mut mixed: Vec<f32> = if params.freq_offset_hz.abs() > f32::EPSILON {
+        let w = 2.0 * PI * params.freq_offset_hz / sample_rate;
+        resampled
+            .iter()
+            .enumerate()
+            .map(|(n, &v)| v * (w * (n as f32)).cos())
+            .collect()
+    } else {
+        resampled
+    };
+
+    // ── (4) Multipath echo (2-tap FIR) ─────────────────────────────────────
+    if params.echo_gain.abs() > f32::EPSILON && params.echo_delay_samples > 0 {
+        let d = params.echo_delay_samples;
+        let g = params.echo_gain;
+        let dry = mixed.clone();
+        for n in d..mixed.len() {
+            mixed[n] += g * dry[n - d];
+        }
+    }
+
+    // ── Renormalize to i16 (avoid clipping artifacts dominating) ────────────
+    let maxv = mixed.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    if maxv <= 1e-6 {
+        return vec![0i16; mixed.len()];
+    }
+    // Identity case (no shaping that changes peak) maps ~1:1; otherwise scale so
+    // the peak hits 90% of full-scale, matching render_symbols_to_samples.
+    let scale = (i16::MAX as f32 * 0.9) / maxv;
+    // Preserve near-identity for the zero-impairment config: if the peak is already
+    // within i16 range and no impairment changed the signal length/shape, scaling
+    // by ~constant keeps the relative waveform; we accept a uniform gain.
+    mixed
+        .iter()
+        .map(|&v| (v * scale).clamp(i16::MIN as f32, i16::MAX as f32) as i16)
+        .collect()
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 2a. SYNC / TIMING-RECOVERY API (COMPILING STUBS — TODO Pass C)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Start-of-burst synchronization mode.
+///
+/// `PilotOnly` is the **default** and is byte-for-byte the current behavior: the
+/// repeated-pilot preamble is the only sync, and decode windows start at sample 0.
+/// `Chirp` (Pass C) prepends a linear-chirp preamble located by cross-correlation,
+/// giving sample-accurate start detection robust to offset and frequency shift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    /// Current behavior: repeated-pilot preamble, windows from sample 0.
+    PilotOnly,
+    /// Linear-chirp preamble located by cross-correlation (Pass C).
+    Chirp,
+}
+
+/// Parameters for the S7 sync layer. Defaults to `PilotOnly` so existing callers
+/// and tests are unaffected; `Chirp` is opt-in.
+#[derive(Debug, Clone)]
+pub struct SyncParams {
+    pub mode: SyncMode,
+    /// Chirp length in symbol-durations (only used in `Chirp` mode).
+    pub chirp_symbols: usize,
+    /// Chirp sweep low frequency (Hz).
+    pub chirp_f_lo_hz: f32,
+    /// Chirp sweep high frequency (Hz).
+    pub chirp_f_hi_hz: f32,
+}
+
+impl Default for SyncParams {
+    fn default() -> Self {
+        SyncParams {
+            mode: SyncMode::PilotOnly,
+            chirp_symbols: 4,
+            chirp_f_lo_hz: 3000.0,
+            chirp_f_hi_hz: 11_000.0,
+        }
+    }
+}
+
+/// Result of start-of-burst detection + timing estimation.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncResult {
+    /// Located burst start, in samples.
+    pub start_sample: usize,
+    /// Drift-corrected (fractional) samples-per-symbol.
+    pub samples_per_symbol: f32,
+    /// Estimated carrier frequency offset (Hz).
+    pub freq_offset_hz: f32,
+    /// Correlation-peak sharpness / detection confidence in 0..1.
+    pub confidence: f32,
+}
+
+/// Generate the f32 linear-chirp template (one value per sample) for a `SyncParams`.
+///
+/// A linear (up-)chirp sweeps instantaneous frequency from `chirp_f_lo_hz` to
+/// `chirp_f_hi_hz` over `chirp_symbols` symbol-durations. The instantaneous phase is
+/// the integral of a linearly-ramping frequency, `φ(n) = 2π( f_lo·t + ½·rate·t² )`,
+/// with `rate = (f_hi − f_lo)/T`. A chirp is used (rather than a single pilot tone)
+/// because its autocorrelation is a SHARP peak: cross-correlating the received
+/// signal against this template gives sample-accurate start-of-burst detection that
+/// is robust to leading noise and degrades only gracefully under a small carrier
+/// frequency offset. The template is unit-amplitude (callers scale as needed).
+fn chirp_template_f32(params: &ModemParams, sync: &SyncParams) -> Vec<f32> {
+    let sps = ((params.sample_rate as f32) * (params.symbol_ms / 1000.0)).round() as usize;
+    let len = sps.saturating_mul(sync.chirp_symbols.max(1));
+    if len == 0 {
+        return Vec::new();
+    }
+    let sr = params.sample_rate as f32;
+    let t_total = (len as f32) / sr; // chirp duration in seconds
+    let f_lo = sync.chirp_f_lo_hz;
+    let f_hi = sync.chirp_f_hi_hz;
+    let rate = (f_hi - f_lo) / t_total; // Hz per second
+    let mut out = Vec::with_capacity(len);
+    for n in 0..len {
+        let t = (n as f32) / sr;
+        // Integral of the linearly-swept frequency gives a quadratic phase term.
+        let phase = 2.0 * PI * (f_lo * t + 0.5 * rate * t * t);
+        out.push(phase.sin());
+    }
+    out
+}
+
+/// Render the sync preamble to prepend to a burst.
+///
+/// In `PilotOnly` mode there is no separate sync preamble (the repeated pilot tone
+/// carries sync), so this returns an empty buffer — keeping the existing encode path
+/// byte-identical. In `Chirp` mode it renders the linear-chirp template (see
+/// [`chirp_template_f32`]) normalized to i16, to be prepended to the FULL rendered
+/// sample stream (orthogonal to the symbol/tone counts).
+pub fn render_sync_preamble(params: &ModemParams, sync: &SyncParams) -> Vec<i16> {
+    match sync.mode {
+        SyncMode::PilotOnly => Vec::new(),
+        SyncMode::Chirp => {
+            let tmpl = chirp_template_f32(params, sync);
+            // Normalize to 90% of full-scale, matching render_symbols_to_samples so
+            // the chirp sits at a comparable level to the data body.
+            let scale = i16::MAX as f32 * 0.9;
+            tmpl.iter()
+                .map(|&v| (v * scale).clamp(i16::MIN as f32, i16::MAX as f32) as i16)
+                .collect()
+        }
+    }
+}
+
+/// Locate the start of a burst and estimate symbol timing + frequency offset.
+///
+/// In `PilotOnly` mode this reports the legacy assumption (start at sample 0,
+/// nominal samples-per-symbol, zero offset) so existing callers are unaffected.
+///
+/// In `Chirp` mode it CROSS-CORRELATES the received samples against the known chirp
+/// template and takes the correlation-peak position as the burst start (the chirp is
+/// the first thing in the rendered stream, so the located start is the chirp's first
+/// sample — equal to the channel's `start_offset_samples`). The peak is found with a
+/// normalized cross-correlation so the score is amplitude-independent; `confidence`
+/// is the peak's sharpness (peak value relative to the local mean), squashed into
+/// 0..1. A coarse carrier `freq_offset_hz` is estimated by comparing the dominant
+/// frequency of the received chirp region against the template's mid-sweep frequency
+/// (a cheap, direction-correct estimate for the small offsets of interest).
+pub fn detect_burst_start(
+    samples: &[i16],
+    params: &ModemParams,
+    sync: &SyncParams,
+) -> Result<SyncResult, ModemError> {
+    if samples.is_empty() {
+        return Err(ModemError::Sync("empty sample buffer".to_string()));
+    }
+    let sps = (params.sample_rate as f32) * (params.symbol_ms / 1000.0);
+
+    if sync.mode == SyncMode::PilotOnly {
+        return Ok(SyncResult {
+            start_sample: 0,
+            samples_per_symbol: sps,
+            freq_offset_hz: 0.0,
+            confidence: 0.0,
+        });
+    }
+
+    // ── Chirp mode: cross-correlate against the template ────────────────────
+    let tmpl = chirp_template_f32(params, sync);
+    let m = tmpl.len();
+    if m == 0 {
+        return Err(ModemError::Sync(
+            "chirp template is empty (chirp_symbols = 0?)".to_string(),
+        ));
+    }
+    if samples.len() < m {
+        return Err(ModemError::Sync(format!(
+            "buffer ({}) shorter than chirp template ({})",
+            samples.len(),
+            m
+        )));
+    }
+
+    let x: Vec<f32> = samples.iter().map(|&s| s as f32).collect();
+    // Template energy (constant across lags) for normalized correlation.
+    let tmpl_energy: f32 = tmpl.iter().map(|&v| v * v).sum::<f32>().max(1e-12);
+    let tmpl_norm = tmpl_energy.sqrt();
+
+    // The chirp is the FIRST feature in the rendered stream, so the true start is
+    // near the front of the received buffer (only the channel's leading noise / start
+    // offset precedes it). A full O(buffer·template) slide over a multi-megasample
+    // burst is needlessly expensive, so bound the lag search to a generous lead region
+    // (≈ one second of audio past where any plausible start offset could sit). This is
+    // both faster and more robust: it cannot lock onto a chance mid-burst correlation.
+    let search_window = m + params.sample_rate; // chirp length + ~1 s of lead
+    let last_start = (x.len() - m).min(search_window);
+
+    // A normalized correlation at one lag: <x_window, tmpl> / (||x_window||·||tmpl||).
+    // Normalizing by window energy keeps the low-energy leading noise from beating the
+    // chirp region and makes `confidence` amplitude-independent.
+    let corr_at = |lag: usize| -> f32 {
+        let win = &x[lag..lag + m];
+        let mut dot = 0.0f32;
+        let mut win_energy = 0.0f32;
+        for i in 0..m {
+            dot += win[i] * tmpl[i];
+            win_energy += win[i] * win[i];
+        }
+        dot / (win_energy.sqrt().max(1e-12) * tmpl_norm)
+    };
+
+    // Coarse-to-fine search: scan the lead region on a coarse stride, then refine
+    // ±stride around the coarse peak at full resolution. This keeps detection
+    // sample-accurate (the fine pass is exhaustive near the peak) at a fraction of the
+    // cost of a full slide. CRUCIAL: a linear chirp's autocorrelation main lobe is only
+    // ~`sr/bandwidth` samples wide (a few samples for a multi-kHz sweep), so the coarse
+    // stride MUST be smaller than that lobe or it steps clean over the true peak and
+    // locks onto a spurious mid-burst correlation. We size the stride to half the main-
+    // lobe width (≥ 1).
+    let bandwidth = (sync.chirp_f_hi_hz - sync.chirp_f_lo_hz).abs().max(1.0);
+    let main_lobe = ((params.sample_rate as f32) / bandwidth).max(1.0);
+    let coarse_stride = (main_lobe * 0.5).floor().max(1.0) as usize;
+    let mut best_score = f32::MIN;
+    let mut best_lag = 0usize;
+    let mut score_sum = 0.0f64;
+    let mut score_cnt = 0u64;
+    let mut lag = 0usize;
+    while lag <= last_start {
+        let score = corr_at(lag);
+        score_sum += score as f64;
+        score_cnt += 1;
+        if score > best_score {
+            best_score = score;
+            best_lag = lag;
+        }
+        lag += coarse_stride;
+    }
+    // Fine refinement: exhaustively scan ±coarse_stride around the coarse peak so the
+    // final lag is sample-accurate even though the coarse pass strode over most lags.
+    let lo = best_lag.saturating_sub(coarse_stride);
+    let hi = (best_lag + coarse_stride).min(x.len() - m);
+    for lag in lo..=hi {
+        let score = corr_at(lag);
+        if score > best_score {
+            best_score = score;
+            best_lag = lag;
+        }
+    }
+
+    // Confidence: how far the peak stands above the typical correlation. A clean chirp
+    // gives a peak near 1.0 with a low background mean, so (peak − mean) is large; pure
+    // noise gives peak ≈ mean. When the buffer is barely longer than the template only
+    // a handful of lags exist and the mean is unreliable, so fall back to the raw peak
+    // score (a chirp self-correlates near 1.0). Clamp into 0..1.
+    let mean_score = if score_cnt > 1 {
+        (score_sum / score_cnt as f64) as f32
+    } else {
+        0.0
+    };
+    let confidence = if score_cnt > 4 {
+        (best_score - mean_score).clamp(0.0, 1.0)
+    } else {
+        best_score.clamp(0.0, 1.0)
+    };
+
+    // Coarse frequency-offset estimate from the located chirp region. We compare the
+    // received chirp's energy at the template's nominal mid-sweep frequency against a
+    // few offset-shifted probes and pick the best — a cheap argmax over a small grid.
+    let freq_offset_hz = estimate_freq_offset(&samples[best_lag..best_lag + m], params, sync);
+
+    Ok(SyncResult {
+        start_sample: best_lag,
+        samples_per_symbol: sps,
+        freq_offset_hz,
+        confidence,
+    })
+}
+
+/// Coarse carrier-frequency-offset estimate over the located chirp region.
+///
+/// The data tones land on exact Goertzel bin centers; a carrier offset shifts them
+/// off-bin. We probe the chirp region's energy at a small grid of candidate offsets
+/// (±~one bin in fine steps) by re-mixing the region down by each candidate and
+/// measuring how much total energy lands back on the chirp's own sweep — the offset
+/// whose de-mix maximizes on-template energy is the estimate. This is a cheap,
+/// direction-correct estimator sufficient for the sub-bin offsets the modem targets.
+fn estimate_freq_offset(region: &[i16], params: &ModemParams, sync: &SyncParams) -> f32 {
+    if region.is_empty() {
+        return 0.0;
+    }
+    let tmpl = chirp_template_f32(params, sync);
+    let n = region.len().min(tmpl.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let sr = params.sample_rate as f32;
+    let x: Vec<f32> = region.iter().take(n).map(|&s| s as f32).collect();
+
+    // Bin resolution sets the search span: probe ±1 bin in fine steps.
+    let bin_hz = sr / (((params.sample_rate as f32) * (params.symbol_ms / 1000.0)).round());
+    let span = bin_hz; // ± one bin
+    let steps = 41i32; // odd, so 0 Hz is sampled exactly
+    let mut best_off = 0.0f32;
+    let mut best_energy = f32::MIN;
+    for k in 0..steps {
+        let off = -span + (2.0 * span) * (k as f32) / ((steps - 1) as f32);
+        // De-mix the region by -off and correlate with the (real) template. A real
+        // cosine de-mix is a first-order shift, matching the channel model's mixer.
+        let w = 2.0 * PI * off / sr;
+        let mut dot = 0.0f32;
+        for i in 0..n {
+            let demixed = x[i] * (w * (i as f32)).cos();
+            dot += demixed * tmpl[i];
+        }
+        let energy = dot.abs();
+        if energy > best_energy {
+            best_energy = energy;
+            best_off = off;
+        }
+    }
+    best_off
+}
+
+/// Produce drift-corrected symbol-window start boundaries for the burst.
+///
+/// Lays symbol windows from the located start (`sync.start_sample`, the chirp's first
+/// sample in `Chirp` mode) to the end of the buffer, with an **early-late timing-
+/// recovery loop** that tracks slow clock drift instead of advancing by a fixed
+/// stride. For each window it evaluates the dominant-tone Goertzel energy at three
+/// sub-window read positions (early / on-time / late) and steers the running window
+/// position and the fractional stride estimate toward the energy peak. Under a
+/// positive `clock_ppm` the true symbol length grows, so the estimated stride creeps
+/// up and the window starts slide cumulatively LATE across the burst — which is
+/// exactly what `decode_with_boundaries`'s pilot search then re-aligns to the data.
+///
+/// The chirp/pilot prefix windows are included in the returned boundaries; the
+/// decode-side pilot-pattern search trims everything up to and including the pilot,
+/// so callers do not need to know the chirp length here.
+pub fn recover_symbol_timing(
+    samples: &[i16],
+    params: &ModemParams,
+    sync: &SyncResult,
+) -> Result<Vec<usize>, ModemError> {
+    if samples.len() < sync.start_sample {
+        return Err(ModemError::Timing(
+            "start_sample is past the end of the buffer".to_string(),
+        ));
+    }
+    let nominal_sps = sync.samples_per_symbol.max(1.0);
+    let sps_int = nominal_sps.round().max(1.0) as usize;
+    let tone_freqs = build_tone_frequencies(params);
+
+    // Dominant-tone alignment energy of the symbol window starting at sample `s`: the
+    // max single-bin Goertzel response over every channel's every tone. It peaks when
+    // the window is aligned to a symbol (one tone fully inside the Hann-windowed window)
+    // and dips when the window straddles two symbols (energy splits) — so SUMMED over a
+    // run of windows it is maximized by the correct symbol-stride. We use the cheap
+    // single-point Goertzel (not the ±½-bin band sum) here: a small carrier offset
+    // shifts every tone's energy together and does not move the *alignment* peak across
+    // stride, so the point metric is enough to time-align and is 3× cheaper.
+    let win_energy = |s: usize| -> f32 {
+        if s + sps_int > samples.len() {
+            return 0.0;
+        }
+        let slice = &samples[s..s + sps_int];
+        let mut best = 0.0f32;
+        for ch_freqs in &tone_freqs {
+            for &f in ch_freqs {
+                let mag = goertzel_point(slice, f, params.sample_rate);
+                if mag > best {
+                    best = mag;
+                }
+            }
+        }
+        best
+    };
+
+    // ── Symbol-timing recovery via per-burst stride search ──────────────────
+    //
+    // A constant clock offset (the S7 drift impairment) makes the TRUE symbol length a
+    // constant `sps·(1+ppm)` for the whole burst — it is not per-symbol jitter — so the
+    // right estimator is a single, drift-corrected stride applied uniformly from the
+    // located start. We search a small grid of candidate strides around nominal and
+    // pick the one whose laid-down windows accumulate the most dominant-tone energy.
+    // This is far more stable than a per-symbol early-late nudge (which, on a clean no-
+    // drift signal, accumulates noise into a spurious walk and misaligns the late
+    // windows). Because a wrong stride drifts the windows OFF the symbols by the end of
+    // the burst, total energy is sharply peaked at the true stride.
+    //
+    // Laying windows at `start + i·sps_est` makes the boundaries slide CUMULATIVELY:
+    // under drift the chosen `sps_est` differs from nominal, so window `i` diverges from
+    // a no-drift baseline by `i·(sps_est − sps_base)` — growing across the burst, which
+    // is exactly the drift-tracking the timing test pins (late ≫ early divergence).
+    let start = sync.start_sample;
+    let usable = samples.len().saturating_sub(start);
+    let approx_syms = (usable / sps_int).max(1);
+
+    // We average the alignment energy over EVERY window in the burst for each candidate
+    // stride: a wrong stride walks the windows off the symbols, and the misalignment —
+    // and the resulting per-window energy loss — accumulates over the whole burst, so
+    // the all-window mean is sharply peaked (≈1 sample wide) at the true stride.
+    //
+    // Because that peak is so sharp, the search grid must step in SUB-SAMPLE increments
+    // across the whole span or it skips the peak and locks onto a spurious lobe. We keep
+    // the span tight — a clock offset large enough to need a wider span (≫1000 ppm)
+    // would slip whole symbols within the burst and is out of scope — so a tight span at
+    // sub-sample resolution is both correct and affordable. ±0.4% of nominal covers
+    // ≈±4000 ppm of clock error, well past any plausible acoustic link.
+    let span = (nominal_sps * 0.004).max(3.0);
+    // Metric = MEAN alignment energy per window, NOT the sum: a shorter candidate
+    // stride packs more windows into the burst, so an energy SUM is biased toward too-
+    // short strides (it rewards window count, not alignment) — which lands the search
+    // on a wildly wrong stride. The per-window mean is maximized at the true stride
+    // regardless of how many windows fit, so it is unbiased.
+    let eval_stride = |sps: f32| -> f64 {
+        let mut acc = 0.0f64;
+        let mut i = 0usize;
+        loop {
+            let s = start as f32 + (i as f32) * sps;
+            let si = s.round() as usize;
+            if si + sps_int > samples.len() {
+                break;
+            }
+            acc += win_energy(si) as f64;
+            i += 1;
+        }
+        if i == 0 {
+            0.0
+        } else {
+            acc / (i as f64)
+        }
+    };
+
+    // Stage 1: coarse grid across the full ±span at sub-sample resolution. With a tight
+    // span (~±8 samples) this still steps well under the ~1-sample peak width.
+    let coarse_steps = 41i32; // odd ⇒ nominal sampled exactly; ~0.4-sample steps
+    let mut best_sps = nominal_sps;
+    let mut best_energy = f64::MIN;
+    for k in 0..coarse_steps {
+        let sps = nominal_sps - span + (2.0 * span) * (k as f32) / ((coarse_steps - 1) as f32);
+        let e = eval_stride(sps);
+        if e > best_energy {
+            best_energy = e;
+            best_sps = sps;
+        }
+    }
+    // Stage 2: fine grid ±one coarse step around the coarse best, for sub-sample stride.
+    let coarse_step = (2.0 * span) / ((coarse_steps - 1) as f32);
+    let fine_steps = 41i32;
+    let coarse = best_sps;
+    for k in 0..fine_steps {
+        let sps =
+            coarse - coarse_step + (2.0 * coarse_step) * (k as f32) / ((fine_steps - 1) as f32);
+        let e = eval_stride(sps);
+        if e > best_energy {
+            best_energy = e;
+            best_sps = sps;
+        }
+    }
+
+    // Stage 3: two-anchor stride refinement. The energy-vs-stride peak is broad, so the
+    // grid stride can still be ~a sample off — and over a long burst even a 1-sample
+    // stride error walks the late windows off their symbols. We sharpen it by directly
+    // measuring the drift GEOMETRY: locally re-align an EARLY window and a LATE window
+    // (each to the sample position that maximizes its own alignment energy, searched a
+    // few samples either side of the grid-stride prediction), then set the stride to the
+    // slope between the two refined positions. Two well-separated anchors pin a constant
+    // (drift-corrected) stride far more precisely than the flat-topped energy peak.
+    if approx_syms >= 8 {
+        let i1 = approx_syms / 8; // early anchor (clear of the chirp/pilot transient)
+        let i2 = approx_syms - 2; // late anchor (maximizes the lever arm)
+                                  // Local refinement radius: a fraction of a symbol is plenty once the grid
+                                  // stride is within ~a sample.
+        let radius = (nominal_sps * 0.05).round().max(4.0) as isize;
+        let refine = |idx: usize| -> Option<f64> {
+            let predicted = start as f64 + (idx as f64) * (best_sps as f64);
+            let center = predicted.round() as isize;
+            let mut best_p = center;
+            let mut best_e = f32::MIN;
+            for d in -radius..=radius {
+                let s = center + d;
+                if s < 0 {
+                    continue;
+                }
+                let su = s as usize;
+                if su + sps_int > samples.len() {
+                    continue;
+                }
+                let e = win_energy(su);
+                if e > best_e {
+                    best_e = e;
+                    best_p = s;
+                }
+            }
+            if best_e > f32::MIN {
+                Some(best_p as f64)
+            } else {
+                None
+            }
+        };
+        if let (Some(p1), Some(p2)) = (refine(i1), refine(i2)) {
+            if i2 > i1 {
+                let slope = (p2 - p1) / ((i2 - i1) as f64);
+                // Only accept if the refined stride is within the search span (guards
+                // against a local-max anchor landing a symbol off and skewing the slope).
+                if (slope - nominal_sps as f64).abs() <= span as f64 {
+                    best_sps = slope as f32;
+                }
+            }
+        }
+    }
+
+    // Lay the final uniform (drift-corrected) windows.
+    let mut bounds: Vec<usize> = Vec::with_capacity(approx_syms);
+    let mut i = 0usize;
+    loop {
+        let s = start as f32 + (i as f32) * best_sps;
+        let si = s.round() as usize;
+        if si + sps_int > samples.len() {
+            break;
+        }
+        bounds.push(si);
+        i += 1;
+    }
+
+    if bounds.is_empty() {
+        return Err(ModemError::Timing(
+            "no symbol windows fit between the located start and the buffer end".to_string(),
+        ));
+    }
+    Ok(bounds)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 2b. RATE-SELECTABLE CODING API (COMPILING STUBS — TODO Pass C)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Named interleaved-Reed-Solomon redundancy points (the coding *rate*), plus a
+/// custom escape hatch. Higher redundancy ⇒ more loss tolerance, lower throughput.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsRate {
+    /// d=4, p=1 (total 5, 20% parity) — high throughput, clean links.
+    High,
+    /// d=4, p=2 (total 6, ~33% parity) — balanced.
+    Medium,
+    /// d=4, p=4 (total 8, 50% parity) — robust, lossy links.
+    Low,
+    /// Explicit (data_shards, parity_shards, shard_size).
+    Custom {
+        data_shards: usize,
+        parity_shards: usize,
+        shard_size: usize,
+    },
+}
+
+impl RsRate {
+    /// (data_shards, parity_shards, shard_size) for this rate.
+    ///
+    /// The named rates hold `data_shards` (and therefore the per-block data
+    /// capacity and zero-padding) CONSTANT at 4 and grow only `parity_shards`
+    /// High → Medium → Low (1 → 2 → 4). This makes the redundancy ladder monotone in
+    /// BOTH axes the tests pin: the parity fraction `p/(d+p)` strictly increases
+    /// (0.20 → 0.33 → 0.50), and — because the data geometry is identical across
+    /// rates — the *encoded length* of a given frame strictly grows with redundancy
+    /// too (a more-protected profile is purely "the same data shards plus more parity
+    /// shards"). A growing-`d`/shrinking-block ladder (the original Pass-A sketch of
+    /// 8/2, 6/3, 4/4) would have INVERTED the encoded-length order for sub-block
+    /// payloads, because the high rate's larger block pads more — so the constant-`d`
+    /// ladder is the geometry that keeps overhead monotone while still leaving every
+    /// RS rate cheaper than brute-force repetition.
+    pub fn shard_config(&self) -> (usize, usize, usize) {
+        match *self {
+            RsRate::High => (4, 1, 128),
+            RsRate::Medium => (4, 2, 128),
+            RsRate::Low => (4, 4, 128),
+            RsRate::Custom {
+                data_shards,
+                parity_shards,
+                shard_size,
+            } => (data_shards, parity_shards, shard_size),
+        }
+    }
+}
+
+/// The coding profile carried in-band so the receiver learns the rate without
+/// out-of-band flags. `Repetition` maps the legacy repetition FEC (kept for
+/// backward compatibility / absolute-floor robustness); `RsRate` selects the
+/// interleaved-RS rate ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodingProfile {
+    Repetition { repeats: usize, pkt_size: usize },
+    RsRate(RsRate),
+}
+
+impl Default for CodingProfile {
+    /// The default matches the encoder's current interleaved-RS default posture
+    /// (a balanced rate), so a stream with no in-band rate header decodes sanely.
+    fn default() -> Self {
+        CodingProfile::RsRate(RsRate::Medium)
+    }
+}
+
+// ── In-band coding-rate header ("CDG1") ─────────────────────────────────────
+//
+// The rate must survive to the receiver without out-of-band `--rs-data` flags, so
+// we prepend a small fixed-size header carrying the profile. Layout (big-endian):
+//
+//   [4 bytes magic "CDG1"]
+//   [1 byte  profile_tag]   0 = Repetition, 1 = interleaved-RS
+//   [2 bytes a]             Repetition: repeats   | RS: data_shards
+//   [2 bytes b]             Repetition: pkt_size  | RS: parity_shards
+//   [2 bytes c]             Repetition: 0         | RS: shard_size
+//
+// = 11 bytes per copy. The whole header is emitted in TRIPLICATE (33 bytes) so a
+// burst erasure cannot wipe the rate: the parser majority-votes the three copies
+// field-by-field. The header is a pure PREFIX in front of the existing
+// `RS01`/`PKT1` packet stream, so the packet formats stay byte-identical and a
+// legacy stream (no `CDG1` prefix) still decodes exactly as before.
+
+const CDG1_MAGIC: &[u8; 4] = b"CDG1";
+const CDG1_TAG_REPETITION: u8 = 0;
+const CDG1_TAG_RS: u8 = 1;
+/// One copy: 4 magic + 1 tag + 3×u16 = 11 bytes.
+const CDG1_COPY_LEN: usize = 4 + 1 + 2 + 2 + 2;
+/// Triplicated header total length (the fixed prefix `parse_coding_header` reports).
+const CDG1_HEADER_LEN: usize = CDG1_COPY_LEN * 3;
+
+/// Serialize one `CodingProfile` into a single (untriplicated) 11-byte CDG1 copy.
+fn encode_cdg1_copy(profile: &CodingProfile) -> [u8; CDG1_COPY_LEN] {
+    let mut buf = [0u8; CDG1_COPY_LEN];
+    buf[0..4].copy_from_slice(CDG1_MAGIC);
+    let (tag, a, b, c): (u8, u16, u16, u16) = match *profile {
+        CodingProfile::Repetition { repeats, pkt_size } => {
+            (CDG1_TAG_REPETITION, repeats as u16, pkt_size as u16, 0)
+        }
+        CodingProfile::RsRate(rate) => {
+            let (d, p, s) = rate.shard_config();
+            (CDG1_TAG_RS, d as u16, p as u16, s as u16)
+        }
+    };
+    buf[4] = tag;
+    buf[5..7].copy_from_slice(&a.to_be_bytes());
+    buf[7..9].copy_from_slice(&b.to_be_bytes());
+    buf[9..11].copy_from_slice(&c.to_be_bytes());
+    buf
+}
+
+/// Reconstruct a `CodingProfile` from a decoded (tag, a, b, c) tuple.
+///
+/// RS profiles are normalized back onto the named rate ladder when the (d, p, s)
+/// triple matches a named rate, so a round-tripped `RsRate::High` parses back as
+/// `RsRate::High` (not `Custom`), which is what the header-round-trip tests assert.
+fn profile_from_fields(tag: u8, a: u16, b: u16, c: u16) -> Result<CodingProfile, ModemError> {
+    match tag {
+        CDG1_TAG_REPETITION => Ok(CodingProfile::Repetition {
+            repeats: a as usize,
+            pkt_size: b as usize,
+        }),
+        CDG1_TAG_RS => {
+            let (d, p, s) = (a as usize, b as usize, c as usize);
+            // Normalize onto the named ladder when the geometry matches.
+            let rate = if (d, p, s) == RsRate::High.shard_config() {
+                RsRate::High
+            } else if (d, p, s) == RsRate::Medium.shard_config() {
+                RsRate::Medium
+            } else if (d, p, s) == RsRate::Low.shard_config() {
+                RsRate::Low
+            } else {
+                RsRate::Custom {
+                    data_shards: d,
+                    parity_shards: p,
+                    shard_size: s,
+                }
+            };
+            Ok(CodingProfile::RsRate(rate))
+        }
+        other => Err(ModemError::CodingHeader(format!(
+            "unknown CDG1 profile tag {other}"
+        ))),
+    }
+}
+
+/// Map a measured/estimated link SNR (dB) to an interleaved-RS redundancy rate.
+///
+/// Lower SNR ⇒ more redundancy (more parity), higher SNR ⇒ less redundancy (more
+/// throughput). The thresholds are deliberately coarse — this is a link-adaptation
+/// *hint*, not a capacity-exact selector — and follow the documented ladder
+/// `High` (clean) → `Medium` (balanced) → `Low` (lossy):
+///
+/// - `snr_db >= 20.0` → [`RsRate::High`]   (d=8, p=2 — clean link, max throughput)
+/// - `snr_db >= 10.0` → [`RsRate::Medium`] (d=6, p=3 — balanced)
+/// - otherwise        → [`RsRate::Low`]    (d=4, p=4 — robust, lossy link)
+pub fn select_rate(snr_db: f32) -> RsRate {
+    if snr_db >= 20.0 {
+        RsRate::High
+    } else if snr_db >= 10.0 {
+        RsRate::Medium
+    } else {
+        RsRate::Low
+    }
+}
+
+/// Packetize a frame under the chosen coding profile, with an in-band rate header.
+///
+/// Honors `profile`: a `Repetition` profile emits the legacy repetition-FEC packet
+/// stream; an `RsRate` profile emits the interleaved Reed-Solomon stream at that
+/// rate's shard geometry. In BOTH cases a triplicated `CDG1` rate header is
+/// prepended so `depacketize_with_profile` / `parse_coding_header` recover the rate
+/// in-band — no out-of-band `--rs-data` flags. The header is a pure prefix, so the
+/// underlying `RS01`/`PKT1` packet bytes are byte-identical to the legacy paths.
+pub fn packetize_with_profile(
+    frame: &[u8],
+    profile: &CodingProfile,
+) -> Result<Vec<u8>, ModemError> {
+    // Body: dispatch on the profile.
+    let body = match *profile {
+        CodingProfile::Repetition { repeats, pkt_size } => {
+            if pkt_size == 0 || repeats == 0 {
+                return Err(ModemError::Other(
+                    "Repetition profile requires repeats > 0 and pkt_size > 0".to_string(),
+                ));
+            }
+            packetize_stream(frame, pkt_size, repeats)
+        }
+        CodingProfile::RsRate(rate) => {
+            let (d, p, s) = rate.shard_config();
+            packetize_stream_rs_interleaved(frame, d, p, s)
+        }
+    };
+
+    // Prefix: triplicated CDG1 rate header.
+    let copy = encode_cdg1_copy(profile);
+    let mut out = Vec::with_capacity(CDG1_HEADER_LEN + body.len());
+    for _ in 0..3 {
+        out.extend_from_slice(&copy);
+    }
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Parse the in-band coding-rate header from the front of a packetized stream.
+///
+/// Majority-votes the triplicated `CDG1` header field-by-field (so a single
+/// corrupted/erased copy cannot flip the rate) and returns the recovered profile
+/// plus the number of prefix bytes the caller must skip. If NO `CDG1` magic is
+/// present in the first copy slot, the stream was produced by a legacy (header-less)
+/// path: this returns `(CodingProfile::default(), 0)` so legacy streams decode
+/// exactly as before — a *missing* header is not an error.
+pub fn parse_coding_header(stream: &[u8]) -> Result<(CodingProfile, usize), ModemError> {
+    // Not even one copy fits, or the first slot is not a CDG1 copy ⇒ legacy stream.
+    if stream.len() < CDG1_COPY_LEN || &stream[0..4] != CDG1_MAGIC {
+        return Ok((CodingProfile::default(), 0));
+    }
+
+    // Collect every well-formed copy in the (up to) three triplicate slots.
+    let mut votes: Vec<(u8, u16, u16, u16)> = Vec::with_capacity(3);
+    for slot in 0..3 {
+        let off = slot * CDG1_COPY_LEN;
+        if off + CDG1_COPY_LEN > stream.len() {
+            break;
+        }
+        let c = &stream[off..off + CDG1_COPY_LEN];
+        if &c[0..4] != CDG1_MAGIC {
+            continue; // a clobbered copy slot; skip it for the vote
+        }
+        let tag = c[4];
+        let a = u16::from_be_bytes([c[5], c[6]]);
+        let b = u16::from_be_bytes([c[7], c[8]]);
+        let cc = u16::from_be_bytes([c[9], c[10]]);
+        votes.push((tag, a, b, cc));
+    }
+
+    if votes.is_empty() {
+        // First slot had the magic but no copy survived field validation.
+        return Err(ModemError::CodingHeader(
+            "CDG1 prefix present but no valid copy could be read".to_string(),
+        ));
+    }
+
+    // Per-field majority vote across the surviving copies.
+    let majority = |vals: &[u16]| -> u16 {
+        let mut counts: HashMap<u16, usize> = HashMap::new();
+        for &v in vals {
+            *counts.entry(v).or_insert(0) += 1;
+        }
+        *counts
+            .iter()
+            .max_by_key(|kv| *kv.1)
+            .map(|(k, _)| k)
+            .unwrap_or(&vals[0])
+    };
+    let tag = {
+        let mut counts: HashMap<u8, usize> = HashMap::new();
+        for v in &votes {
+            *counts.entry(v.0).or_insert(0) += 1;
+        }
+        *counts
+            .iter()
+            .max_by_key(|kv| *kv.1)
+            .map(|(k, _)| k)
+            .unwrap_or(&votes[0].0)
+    };
+    let a = majority(&votes.iter().map(|v| v.1).collect::<Vec<_>>());
+    let b = majority(&votes.iter().map(|v| v.2).collect::<Vec<_>>());
+    let c = majority(&votes.iter().map(|v| v.3).collect::<Vec<_>>());
+
+    let profile = profile_from_fields(tag, a, b, c)?;
+    Ok((profile, CDG1_HEADER_LEN))
+}
+
+/// Depacketize a stream produced by `packetize_with_profile`, learning the rate
+/// in-band.
+///
+/// Parses the `CDG1` prefix (if any), skips it, then dispatches on the learned
+/// profile: a `Repetition` profile is recovered with `depacketize_stream`, an
+/// `RsRate` profile with `depacketize_stream_rs` (which self-describes its shard
+/// geometry from the `RS01` headers). A legacy header-less stream (consumed = 0)
+/// falls through to `depacketize_stream_rs` exactly as today.
+pub fn depacketize_with_profile(stream: &[u8]) -> Result<Vec<u8>, ModemError> {
+    let (profile, consumed) = parse_coding_header(stream)?;
+    let body = &stream[consumed..];
+    match profile {
+        CodingProfile::Repetition { repeats, .. } => depacketize_stream(body, repeats),
+        CodingProfile::RsRate(_) => depacketize_stream_rs(body),
+    }
+}
+
 // ============================================================================
 // ERROR-PATH UNIT TESTS (WS-2 Phase B — the negative/Err-path net)
 //
@@ -1515,6 +2588,283 @@ mod tests {
         assert!(
             min_freq >= MUSIC_CLEAR_FLOOR_HZ,
             "lowest default tone {min_freq:.1} Hz must be >= {MUSIC_CLEAR_FLOOR_HZ} Hz"
+        );
+    }
+
+    // ========================================================================
+    // S7 ACOUSTIC-CHANNEL MODEL — smoke tests (REAL code, not a stub).
+    //
+    // These prove the model (a) is a near-identity passthrough under the
+    // zero-impairment config and (b) genuinely perturbs the samples under a
+    // non-trivial config, and (c) is deterministic for a fixed seed. Everything
+    // is in-memory and seeded — no filesystem, no audio hardware.
+    // ========================================================================
+
+    /// Build a short, non-trivial test tone burst (a couple of default symbol
+    /// windows of a single channel-0 tone) to feed the channel model.
+    fn smoke_burst() -> Vec<i16> {
+        let params = ModemParams::default();
+        let mut channels_symbols: Vec<Vec<u8>> = vec![Vec::new(); params.channels];
+        channels_symbols[0] = vec![5u8, 12u8, 20u8];
+        render_symbols_to_samples(&channels_symbols, &params)
+    }
+
+    /// Property: a zero-impairment (`identity`) channel is a near-identity
+    /// passthrough — same length, and the waveform shape is preserved within a
+    /// tight relative tolerance (only a uniform renormalization gain may apply).
+    #[test]
+    fn test_acoustic_channel_identity_is_near_passthrough() {
+        let input = smoke_burst();
+        assert!(!input.is_empty(), "smoke burst must be non-empty");
+
+        let out = simulate_acoustic_channel(&input, &AcousticChannelParams::identity());
+        assert_eq!(
+            out.len(),
+            input.len(),
+            "identity channel must not change sample count"
+        );
+
+        // The model renormalizes peak->90% full-scale; render_symbols_to_samples
+        // already did the same, so identity is effectively a unit gain. Compare
+        // the normalized waveforms: max absolute deviation must be tiny relative
+        // to full-scale.
+        let in_peak = input.iter().map(|&s| (s as f32).abs()).fold(0.0, f32::max);
+        let out_peak = out.iter().map(|&s| (s as f32).abs()).fold(0.0, f32::max);
+        assert!(in_peak > 0.0 && out_peak > 0.0);
+        let mut max_dev = 0.0f32;
+        for (&a, &b) in input.iter().zip(out.iter()) {
+            let na = a as f32 / in_peak;
+            let nb = b as f32 / out_peak;
+            max_dev = max_dev.max((na - nb).abs());
+        }
+        assert!(
+            max_dev < 0.02,
+            "identity channel must be a near-passthrough; normalized max deviation \
+             was {max_dev:.4} (expected < 0.02)"
+        );
+    }
+
+    /// Property: a non-trivial config (start offset + clock drift + frequency
+    /// offset + echo) GENUINELY perturbs the samples — the output must differ
+    /// materially from the input (it must not be a passthrough). This guards that
+    /// the model is real working code that the Pass-B failing tests can rely on.
+    #[test]
+    fn test_acoustic_channel_perturbs_samples() {
+        let input = smoke_burst();
+        let params = AcousticChannelParams {
+            seed: 1234,
+            start_offset_samples: 137, // a non-multiple-of-symbol start offset
+            clock_ppm: 500.0,          // half a per-mille clock error
+            freq_offset_hz: 7.0,       // nudge off the 25 Hz bin centers
+            echo_delay_samples: 64,    // a short room echo
+            echo_gain: 0.4,
+            jitter_samples: 0.0,
+        };
+        let out = simulate_acoustic_channel(&input, &params);
+
+        // Start offset alone makes the lengths differ; assert the model moved the
+        // signal (longer due to the prepended offset + clock stretch).
+        assert!(
+            out.len() > input.len(),
+            "start offset + positive clock_ppm must lengthen the burst (got {} vs {})",
+            out.len(),
+            input.len()
+        );
+
+        // And on the overlapping region the waveform must materially differ from a
+        // plain copy: count how many samples differ once we skip the prepended
+        // offset region. With offset+drift+mix+echo, the vast majority must differ.
+        let skip = params.start_offset_samples as usize;
+        let mut differing = 0usize;
+        let mut compared = 0usize;
+        for (i, &a) in input.iter().enumerate() {
+            if let Some(&b) = out.get(i + skip) {
+                compared += 1;
+                if a != b {
+                    differing += 1;
+                }
+            }
+        }
+        assert!(compared > 0, "must have an overlapping region to compare");
+        let frac = differing as f32 / compared as f32;
+        assert!(
+            frac > 0.5,
+            "non-trivial channel must perturb most samples; only {:.1}% differed",
+            100.0 * frac
+        );
+    }
+
+    /// Property: the model is DETERMINISTIC — same seed + same params ⇒ identical
+    /// output (the seeded ChaCha8Rng guarantee tests rely on).
+    #[test]
+    fn test_acoustic_channel_is_deterministic() {
+        let input = smoke_burst();
+        let params = AcousticChannelParams {
+            seed: 99,
+            start_offset_samples: 40,
+            clock_ppm: 0.0,
+            freq_offset_hz: 0.0,
+            echo_delay_samples: 0,
+            echo_gain: 0.0,
+            jitter_samples: 1.5, // jitter exercises the seeded RNG
+        };
+        let a = simulate_acoustic_channel(&input, &params);
+        let b = simulate_acoustic_channel(&input, &params);
+        assert_eq!(a, b, "same seed + params must produce identical output");
+    }
+
+    // ========================================================================
+    // S7 RATE-SELECTABLE CODING — unit-level RED net (Pass B).
+    //
+    // These pin the rate-coding contract at the byte/stream level (no audio): the
+    // overhead ladder, in-band rate signaling (CDG1), and per-rate identity. They
+    // RED against the Pass-A stubs (packetize_with_profile ignores `profile` and
+    // emits a fixed Medium stream with no CDG1 header; parse_coding_header always
+    // returns the default and 0 consumed). The audio-pipeline legs of category 4
+    // live in tests/modem_realair.rs; these are the pure-coding counterparts so a
+    // Pass-C breakage is caught at both levels.
+    // ========================================================================
+
+    /// Property (RED): packetize_with_profile honors the rate — encoded length must
+    /// strictly DECREASE in redundancy from High → Medium → Low (i.e. grow in size
+    /// High < Medium < Low, since more parity = bulkier). The stub emits a fixed
+    /// Medium stream for every profile, so all three are EQUAL → RED.
+    #[test]
+    fn test_profile_overhead_ladder_unit() {
+        let frame = seeded_payload(200, 480);
+        let len_high = packetize_with_profile(&frame, &CodingProfile::RsRate(RsRate::High))
+            .expect("High")
+            .len();
+        let len_med = packetize_with_profile(&frame, &CodingProfile::RsRate(RsRate::Medium))
+            .expect("Medium")
+            .len();
+        let len_low = packetize_with_profile(&frame, &CodingProfile::RsRate(RsRate::Low))
+            .expect("Low")
+            .len();
+        assert!(
+            len_high < len_med && len_med < len_low,
+            "encoded length must grow with redundancy: High({len_high}) < Medium({len_med}) \
+             < Low({len_low}). The stub emits a FIXED Medium stream for every profile (all \
+             equal) — RED until packetize_with_profile honors the profile."
+        );
+    }
+
+    /// Property (RED): parse_coding_header must recover the profile that
+    /// packetize_with_profile USED, for each RsRate — the rate travels in-band via a
+    /// triplicated CDG1 header. The stub emits no header and always returns the
+    /// default (Medium) + 0 consumed, so this is RED for High and Low.
+    #[test]
+    fn test_coding_header_round_trips_profile_unit() {
+        let frame = seeded_payload(201, 256);
+        for rate in [RsRate::High, RsRate::Medium, RsRate::Low] {
+            let profile = CodingProfile::RsRate(rate);
+            let stream = packetize_with_profile(&frame, &profile).expect("packetize");
+            let (parsed, consumed) = parse_coding_header(&stream).expect("parse_coding_header");
+            assert_eq!(
+                parsed, profile,
+                "parse_coding_header must recover the USED profile {profile:?} in-band \
+                 (got {parsed:?}). RED until the triplicated CDG1 header is emitted + parsed."
+            );
+            // A real header occupies bytes; the stub reports 0 consumed for every rate.
+            assert!(
+                consumed > 0,
+                "an in-band CDG1 rate header must consume a non-zero, fixed-size prefix for \
+                 {rate:?} (got consumed = 0). RED until the header is emitted."
+            );
+        }
+    }
+
+    /// Property (RED): packetize_with_profile -> depacketize_with_profile is a
+    /// byte-exact identity on a clean stream for EVERY RsRate (the depacketizer learns
+    /// the rate in-band and skips the CDG1 prefix). The stub's depacketizer delegates
+    /// straight to depacketize_stream_rs with consumed = 0; once Pass C prepends a
+    /// real CDG1 prefix to the High/Low streams, the stub depacketizer would choke on
+    /// that prefix — so this identity is the contract Pass C must keep whole.
+    #[test]
+    fn test_per_rate_profile_identity_unit() {
+        let frame = seeded_payload(202, 300);
+        for rate in [RsRate::High, RsRate::Medium, RsRate::Low] {
+            let profile = CodingProfile::RsRate(rate);
+            let stream = packetize_with_profile(&frame, &profile).expect("packetize");
+            let recovered = depacketize_with_profile(&stream).expect("depacketize");
+            assert_eq!(
+                recovered, frame,
+                "packetize_with_profile -> depacketize_with_profile must be a byte-exact \
+                 identity on a clean stream for {rate:?}"
+            );
+        }
+    }
+
+    /// Property (RED): the Repetition profile must be honored end-to-end — a
+    /// `CodingProfile::Repetition` stream must depacketize byte-exactly, AND its
+    /// header must parse back as the Repetition profile (the lowest-efficiency,
+    /// absolute-floor option kept selectable). The stub ALWAYS emits an interleaved-RS
+    /// stream and ignores Repetition entirely, so depacketize_with_profile produces a
+    /// non-identity (or the header parses as RS) → RED.
+    #[test]
+    fn test_repetition_profile_honored_unit() {
+        let frame = seeded_payload(203, 240);
+        let profile = CodingProfile::Repetition {
+            repeats: 3,
+            pkt_size: 200,
+        };
+        let stream = packetize_with_profile(&frame, &profile).expect("packetize Repetition");
+
+        let (parsed, _consumed) = parse_coding_header(&stream).expect("parse_coding_header");
+        assert_eq!(
+            parsed, profile,
+            "parse_coding_header must recover the Repetition profile {profile:?} (got \
+             {parsed:?}). The stub emits an RS stream and ignores Repetition — RED."
+        );
+
+        let recovered = depacketize_with_profile(&stream).expect("depacketize Repetition");
+        assert_eq!(
+            recovered, frame,
+            "a Repetition-profile stream must depacketize byte-exactly via \
+             depacketize_with_profile — RED until the profile is honored."
+        );
+    }
+
+    /// Property: the channel-quality → rate auto-selector picks LOWER redundancy at
+    /// HIGHER SNR and HIGHER redundancy at LOWER SNR (the link-adaptation contract the
+    /// RED net flagged but could not call, since `select_rate` did not exist in Pass A).
+    /// We assert the monotone direction via the parity fraction p/(d+p): a high-SNR
+    /// pick must have a SMALLER parity fraction than a low-SNR pick.
+    #[test]
+    fn test_select_rate_picks_lower_redundancy_at_higher_snr() {
+        let parity_frac = |r: RsRate| {
+            let (d, p, _) = r.shard_config();
+            p as f32 / (d + p) as f32
+        };
+        let clean = select_rate(30.0); // high SNR
+        let mid = select_rate(15.0); // medium SNR
+        let lossy = select_rate(3.0); // low SNR
+
+        // Higher SNR ⇒ lower redundancy (smaller parity fraction); the ladder is monotone.
+        assert!(
+            parity_frac(clean) < parity_frac(mid),
+            "a clean (30 dB) link must pick LESS redundancy than a 15 dB link: \
+             got {clean:?} (parity {:.3}) vs {mid:?} (parity {:.3})",
+            parity_frac(clean),
+            parity_frac(mid)
+        );
+        assert!(
+            parity_frac(mid) < parity_frac(lossy),
+            "a 15 dB link must pick LESS redundancy than a 3 dB link: \
+             got {mid:?} (parity {:.3}) vs {lossy:?} (parity {:.3})",
+            parity_frac(mid),
+            parity_frac(lossy)
+        );
+        // And concretely the named ends of the ladder.
+        assert_eq!(
+            clean,
+            RsRate::High,
+            "high SNR must select the High (low-parity) rate"
+        );
+        assert_eq!(
+            lossy,
+            RsRate::Low,
+            "low SNR must select the Low (high-parity) rate"
         );
     }
 }

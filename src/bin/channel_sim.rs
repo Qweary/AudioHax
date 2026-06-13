@@ -3,17 +3,29 @@ use std::env;
 use std::fs::File;
 use std::io::{Read, Write};
 
-use rand::prelude::*;
 use audiohax::modem;
-use audiohax::modem::{depacketize_stream, depacketize_stream_rs};
+use audiohax::modem::{depacketize_stream, depacketize_stream_rs, AcousticChannelParams};
+use rand::prelude::*;
 
 fn print_usage(name: &str) {
     eprintln!("Usage:");
-    eprintln!("  {} <in_bytes.bin> <out_sim.bin> [--mode bitflip|byteburst|packet] [--flip_prob P] [--burst_prob P] [--burst_len L] [--packet_size N] [--repeats R] [--rs-data D --rs-parity P]", name);
+    eprintln!("  {} <in_bytes.bin> <out_sim.bin> [--mode bitflip|byteburst|packet|acoustic] [--flip_prob P] [--burst_prob P] [--burst_len L] [--packet_size N] [--repeats R] [--rs-data D --rs-parity P]", name);
+    eprintln!();
+    eprintln!(
+        "  Acoustic mode treats the input as raw little-endian i16 audio samples and applies"
+    );
+    eprintln!(
+        "  the S7 seeded acoustic-channel model (start offset / clock drift / freq offset / echo):"
+    );
+    eprintln!("    [--acoustic-seed S] [--start-offset N] [--clock-ppm P] [--freq-offset HZ] [--echo-delay N] [--echo-gain G] [--jitter J]");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  {} packetized.bin sim_bytes.bin --mode packet --packet_size 152 --burst_prob 0.05 --flip_prob 0.001 --rs-data 4 --rs-parity 2", name);
-    eprintln!("  {} packetized.bin sim_bytes.bin --mode bitflip --flip_prob 0.0005", name);
+    eprintln!(
+        "  {} packetized.bin sim_bytes.bin --mode bitflip --flip_prob 0.0005",
+        name
+    );
+    eprintln!("  {} burst_samples.i16 out_samples.i16 --mode acoustic --start-offset 137 --clock-ppm 500 --freq-offset 7 --echo-delay 64 --echo-gain 0.4", name);
 }
 
 fn detect_and_write_file(bytes: &[u8], out_basename: &str) -> std::io::Result<()> {
@@ -53,19 +65,107 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rs_data: Option<usize> = None;
     let mut rs_parity: Option<usize> = None;
 
+    // Acoustic-channel (S7) knobs — used only in --mode acoustic.
+    let mut acoustic = AcousticChannelParams::identity();
+
     // parse args
     let mut i = 3usize;
     while i < args.len() {
         match args[i].as_str() {
-            "--mode" => { if let Some(v) = args.get(i+1) { mode = v.clone(); } i += 2; }
-            "--flip_prob" => { if let Some(v) = args.get(i+1) { flip_prob = v.parse::<f64>().unwrap_or(0.0); } i += 2; }
-            "--burst_prob" => { if let Some(v) = args.get(i+1) { burst_prob = v.parse::<f64>().unwrap_or(0.0); } i += 2; }
-            "--burst_len" => { if let Some(v) = args.get(i+1) { burst_len = v.parse::<usize>().unwrap_or(16); } i += 2; }
-            "--packet_size" => { if let Some(v) = args.get(i+1) { packet_size = v.parse::<usize>().unwrap_or(128); } i += 2; }
-            "--repeats" => { if let Some(v) = args.get(i+1) { repeats_opt = v.parse::<usize>().ok(); } i += 2; }
-            "--rs-data" => { if let Some(v) = args.get(i+1) { rs_data = v.parse::<usize>().ok(); } i += 2; }
-            "--rs-parity" => { if let Some(v) = args.get(i+1) { rs_parity = v.parse::<usize>().ok(); } i += 2; }
-            _ => { eprintln!("Unknown arg {}", args[i]); i += 1; }
+            "--mode" => {
+                if let Some(v) = args.get(i + 1) {
+                    mode = v.clone();
+                }
+                i += 2;
+            }
+            "--acoustic-seed" => {
+                if let Some(v) = args.get(i + 1) {
+                    acoustic.seed = v.parse().unwrap_or(0);
+                }
+                i += 2;
+            }
+            "--start-offset" => {
+                if let Some(v) = args.get(i + 1) {
+                    acoustic.start_offset_samples = v.parse().unwrap_or(0);
+                }
+                i += 2;
+            }
+            "--clock-ppm" => {
+                if let Some(v) = args.get(i + 1) {
+                    acoustic.clock_ppm = v.parse().unwrap_or(0.0);
+                }
+                i += 2;
+            }
+            "--freq-offset" => {
+                if let Some(v) = args.get(i + 1) {
+                    acoustic.freq_offset_hz = v.parse().unwrap_or(0.0);
+                }
+                i += 2;
+            }
+            "--echo-delay" => {
+                if let Some(v) = args.get(i + 1) {
+                    acoustic.echo_delay_samples = v.parse().unwrap_or(0);
+                }
+                i += 2;
+            }
+            "--echo-gain" => {
+                if let Some(v) = args.get(i + 1) {
+                    acoustic.echo_gain = v.parse().unwrap_or(0.0);
+                }
+                i += 2;
+            }
+            "--jitter" => {
+                if let Some(v) = args.get(i + 1) {
+                    acoustic.jitter_samples = v.parse().unwrap_or(0.0);
+                }
+                i += 2;
+            }
+            "--flip_prob" => {
+                if let Some(v) = args.get(i + 1) {
+                    flip_prob = v.parse::<f64>().unwrap_or(0.0);
+                }
+                i += 2;
+            }
+            "--burst_prob" => {
+                if let Some(v) = args.get(i + 1) {
+                    burst_prob = v.parse::<f64>().unwrap_or(0.0);
+                }
+                i += 2;
+            }
+            "--burst_len" => {
+                if let Some(v) = args.get(i + 1) {
+                    burst_len = v.parse::<usize>().unwrap_or(16);
+                }
+                i += 2;
+            }
+            "--packet_size" => {
+                if let Some(v) = args.get(i + 1) {
+                    packet_size = v.parse::<usize>().unwrap_or(128);
+                }
+                i += 2;
+            }
+            "--repeats" => {
+                if let Some(v) = args.get(i + 1) {
+                    repeats_opt = v.parse::<usize>().ok();
+                }
+                i += 2;
+            }
+            "--rs-data" => {
+                if let Some(v) = args.get(i + 1) {
+                    rs_data = v.parse::<usize>().ok();
+                }
+                i += 2;
+            }
+            "--rs-parity" => {
+                if let Some(v) = args.get(i + 1) {
+                    rs_parity = v.parse::<usize>().ok();
+                }
+                i += 2;
+            }
+            _ => {
+                eprintln!("Unknown arg {}", args[i]);
+                i += 1;
+            }
         }
     }
 
@@ -77,6 +177,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // RNG
     let mut rng = StdRng::from_entropy();
+
+    // ── ACOUSTIC mode: interpret input as raw little-endian i16 audio samples,
+    // apply the S7 seeded acoustic-channel model, and write the perturbed samples
+    // back. This is the audio-domain channel (start offset / clock drift / freq
+    // offset / multipath echo), distinct from the byte-domain models below. It
+    // exercises the SAME library function the integration tests use, so behavior
+    // is identical across the bin and the test crate.
+    if mode == "acoustic" {
+        if bytes.len() % 2 != 0 {
+            eprintln!("acoustic mode: input length must be even (raw i16 LE samples)");
+            std::process::exit(1);
+        }
+        let samples: Vec<i16> = bytes
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        println!(
+            "Acoustic channel: {} samples, seed={} start_offset={} clock_ppm={} freq_offset={} echo_delay={} echo_gain={} jitter={}",
+            samples.len(),
+            acoustic.seed,
+            acoustic.start_offset_samples,
+            acoustic.clock_ppm,
+            acoustic.freq_offset_hz,
+            acoustic.echo_delay_samples,
+            acoustic.echo_gain,
+            acoustic.jitter_samples
+        );
+        let out = modem::simulate_acoustic_channel(&samples, &acoustic);
+        let mut out_bytes: Vec<u8> = Vec::with_capacity(out.len() * 2);
+        for s in &out {
+            out_bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        let mut of = File::create(out_path)?;
+        of.write_all(&out_bytes)?;
+        println!(
+            "Wrote {} perturbed samples ({} bytes) to {}",
+            out.len(),
+            out_bytes.len(),
+            out_path
+        );
+        println!("Simulation complete.");
+        return Ok(());
+    }
 
     // simulate
     let mut sim = bytes.clone();
@@ -97,13 +240,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "byteburst" => {
-            println!("Applying byte-burst erasure model: burst_prob={}, burst_len={}", burst_prob, burst_len);
+            println!(
+                "Applying byte-burst erasure model: burst_prob={}, burst_len={}",
+                burst_prob, burst_len
+            );
             let mut i = 0usize;
             while i < sim.len() {
                 if rng.gen_bool(burst_prob) {
                     let len = burst_len; // fixed length; could be randomized
-                    let end = std::cmp::min(i+len, sim.len());
-                    for j in i..end { sim[j] = 0u8; } // erase -> zeros
+                    let end = std::cmp::min(i + len, sim.len());
+                    for j in i..end {
+                        sim[j] = 0u8;
+                    } // erase -> zeros
                     i = end;
                 } else {
                     i += 1;
@@ -111,13 +259,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "packet" => {
-            println!("Packet-aware mode: packet_size={}, burst_prob={}, flip_prob={}", packet_size, burst_prob, flip_prob);
+            println!(
+                "Packet-aware mode: packet_size={}, burst_prob={}, flip_prob={}",
+                packet_size, burst_prob, flip_prob
+            );
             let mut idx = 0usize;
             while idx < sim.len() {
                 let end = std::cmp::min(idx + packet_size, sim.len());
                 if rng.gen_bool(burst_prob) {
                     // drop whole packet -> zero it
-                    for j in idx..end { sim[j] = 0u8; }
+                    for j in idx..end {
+                        sim[j] = 0u8;
+                    }
                 } else {
                     // surviving packet: optionally flip bits inside
                     if flip_prob > 0.0 {
@@ -134,7 +287,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         other => {
-            eprintln!("Unknown mode: {}. Supported: bitflip, byteburst, packet", other);
+            eprintln!(
+                "Unknown mode: {}. Supported: bitflip, byteburst, packet",
+                other
+            );
             std::process::exit(1);
         }
     }
@@ -158,7 +314,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else if let Some(r) = repeats_opt {
-        println!("Attempting repetition depacketize (expected repeats = {})", r);
+        println!(
+            "Attempting repetition depacketize (expected repeats = {})",
+            r
+        );
         match depacketize_stream(&sim, r) {
             Ok(v) => {
                 println!("Repetition depacketize succeeded: {} bytes", v.len());
@@ -170,19 +329,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        println!("No depacketize options provided (no RS & no repeats); skipping depacketize attempt.");
+        println!(
+            "No depacketize options provided (no RS & no repeats); skipping depacketize attempt."
+        );
         None
     };
 
     // If we recovered bytes, try parsing/extracting frame
     if let Some(frame_bytes) = recovered {
-        println!("Attempting to parse frame header from recovered bytes ({} bytes)...", frame_bytes.len());
+        println!(
+            "Attempting to parse frame header from recovered bytes ({} bytes)...",
+            frame_bytes.len()
+        );
         match modem::parse_frame_header(&frame_bytes) {
             Ok((_fname, _compr, _enc, start, plen, _crc)) => {
                 println!("Frame header parsed. payload start {} len {}", start, plen);
                 match modem::extract_frame(&frame_bytes, None) {
                     Ok((fname, recovered_payload)) => {
-                        println!("Successfully extracted file '{}' ({} bytes)", fname, recovered_payload.len());
+                        println!(
+                            "Successfully extracted file '{}' ({} bytes)",
+                            fname,
+                            recovered_payload.len()
+                        );
                         detect_and_write_file(&recovered_payload, "sim_out")?;
                     }
                     Err(e) => {
