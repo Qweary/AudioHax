@@ -12,8 +12,8 @@
 //! NOTE: demo-oriented; tune params (symbol_ms, tone spacing, channel spacing,
 //! packet size, and FEC) to suit the acoustic environment.
 
-use std::error::Error;
 use std::collections::HashMap;
+use std::error::Error;
 
 use crc32fast::Hasher as Crc32;
 use flate2::{write::GzEncoder, Compression};
@@ -21,8 +21,8 @@ use std::io::Write;
 
 use rand_core::{OsRng, RngCore};
 
-pub use hound;
 pub use hex;
+pub use hound;
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -32,19 +32,87 @@ use std::f32::consts::PI;
 /// Reed-Solomon crate (keep the same import style you used)
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
+/// Structured error type for the modem DECODE path.
+///
+/// Every decode-side failure mode (header/magic, truncation/bounds, CRC, AES-GCM,
+/// gzip, Reed-Solomon, repetition-depacketize, and a catch-all) maps to a distinct
+/// variant so callers can diagnose *why* a decode failed instead of getting an
+/// opaque `Box<dyn Error>` or — worse — silently-wrong bytes / a panic.
+///
+/// `ModemError` is `Send + Sync + 'static` (all fields are owned `String`/scalars
+/// or `#[from]` source types that are themselves `Send + Sync`), so it composes
+/// cleanly with `anyhow` in the modem bins via `?`.
+#[derive(Debug, thiserror::Error)]
+pub enum ModemError {
+    /// Header is shorter than the fixed minimum, or the magic bytes are not "AHX1"
+    /// (frame) — a structurally invalid header that cannot be parsed at all.
+    #[error("invalid frame header: {0}")]
+    BadHeader(String),
+
+    /// A length/bounds failure: the buffer is too short to contain the declared
+    /// filename, lengths, or payload — i.e. a truncated frame/stream. This replaces
+    /// the previous index-into-too-short-slice / `.unwrap()` panic sites.
+    #[error("truncated frame/buffer: {0}")]
+    Truncated(String),
+
+    /// CRC32 of the recovered (decrypted, pre-decompression) payload does not match
+    /// the CRC carried in the header. Carries both values for diagnosis. A failed
+    /// CRC now produces this error instead of silently returning garbage bytes.
+    #[error("CRC mismatch: header expected {expected:#010x}, computed {computed:#010x}")]
+    CrcMismatch { expected: u32, computed: u32 },
+
+    /// Frame is flagged encrypted but no decryption key was supplied.
+    #[error("frame is encrypted but no decryption key was provided")]
+    MissingKey,
+
+    /// Supplied key is not valid hex, or is not exactly 32 bytes (64 hex chars).
+    #[error("invalid decryption key: {0}")]
+    BadKey(String),
+
+    /// AES-256-GCM decryption / authentication failed (wrong key, tampered
+    /// ciphertext, or truncated nonce/tag).
+    #[error("decryption (AES-GCM) failed: {0}")]
+    Decrypt(String),
+
+    /// gzip decompression of the recovered payload failed.
+    #[error("decompression (gzip) failed")]
+    Decompress(#[from] std::io::Error),
+
+    /// Reed-Solomon reconstruction failed, or a block had fewer than `data_shards`
+    /// surviving shards so reconstruction was not even attempted.
+    #[error("Reed-Solomon reconstruction failed: {0}")]
+    ReedSolomon(String),
+
+    /// Repetition-FEC depacketize found no usable packets (e.g. no "PKT1" magic
+    /// survived, so there are no copies to majority-vote over).
+    #[error("repetition depacketize failed: {0}")]
+    Depacketize(String),
+
+    /// Catch-all for a lower-level error that does not map cleanly to a variant
+    /// above; the message is owned so the error stays `Send + Sync + 'static`.
+    #[error("modem error: {0}")]
+    Other(String),
+}
+
+impl From<reed_solomon_erasure::Error> for ModemError {
+    fn from(e: reed_solomon_erasure::Error) -> Self {
+        ModemError::ReedSolomon(e.to_string())
+    }
+}
+
 /// Modem params and defaults (sane demo defaults)
 #[derive(Debug, Clone)]
 pub struct ModemParams {
     pub sample_rate: usize,
     pub symbol_ms: f32,
     pub m_tones: usize,
-    pub channels: usize,            // parallel channels
-    pub amplitude: f32,             // per-channel amplitude scale (0..1)
-    pub base_freq_hz: f32,          // base freq for channel 0
-    pub channel_spacing_hz: f32,    // spacing between channel bands
-    pub tone_spacing_hz: f32,       // spacing between tones in a band
-    pub preamble_repeats: usize,    // repeats of preamble
-    pub preamble_symbols: Vec<u8>,  // small pattern, relative to m_tones
+    pub channels: usize,           // parallel channels
+    pub amplitude: f32,            // per-channel amplitude scale (0..1)
+    pub base_freq_hz: f32,         // base freq for channel 0
+    pub channel_spacing_hz: f32,   // spacing between channel bands
+    pub tone_spacing_hz: f32,      // spacing between tones in a band
+    pub preamble_repeats: usize,   // repeats of preamble
+    pub preamble_symbols: Vec<u8>, // small pattern, relative to m_tones
 }
 
 impl Default for ModemParams {
@@ -59,7 +127,7 @@ impl Default for ModemParams {
             channel_spacing_hz: 400.0,
             tone_spacing_hz: 30.0,
             preamble_repeats: 8,
-            preamble_symbols: vec![ (32/2) as u8 ], // middle tone as pilot
+            preamble_symbols: vec![(32 / 2) as u8], // middle tone as pilot
         }
     }
 }
@@ -97,10 +165,16 @@ pub fn build_frame(
     // optional encryption: AES-GCM-256. final_payload = nonce || ciphertext
     let (final_payload, encrypted_flag) = if let Some(khex) = encrypt_key_hex {
         let key_bytes = hex::decode(khex).map_err(|e| {
-            Box::<dyn Error>::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Invalid hex key: {}", e)))
+            Box::<dyn Error>::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid hex key: {}", e),
+            ))
         })?;
         if key_bytes.len() != 32 {
-            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Encryption key must be 32 bytes (64 hex chars)")));
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Encryption key must be 32 bytes (64 hex chars)",
+            )));
         }
         let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
         let cipher = Aes256Gcm::new(key);
@@ -115,7 +189,12 @@ pub fn build_frame(
         // encrypt
         let cipher_text = cipher
             .encrypt(nonce, compressed_bytes.as_ref())
-            .map_err(|e| Box::<dyn Error>::from(std::io::Error::new(std::io::ErrorKind::Other, format!("encrypt error: {}", e))))?;
+            .map_err(|e| {
+                Box::<dyn Error>::from(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("encrypt error: {}", e),
+                ))
+            })?;
 
         // final payload = nonce || ciphertext
         let mut v = Vec::with_capacity(12 + cipher_text.len());
@@ -130,8 +209,12 @@ pub fn build_frame(
     let mut out = Vec::new();
     out.extend_from_slice(b"AHX1");
     let mut flags: u8 = 0;
-    if compress { flags |= 1; }
-    if encrypted_flag { flags |= 2; }
+    if compress {
+        flags |= 1;
+    }
+    if encrypted_flag {
+        flags |= 2;
+    }
     out.push(flags);
 
     let fname_bytes = filename.as_bytes();
@@ -150,69 +233,100 @@ pub fn build_frame(
 }
 
 /// Parse header and return (filename, compressed_flag, encrypted_flag, payload_start_index, payload_len, crc)
-pub fn parse_frame_header(buf: &[u8]) -> Result<(String, bool, bool, usize, usize, u32), Box<dyn Error>> {
+pub fn parse_frame_header(
+    buf: &[u8],
+) -> Result<(String, bool, bool, usize, usize, u32), ModemError> {
     if buf.len() < 4 + 1 + 2 + 4 + 4 {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Buffer too small")));
+        return Err(ModemError::BadHeader(
+            "buffer too small for fixed header".to_string(),
+        ));
     }
     if &buf[0..4] != b"AHX1" {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid magic")));
+        return Err(ModemError::BadHeader(
+            "invalid magic (expected AHX1)".to_string(),
+        ));
     }
     let flags = buf[4];
     let compressed = (flags & 1) != 0;
     let encrypted = (flags & 2) != 0;
     let mut idx = 5usize;
-    let fname_len = u16::from_be_bytes([buf[idx], buf[idx+1]]) as usize;
+    let fname_len = u16::from_be_bytes([buf[idx], buf[idx + 1]]) as usize;
     idx += 2;
     if buf.len() < idx + fname_len + 4 + 4 {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Buffer too small for filename and lengths")));
+        return Err(ModemError::Truncated(
+            "buffer too small for filename and lengths".to_string(),
+        ));
     }
-    let fname = String::from_utf8(buf[idx .. idx + fname_len].to_vec())
-        .map_err(|e| Box::<dyn Error>::from(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid filename utf8: {}", e))))?;
+    let fname = String::from_utf8(buf[idx..idx + fname_len].to_vec())
+        .map_err(|e| ModemError::BadHeader(format!("invalid filename utf8: {}", e)))?;
     idx += fname_len;
-    let payload_len = u32::from_be_bytes([buf[idx], buf[idx+1], buf[idx+2], buf[idx+3]]) as usize;
+    let payload_len =
+        u32::from_be_bytes([buf[idx], buf[idx + 1], buf[idx + 2], buf[idx + 3]]) as usize;
     idx += 4;
-    let crc = u32::from_be_bytes([buf[idx], buf[idx+1], buf[idx+2], buf[idx+3]]);
+    let crc = u32::from_be_bytes([buf[idx], buf[idx + 1], buf[idx + 2], buf[idx + 3]]);
     idx += 4;
     let payload_start = idx;
     if buf.len() < payload_start + payload_len {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Buffer does not contain full payload")));
+        return Err(ModemError::Truncated(
+            "buffer does not contain full payload".to_string(),
+        ));
     }
-    Ok((fname, compressed, encrypted, payload_start, payload_len, crc))
+    Ok((
+        fname,
+        compressed,
+        encrypted,
+        payload_start,
+        payload_len,
+        crc,
+    ))
 }
 
 /// Extract frame: decrypt if needed (requires decrypt key), verify CRC, decompress if needed.
-pub fn extract_frame(frame: &[u8], decrypt_key_hex: Option<&str>) -> Result<(String, Vec<u8>), Box<dyn Error>> {
-    let (fname, compressed, encrypted, payload_start, payload_len, crc) = parse_frame_header(frame)?;
-    let payload = &frame[payload_start .. payload_start + payload_len];
+pub fn extract_frame(
+    frame: &[u8],
+    decrypt_key_hex: Option<&str>,
+) -> Result<(String, Vec<u8>), ModemError> {
+    let (fname, compressed, encrypted, payload_start, payload_len, crc) =
+        parse_frame_header(frame)?;
+    let payload = &frame[payload_start..payload_start + payload_len];
 
     // decrypt if needed
     let decrypted: Vec<u8> = if encrypted {
-        let khex = decrypt_key_hex.ok_or_else(|| Box::<dyn Error>::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Frame is encrypted but no decryption key provided")))?;
-        let key_bytes = hex::decode(khex).map_err(|e| Box::<dyn Error>::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Invalid hex key: {}", e))))?;
+        let khex = decrypt_key_hex.ok_or(ModemError::MissingKey)?;
+        let key_bytes =
+            hex::decode(khex).map_err(|e| ModemError::BadKey(format!("invalid hex key: {}", e)))?;
         if key_bytes.len() != 32 {
-            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Decryption key must be 32 bytes (64 hex)")));
+            return Err(ModemError::BadKey(
+                "key must be 32 bytes (64 hex chars)".to_string(),
+            ));
         }
         let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
         let cipher = Aes256Gcm::new(key);
         if payload.len() < 12 {
-            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "Encrypted payload too short")));
+            return Err(ModemError::Truncated(
+                "encrypted payload too short for nonce".to_string(),
+            ));
         }
         let (nonce_bytes, ciphertext) = payload.split_at(12);
         let nonce = Nonce::from_slice(nonce_bytes);
-        let plain = cipher.decrypt(nonce, ciphertext.as_ref())
-            .map_err(|e| Box::<dyn Error>::from(std::io::Error::new(std::io::ErrorKind::Other, format!("decrypt error: {}", e))))?;
-        plain
+        cipher
+            .decrypt(nonce, ciphertext.as_ref())
+            .map_err(|e| ModemError::Decrypt(e.to_string()))?
     } else {
         payload.to_vec()
     };
 
-    // CRC check
+    // CRC check — ENFORCING. The CRC is computed over the decrypted, pre-decompression
+    // bytes (the same `compressed_bytes` build_frame hashed). A mismatch means the
+    // payload is corrupt; return an error rather than emit silently-wrong bytes.
     let mut h = Crc32::new();
     h.update(&decrypted);
     let computed_crc = h.finalize();
     if computed_crc != crc {
-        eprintln!("Warning: CRC mismatch: header {} != computed {}", crc, computed_crc);
-        // continue; caller may verify contents
+        return Err(ModemError::CrcMismatch {
+            expected: crc,
+            computed: computed_crc,
+        });
     }
 
     // decompress if needed
@@ -221,7 +335,7 @@ pub fn extract_frame(frame: &[u8], decrypt_key_hex: Option<&str>) -> Result<(Str
         use std::io::Read;
         let mut d = GzDecoder::new(&decrypted[..]);
         let mut out = Vec::new();
-        d.read_to_end(&mut out)?;
+        d.read_to_end(&mut out)?; // std::io::Error -> ModemError::Decompress via #[from]
         out
     } else {
         decrypted
@@ -304,9 +418,13 @@ pub fn split_round_robin(symbols: &[u8], channels: usize) -> Vec<Vec<u8>> {
 
 /// Render channels' symbol streams into mono i16 samples.
 /// Each channel contributes a single sine per-symbol. Tones are placed in separated bands.
-pub fn render_symbols_to_samples(channels_symbols: &Vec<Vec<u8>>, params: &ModemParams) -> Vec<i16> {
+pub fn render_symbols_to_samples(
+    channels_symbols: &Vec<Vec<u8>>,
+    params: &ModemParams,
+) -> Vec<i16> {
     let sample_rate = params.sample_rate as f32;
-    let samples_per_symbol = ((params.sample_rate as f32) * (params.symbol_ms / 1000.0)).round() as usize;
+    let samples_per_symbol =
+        ((params.sample_rate as f32) * (params.symbol_ms / 1000.0)).round() as usize;
     let mut out_samples: Vec<f32> = Vec::new();
 
     let max_len = channels_symbols.iter().map(|v| v.len()).max().unwrap_or(0);
@@ -326,7 +444,9 @@ pub fn render_symbols_to_samples(channels_symbols: &Vec<Vec<u8>>, params: &Modem
             for (ch, ch_symbols) in channels_symbols.iter().enumerate() {
                 let sym = if symbol_index < ch_symbols.len() {
                     ch_symbols[symbol_index]
-                } else { 0u8 } as usize;
+                } else {
+                    0u8
+                } as usize;
                 let tone_freq = params.base_freq_hz
                     + (ch as f32) * params.channel_spacing_hz
                     + (sym as f32) * params.tone_spacing_hz;
@@ -338,7 +458,10 @@ pub fn render_symbols_to_samples(channels_symbols: &Vec<Vec<u8>>, params: &Modem
     }
 
     // normalize to i16
-    let maxv = out_samples.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-6);
+    let maxv = out_samples
+        .iter()
+        .fold(0.0f32, |m, &v| m.max(v.abs()))
+        .max(1e-6);
     let scale = (i16::MAX as f32 * 0.9) / maxv;
     let mut out_i16: Vec<i16> = Vec::with_capacity(out_samples.len());
     for &v in out_samples.iter() {
@@ -366,7 +489,9 @@ pub fn build_tone_frequencies(params: &ModemParams) -> Vec<Vec<f32>> {
 /// Goertzel: magnitude-squared for target frequency on slice of i16 samples.
 pub fn goertzel_mag_squared(samples: &[i16], target_freq: f32, sample_rate: usize) -> f32 {
     let n = samples.len();
-    if n == 0 { return 0.0; }
+    if n == 0 {
+        return 0.0;
+    }
     let sr = sample_rate as f32;
     let kf = target_freq * (n as f32) / sr;
     let k = kf.round() as usize;
@@ -384,8 +509,8 @@ pub fn goertzel_mag_squared(samples: &[i16], target_freq: f32, sample_rate: usiz
 }
 
 /* -----------------------------
-   Packetization + simple repetition FEC
-   ----------------------------- */
+Packetization + simple repetition FEC
+----------------------------- */
 
 /// Packetize an arbitrary byte stream into small packets with header and repeat each packet `repeats` times.
 /// Old (repeat-based) Packet format:
@@ -420,24 +545,32 @@ pub fn packetize_stream(data: &[u8], pkt_payload_size: usize, repeats: usize) ->
 
 /// Attempt to depacketize a stream produced by packetize_stream using majority voting across repeated packet instances.
 /// Returns Err if no packets found at all.
-pub fn depacketize_stream(buf: &[u8], _expected_repeats: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+pub fn depacketize_stream(buf: &[u8], _expected_repeats: usize) -> Result<Vec<u8>, ModemError> {
     let magic = b"PKT1";
     let mut map: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
     let mut max_seq: i64 = -1;
     let mut i = 0usize;
     while i + 4 + 4 + 2 + 4 <= buf.len() {
-        if &buf[i..i+4] == magic {
+        if &buf[i..i + 4] == magic {
             // try to parse packet header
-            if i + 4 + 4 + 2 + 4 > buf.len() { break; }
-            let seq = u32::from_be_bytes([buf[i+4], buf[i+5], buf[i+6], buf[i+7]]);
-            let len = u16::from_be_bytes([buf[i+8], buf[i+9]]) as usize;
-            let _crc = u32::from_be_bytes([buf[i+10], buf[i+11], buf[i+12], buf[i+13]]);
+            if i + 4 + 4 + 2 + 4 > buf.len() {
+                break;
+            }
+            let seq = u32::from_be_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]);
+            let len = u16::from_be_bytes([buf[i + 8], buf[i + 9]]) as usize;
+            let _crc = u32::from_be_bytes([buf[i + 10], buf[i + 11], buf[i + 12], buf[i + 13]]);
             let pkt_total = 4 + 4 + 2 + 4 + len;
-            if i + pkt_total > buf.len() { break; }
-            let payload = &buf[i + 14 .. i + 14 + len];
+            if i + pkt_total > buf.len() {
+                break;
+            }
+            let payload = &buf[i + 14..i + 14 + len];
             // store the payload (copy)
-            map.entry(seq).or_insert_with(Vec::new).push(payload.to_vec());
-            if (seq as i64) > max_seq { max_seq = seq as i64; }
+            map.entry(seq)
+                .or_insert_with(Vec::new)
+                .push(payload.to_vec());
+            if (seq as i64) > max_seq {
+                max_seq = seq as i64;
+            }
             // advance index by 1 to allow overlapping detection
             i += 1;
         } else {
@@ -446,7 +579,9 @@ pub fn depacketize_stream(buf: &[u8], _expected_repeats: usize) -> Result<Vec<u8
     }
 
     if map.is_empty() {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No packets found")));
+        return Err(ModemError::Depacketize(
+            "no PKT1 packets found in stream".to_string(),
+        ));
     }
 
     // reconstruct by sequence order
@@ -460,8 +595,12 @@ pub fn depacketize_stream(buf: &[u8], _expected_repeats: usize) -> Result<Vec<u8
         let copies = &map[&seq];
         // find most common length among copies
         let mut len_counts: HashMap<usize, usize> = HashMap::new();
-        for c in copies.iter() { *len_counts.entry(c.len()).or_insert(0) += 1; }
-        let (&chosen_len, _cnt) = len_counts.iter().max_by_key(|kv| kv.1).unwrap();
+        for c in copies.iter() {
+            *len_counts.entry(c.len()).or_insert(0) += 1;
+        }
+        let (&chosen_len, _cnt) = len_counts.iter().max_by_key(|kv| kv.1).ok_or_else(|| {
+            ModemError::Depacketize(format!("no surviving copies for seq {}", seq))
+        })?;
         // prepare vector of byte-majority for each position
         let mut rec = vec![0u8; chosen_len];
         for pos in 0..chosen_len {
@@ -475,7 +614,12 @@ pub fn depacketize_stream(buf: &[u8], _expected_repeats: usize) -> Result<Vec<u8
             if counts.is_empty() {
                 rec[pos] = 0u8;
             } else {
-                let (&val, _c) = counts.iter().max_by_key(|kv| kv.1).unwrap();
+                let (&val, _c) = counts.iter().max_by_key(|kv| kv.1).ok_or_else(|| {
+                    ModemError::Depacketize(format!(
+                        "byte-majority vote produced no value at seq {} pos {}",
+                        seq, pos
+                    ))
+                })?;
                 rec[pos] = val;
             }
         }
@@ -486,26 +630,34 @@ pub fn depacketize_stream(buf: &[u8], _expected_repeats: usize) -> Result<Vec<u8
 }
 
 /* -----------------------------
-   Reed-Solomon Packetization (RS)
-   -----------------------------
-   RS packet format used here (header):
-   [4 bytes magic "RS01"]
-   [8 bytes orig_len (BE u64)]   <- original total stream length (so we can trim padding)
-   [4 bytes block_seq (BE u32)]
-   [2 bytes data_shards (BE u16)]
-   [2 bytes parity_shards (BE u16)]
-   [2 bytes shard_idx (BE u16)]
-   [2 bytes shard_size (BE u16)]
-   [4 bytes crc32 (BE u32) - crc of shard payload]
-   [shard payload - exactly shard_size bytes]
-   ----------------------------- */
+Reed-Solomon Packetization (RS)
+-----------------------------
+RS packet format used here (header):
+[4 bytes magic "RS01"]
+[8 bytes orig_len (BE u64)]   <- original total stream length (so we can trim padding)
+[4 bytes block_seq (BE u32)]
+[2 bytes data_shards (BE u16)]
+[2 bytes parity_shards (BE u16)]
+[2 bytes shard_idx (BE u16)]
+[2 bytes shard_size (BE u16)]
+[4 bytes crc32 (BE u32) - crc of shard payload]
+[shard payload - exactly shard_size bytes]
+----------------------------- */
 
 /// Packetize using Reed-Solomon shards. `shard_size` is bytes per shard.
 /// For a block we pack `data_shards * shard_size` bytes (pad last block with zeros),
 /// then create `data_shards + parity_shards` shards and emit each as a packet.
-pub fn packetize_stream_rs(data: &[u8], shard_size: usize, data_shards: usize, parity_shards: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+pub fn packetize_stream_rs(
+    data: &[u8],
+    shard_size: usize,
+    data_shards: usize,
+    parity_shards: usize,
+) -> Result<Vec<u8>, Box<dyn Error>> {
     if data_shards == 0 || parity_shards == 0 || shard_size == 0 {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "RS params must be > 0")));
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "RS params must be > 0",
+        )));
     }
     let total_shards = data_shards + parity_shards;
     let block_size = data_shards * shard_size;
@@ -525,7 +677,7 @@ pub fn packetize_stream_rs(data: &[u8], shard_size: usize, data_shards: usize, p
         let mut shards: Vec<Vec<u8>> = Vec::with_capacity(total_shards);
         for d in 0..data_shards {
             let start = d * shard_size;
-            shards.push(block[start .. start + shard_size].to_vec());
+            shards.push(block[start..start + shard_size].to_vec());
         }
         // parity placeholders
         for _ in 0..parity_shards {
@@ -567,7 +719,7 @@ pub fn packetize_stream_rs(data: &[u8], shard_size: usize, data_shards: usize, p
 /// Depacketize RS stream produced by `packetize_stream_rs`.
 /// Scans stream for RS packets, groups shards by block, attempts to reconstruct when at least `data_shards` present.
 /// Returns reconstructed original stream trimmed to original length (using orig_len).
-pub fn depacketize_stream_rs(buf: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+pub fn depacketize_stream_rs(buf: &[u8]) -> Result<Vec<u8>, ModemError> {
     let magic = b"RS01";
     #[derive(Debug, Clone)]
     struct BlockState {
@@ -583,26 +735,40 @@ pub fn depacketize_stream_rs(buf: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
 
     let mut i = 0usize;
     while i + header_min <= buf.len() {
-        if &buf[i..i+4] == magic {
+        if &buf[i..i + 4] == magic {
             // ensure full header available
-            if i + header_min > buf.len() { break; }
+            if i + header_min > buf.len() {
+                break;
+            }
             let base = i + 4;
             let orig_len = u64::from_be_bytes([
-                buf[base], buf[base+1], buf[base+2], buf[base+3],
-                buf[base+4], buf[base+5], buf[base+6], buf[base+7],
+                buf[base],
+                buf[base + 1],
+                buf[base + 2],
+                buf[base + 3],
+                buf[base + 4],
+                buf[base + 5],
+                buf[base + 6],
+                buf[base + 7],
             ]);
-            let seq = u32::from_be_bytes([buf[base+8], buf[base+9], buf[base+10], buf[base+11]]);
-            let data_shards = u16::from_be_bytes([buf[base+12], buf[base+13]]) as usize;
-            let parity_shards = u16::from_be_bytes([buf[base+14], buf[base+15]]) as usize;
-            let shard_idx = u16::from_be_bytes([buf[base+16], buf[base+17]]) as usize;
-            let shard_size = u16::from_be_bytes([buf[base+18], buf[base+19]]) as usize;
-            let crc = u32::from_be_bytes([buf[base+20], buf[base+21], buf[base+22], buf[base+23]]);
+            let seq =
+                u32::from_be_bytes([buf[base + 8], buf[base + 9], buf[base + 10], buf[base + 11]]);
+            let data_shards = u16::from_be_bytes([buf[base + 12], buf[base + 13]]) as usize;
+            let parity_shards = u16::from_be_bytes([buf[base + 14], buf[base + 15]]) as usize;
+            let shard_idx = u16::from_be_bytes([buf[base + 16], buf[base + 17]]) as usize;
+            let shard_size = u16::from_be_bytes([buf[base + 18], buf[base + 19]]) as usize;
+            let crc = u32::from_be_bytes([
+                buf[base + 20],
+                buf[base + 21],
+                buf[base + 22],
+                buf[base + 23],
+            ]);
             let pkt_len = header_min + shard_size;
             if i + pkt_len > buf.len() {
                 // incomplete packet at end
                 break;
             }
-            let payload = buf[i + header_min .. i + header_min + shard_size].to_vec();
+            let payload = buf[i + header_min..i + header_min + shard_size].to_vec();
 
             // check or create blockstate
             let entry = map.entry(seq).or_insert_with(|| BlockState {
@@ -614,7 +780,10 @@ pub fn depacketize_stream_rs(buf: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
             });
 
             // header consistency check
-            if entry.data_shards != data_shards || entry.parity_shards != parity_shards || entry.shard_size != shard_size {
+            if entry.data_shards != data_shards
+                || entry.parity_shards != parity_shards
+                || entry.shard_size != shard_size
+            {
                 // inconsistent -> skip packet
                 i += 1;
                 continue;
@@ -640,7 +809,9 @@ pub fn depacketize_stream_rs(buf: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     }
 
     if map.is_empty() {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No RS packets found")));
+        return Err(ModemError::ReedSolomon(
+            "no RS01 packets found in stream".to_string(),
+        ));
     }
 
     // reconstruct blocks in ascending seq order
@@ -650,8 +821,14 @@ pub fn depacketize_stream_rs(buf: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut overall_orig_len: Option<u64> = None;
 
     for seq in seqs {
-        let state = map.remove(&seq).unwrap();
-        if overall_orig_len.is_none() { overall_orig_len = Some(state.orig_len); }
+        // `seq` came from map.keys(), so the entry is present; treat a missing entry
+        // as a typed error rather than panicking.
+        let state = map.remove(&seq).ok_or_else(|| {
+            ModemError::ReedSolomon(format!("missing block state for seq {}", seq))
+        })?;
+        if overall_orig_len.is_none() {
+            overall_orig_len = Some(state.orig_len);
+        }
 
         let data_shards = state.data_shards;
         let parity_shards = state.parity_shards;
@@ -661,7 +838,10 @@ pub fn depacketize_stream_rs(buf: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
         // count present shards
         let present = state.shards.iter().filter(|s| s.is_some()).count();
         if present < data_shards {
-            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Not enough shards for block {}: have {}, need {}", seq, present, data_shards))));
+            return Err(ModemError::ReedSolomon(format!(
+                "not enough shards for block {}: have {}, need {}",
+                seq, present, data_shards
+            )));
         }
 
         // Convert to Vec<Option<Vec<u8>>> for crate
@@ -710,7 +890,12 @@ fn interleave_packets(blocks: &Vec<Vec<ShardPacket>>) -> Vec<u8> {
         return Vec::new();
     }
     let total_shards = blocks[0].len();
-    let mut out = Vec::with_capacity(blocks.iter().map(|b| b.iter().map(|s| s.bytes.len()).sum::<usize>()).sum());
+    let mut out = Vec::with_capacity(
+        blocks
+            .iter()
+            .map(|b| b.iter().map(|s| s.bytes.len()).sum::<usize>())
+            .sum(),
+    );
     for s in 0..total_shards {
         for b in 0..blocks.len() {
             if s < blocks[b].len() {
@@ -798,8 +983,8 @@ pub fn packetize_stream_rs_interleaved(
             hdr.extend_from_slice(&(block_seq as u32).to_be_bytes());
             hdr.extend_from_slice(&(d as u16).to_be_bytes());
             hdr.extend_from_slice(&(p as u16).to_be_bytes());
-            hdr.extend_from_slice(&((shard_idx as u16)).to_be_bytes());
-            hdr.extend_from_slice(&((shard_size as u16)).to_be_bytes());
+            hdr.extend_from_slice(&(shard_idx as u16).to_be_bytes());
+            hdr.extend_from_slice(&(shard_size as u16).to_be_bytes());
             let mut hcrc = Crc32::new();
             hcrc.update(&payload_bytes);
             hdr.extend_from_slice(&hcrc.finalize().to_be_bytes());
@@ -896,9 +1081,25 @@ pub fn simulate_channel_bytes(
     avg_burst_len: usize,
 ) -> Vec<u8> {
     // Safety clamp params
-    let rf = if random_flip_prob < 0.0 { 0.0 } else if random_flip_prob > 1.0 { 1.0 } else { random_flip_prob };
-    let bp = if burst_erase_prob < 0.0 { 0.0 } else if burst_erase_prob > 1.0 { 1.0 } else { burst_erase_prob };
-    let avg_burst = if avg_burst_len == 0 { 1usize } else { avg_burst_len };
+    let rf = if random_flip_prob < 0.0 {
+        0.0
+    } else if random_flip_prob > 1.0 {
+        1.0
+    } else {
+        random_flip_prob
+    };
+    let bp = if burst_erase_prob < 0.0 {
+        0.0
+    } else if burst_erase_prob > 1.0 {
+        1.0
+    } else {
+        burst_erase_prob
+    };
+    let avg_burst = if avg_burst_len == 0 {
+        1usize
+    } else {
+        avg_burst_len
+    };
 
     // copy input
     let mut out: Vec<u8> = input.to_vec();
@@ -939,4 +1140,175 @@ pub fn simulate_channel_bytes(
     }
 
     out
+}
+
+// ============================================================================
+// ERROR-PATH UNIT TESTS (WS-2 Phase B — the negative/Err-path net)
+//
+// Phase A's tests/modem_roundtrip.rs is a POSITIVE byte-identity net. These tests
+// pin the NEW enforcing behavior: corrupt/truncated/malformed input must yield a
+// typed `ModemError` (never silently-wrong bytes, never a panic), and a clean
+// frame must still round-trip Ok (so enforcement does not over-fire).
+//
+// Everything runs IN MEMORY: no WAV files, no filesystem, no audio hardware.
+// Each test's top comment names the property it validates.
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::RngCore;
+    use rand::SeedableRng;
+
+    // Fixed 32-byte (64 hex char) AES-256 key for deterministic encrypted-frame tests.
+    const TEST_KEY_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+    /// Deterministic pseudo-random payload, seeded for stable tests.
+    fn seeded_payload(seed: u64, len: usize) -> Vec<u8> {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+        let mut v = vec![0u8; len];
+        rng.fill_bytes(&mut v);
+        v
+    }
+
+    /// Property: a plain frame whose payload region is corrupted (one byte flipped
+    /// AFTER build_frame) is REJECTED with `CrcMismatch` — extract_frame returns Err,
+    /// not Ok-with-garbage. This is the core CRC-enforcement guarantee.
+    #[test]
+    fn test_corrupted_payload_rejected_with_crc_mismatch() {
+        let payload = seeded_payload(7, 256);
+        let mut frame = build_frame("corrupt.bin", &payload, false, None).expect("build_frame");
+
+        // Locate the payload start via the header and flip a byte inside the payload.
+        let (_f, _c, _e, start, len, _crc) = parse_frame_header(&frame).expect("parse header");
+        assert!(len > 0);
+        frame[start] ^= 0xFF; // corrupt first payload byte
+
+        match extract_frame(&frame, None) {
+            Err(ModemError::CrcMismatch { expected, computed }) => {
+                assert_ne!(expected, computed, "CRC values must differ on corruption");
+            }
+            other => panic!("expected CrcMismatch, got {:?}", other),
+        }
+    }
+
+    /// Property: a buffer shorter than the fixed header minimum does NOT panic; it
+    /// returns a header/truncation Err from both parse_frame_header and extract_frame.
+    #[test]
+    fn test_short_buffer_returns_err_not_panic() {
+        let tiny = [b'A', b'H', b'X']; // 3 bytes — below the fixed-header minimum
+        match parse_frame_header(&tiny) {
+            Err(ModemError::BadHeader(_)) => {}
+            other => panic!("expected BadHeader on short buffer, got {:?}", other),
+        }
+        // extract_frame must surface the same class of error, not panic.
+        assert!(matches!(
+            extract_frame(&tiny, None),
+            Err(ModemError::BadHeader(_))
+        ));
+    }
+
+    /// Property: a well-sized buffer whose declared payload_len overruns the actual
+    /// buffer is reported as `Truncated`, not an out-of-bounds index panic.
+    #[test]
+    fn test_truncated_payload_returns_truncated_err() {
+        let payload = seeded_payload(8, 64);
+        let frame = build_frame("trunc.bin", &payload, false, None).expect("build_frame");
+        // Chop off the tail so the header still parses but the payload is incomplete.
+        let chopped = &frame[..frame.len() - 10];
+        match parse_frame_header(chopped) {
+            Err(ModemError::Truncated(_)) => {}
+            other => panic!("expected Truncated, got {:?}", other),
+        }
+    }
+
+    /// Property: a frame with bad magic bytes yields the BadHeader Err (not a panic,
+    /// not a CRC walk over garbage).
+    #[test]
+    fn test_bad_magic_returns_bad_header() {
+        let payload = seeded_payload(9, 64);
+        let mut frame = build_frame("magic.bin", &payload, false, None).expect("build_frame");
+        frame[0] = b'X'; // break "AHX1"
+        match extract_frame(&frame, None) {
+            Err(ModemError::BadHeader(_)) => {}
+            other => panic!("expected BadHeader on bad magic, got {:?}", other),
+        }
+    }
+
+    /// Property: decrypting an encrypted frame with the WRONG key fails gracefully
+    /// with a Decrypt Err (AES-GCM auth failure) — never a panic, never garbage.
+    #[test]
+    fn test_wrong_decrypt_key_returns_decrypt_err() {
+        let payload = seeded_payload(10, 128);
+        let frame =
+            build_frame("enc.bin", &payload, false, Some(TEST_KEY_HEX)).expect("build_frame");
+        // A different valid 32-byte key.
+        let wrong_key = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+        match extract_frame(&frame, Some(wrong_key)) {
+            Err(ModemError::Decrypt(_)) => {}
+            other => panic!("expected Decrypt on wrong key, got {:?}", other),
+        }
+    }
+
+    /// Property: an encrypted frame extracted with NO key returns MissingKey, not a panic.
+    #[test]
+    fn test_encrypted_frame_without_key_returns_missing_key() {
+        let payload = seeded_payload(11, 96);
+        let frame =
+            build_frame("enc2.bin", &payload, false, Some(TEST_KEY_HEX)).expect("build_frame");
+        assert!(matches!(
+            extract_frame(&frame, None),
+            Err(ModemError::MissingKey)
+        ));
+    }
+
+    /// Property: depacketize_stream on a buffer containing NO PKT1 magic returns
+    /// Depacketize Err (no copies to vote over) instead of hitting a `.unwrap()` panic.
+    #[test]
+    fn test_depacketize_repetition_no_packets_returns_err() {
+        let junk = seeded_payload(12, 200); // random bytes, vanishingly unlikely to contain PKT1
+        match depacketize_stream(&junk, 3) {
+            Err(ModemError::Depacketize(_)) => {}
+            // If by astronomically-low chance random bytes contained a PKT1 frame, an Ok
+            // is still non-panicking; assert no panic by accepting Ok too.
+            Ok(_) => {}
+            other => panic!("expected Depacketize Err or Ok, got {:?}", other),
+        }
+    }
+
+    /// Property: depacketize_stream_rs on a buffer with no RS01 magic returns a
+    /// ReedSolomon Err — exercises the malformed-stream path that previously reached
+    /// the `map.remove(..).unwrap()` site only via valid input. No panic.
+    #[test]
+    fn test_depacketize_rs_no_packets_returns_err() {
+        let junk = seeded_payload(13, 200);
+        match depacketize_stream_rs(&junk) {
+            Err(ModemError::ReedSolomon(_)) => {}
+            Ok(_) => {}
+            other => panic!("expected ReedSolomon Err or Ok, got {:?}", other),
+        }
+    }
+
+    /// Property (POSITIVE GUARD): a clean, uncorrupted frame STILL round-trips Ok
+    /// across all four flag combinations — CRC enforcement must not over-fire and
+    /// reject valid frames. Mirrors Phase A intent at the unit level.
+    #[test]
+    fn test_clean_frame_still_round_trips_ok() {
+        let payload = seeded_payload(14, 300);
+        let cases: [(bool, Option<&str>); 4] = [
+            (false, None),
+            (true, None),
+            (false, Some(TEST_KEY_HEX)),
+            (true, Some(TEST_KEY_HEX)),
+        ];
+        for (compress, key) in cases {
+            let frame = build_frame("clean.bin", &payload, compress, key).expect("build_frame");
+            let (fname, recovered) =
+                extract_frame(&frame, key).expect("clean frame must extract Ok");
+            assert_eq!(fname, "clean.bin");
+            assert_eq!(
+                recovered, payload,
+                "clean payload must round-trip (compress={compress})"
+            );
+        }
+    }
 }
