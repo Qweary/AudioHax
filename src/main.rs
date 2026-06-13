@@ -1,32 +1,52 @@
-// src/main.rs
+// src/main.rs — the OpenCV/audio ADAPTER (S9 §3.2).
+//
+// After the WS-4 Phase 1 engine extraction this binary is a THIN adapter. It owns
+// everything that touches `Mat`, highgui, MIDI ports, and wall-clock scheduling; the
+// musical decisions live in the headless `audiohax::engine` core. Concretely the
+// adapter:
+//   * parses argv via the shared `audiohax::cli` grammar (→ EngineConfig + image path
+//     + play/no-play),
+//   * acquires the image via OpenCV (`load_image_from_source` → `Mat`),
+//     extracts `analyze_global` / `scan_image` feature structs, writes overlays, and
+//     drives the highgui window,
+//   * exposes those features to the engine through a `PrecomputedSource: FeatureSource`
+//     (copying `image_analysis::*` → `engine::*` by field — the boundary; no `Mat`
+//     ever crosses),
+//   * implements `engine::AudioSink for MidiOut` HERE (orphan rule — the lib cannot
+//     name the bin-private `MidiOut`),
+//   * builds a `PipelineEngine`, feeds global features, then for each step calls
+//     `engine.decide_step(&source, k)` and applies the jitter + `Instant`-based
+//     scheduling (the adapter owns timing/RNG — D8) and the per-step overlay.
+//
+// GONE from this file (moved into the engine / dissolved): `worker_decide_action`,
+// `play_scanned_steps_concurrent`, the `Barrier`/worker pool, `InstrumentAction`, the
+// mode/progression/plan derivation. The jitter + `ScheduledEvent` time-ordering +
+// `thread::sleep` execution STAY here (wall-clock playback is an adapter concern).
+//
+// NOTE: this binary requires the `opencv`/`image` features and CANNOT compile on a
+// headless box — it is validated by inspection + type-correctness reasoning, exactly
+// as before (the engine/CLI it depends on ARE headless-tested).
+
 mod image_analysis;
 mod image_source;
 mod midi_output;
 
-use audiohax::{chord_engine, mapping_loader};
-use chord_engine::ChordEngine;
-use image_analysis::{
-    analyze_global, analyze_scan_bar, draw_scan_bar_overlay_for_rect, scan_image,
+use audiohax::cli::{pipeline_to_engine_config, Cli, Command, PlayArgs};
+use audiohax::engine::{
+    AudioSink, AudioSinkError, FeatureSource, GlobalFeatures as EngGlobal, PipelineEngine,
+    ScanBarFeatures as EngScanBar,
 };
+use audiohax::mapping_loader::load_mappings;
+use clap::Parser;
+use image_analysis::{analyze_global, draw_scan_bar_overlay_for_rect, scan_image};
 use image_source::{load_image_from_source, ImageSource};
-use mapping_loader::{load_mappings, lookup_range_map};
 use midi_output::MidiOut;
 use opencv::core;
 use opencv::prelude::MatTraitConst; // needed for .cols()/.rows()
 use rand::Rng;
-use std::env;
-use std::sync::{Arc, Barrier, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
-/// Single instrument action for a step: one or more note events (arpeggio or single note)
-#[derive(Clone, Debug)]
-struct InstrumentAction {
-    /// sequence of (note, velocity, hold_ms, offset_ms) where offset_ms is relative to step start
-    events: Vec<(u8, u8, u64, u64)>,
-}
-
-/// Scheduled MIDI event (time-based)
+/// Scheduled MIDI event (time-based) — adapter-owned wall-clock playback unit.
 #[derive(Clone, Debug)]
 struct ScheduledEvent {
     at: Instant,
@@ -36,360 +56,109 @@ struct ScheduledEvent {
     vel: u8, // used only for note_on (note_off vel ignored)
 }
 
-fn parse_cli_arg<T: std::str::FromStr>(args: &[String], key: &str, default: T) -> T {
-    args.iter()
-        .position(|a| a == key)
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse::<T>().ok())
-        .unwrap_or(default)
-}
-
-/// Thin playback adapter for one instrument on one step: extract → lookup → realize → map.
-///
-/// Makes NO musical decision. All musical logic — voicing, dynamics, rhythm,
-/// articulation, orchestration roles — lives in `chord_engine.rs`. This function
-/// only: (1) looks up THIS step's `StepPlan` (wrapping by `step_idx`), (2) projects
-/// the image-domain `ScanBarFeatures` into the plain-scalar `PerfFeatures` the lib
-/// consumes (no OpenCV/image type crosses into the lib), (3) calls the single pure
-/// entry point `chord_engine::realize_step`, and (4) maps each returned `NoteEvent`
-/// onto the existing `(note, velocity, hold_ms, offset_ms)` tuple the coordinator
-/// schedules.
-///
-/// `_edge_threshold` is retained for call-site compatibility but unused — the worker
-/// no longer branches on edge density itself; `realize_step` owns that decision.
-fn worker_decide_action(
-    f: &image_analysis::ScanBarFeatures,
-    inst_idx: usize,
-    step_idx: usize,
-    num_instruments: usize,
-    plan: &[chord_engine::StepPlan],
-    ms_per_step: u64,
-    _edge_threshold: f32,
-) -> InstrumentAction {
-    // 1) Look up THIS step's plan, wrapping like the old chords[step_idx % len].
-    //    Empty-plan guard: emit no events (a silent step) — the minimal safe choice
-    //    that never panics and makes no musical decision here.
-    if plan.is_empty() {
-        return InstrumentAction { events: Vec::new() };
+/// `engine::AudioSink for MidiOut` lives HERE (S9 §3.3 / D3) — the lib cannot name the
+/// bin-private `MidiOut`, and even a re-export would be an orphan violation. Each
+/// method maps `MidiOut`'s `Box<dyn Error>` (NOT `Send + Sync`) into an
+/// `AudioSinkError` by stringifying it — keeping `midi_output.rs` untouched.
+impl AudioSink for MidiOut {
+    fn note_on(&mut self, channel: u8, note: u8, velocity: u8) -> Result<(), AudioSinkError> {
+        MidiOut::note_on(self, channel, note, velocity)
+            .map_err(|e| AudioSinkError::msg(e.to_string()))
     }
-    let step = &plan[step_idx % plan.len()];
-
-    // 2) Project the image features into the plain-scalar PerfFeatures.
-    //    ScanBarFeatures fields are all f32 and units already match PerfFeatures
-    //    (saturation/brightness 0..=100, edge_density 0..=1) — no cast needed.
-    let features = chord_engine::PerfFeatures {
-        saturation: f.avg_saturation,
-        brightness: f.avg_brightness,
-        edge_density: f.edge_density,
-    };
-
-    // 3) Call the single pure entry point and map NoteEvent -> the existing tuple.
-    let note_events =
-        chord_engine::realize_step(step, inst_idx, num_instruments, &features, ms_per_step);
-    let events = note_events
-        .into_iter()
-        .map(|e| (e.note, e.velocity, e.hold_ms, e.offset_ms))
-        .collect();
-    InstrumentAction { events }
+    fn note_off(&mut self, channel: u8, note: u8) -> Result<(), AudioSinkError> {
+        MidiOut::note_off(self, channel, note).map_err(|e| AudioSinkError::msg(e.to_string()))
+    }
+    fn program_change(&mut self, channel: u8, program: u8) -> Result<(), AudioSinkError> {
+        MidiOut::program_change(self, channel, program)
+            .map_err(|e| AudioSinkError::msg(e.to_string()))
+    }
 }
 
-/// Play steps concurrently: workers populate InstrumentAction for their instrument each step,
-/// then coordinator collects them and schedules all MIDI note_on/note_off events (single-threaded).
-/// jitter_percent is applied to each event's duration (±percent).
-fn play_scanned_steps_concurrent(
-    steps: Vec<Vec<image_analysis::ScanBarFeatures>>,
-    ms_per_step: u64,
-    jitter_percent: f32,
-    plan: Arc<Vec<chord_engine::StepPlan>>,
-    preferred_midi_port_hint: Option<&str>,
-    img_for_overlay: &opencv::prelude::Mat,
+/// The adapter's `FeatureSource`: wraps the OpenCV-extracted whole-image features plus
+/// the precomputed per-step `Vec<Vec<image_analysis::ScanBarFeatures>>`, converting
+/// `image_analysis::*` → `engine::*` by field copy at the boundary (S9 §3.2 / D1). No
+/// `Mat` is held; the engine never sees pixels.
+struct PrecomputedSource {
+    global: EngGlobal,
+    steps: Vec<Vec<EngScanBar>>,
+}
+
+impl PrecomputedSource {
+    /// Build from the OpenCV feature structs, performing the boundary field copy ONCE.
+    fn new(
+        global: &image_analysis::GlobalFeatures,
+        steps: &[Vec<image_analysis::ScanBarFeatures>],
+    ) -> Self {
+        PrecomputedSource {
+            global: to_eng_global(global),
+            steps: steps
+                .iter()
+                .map(|row| row.iter().map(to_eng_scanbar).collect())
+                .collect(),
+        }
+    }
+}
+
+impl FeatureSource for PrecomputedSource {
+    fn global_features(&self) -> EngGlobal {
+        self.global
+    }
+    fn scan_bar_features(&self, step_idx: usize, num_instruments: usize) -> Vec<EngScanBar> {
+        let mut row = self.steps.get(step_idx).cloned().unwrap_or_default();
+        // Defensive: keep the row exactly `num_instruments` wide (it already is in the
+        // batch path; a live source might not be).
+        row.truncate(num_instruments);
+        row
+    }
+    fn step_count(&self) -> usize {
+        self.steps.len()
+    }
+}
+
+/// Boundary copy `image_analysis::GlobalFeatures` → `engine::GlobalFeatures` (S9 §3.2).
+fn to_eng_global(g: &image_analysis::GlobalFeatures) -> EngGlobal {
+    EngGlobal {
+        avg_hue: g.avg_hue,
+        avg_saturation: g.avg_saturation,
+        avg_brightness: g.avg_brightness,
+        edge_density: g.edge_density,
+        hue_spread: g.hue_spread,
+        texture_laplacian_var: g.texture_laplacian_var,
+        shape_complexity: g.shape_complexity,
+        aspect_ratio: g.aspect_ratio,
+    }
+}
+
+/// Boundary copy `image_analysis::ScanBarFeatures` → `engine::ScanBarFeatures`.
+fn to_eng_scanbar(s: &image_analysis::ScanBarFeatures) -> EngScanBar {
+    EngScanBar {
+        bar_index: s.bar_index,
+        avg_hue: s.avg_hue,
+        avg_saturation: s.avg_saturation,
+        avg_brightness: s.avg_brightness,
+        edge_density: s.edge_density,
+        texture_laplacian_var: s.texture_laplacian_var,
+        hue_hist: s.hue_hist.clone(),
+    }
+}
+
+/// Resolve the image path argument into an `ImageSource` (the example image when no
+/// path is given) — replaces the old overloaded-`"play"` positional logic.
+fn resolve_source(image: &Option<std::path::PathBuf>) -> ImageSource {
+    match image {
+        Some(p) => ImageSource::UserPath(p.to_string_lossy().to_string()),
+        None => ImageSource::UserPath("assets/images/example.jpg".to_string()),
+    }
+}
+
+/// Compute the scan-bar rect for step `si` of `total` (overlay geometry — adapter-only).
+fn step_rect(
+    si: usize,
+    total: usize,
+    width: i32,
+    height: i32,
     bar_thickness_frac: f32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if steps.is_empty() {
-        return Ok(());
-    }
-    let num_steps = steps.len();
-    let num_instruments = steps[0].len();
-    if num_instruments == 0 {
-        return Ok(());
-    }
-
-    // Validate consistent instrument count
-    for (i, s) in steps.iter().enumerate() {
-        if s.len() != num_instruments {
-            return Err(format!("Step {} has inconsistent instrument count", i).into());
-        }
-    }
-
-    // MIDI open once
-    println!("Opening MIDI port...");
-    let mut midi = MidiOut::open_first(preferred_midi_port_hint)?;
-    println!("MIDI opened.");
-
-    // set initial programs for channels
-    for i in 0..num_instruments {
-        let ch = (i % 16) as u8;
-        let prog = ((i * 7) % 128) as u8;
-        midi.program_change(ch, prog)?;
-    }
-
-    // shared actions (one slot per instrument)
-    let actions: Arc<Mutex<Vec<Option<InstrumentAction>>>> =
-        Arc::new(Mutex::new(vec![None; num_instruments]));
-    let barrier = Arc::new(Barrier::new(num_instruments + 1));
-
-    // parameters for workers
-    let edge_threshold = 0.30_f32;
-
-    // spawn workers
-    let mut handles = Vec::new();
-    for inst_idx in 0..num_instruments {
-        let steps_clone = steps.clone();
-        let acts = actions.clone();
-        let bar = barrier.clone();
-        let plan_cl = plan.clone();
-        let ms_per_step_local = ms_per_step;
-        let h_threshold = edge_threshold;
-
-        let handle = thread::spawn(move || {
-            for step_idx in 0..num_steps {
-                let f = &steps_clone[step_idx][inst_idx];
-                let action = worker_decide_action(
-                    f,
-                    inst_idx,
-                    step_idx,
-                    num_instruments,
-                    &plan_cl,
-                    ms_per_step_local,
-                    h_threshold,
-                );
-                {
-                    let mut g = acts.lock().unwrap();
-                    g[inst_idx] = Some(action);
-                }
-                // signal ready
-                bar.wait();
-                // wait for coordinator to process this step and release
-                bar.wait();
-            }
-        });
-
-        handles.push(handle);
-    }
-
-    // Coordinator loop per step: gather InstrumentAction for this step, build scheduled events (all instruments),
-    // execute them in time order (single-threaded), then release workers.
-    for step_idx in 0..num_steps {
-        // wait for workers to compute this step
-        barrier.wait();
-
-        // show overlay for this step
-        let width = img_for_overlay.cols();
-        let height = img_for_overlay.rows();
-        let vertical_default = width > height;
-        let bar_w = if vertical_default {
-            ((width as f32) * bar_thickness_frac).max(1.0).round() as i32
-        } else {
-            width
-        };
-        let bar_h = if !vertical_default {
-            ((height as f32) * bar_thickness_frac).max(1.0).round() as i32
-        } else {
-            height
-        };
-        let travel_x = (width - bar_w).max(0);
-        let travel_y = (height - bar_h).max(0);
-        let x0 = if vertical_default {
-            if num_steps == 1 {
-                0
-            } else {
-                ((step_idx as f32) * (travel_x as f32) / ((num_steps - 1) as f32)).round() as i32
-            }
-        } else {
-            0
-        };
-        let y0 = if !vertical_default {
-            if num_steps == 1 {
-                0
-            } else {
-                ((step_idx as f32) * (travel_y as f32) / ((num_steps - 1) as f32)).round() as i32
-            }
-        } else {
-            0
-        };
-        let rect = core::Rect::new(
-            x0,
-            y0,
-            if vertical_default { bar_w } else { width },
-            if vertical_default { height } else { bar_h },
-        );
-
-        if let Ok(overlay) =
-            draw_scan_bar_overlay_for_rect(img_for_overlay, rect, num_instruments, vertical_default)
-        {
-            let _ = opencv::highgui::imshow("ScanBar Live", &overlay);
-            let _ = opencv::highgui::wait_key(1);
-        }
-
-        // Collect actions snapshot
-        let snapshot: Vec<Option<InstrumentAction>> = {
-            let guard = actions.lock().unwrap();
-            guard.clone()
-        };
-
-        // Build scheduled events
-        let mut events: Vec<ScheduledEvent> = Vec::new();
-        let t0 = Instant::now();
-        let mut rng = rand::thread_rng();
-
-        for inst_idx in 0..num_instruments {
-            if let Some(action) = &snapshot[inst_idx] {
-                let channel = (inst_idx % 16) as u8;
-                for (note, vel, hold_ms, offset_ms) in &action.events {
-                    // apply jitter_percent on hold_ms
-                    let jitter = rng.gen_range(
-                        -(jitter_percent * 100.0) as i32..=(jitter_percent * 100.0) as i32,
-                    ) as f32
-                        / 100.0;
-                    let base_hold = *hold_ms as f32;
-                    let hold_ms_f = (base_hold * (1.0 + jitter)).max(8.0).round() as u64;
-
-                    let start_instant = t0 + Duration::from_millis(*offset_ms);
-                    let on_event = ScheduledEvent {
-                        at: start_instant,
-                        on: true,
-                        channel,
-                        note: *note,
-                        vel: *vel,
-                    };
-                    let off_event = ScheduledEvent {
-                        at: start_instant + Duration::from_millis(hold_ms_f),
-                        on: false,
-                        channel,
-                        note: *note,
-                        vel: 0,
-                    };
-                    events.push(on_event);
-                    events.push(off_event);
-                }
-            }
-        }
-
-        // Sort events by time
-        events.sort_by_key(|e| e.at);
-
-        // Execute scheduled events (single-threaded)
-        for ev in events {
-            let now = Instant::now();
-            if ev.at > now {
-                let sleep_dur = ev.at - now;
-                // sleep until event time (coarse)
-                thread::sleep(sleep_dur);
-            }
-            if ev.on {
-                if let Err(e) = midi.note_on(ev.channel, ev.note, ev.vel) {
-                    eprintln!("MIDI note_on error: {}", e);
-                }
-            } else {
-                if let Err(e) = midi.note_off(ev.channel, ev.note) {
-                    eprintln!("MIDI note_off error: {}", e);
-                }
-            }
-        }
-
-        // clear actions slots
-        {
-            let mut guard = actions.lock().unwrap();
-            for slot in guard.iter_mut() {
-                *slot = None;
-            }
-        }
-
-        // release workers to next step
-        barrier.wait();
-    }
-
-    // join workers
-    for h in handles {
-        if let Err(e) = h.join() {
-            eprintln!("Worker thread panicked: {:?}", e);
-        }
-    }
-
-    println!("Completed playback of {} steps.", num_steps);
-    Ok(())
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load mappings
-    let mappings = load_mappings("assets/mappings.json")?;
-    println!("Mappings loaded.");
-
-    // CLI
-    let args: Vec<String> = env::args().collect();
-
-    let instrument_count: usize = parse_cli_arg(&args, "--instruments", 4usize);
-    let bar_thickness_frac: f32 = parse_cli_arg(&args, "--thickness", 0.10f32);
-    let num_steps: usize = parse_cli_arg(&args, "--steps", 40usize);
-    let ms_per_step: u64 = parse_cli_arg(&args, "--ms-per-step", 250u64);
-    let jitter_percent: f32 = parse_cli_arg(&args, "--jitter-percent", 15.0f32); // percent (e.g., 15 -> ±15%)
-
-    println!("Instrument count: {}", instrument_count);
-    println!(
-        "Scan bar thickness = {:.2}, steps = {}, ms/step = {}, jitter% = {}",
-        bar_thickness_frac, num_steps, ms_per_step, jitter_percent
-    );
-
-    // Image source (first arg unless it's "play" or flags)
-    // If first arg looks like a path and doesn't start with "--", use it
-    let maybe_img = args.get(1).filter(|s| !s.starts_with("--")).cloned();
-    let src = if let Some(p) = maybe_img {
-        if p == "play" {
-            ImageSource::UserPath("assets/images/example.jpg".to_string())
-        } else {
-            ImageSource::UserPath(p)
-        }
-    } else {
-        ImageSource::UserPath("assets/images/example.jpg".to_string())
-    };
-
-    let img = load_image_from_source(&src)?;
-    println!("Image loaded from source.");
-
-    // Global features
-    let global_features = analyze_global(&img)?;
-    println!("Global features: {:?}", global_features);
-
-    // static scan compatibility (per-instrument bar avg)
-    let static_scan = analyze_scan_bar(&img, instrument_count, true)?;
-    println!("Static scan-bar features (compat): {:?}", static_scan);
-
-    // pick mode and make chord progression
-    let hue = global_features.avg_hue;
-    let mode =
-        lookup_range_map(&mappings.global.hue_to_mode, hue).unwrap_or_else(|| "Ionian".to_string());
-    println!("Chosen mode from hue {} -> {}", hue, mode);
-
-    let engine = ChordEngine::new(mappings);
-    let progression = engine.pick_progression(&mode);
-    println!("Picked progression: {:?}", progression);
-
-    let chords_vec =
-        engine.generate_chords(&progression, 60, &mode, global_features.edge_density, 0.0);
-    println!("Generated chords: {:?}", chords_vec);
-    // Plan the phrases once from the generated chords and share the PLAN (not the
-    // raw chords). plan_phrases runs voice_lead_sequence internally, so the shared
-    // plan carries the voice-led chords — no separate voice-leading call needed.
-    let plan_vec = engine.plan_phrases(&chords_vec); // Vec<chord_engine::StepPlan>
-    let plan_arc = Arc::new(plan_vec); // Arc<Vec<StepPlan>>
-
-    // Run full scan producing steps (each step -> per-instrument ScanBarFeatures)
-    let steps = scan_image(&img, instrument_count, bar_thickness_frac, num_steps, None)?;
-    println!("Completed scanning image. Steps: {}", steps.len());
-
-    // Save overlays for inspection: first / mid / last
-    let width = img.cols();
-    let height = img.rows();
+) -> (core::Rect, bool, i32, i32) {
     let vertical_default = width > height;
     let bar_w = if vertical_default {
         ((width as f32) * bar_thickness_frac).max(1.0).round() as i32
@@ -401,35 +170,90 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         height
     };
+    let travel_x = (width - bar_w).max(0);
+    let travel_y = (height - bar_h).max(0);
+    let x0 = if vertical_default {
+        if total <= 1 {
+            0
+        } else {
+            ((si as f32) * (travel_x as f32) / ((total - 1) as f32)).round() as i32
+        }
+    } else {
+        0
+    };
+    let y0 = if !vertical_default {
+        if total <= 1 {
+            0
+        } else {
+            ((si as f32) * (travel_y as f32) / ((total - 1) as f32)).round() as i32
+        }
+    } else {
+        0
+    };
+    let rect = core::Rect::new(
+        x0,
+        y0,
+        if vertical_default { bar_w } else { width },
+        if vertical_default { height } else { bar_h },
+    );
+    (rect, vertical_default, bar_w, bar_h)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ── CLI (shared clap grammar) ───────────────────────────────────────────────
+    let cli = Cli::parse();
+
+    // Phase 1 wires the `play` subcommand (the others — render/analyze/modem — are
+    // surfaced by the grammar but their adapter bodies are follow-on work; the modem
+    // subcommand mirrors the dedicated bins). Map non-play to a friendly message
+    // rather than silently doing nothing.
+    let play_args: PlayArgs = match cli.command {
+        Command::Play(p) => p,
+        Command::Render(_) | Command::Analyze(_) => {
+            println!("`render`/`analyze` are recognized but not yet wired in Phase 1; use `play`.");
+            return Ok(());
+        }
+        Command::Modem(_) => {
+            println!("Use the dedicated modem bins (modem_encode/modem_decode/channel_sim/make_packetized), or `audiohax modem …` once wired.");
+            return Ok(());
+        }
+    };
+
+    // ── Mappings + engine config ────────────────────────────────────────────────
+    let mappings = load_mappings("assets/mappings.json")?;
+    println!("Mappings loaded.");
+
+    let engine_config = pipeline_to_engine_config(&play_args.pipeline);
+    let instrument_count = engine_config.num_instruments;
+    let bar_thickness_frac = engine_config.bar_thickness_frac;
+    let ms_per_step = engine_config.ms_per_step;
+    let num_steps = play_args.pipeline.steps;
+    let jitter_percent = play_args.pipeline.jitter_percent;
+    println!("Instrument count: {}", instrument_count);
+    println!(
+        "Scan bar thickness = {:.2}, steps = {}, ms/step = {}, jitter% = {}",
+        bar_thickness_frac, num_steps, ms_per_step, jitter_percent
+    );
+
+    // ── OpenCV image acquisition + feature extraction (adapter zone) ────────────
+    let src = resolve_source(&play_args.image);
+    let img = load_image_from_source(&src)?;
+    println!("Image loaded from source.");
+
+    let global_features = analyze_global(&img)?;
+    println!("Global features: {:?}", global_features);
+
+    // Full scan → per-step per-instrument features (OpenCV).
+    let steps = scan_image(&img, instrument_count, bar_thickness_frac, num_steps, None)?;
+    println!("Completed scanning image. Steps: {}", steps.len());
+
+    // Save overlays for inspection: first / mid / last (OpenCV imwrite).
+    let width = img.cols();
+    let height = img.rows();
     let indices = vec![0usize, steps.len() / 2, steps.len().saturating_sub(1)];
     for &si in &indices {
-        let travel_x = (width - bar_w).max(0);
-        let travel_y = (height - bar_h).max(0);
-        let x0 = if vertical_default {
-            if steps.len() == 1 {
-                0
-            } else {
-                ((si as f32) * (travel_x as f32) / ((steps.len() - 1) as f32)).round() as i32
-            }
-        } else {
-            0
-        };
-        let y0 = if !vertical_default {
-            if steps.len() == 1 {
-                0
-            } else {
-                ((si as f32) * (travel_y as f32) / ((steps.len() - 1) as f32)).round() as i32
-            }
-        } else {
-            0
-        };
-        let rect = core::Rect::new(
-            x0,
-            y0,
-            if vertical_default { bar_w } else { width },
-            if vertical_default { height } else { bar_h },
-        );
-
+        let (rect, vertical_default, _bw, _bh) =
+            step_rect(si, steps.len(), width, height, bar_thickness_frac);
         if let Ok(overlay) =
             draw_scan_bar_overlay_for_rect(&img, rect, instrument_count, vertical_default)
         {
@@ -443,26 +267,109 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Playback?
-    if args.iter().any(|a| a == "play") {
-        let preferred = std::env::var("AUDIOHAX_MIDI_PORT").ok();
-        let preferred_ref = preferred.as_deref().or(Some("AudioHaxOut"));
-        println!("Attempting playback (preferred MIDI = {:?})", preferred_ref);
+    // ── Build the engine + feed global features (the engine derives mode/plan) ──
+    let source = PrecomputedSource::new(&global_features, &steps);
+    let mut engine = PipelineEngine::new(mappings, engine_config);
+    engine.set_features_global(&source.global_features());
+    println!("Engine mode: {}", engine.current_state().mode);
 
-        let _ = opencv::highgui::named_window("ScanBar Live", opencv::highgui::WINDOW_AUTOSIZE);
+    // ── Playback ────────────────────────────────────────────────────────────────
+    // `play` always plays (the old overloaded "play" token is gone). The driver loop
+    // pulls per-step decisions from the engine and the ADAPTER applies jitter +
+    // Instant scheduling + highgui overlay (D8 — timing/RNG are the adapter's).
+    let preferred = std::env::var("AUDIOHAX_MIDI_PORT").ok();
+    let preferred_ref = play_args
+        .midi_port
+        .as_deref()
+        .or(preferred.as_deref())
+        .or(Some("AudioHaxOut"));
+    println!("Attempting playback (preferred MIDI = {:?})", preferred_ref);
 
-        play_scanned_steps_concurrent(
-            steps,
-            ms_per_step,
-            jitter_percent,
-            plan_arc,
-            preferred_ref,
-            &img,
-            bar_thickness_frac,
-        )?;
-    } else {
-        println!("Run with `cargo run -- play` to play to a MIDI port (add CLI flags e.g. --jitter-percent 20 --thickness 0.08).");
+    let _ = opencv::highgui::named_window("ScanBar Live", opencv::highgui::WINDOW_AUTOSIZE);
+
+    if source.step_count() == 0 {
+        println!("No steps to play.");
+        return Ok(());
     }
 
+    println!("Opening MIDI port...");
+    let mut midi = MidiOut::open_first(preferred_ref)?;
+    println!("MIDI opened.");
+
+    // Initial per-channel programs (same scheme as before: prog = (i*7)%128).
+    for i in 0..instrument_count {
+        let ch = (i % 16) as u8;
+        let prog = ((i * 7) % 128) as u8;
+        // via the AudioSink trait so the adapter speaks one vocabulary to the engine's sink.
+        let _ = AudioSink::program_change(&mut midi, ch, prog);
+    }
+
+    let total_steps = source.step_count();
+    let mut rng = rand::thread_rng();
+
+    for step_idx in 0..total_steps {
+        // 1) Overlay for this step (OpenCV highgui — adapter).
+        let (rect, vertical_default, _bw, _bh) =
+            step_rect(step_idx, total_steps, width, height, bar_thickness_frac);
+        if let Ok(overlay) =
+            draw_scan_bar_overlay_for_rect(&img, rect, instrument_count, vertical_default)
+        {
+            let _ = opencv::highgui::imshow("ScanBar Live", &overlay);
+            let _ = opencv::highgui::wait_key(1);
+        }
+
+        // 2) Pure musical decisions from the engine (no jitter, no wall clock).
+        let decisions = engine.decide_step(&source, step_idx);
+
+        // 3) Adapter applies jitter + Instant scheduling, then sends via the sink.
+        let mut events: Vec<ScheduledEvent> = Vec::new();
+        let t0 = Instant::now();
+        for dec in &decisions {
+            let channel = dec.channel;
+            for ev in &dec.events {
+                // jitter_percent on hold_ms (±percent), identical to the old worker path.
+                let jitter = rng
+                    .gen_range(-(jitter_percent * 100.0) as i32..=(jitter_percent * 100.0) as i32)
+                    as f32
+                    / 100.0;
+                let base_hold = ev.hold_ms as f32;
+                let hold_ms_f = (base_hold * (1.0 + jitter)).max(8.0).round() as u64;
+
+                let start_instant = t0 + Duration::from_millis(ev.offset_ms);
+                events.push(ScheduledEvent {
+                    at: start_instant,
+                    on: true,
+                    channel,
+                    note: ev.note,
+                    vel: ev.velocity,
+                });
+                events.push(ScheduledEvent {
+                    at: start_instant + Duration::from_millis(hold_ms_f),
+                    on: false,
+                    channel,
+                    note: ev.note,
+                    vel: 0,
+                });
+            }
+        }
+
+        // 4) Time-order and execute (single-threaded wall-clock playback — adapter).
+        events.sort_by_key(|e| e.at);
+        for sev in events {
+            let now = Instant::now();
+            if sev.at > now {
+                std::thread::sleep(sev.at - now);
+            }
+            if sev.on {
+                if let Err(e) = AudioSink::note_on(&mut midi, sev.channel, sev.note, sev.vel) {
+                    eprintln!("MIDI note_on error: {}", e);
+                }
+            } else if let Err(e) = AudioSink::note_off(&mut midi, sev.channel, sev.note) {
+                eprintln!("MIDI note_off error: {}", e);
+            }
+        }
+    }
+
+    println!("Completed playback of {} steps.", total_steps);
     Ok(())
 }

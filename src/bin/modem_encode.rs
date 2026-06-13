@@ -1,35 +1,16 @@
 // src/bin/modem_encode.rs
-use std::env;
+//
+// S9 (WS-4 Phase 1): the hand-rolled `print_usage` + `while i < args.len()` parser was
+// replaced by the shared clap grammar in `audiohax::cli` (one coherent, validated,
+// `--help`-bearing CLI across all four modem bins). Legacy flag spellings are
+// preserved (the shared struct uses the same long names). The bin keeps its name and
+// entry point and runs the SAME `modem::*` library logic unchanged below.
 use std::fs::{self, File};
 use std::io::Write;
 
+use audiohax::cli::{parse_modem_encode, ModemPreset};
 use audiohax::modem::{self, ModemParams};
 use hound;
-
-fn print_usage(name: &str) {
-    eprintln!("Usage:");
-    eprintln!("  {} <out.wav> <input_file> [options]", name);
-    eprintln!("Options:");
-    eprintln!("  --compress");
-    eprintln!("  --encrypt KEYHEX");
-    eprintln!("  --channels N");
-    eprintln!("  --symbol-ms MS");
-    eprintln!("  --mtones M");
-    eprintln!("  --pkt-size N");
-    eprintln!("  --repeats R");
-    eprintln!("  --rs-data D --rs-parity P --rs-shard-size S");
-    eprintln!("  --preset <fast|balanced|robust>");
-    eprintln!("  --no-interleave    (disable RS interleaving; default is interleaved)");
-    eprintln!("  --estimate-duration   (print estimate and exit)");
-    eprintln!("  --simulate           (run simple channel simulator on packet bytes)");
-    eprintln!("  --sim-flip P         (byte flip prob, 0.0..1.0 default 0.0)");
-    eprintln!("  --sim-burst-prob P   (prob to start a burst erase at a byte, default 0.0)");
-    eprintln!("  --sim-burst-len N    (average burst length in bytes, default 64)");
-    eprintln!("  --sim-out PATH       (write simulated packet-bytes to file)");
-    eprintln!();
-    eprintln!("Example:");
-    eprintln!("  {} out.wav myimage.png --compress --preset robust --rs-data 4 --rs-parity 5 --rs-shard-size 128", name);
-}
 
 fn apply_preset(p: &mut ModemParams, preset: &str, chosen: &mut PresetParams) {
     match preset {
@@ -69,128 +50,64 @@ struct PresetParams {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 3 {
-        print_usage(&args[0]);
-        std::process::exit(1);
-    }
-    let out_wav = &args[1];
-    let input_path = &args[2];
+    // Shared clap grammar (S9 §3.7) — replaces the hand-rolled positional parser.
+    let cli = parse_modem_encode();
+    let out_wav = cli.out_wav.to_string_lossy().to_string();
+    let out_wav = out_wav.as_str();
+    let input_path = cli.input.clone();
 
     // basic options (may be overridden by preset or explicit flags)
-    let mut compress = false;
-    let mut encrypt_key_hex: Option<String> = None;
+    let compress = cli.compress;
+    let encrypt_key_hex: Option<String> = cli.encrypt.clone();
 
-    let mut preset: Option<String> = None;
+    // preset: map the typed enum back to the legacy string apply_preset() expects so
+    // the downstream preset/RS-finalization logic stays byte-for-byte unchanged.
+    let preset: Option<String> = cli.preset.map(|p| match p {
+        ModemPreset::Fast => "fast".to_string(),
+        ModemPreset::Balanced => "balanced".to_string(),
+        ModemPreset::Robust => "robust".to_string(),
+    });
 
-    // parse-first-phase: collect flags into variables
-    let mut channels_override: Option<usize> = None;
-    let mut symbol_ms_override: Option<f32> = None;
-    let mut mtones_override: Option<usize> = None;
-    let mut pkt_size_arg: Option<usize> = None;
-    let mut repeats_arg: Option<usize> = None;
+    // parse-first-phase: collect flags into variables (same shapes as before)
+    let channels_override: Option<usize> = cli.channels;
+    let symbol_ms_override: Option<f32> = cli.symbol_ms;
+    let mtones_override: Option<usize> = cli.mtones;
+    let pkt_size_arg: Option<usize> = cli.pkt_size;
+    let repeats_arg: Option<usize> = cli.repeats;
 
     // RS params
-    let mut rs_data_shards: Option<usize> = None;
-    let mut rs_parity_shards: Option<usize> = None;
-    let mut rs_shard_size: Option<usize> = None;
+    let mut rs_data_shards: Option<usize> = cli.rs_data;
+    let mut rs_parity_shards: Option<usize> = cli.rs_parity;
+    let mut rs_shard_size: Option<usize> = cli.rs_shard_size;
 
-    // interleave control (default true)
-    let mut interleave_enabled = true;
+    // interleave control (default true; --no-interleave disables)
+    let interleave_enabled = !cli.no_interleave;
 
     // estimate flag
-    let mut estimate_only = false;
+    let estimate_only = cli.estimate_duration;
 
     // simulator flags
-    let mut simulate = false;
-    let mut sim_flip_prob: f64 = 0.0;
-    let mut sim_burst_prob: f64 = 0.0;
-    let mut sim_burst_len: usize = 64;
-    let mut sim_out: Option<String> = None;
-
-    // low-level parse
-    let mut i = 3usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--compress" => { compress = true; i += 1; }
-            "--encrypt" => {
-                if i + 1 >= args.len() { eprintln!("Missing key for --encrypt"); std::process::exit(1); }
-                encrypt_key_hex = Some(args[i+1].clone());
-                i += 2;
-            }
-            "--channels" => {
-                channels_override = args.get(i+1).and_then(|s| s.parse().ok());
-                i += 2;
-            }
-            "--symbol-ms" => {
-                symbol_ms_override = args.get(i+1).and_then(|s| s.parse().ok());
-                i += 2;
-            }
-            "--mtones" => {
-                mtones_override = args.get(i+1).and_then(|s| s.parse().ok());
-                i += 2;
-            }
-            "--pkt-size" => {
-                pkt_size_arg = args.get(i+1).and_then(|s| s.parse().ok());
-                i += 2;
-            }
-            "--repeats" => {
-                repeats_arg = args.get(i+1).and_then(|s| s.parse().ok());
-                i += 2;
-            }
-            "--rs-data" => {
-                rs_data_shards = args.get(i+1).and_then(|s| s.parse().ok());
-                i += 2;
-            }
-            "--rs-parity" => {
-                rs_parity_shards = args.get(i+1).and_then(|s| s.parse().ok());
-                i += 2;
-            }
-            "--rs-shard-size" => {
-                rs_shard_size = args.get(i+1).and_then(|s| s.parse().ok());
-                i += 2;
-            }
-            "--preset" => {
-                if let Some(pv) = args.get(i+1) { preset = Some(pv.clone()); }
-                i += 2;
-            }
-            "--no-interleave" => { interleave_enabled = false; i += 1; }
-            "--interleave" => { interleave_enabled = true; i += 1; }
-            "--estimate-duration" => { estimate_only = true; i += 1; }
-            "--simulate" => { simulate = true; i += 1; }
-            "--sim-flip" => {
-                if let Some(v) = args.get(i+1) { sim_flip_prob = v.parse().unwrap_or(0.0); }
-                i += 2;
-            }
-            "--sim-burst-prob" => {
-                if let Some(v) = args.get(i+1) { sim_burst_prob = v.parse().unwrap_or(0.0); }
-                i += 2;
-            }
-            "--sim-burst-len" => {
-                if let Some(v) = args.get(i+1) { sim_burst_len = v.parse().unwrap_or(64); }
-                i += 2;
-            }
-            "--sim-out" => {
-                if let Some(v) = args.get(i+1) { sim_out = Some(v.clone()); }
-                i += 2;
-            }
-            _ => { eprintln!("Unknown arg {}", args[i]); i += 1; }
-        }
-    }
+    let simulate = cli.simulate;
+    let sim_flip_prob: f64 = cli.sim_flip.unwrap_or(0.0);
+    let sim_burst_prob: f64 = cli.sim_burst_prob.unwrap_or(0.0);
+    let sim_burst_len: usize = cli.sim_burst_len.unwrap_or(64);
+    let sim_out: Option<String> = cli.sim_out.map(|p| p.to_string_lossy().to_string());
 
     // read file
-    let payload = fs::read(input_path)?;
-    let filename = std::path::Path::new(input_path).file_name().and_then(|s| s.to_str()).unwrap_or("payload");
+    let payload = fs::read(&input_path)?;
+    let filename = input_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("payload");
 
     // build frame (header + payload)
-    let frame = modem::build_frame(
-        filename,
-        &payload,
-        compress,
-        encrypt_key_hex.as_deref(),
-    )?;
+    let frame = modem::build_frame(filename, &payload, compress, encrypt_key_hex.as_deref())?;
 
-    println!("Frame built: {} bytes (payload {})", frame.len(), payload.len());
+    println!(
+        "Frame built: {} bytes (payload {})",
+        frame.len(),
+        payload.len()
+    );
 
     // symbol parameters
     let mut params = ModemParams::default();
@@ -202,20 +119,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Applied preset '{}'", pstr);
     }
 
-    if let Some(c) = channels_override { params.channels = c; }
-    if let Some(ms) = symbol_ms_override { params.symbol_ms = ms; }
-    if let Some(m) = mtones_override { params.m_tones = m; }
+    if let Some(c) = channels_override {
+        params.channels = c;
+    }
+    if let Some(ms) = symbol_ms_override {
+        params.symbol_ms = ms;
+    }
+    if let Some(m) = mtones_override {
+        params.m_tones = m;
+    }
 
     // final pkt_size & repeats decision (preset values are treated as defaults)
     let pkt_size = pkt_size_arg.or(preset_params.pkt_size).unwrap_or(200);
     let repeats = repeats_arg.or(preset_params.repeats).unwrap_or(3);
 
     // finalize RS params: explicit flags override preset
-    if let Some(d) = rs_data_shards { rs_data_shards = Some(d); }
-    if let Some(p) = rs_parity_shards { rs_parity_shards = Some(p); }
-    if rs_shard_size.is_none() { rs_shard_size = preset_params.rs.map(|t| t.2); }
+    if let Some(d) = rs_data_shards {
+        rs_data_shards = Some(d);
+    }
+    if let Some(p) = rs_parity_shards {
+        rs_parity_shards = Some(p);
+    }
+    if rs_shard_size.is_none() {
+        rs_shard_size = preset_params.rs.map(|t| t.2);
+    }
     if rs_data_shards.is_none() && preset_params.rs.is_some() {
-        let (d,p,s) = preset_params.rs.unwrap();
+        let (d, p, s) = preset_params.rs.unwrap();
         rs_data_shards = Some(d);
         rs_parity_shards = Some(p);
         rs_shard_size = Some(s);
@@ -226,7 +155,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let (Some(d), Some(p), Some(s)) = (rs_data_shards, rs_parity_shards, rs_shard_size) {
             let est = modem::estimate_duration_seconds(
                 frame.len(),
-                d, p, s,
+                d,
+                p,
+                s,
                 params.m_tones,
                 params.channels,
                 params.symbol_ms as usize,
@@ -238,7 +169,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let hours = (secs / 3600.0).floor() as u64;
             let mins = ((secs % 3600.0) / 60.0).floor() as u64;
             let srem = (secs % 60.0).round() as u64;
-            println!("Estimated duration: {:.2} s ({}:{:02}:{:02})", secs, hours, mins, srem);
+            println!(
+                "Estimated duration: {:.2} s ({}:{:02}:{:02})",
+                secs, hours, mins, srem
+            );
         } else {
             // rough estimate for repetition-based packetization
             let pkt_payload = pkt_size;
@@ -257,7 +191,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let bps = modem::bits_per_symbol(params.m_tones);
             let bits_per_symbol = if bps == 0 { 1 } else { bps };
             let symbols_payload = (enc_bytes * 8 + bits_per_symbol - 1) / bits_per_symbol;
-            let symbols_total = symbols_payload + params.preamble_symbols.len() * params.preamble_repeats * params.channels;
+            let symbols_total = symbols_payload
+                + params.preamble_symbols.len() * params.preamble_repeats * params.channels;
             let samples_per_symbol = (params.sample_rate * params.symbol_ms as usize) / 1000;
             let total_samples = symbols_total * samples_per_symbol;
             let secs = (total_samples as f64) / (params.sample_rate as f64);
@@ -266,29 +201,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let hours = (secs / 3600.0).floor() as u64;
             let mins = ((secs % 3600.0) / 60.0).floor() as u64;
             let srem = (secs % 60.0).round() as u64;
-            println!("Estimated duration (rough): {:.2} s ({}:{:02}:{:02})", secs, hours, mins, srem);
+            println!(
+                "Estimated duration (rough): {:.2} s ({}:{:02}:{:02})",
+                secs, hours, mins, srem
+            );
         }
         return Ok(());
     }
 
     // choose packetization: RS if options provided, otherwise repeats
-    let mut packetized_bytes: Vec<u8> = if let (Some(d), Some(p), Some(s)) = (rs_data_shards, rs_parity_shards, rs_shard_size) {
+    let mut packetized_bytes: Vec<u8> = if let (Some(d), Some(p), Some(s)) =
+        (rs_data_shards, rs_parity_shards, rs_shard_size)
+    {
         if interleave_enabled {
             println!("Using Reed-Solomon FEC (interleaved): data_shards={} parity_shards={} shard_size={}", d, p, s);
             modem::packetize_stream_rs_interleaved(&frame, d, p, s)
         } else {
-            println!("Using Reed-Solomon FEC: data_shards={} parity_shards={} shard_size={}", d, p, s);
+            println!(
+                "Using Reed-Solomon FEC: data_shards={} parity_shards={} shard_size={}",
+                d, p, s
+            );
             modem::packetize_stream_rs(&frame, s, d, p)?
         }
     } else {
-        println!("Packetizing frame: pkt_size={} repeats={}", pkt_size, repeats);
+        println!(
+            "Packetizing frame: pkt_size={} repeats={}",
+            pkt_size, repeats
+        );
         modem::packetize_stream(&frame, pkt_size, repeats)
     };
 
     // optionally simulate a channel (operates on packetized bytes)
     if simulate {
-        println!("Simulating channel: flip_prob={} burst_prob={} burst_len={}", sim_flip_prob, sim_burst_prob, sim_burst_len);
-        let sim_bytes = modem::simulate_channel_bytes(&packetized_bytes, sim_flip_prob, sim_burst_prob, sim_burst_len);
+        println!(
+            "Simulating channel: flip_prob={} burst_prob={} burst_len={}",
+            sim_flip_prob, sim_burst_prob, sim_burst_len
+        );
+        let sim_bytes = modem::simulate_channel_bytes(
+            &packetized_bytes,
+            sim_flip_prob,
+            sim_burst_prob,
+            sim_burst_len,
+        );
         if let Some(path) = sim_out {
             let mut f = File::create(path)?;
             f.write_all(&sim_bytes)?;
@@ -306,7 +260,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- PREAMBLE: prepend per-channel preamble symbols to each channel's stream
     if params.preamble_symbols.len() > 0 && params.preamble_repeats > 0 {
-        let mut pre_vec: Vec<u8> = Vec::with_capacity(params.preamble_symbols.len() * params.preamble_repeats);
+        let mut pre_vec: Vec<u8> =
+            Vec::with_capacity(params.preamble_symbols.len() * params.preamble_repeats);
         for _ in 0..params.preamble_repeats {
             pre_vec.extend_from_slice(&params.preamble_symbols);
         }
@@ -315,7 +270,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             newv.extend_from_slice(ch_syms);
             *ch_syms = newv;
         }
-        println!("Prepended preamble ({} symbols per channel)", params.preamble_symbols.len() * params.preamble_repeats);
+        println!(
+            "Prepended preamble ({} symbols per channel)",
+            params.preamble_symbols.len() * params.preamble_repeats
+        );
     }
 
     // render to samples

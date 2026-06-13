@@ -1,32 +1,16 @@
 // src/bin/channel_sim.rs
-use std::env;
+//
+// S9 (WS-4 Phase 1): hand-rolled positional parsing replaced by the shared clap
+// grammar in `audiohax::cli`. Legacy UNDERSCORE flag spellings (`--flip_prob`,
+// `--burst_prob`, `--burst_len`, `--packet_size`) are preserved as aliases in the
+// shared struct so existing scripts keep working. Same library logic runs unchanged.
 use std::fs::File;
 use std::io::{Read, Write};
 
+use audiohax::cli::{parse_channel_sim, ChannelMode};
 use audiohax::modem;
 use audiohax::modem::{depacketize_stream, depacketize_stream_rs, AcousticChannelParams};
 use rand::prelude::*;
-
-fn print_usage(name: &str) {
-    eprintln!("Usage:");
-    eprintln!("  {} <in_bytes.bin> <out_sim.bin> [--mode bitflip|byteburst|packet|acoustic] [--flip_prob P] [--burst_prob P] [--burst_len L] [--packet_size N] [--repeats R] [--rs-data D --rs-parity P]", name);
-    eprintln!();
-    eprintln!(
-        "  Acoustic mode treats the input as raw little-endian i16 audio samples and applies"
-    );
-    eprintln!(
-        "  the S7 seeded acoustic-channel model (start offset / clock drift / freq offset / echo):"
-    );
-    eprintln!("    [--acoustic-seed S] [--start-offset N] [--clock-ppm P] [--freq-offset HZ] [--echo-delay N] [--echo-gain G] [--jitter J]");
-    eprintln!();
-    eprintln!("Examples:");
-    eprintln!("  {} packetized.bin sim_bytes.bin --mode packet --packet_size 152 --burst_prob 0.05 --flip_prob 0.001 --rs-data 4 --rs-parity 2", name);
-    eprintln!(
-        "  {} packetized.bin sim_bytes.bin --mode bitflip --flip_prob 0.0005",
-        name
-    );
-    eprintln!("  {} burst_samples.i16 out_samples.i16 --mode acoustic --start-offset 137 --clock-ppm 500 --freq-offset 7 --echo-delay 64 --echo-gain 0.4", name);
-}
 
 fn detect_and_write_file(bytes: &[u8], out_basename: &str) -> std::io::Result<()> {
     let mut ext = "bin";
@@ -47,127 +31,41 @@ fn detect_and_write_file(bytes: &[u8], out_basename: &str) -> std::io::Result<()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 3 {
-        print_usage(&args[0]);
-        std::process::exit(1);
-    }
-    let in_path = &args[1];
-    let out_path = &args[2];
+    // Shared clap grammar (S9 §3.7), legacy underscore flag aliases preserved.
+    let cli = parse_channel_sim();
+    let in_path = cli.in_bytes.to_string_lossy().to_string();
+    let in_path = in_path.as_str();
+    let out_path = cli.out_sim.to_string_lossy().to_string();
+    let out_path = out_path.as_str();
 
-    // defaults
-    let mut mode = "bitflip".to_string();
-    let mut flip_prob: f64 = 0.0;
-    let mut burst_prob: f64 = 0.0;
-    let mut burst_len: usize = 16;
-    let mut packet_size: usize = 128;
-    let mut repeats_opt: Option<usize> = None;
-    let mut rs_data: Option<usize> = None;
-    let mut rs_parity: Option<usize> = None;
+    // map the typed ChannelMode enum back to the legacy mode string the match below
+    // already dispatches on (keeps the simulation logic byte-for-byte unchanged).
+    let mode = match cli.mode {
+        ChannelMode::Bitflip => "bitflip".to_string(),
+        ChannelMode::Byteburst => "byteburst".to_string(),
+        ChannelMode::Packet => "packet".to_string(),
+        ChannelMode::Acoustic => "acoustic".to_string(),
+    };
+    let flip_prob: f64 = cli.flip_prob;
+    let burst_prob: f64 = cli.burst_prob;
+    let burst_len: usize = cli.burst_len;
+    let packet_size: usize = cli.packet_size;
+    let repeats_opt: Option<usize> = cli.repeats;
+    let rs_data: Option<usize> = cli.rs_data;
+    let rs_parity: Option<usize> = cli.rs_parity;
 
     // Acoustic-channel (S7) knobs — used only in --mode acoustic.
+    // Cast to AcousticChannelParams' field types at the boundary (the bin owns this
+    // conversion). The legacy `.parse()` inferred these from the field types directly;
+    // the CLI exposes width-neutral usize/f64 and the bin narrows here — same values.
     let mut acoustic = AcousticChannelParams::identity();
-
-    // parse args
-    let mut i = 3usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--mode" => {
-                if let Some(v) = args.get(i + 1) {
-                    mode = v.clone();
-                }
-                i += 2;
-            }
-            "--acoustic-seed" => {
-                if let Some(v) = args.get(i + 1) {
-                    acoustic.seed = v.parse().unwrap_or(0);
-                }
-                i += 2;
-            }
-            "--start-offset" => {
-                if let Some(v) = args.get(i + 1) {
-                    acoustic.start_offset_samples = v.parse().unwrap_or(0);
-                }
-                i += 2;
-            }
-            "--clock-ppm" => {
-                if let Some(v) = args.get(i + 1) {
-                    acoustic.clock_ppm = v.parse().unwrap_or(0.0);
-                }
-                i += 2;
-            }
-            "--freq-offset" => {
-                if let Some(v) = args.get(i + 1) {
-                    acoustic.freq_offset_hz = v.parse().unwrap_or(0.0);
-                }
-                i += 2;
-            }
-            "--echo-delay" => {
-                if let Some(v) = args.get(i + 1) {
-                    acoustic.echo_delay_samples = v.parse().unwrap_or(0);
-                }
-                i += 2;
-            }
-            "--echo-gain" => {
-                if let Some(v) = args.get(i + 1) {
-                    acoustic.echo_gain = v.parse().unwrap_or(0.0);
-                }
-                i += 2;
-            }
-            "--jitter" => {
-                if let Some(v) = args.get(i + 1) {
-                    acoustic.jitter_samples = v.parse().unwrap_or(0.0);
-                }
-                i += 2;
-            }
-            "--flip_prob" => {
-                if let Some(v) = args.get(i + 1) {
-                    flip_prob = v.parse::<f64>().unwrap_or(0.0);
-                }
-                i += 2;
-            }
-            "--burst_prob" => {
-                if let Some(v) = args.get(i + 1) {
-                    burst_prob = v.parse::<f64>().unwrap_or(0.0);
-                }
-                i += 2;
-            }
-            "--burst_len" => {
-                if let Some(v) = args.get(i + 1) {
-                    burst_len = v.parse::<usize>().unwrap_or(16);
-                }
-                i += 2;
-            }
-            "--packet_size" => {
-                if let Some(v) = args.get(i + 1) {
-                    packet_size = v.parse::<usize>().unwrap_or(128);
-                }
-                i += 2;
-            }
-            "--repeats" => {
-                if let Some(v) = args.get(i + 1) {
-                    repeats_opt = v.parse::<usize>().ok();
-                }
-                i += 2;
-            }
-            "--rs-data" => {
-                if let Some(v) = args.get(i + 1) {
-                    rs_data = v.parse::<usize>().ok();
-                }
-                i += 2;
-            }
-            "--rs-parity" => {
-                if let Some(v) = args.get(i + 1) {
-                    rs_parity = v.parse::<usize>().ok();
-                }
-                i += 2;
-            }
-            _ => {
-                eprintln!("Unknown arg {}", args[i]);
-                i += 1;
-            }
-        }
-    }
+    acoustic.seed = cli.acoustic_seed;
+    acoustic.start_offset_samples = cli.start_offset as isize;
+    acoustic.clock_ppm = cli.clock_ppm as f32;
+    acoustic.freq_offset_hz = cli.freq_offset as f32;
+    acoustic.echo_delay_samples = cli.echo_delay;
+    acoustic.echo_gain = cli.echo_gain as f32;
+    acoustic.jitter_samples = cli.jitter as f32;
 
     // read input bytes
     let mut f = File::open(in_path)?;

@@ -35,6 +35,11 @@ default = ["opencv", "midir", "image"]
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# ── WS-4 Phase 1 (S9) — CLI + config, all pure-Rust (build --no-default-features) ──
+clap = { version = "4", features = ["derive"] }   # unified CLI parser (cli.rs)
+toml = "0.8"                                        # parse audiohax.toml config file
+directories = "5"                                  # platform config dir for the config file
 midir = { version = "0.8", optional = true }
 rand = "0.8"
 opencv = { version = "0.95.1", optional = true }

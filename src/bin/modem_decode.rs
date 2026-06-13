@@ -1,8 +1,11 @@
 // src/bin/modem_decode.rs
-use std::env;
+//
+// S9 (WS-4 Phase 1): hand-rolled positional parsing replaced by the shared clap
+// grammar in `audiohax::cli`. Same library logic runs unchanged below.
 use std::fs::File;
 use std::io::Write;
 
+use audiohax::cli::parse_modem_decode;
 use audiohax::modem::{self, ModemParams};
 use hound;
 
@@ -27,87 +30,65 @@ fn detect_and_write_file(bytes: &[u8], out_basename: &str) -> std::io::Result<()
 
 /// find a subslice pattern in `haystack`; returns first index if found, else None
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() { return None; }
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
     for i in 0..=haystack.len() - needle.len() {
-        if &haystack[i..i + needle.len()] == needle { return Some(i); }
+        if &haystack[i..i + needle.len()] == needle {
+            return Some(i);
+        }
     }
     None
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <in.wav> [out_basename] [--decrypt KEYHEX] [--channels N] [--mtones M] [--symbol-ms MS] [--repeats R] [--rs-data D --rs-parity P]", args[0]);
-        std::process::exit(1);
-    }
-    let in_wav = &args[1];
-    let out_basename = args.get(2).map(|s| s.as_str()).unwrap_or("payload");
-    let maybe_key = args.iter().position(|a| a == "--decrypt").and_then(|i| args.get(i+1)).map(|s| s.as_str());
+    // Shared clap grammar (S9 §3.7).
+    let cli = parse_modem_decode();
+    let in_wav = cli.in_wav.to_string_lossy().to_string();
+    let in_wav = in_wav.as_str();
+    let out_basename = cli
+        .out_basename
+        .clone()
+        .unwrap_or_else(|| "payload".to_string());
+    let out_basename = out_basename.as_str();
+    let maybe_key = cli.decrypt.as_deref();
 
-    // Parse optional params
+    // Parse optional params (same shapes as before; clap fills the Options).
     let mut params = ModemParams::default();
-    let mut expected_repeats: Option<usize> = None;
-    let mut rs_data_shards: Option<usize> = None;
-    let mut rs_parity_shards: Option<usize> = None;
-
-    let mut i = 2usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--channels" => {
-                if let Some(v) = args.get(i+1) {
-                    if let Ok(c) = v.parse::<usize>() {
-                        params.channels = c;
-                    }
-                }
-                i += 2;
-            }
-            "--mtones" => {
-                if let Some(v) = args.get(i+1) {
-                    if let Ok(m) = v.parse::<usize>() {
-                        params.m_tones = m;
-                    }
-                }
-                i += 2;
-            }
-            "--symbol-ms" => {
-                if let Some(v) = args.get(i+1) {
-                    if let Ok(ms) = v.parse::<f32>() {
-                        params.symbol_ms = ms;
-                    }
-                }
-                i += 2;
-            }
-            "--repeats" => {
-                if let Some(v) = args.get(i+1) {
-                    if let Ok(r) = v.parse::<usize>() { expected_repeats = Some(r); }
-                }
-                i += 2;
-            }
-            "--rs-data" => {
-                if let Some(v) = args.get(i+1) {
-                    if let Ok(n) = v.parse::<usize>() { rs_data_shards = Some(n); }
-                }
-                i += 2;
-            }
-            "--rs-parity" => {
-                if let Some(v) = args.get(i+1) {
-                    if let Ok(n) = v.parse::<usize>() { rs_parity_shards = Some(n); }
-                }
-                i += 2;
-            }
-            _ => { i += 1; }
-        }
+    if let Some(c) = cli.channels {
+        params.channels = c;
     }
+    if let Some(m) = cli.mtones {
+        params.m_tones = m;
+    }
+    if let Some(ms) = cli.symbol_ms {
+        params.symbol_ms = ms;
+    }
+    let expected_repeats: Option<usize> = cli.repeats;
+    let rs_data_shards: Option<usize> = cli.rs_data;
+    let rs_parity_shards: Option<usize> = cli.rs_parity;
 
-    println!("Using params: channels={}, m_tones={}, symbol_ms={}, sample_rate={}{}",
-             params.channels, params.m_tones, params.symbol_ms, params.sample_rate,
-             match expected_repeats { Some(r) => format!(", expected_repeats={}", r), None => String::new() });
+    println!(
+        "Using params: channels={}, m_tones={}, symbol_ms={}, sample_rate={}{}",
+        params.channels,
+        params.m_tones,
+        params.symbol_ms,
+        params.sample_rate,
+        match expected_repeats {
+            Some(r) => format!(", expected_repeats={}", r),
+            None => String::new(),
+        }
+    );
 
     let reader = hound::WavReader::open(in_wav)?;
-    let samples_i16: Vec<i16> = reader.into_samples::<i16>().filter_map(Result::ok).collect();
+    let samples_i16: Vec<i16> = reader
+        .into_samples::<i16>()
+        .filter_map(Result::ok)
+        .collect();
     println!("Read {} samples", samples_i16.len());
 
-    let samples_per_symbol = ((params.sample_rate as f32) * (params.symbol_ms / 1000.0)).round() as usize;
+    let samples_per_symbol =
+        ((params.sample_rate as f32) * (params.symbol_ms / 1000.0)).round() as usize;
     println!("Samples per symbol (computed) = {}", samples_per_symbol);
 
     // Build tone frequency map (and print it)
@@ -121,8 +102,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut detected_by_channel: Vec<Vec<u8>> = vec![Vec::new(); params.channels];
 
     for window_start in (0..samples_i16.len()).step_by(samples_per_symbol) {
-        if window_start + samples_per_symbol > samples_i16.len() { break; }
-        let slice = &samples_i16[window_start .. window_start + samples_per_symbol];
+        if window_start + samples_per_symbol > samples_i16.len() {
+            break;
+        }
+        let slice = &samples_i16[window_start..window_start + samples_per_symbol];
         for ch in 0..params.channels {
             let freqs = &tone_freqs[ch];
             let mut max_idx = 0usize;
@@ -140,7 +123,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // debug print (first few)
     for (ch, vec) in detected_by_channel.iter().enumerate() {
-        println!("Channel {} detected (first 20): {:?}", ch, &vec[..std::cmp::min(20, vec.len())]);
+        println!(
+            "Channel {} detected (first 20): {:?}",
+            ch,
+            &vec[..std::cmp::min(20, vec.len())]
+        );
     }
 
     // --- PREAMBLE DETECTION & ALIGNMENT ---
@@ -152,14 +139,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pattern.extend_from_slice(&params.preamble_symbols);
         }
         let pat_len = pattern.len();
-        println!("Looking for per-channel preamble pattern ({} symbols)", pat_len);
+        println!(
+            "Looking for per-channel preamble pattern ({} symbols)",
+            pat_len
+        );
         for ch in 0..params.channels {
             let chvec = &mut detected_by_channel[ch];
             if let Some(idx) = find_subslice(chvec, &pattern) {
                 println!("Channel {}: found preamble at index {} (trimming)", ch, idx);
                 // trim to start after preamble
                 if idx + pat_len <= chvec.len() {
-                    *chvec = chvec[idx + pat_len ..].to_vec();
+                    *chvec = chvec[idx + pat_len..].to_vec();
                 } else {
                     *chvec = Vec::new();
                 }
@@ -173,7 +163,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // round-robin reinterleave (after alignment/trimming)
     let mut symbols: Vec<u8> = Vec::new();
-    let max_len = detected_by_channel.iter().map(|v| v.len()).max().unwrap_or(0);
+    let max_len = detected_by_channel
+        .iter()
+        .map(|v| v.len())
+        .max()
+        .unwrap_or(0);
     for i in 0..max_len {
         for ch in 0..params.channels {
             if i < detected_by_channel[ch].len() {
@@ -189,7 +183,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Recovered {} bytes from symbols", bytes.len());
     let head_len = std::cmp::min(64, bytes.len());
     print!("Head of recovered bytes (first {}):", head_len);
-    for b in &bytes[..head_len] { print!(" {:02X}", b); }
+    for b in &bytes[..head_len] {
+        print!(" {:02X}", b);
+    }
     println!();
 
     // If RS options were provided, attempt RS depacketize, otherwise use repeat-based depacketize, then fallback to raw frame parse.
@@ -201,14 +197,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(v)
             }
             Err(e) => {
-                eprintln!("Depacketize RS failed: {}. Falling back to repeat-depacketize.", e);
+                eprintln!(
+                    "Depacketize RS failed: {}. Falling back to repeat-depacketize.",
+                    e
+                );
                 None
             }
         }
     } else {
         // try repetition-based
         if let Some(r) = expected_repeats {
-            println!("Attempting repetition depacketize (expected repeats = {})", r);
+            println!(
+                "Attempting repetition depacketize (expected repeats = {})",
+                r
+            );
             match modem::depacketize_stream(&bytes, r) {
                 Ok(v) => {
                     println!("Depacketize succeeded: {} bytes", v.len());
@@ -225,7 +227,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Decide what to parse as frame bytes: prefer depacketized result if available, else raw bytes
-    let frame_bytes = if let Some(v) = packetized_result { v } else { bytes };
+    let frame_bytes = if let Some(v) = packetized_result {
+        v
+    } else {
+        bytes
+    };
 
     // Try parse frame header / extract
     match modem::parse_frame_header(&frame_bytes) {
