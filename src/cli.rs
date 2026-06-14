@@ -101,14 +101,42 @@ impl Default for PipelineArgs {
     }
 }
 
+/// Runtime output sink for `audiohax play` (WS-4 S12). Replaces the S11
+/// compile-time `#[cfg(feature="midi-out")]` sink choice: both sinks are now
+/// compiled into the default binary and selected here at parse time, so a single
+/// shipped binary can play in-process OR route to an external MIDI port/DAW with no
+/// rebuild. clap renders the variants kebab-cased as `synth` / `midi`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum OutputSink {
+    /// In-process pure-Rust SoundFont synth (rustysynth + cpal). Dry; the default.
+    #[default]
+    Synth,
+    /// Route NoteEvents to an external MIDI port / DAW / FluidSynth / Qsynth.
+    Midi,
+}
+
 /// Args for `audiohax play`.
 #[derive(Debug, Args, PartialEq)]
 pub struct PlayArgs {
     /// Image path (resolves the old magic positional). Omit to use the example image.
     pub image: Option<PathBuf>,
-    /// MIDI port name hint (else `$AUDIOHAX_MIDI_PORT` or `"AudioHaxOut"`).
+    /// Output sink: `synth` (in-process, default) or `midi` (external port/DAW).
+    #[arg(long, value_enum, default_value_t = OutputSink::Synth)]
+    pub output: OutputSink,
+    /// MIDI port selector (only with `--output midi`): a NAME SUBSTRING or a numeric
+    /// INDEX (as shown by `--list-midi-ports`). Else `$AUDIOHAX_MIDI_PORT` or the first
+    /// available port.
     #[arg(long)]
     pub midi_port: Option<String>,
+    /// List the available MIDI output ports (index + name) and exit. Implies no playback.
+    #[arg(long)]
+    pub list_midi_ports: bool,
+    /// Create a virtual MIDI output port that a DAW / Qsynth can subscribe to, instead
+    /// of connecting to an existing port. The optional value sets the port name
+    /// (default `AudioHaxOut`). Unix only (Linux ALSA / macOS CoreMIDI); on Windows this
+    /// errors at construction with guidance to use loopMIDI. Forces `--output midi`.
+    #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "AudioHaxOut")]
+    pub midi_virtual: Option<String>,
     #[command(flatten)]
     pub pipeline: PipelineArgs,
 }
@@ -646,6 +674,116 @@ mod tests {
     fn cli_rejects_non_numeric_instruments() {
         let r = Cli::try_parse_from(["audiohax", "play", "--instruments", "notanumber"]);
         assert!(r.is_err(), "non-numeric instrument count must be rejected");
+    }
+
+    // ── WS-4 S12: `play` output-selection flags ─────────────────────────────────
+
+    #[test]
+    fn play_output_defaults_to_synth() {
+        // No-flag behavior is preserved: the default sink is the in-process synth,
+        // and the three new MIDI knobs are all absent/false.
+        let cli = Cli::try_parse_from(["audiohax", "play", "pic.png"]).expect("parse play");
+        match cli.command {
+            Command::Play(p) => {
+                assert_eq!(p.output, OutputSink::Synth, "default output is synth");
+                assert_eq!(p.midi_port, None);
+                assert!(!p.list_midi_ports);
+                assert_eq!(p.midi_virtual, None, "no virtual port by default");
+            }
+            other => panic!("expected Play, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn play_output_midi_parses() {
+        let cli = Cli::try_parse_from(["audiohax", "play", "--output", "midi"])
+            .expect("parse --output midi");
+        match cli.command {
+            Command::Play(p) => assert_eq!(p.output, OutputSink::Midi),
+            other => panic!("expected Play, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn play_output_synth_parses_explicitly() {
+        let cli = Cli::try_parse_from(["audiohax", "play", "--output", "synth"])
+            .expect("parse --output synth");
+        match cli.command {
+            Command::Play(p) => assert_eq!(p.output, OutputSink::Synth),
+            other => panic!("expected Play, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn play_rejects_unknown_output_variant() {
+        // The ValueEnum rejects anything that is not `synth`/`midi`.
+        let r = Cli::try_parse_from(["audiohax", "play", "--output", "loud"]);
+        assert!(r.is_err(), "unknown --output variant must be rejected");
+    }
+
+    #[test]
+    fn play_list_midi_ports_flag_parses() {
+        let cli = Cli::try_parse_from(["audiohax", "play", "--list-midi-ports"])
+            .expect("parse list flag");
+        match cli.command {
+            Command::Play(p) => assert!(p.list_midi_ports),
+            other => panic!("expected Play, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn play_midi_port_accepts_substring() {
+        let cli = Cli::try_parse_from([
+            "audiohax",
+            "play",
+            "--output",
+            "midi",
+            "--midi-port",
+            "FLUID",
+        ])
+        .expect("parse --midi-port substring");
+        match cli.command {
+            Command::Play(p) => assert_eq!(p.midi_port.as_deref(), Some("FLUID")),
+            other => panic!("expected Play, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn play_midi_port_accepts_numeric_index() {
+        // clap carries the selector as an opaque String; the index-vs-substring
+        // discrimination happens in MidiOut::open_selector, not in the grammar.
+        let cli = Cli::try_parse_from(["audiohax", "play", "--output", "midi", "--midi-port", "2"])
+            .expect("parse --midi-port index");
+        match cli.command {
+            Command::Play(p) => assert_eq!(p.midi_port.as_deref(), Some("2")),
+            other => panic!("expected Play, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn play_midi_virtual_bare_uses_default_name() {
+        // Bare `--midi-virtual` → Some("AudioHaxOut") via default_missing_value.
+        let cli = Cli::try_parse_from(["audiohax", "play", "--midi-virtual"])
+            .expect("parse bare --midi-virtual");
+        match cli.command {
+            Command::Play(p) => assert_eq!(p.midi_virtual.as_deref(), Some("AudioHaxOut")),
+            other => panic!("expected Play, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn play_midi_virtual_valued_uses_given_name() {
+        let cli = Cli::try_parse_from(["audiohax", "play", "--midi-virtual", "MyPort"])
+            .expect("parse valued --midi-virtual");
+        match cli.command {
+            Command::Play(p) => assert_eq!(p.midi_virtual.as_deref(), Some("MyPort")),
+            other => panic!("expected Play, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn output_sink_default_is_synth() {
+        assert_eq!(OutputSink::default(), OutputSink::Synth);
     }
 
     #[test]

@@ -35,18 +35,19 @@
 mod image_analysis;
 #[cfg(feature = "opencv")]
 mod image_source;
-// External MIDI-out adapter module — pulled in only under the `midi-out` feature.
-#[cfg(feature = "midi-out")]
+// External MIDI-out adapter module. WS-4 S12: `midi-out` is now in the DEFAULT
+// feature set, so this module + the `MidiOut` sink are always compiled and the sink
+// is chosen at RUNTIME (see the `--output`/`--midi-virtual` branch below), not by cfg.
 mod midi_output;
 
-use audiohax::cli::{pipeline_to_engine_config, Cli, Command, PlayArgs};
+use audiohax::cli::{pipeline_to_engine_config, Cli, Command, OutputSink, PlayArgs};
 use audiohax::engine::{AudioSink, FeatureSource, PipelineEngine};
 use audiohax::mapping_loader::load_mappings;
 use clap::Parser;
 
 // ── OpenCV path imports (gated) ──────────────────────────────────────────────
 #[cfg(feature = "opencv")]
-use audiohax::engine::{AudioSinkError, GlobalFeatures as EngGlobal, ScanBarFeatures as EngScanBar};
+use audiohax::engine::{GlobalFeatures as EngGlobal, ScanBarFeatures as EngScanBar};
 #[cfg(feature = "opencv")]
 use image_analysis::{analyze_global, draw_scan_bar_overlay_for_rect, scan_image};
 #[cfg(feature = "opencv")]
@@ -56,12 +57,12 @@ use opencv::core;
 #[cfg(feature = "opencv")]
 use opencv::prelude::MatTraitConst; // needed for .cols()/.rows()
 
-// ── External MIDI-out sink import (gated) ────────────────────────────────────
-#[cfg(feature = "midi-out")]
-use midi_output::MidiOut;
-// `AudioSinkError` is also needed for the MidiOut impl when opencv is OFF.
-#[cfg(all(feature = "midi-out", not(feature = "opencv")))]
+// ── External MIDI-out sink import ────────────────────────────────────────────
+// WS-4 S12: `MidiOut` (and its `AudioSinkError` use) are always compiled now — the
+// sink is selected at runtime. `AudioSinkError` is imported once here regardless of
+// the `opencv` flag (the `impl AudioSink for MidiOut` below always needs it).
 use audiohax::engine::AudioSinkError;
+use midi_output::MidiOut;
 
 use rand::Rng;
 use std::time::{Duration, Instant};
@@ -80,8 +81,8 @@ struct ScheduledEvent {
 /// bin-private `MidiOut`, and even a re-export would be an orphan violation. Each
 /// method maps `MidiOut`'s `Box<dyn Error>` (NOT `Send + Sync`) into an
 /// `AudioSinkError` by stringifying it — keeping `midi_output.rs` untouched.
-/// WS-4 Phase 2 (S11): gated on `midi-out` — the in-process `SynthSink` is the default.
-#[cfg(feature = "midi-out")]
+/// WS-4 S12: unconditional — `midi-out` is in `default`, so `MidiOut` is always
+/// compiled and selected at runtime; the in-process `SynthSink` remains the default.
 impl AudioSink for MidiOut {
     fn note_on(&mut self, channel: u8, note: u8, velocity: u8) -> Result<(), AudioSinkError> {
         MidiOut::note_on(self, channel, note, velocity)
@@ -256,6 +257,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // ── `--list-midi-ports` query short-circuit (WS-4 S12) ──────────────────────
+    // This is a query, not playback: enumerate the available MIDI output ports and
+    // exit BEFORE any mapping/image work. The printed index is the selector accepted
+    // by `--midi-port <index>`.
+    if play_args.list_midi_ports {
+        match MidiOut::list_ports() {
+            Ok(ports) if !ports.is_empty() => {
+                println!("Available MIDI output ports:");
+                for (i, name) in ports {
+                    println!("  [{i}] {name}");
+                }
+            }
+            Ok(_) => println!(
+                "No MIDI output ports found. Use `--midi-virtual` (Linux/macOS) to create \
+                 one, or start a synth (loopMIDI/IAC/Qsynth) and re-run."
+            ),
+            Err(e) => eprintln!("Could not enumerate MIDI ports: {e}"),
+        }
+        return Ok(());
+    }
+
     // ── Mappings + engine config ────────────────────────────────────────────────
     let mappings = load_mappings("assets/mappings.json")?;
     println!("Mappings loaded.");
@@ -367,25 +389,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // ── Sink selection by feature ───────────────────────────────────────────────
-    // DEFAULT (synth, no midi-out): the in-process pure-Rust `SynthSink`. The
-    // `midi-out` flag selects the external-MIDI sink (`MidiOut` → midir → DAW/FluidSynth).
-    #[cfg(feature = "midi-out")]
-    let mut sink: Box<dyn AudioSink> = {
-        let preferred = std::env::var("AUDIOHAX_MIDI_PORT").ok();
-        let preferred_ref = play_args
-            .midi_port
-            .as_deref()
-            .or(preferred.as_deref())
-            .or(Some("AudioHaxOut"));
-        println!("Opening external MIDI port (preferred = {:?})...", preferred_ref);
-        let midi = MidiOut::open_first(preferred_ref)?;
-        println!("MIDI opened.");
-        Box::new(midi)
-    };
+    // ── Sink selection at RUNTIME (WS-4 S12) ────────────────────────────────────
+    // Both sinks are compiled in; the concrete one is chosen here, not by cfg.
+    // `--midi-virtual` forces the MIDI sink; otherwise `--output` decides (default
+    // `synth`). The engine driver below speaks only `Box<dyn AudioSink>` — the seam.
+    let want_midi =
+        matches!(play_args.output, OutputSink::Midi) || play_args.midi_virtual.is_some();
 
-    #[cfg(not(feature = "midi-out"))]
-    let mut sink: Box<dyn AudioSink> = {
+    let mut sink: Box<dyn AudioSink> = if want_midi {
+        let midi = if let Some(vname) = play_args.midi_virtual.as_deref() {
+            println!(
+                "Creating virtual MIDI output port '{vname}' (subscribe to it from your DAW/Qsynth)..."
+            );
+            MidiOut::open_virtual(vname)?
+        } else {
+            let env_port = std::env::var("AUDIOHAX_MIDI_PORT").ok();
+            let selector = play_args.midi_port.as_deref().or(env_port.as_deref());
+            println!("Connecting to external MIDI port (selector = {selector:?})...");
+            MidiOut::open_selector(selector)?
+        };
+        println!("MIDI output ready.");
+        Box::new(midi)
+    } else {
         println!("Starting in-process synth (rustysynth + cpal, bundled SoundFont)...");
         let synth = audiohax::synth_sink::SynthSink::with_bundled_soundfont()?;
         println!("Synth audio stream started @ {} Hz.", synth.sample_rate());

@@ -2,6 +2,9 @@
 name = "audiohax"       # changed to snake case
 version = "0.1.0"
 edition = "2021"
+# `cargo run` (no `--bin`) is ambiguous across the 8 bins; pin it to the
+# image-to-music app so `cargo run -- play <img>` works without `--bin audiohax`.
+default-run = "audiohax"
 
 # ── Explicit bin tables for the IMAGE-dependent targets ──────────────────────
 # These three targets import the `image`/`opencv` crates UNCONDITIONALLY, so they
@@ -34,7 +37,11 @@ required-features = ["image"]
 # with NO system OpenCV, NO libclang, NO external FluidSynth, NO virtual MIDI port.
 # (On Linux, cpal's ALSA backend still needs `libasound2-dev` to build — the one
 # surviving, ubiquitous Linux build prereq; design §6.4. Windows/macOS: dep-free.)
-default = ["pure-analysis", "synth"]
+# WS-4 S12: `midi-out` PROMOTED into default so the shipped binary offers
+# `--output midi` with no rebuild (runtime sink selection needs BOTH sinks
+# compiled in). midir's Linux ALSA backend reuses cpal's `libasound2-dev`
+# prereq — no NEW system dep; Windows/macOS need nothing extra. (design-s12 §2.1a)
+default = ["pure-analysis", "synth", "midi-out"]
 
 # ── WS-4 Phase 2 (S11) Lane A — pure-Rust image-feature analyzer (src/pure_analysis.rs).
 # Pulls `image` + `imageproc` (both pure Rust; build headless with OpenCV off via
