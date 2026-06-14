@@ -16,3 +16,15 @@ pub mod engine;
 // WS-4 Phase 3 (S10) — pure-Rust ratatui TUI front-end, a pure OBSERVER over the S9
 // engine seam. Builds & unit-tests under `cargo test --lib --no-default-features`.
 pub mod tui;
+
+// WS-4 Phase 2 (S11) Lane A — pure-Rust image+imageproc feature analyzer that
+// implements engine::FeatureSource. Feature-gated so the bare
+// `--no-default-features` lib (music + modem) stays dependency-free.
+#[cfg(feature = "pure-analysis")]
+pub mod pure_analysis; // Lane A — image+imageproc; implements engine::FeatureSource
+
+// WS-4 Phase 2 (S11) Lane B — pure-Rust in-process synth sink (rustysynth+cpal) that
+// implements engine::AudioSink. Feature-gated so the bare `--no-default-features`
+// lib (music + modem) stays dependency-free.
+#[cfg(feature = "synth")]
+pub mod synth_sink; // Lane B — rustysynth+cpal; implements engine::AudioSink

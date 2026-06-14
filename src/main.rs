@@ -23,26 +23,46 @@
 // mode/progression/plan derivation. The jitter + `ScheduledEvent` time-ordering +
 // `thread::sleep` execution STAY here (wall-clock playback is an adapter concern).
 //
-// NOTE: this binary requires the `opencv`/`image` features and CANNOT compile on a
-// headless box — it is validated by inspection + type-correctness reasoning, exactly
-// as before (the engine/CLI it depends on ARE headless-tested).
+// WS-4 Phase 2 (S11) Lane C: the DEFAULT build is now PURE RUST (`pure-analysis` +
+// `synth`) and DOES compile on a headless/clean box. The OpenCV acquisition/analysis
+// + highgui window + overlay PNGs are `#[cfg(feature="opencv")]`-gated; the external
+// MIDI-out sink is `#[cfg(feature="midi-out")]`-gated. With no flags, main.rs loads
+// the image via `pure_analysis::load_pure_image`, drives the engine with
+// `PureAnalysisSource`, and plays via the in-process `SynthSink`. (design §3.C/§5.2)
 
+// OpenCV-only adapter modules — pulled in only under the `opencv` feature.
+#[cfg(feature = "opencv")]
 mod image_analysis;
+#[cfg(feature = "opencv")]
 mod image_source;
+// External MIDI-out adapter module — pulled in only under the `midi-out` feature.
+#[cfg(feature = "midi-out")]
 mod midi_output;
 
 use audiohax::cli::{pipeline_to_engine_config, Cli, Command, PlayArgs};
-use audiohax::engine::{
-    AudioSink, AudioSinkError, FeatureSource, GlobalFeatures as EngGlobal, PipelineEngine,
-    ScanBarFeatures as EngScanBar,
-};
+use audiohax::engine::{AudioSink, FeatureSource, PipelineEngine};
 use audiohax::mapping_loader::load_mappings;
 use clap::Parser;
+
+// ── OpenCV path imports (gated) ──────────────────────────────────────────────
+#[cfg(feature = "opencv")]
+use audiohax::engine::{AudioSinkError, GlobalFeatures as EngGlobal, ScanBarFeatures as EngScanBar};
+#[cfg(feature = "opencv")]
 use image_analysis::{analyze_global, draw_scan_bar_overlay_for_rect, scan_image};
+#[cfg(feature = "opencv")]
 use image_source::{load_image_from_source, ImageSource};
-use midi_output::MidiOut;
+#[cfg(feature = "opencv")]
 use opencv::core;
+#[cfg(feature = "opencv")]
 use opencv::prelude::MatTraitConst; // needed for .cols()/.rows()
+
+// ── External MIDI-out sink import (gated) ────────────────────────────────────
+#[cfg(feature = "midi-out")]
+use midi_output::MidiOut;
+// `AudioSinkError` is also needed for the MidiOut impl when opencv is OFF.
+#[cfg(all(feature = "midi-out", not(feature = "opencv")))]
+use audiohax::engine::AudioSinkError;
+
 use rand::Rng;
 use std::time::{Duration, Instant};
 
@@ -60,6 +80,8 @@ struct ScheduledEvent {
 /// bin-private `MidiOut`, and even a re-export would be an orphan violation. Each
 /// method maps `MidiOut`'s `Box<dyn Error>` (NOT `Send + Sync`) into an
 /// `AudioSinkError` by stringifying it — keeping `midi_output.rs` untouched.
+/// WS-4 Phase 2 (S11): gated on `midi-out` — the in-process `SynthSink` is the default.
+#[cfg(feature = "midi-out")]
 impl AudioSink for MidiOut {
     fn note_on(&mut self, channel: u8, note: u8, velocity: u8) -> Result<(), AudioSinkError> {
         MidiOut::note_on(self, channel, note, velocity)
@@ -77,12 +99,15 @@ impl AudioSink for MidiOut {
 /// The adapter's `FeatureSource`: wraps the OpenCV-extracted whole-image features plus
 /// the precomputed per-step `Vec<Vec<image_analysis::ScanBarFeatures>>`, converting
 /// `image_analysis::*` → `engine::*` by field copy at the boundary (S9 §3.2 / D1). No
-/// `Mat` is held; the engine never sees pixels.
+/// `Mat` is held; the engine never sees pixels. WS-4 Phase 2 (S11): OpenCV-path only —
+/// the default path uses `pure_analysis::PureAnalysisSource` instead.
+#[cfg(feature = "opencv")]
 struct PrecomputedSource {
     global: EngGlobal,
     steps: Vec<Vec<EngScanBar>>,
 }
 
+#[cfg(feature = "opencv")]
 impl PrecomputedSource {
     /// Build from the OpenCV feature structs, performing the boundary field copy ONCE.
     fn new(
@@ -99,6 +124,7 @@ impl PrecomputedSource {
     }
 }
 
+#[cfg(feature = "opencv")]
 impl FeatureSource for PrecomputedSource {
     fn global_features(&self) -> EngGlobal {
         self.global
@@ -116,6 +142,7 @@ impl FeatureSource for PrecomputedSource {
 }
 
 /// Boundary copy `image_analysis::GlobalFeatures` → `engine::GlobalFeatures` (S9 §3.2).
+#[cfg(feature = "opencv")]
 fn to_eng_global(g: &image_analysis::GlobalFeatures) -> EngGlobal {
     EngGlobal {
         avg_hue: g.avg_hue,
@@ -130,6 +157,7 @@ fn to_eng_global(g: &image_analysis::GlobalFeatures) -> EngGlobal {
 }
 
 /// Boundary copy `image_analysis::ScanBarFeatures` → `engine::ScanBarFeatures`.
+#[cfg(feature = "opencv")]
 fn to_eng_scanbar(s: &image_analysis::ScanBarFeatures) -> EngScanBar {
     EngScanBar {
         bar_index: s.bar_index,
@@ -144,6 +172,9 @@ fn to_eng_scanbar(s: &image_analysis::ScanBarFeatures) -> EngScanBar {
 
 /// Resolve the image path argument into an `ImageSource` (the example image when no
 /// path is given) — replaces the old overloaded-`"play"` positional logic.
+/// WS-4 Phase 2 (S11): OpenCV-path only (returns the OpenCV `ImageSource`); the pure
+/// path resolves to `pure_analysis::PureImageSource` inline below.
+#[cfg(feature = "opencv")]
 fn resolve_source(image: &Option<std::path::PathBuf>) -> ImageSource {
     match image {
         Some(p) => ImageSource::UserPath(p.to_string_lossy().to_string()),
@@ -152,6 +183,8 @@ fn resolve_source(image: &Option<std::path::PathBuf>) -> ImageSource {
 }
 
 /// Compute the scan-bar rect for step `si` of `total` (overlay geometry — adapter-only).
+/// WS-4 Phase 2 (S11): OpenCV-path only (uses `opencv::core::Rect` for highgui overlays).
+#[cfg(feature = "opencv")]
 fn step_rect(
     si: usize,
     total: usize,
@@ -217,6 +250,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Use the dedicated modem bins (modem_encode/modem_decode/channel_sim/make_packetized), or `audiohax modem …` once wired.");
             return Ok(());
         }
+        Command::Tui(_) => {
+            println!("Use the dedicated `audiohax-tui` bin for the terminal UI.");
+            return Ok(());
+        }
     };
 
     // ── Mappings + engine config ────────────────────────────────────────────────
@@ -235,56 +272,94 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bar_thickness_frac, num_steps, ms_per_step, jitter_percent
     );
 
-    // ── OpenCV image acquisition + feature extraction (adapter zone) ────────────
-    let src = resolve_source(&play_args.image);
-    let img = load_image_from_source(&src)?;
-    println!("Image loaded from source.");
+    // ── Image acquisition + feature extraction (analyzer selection by feature) ──
+    //
+    // WS-4 Phase 2 (S11) Lane C: the DEFAULT (pure-analysis, no opencv) path acquires
+    // the image and extracts features with the pure-Rust analyzer; the `opencv` flag
+    // selects the legacy OpenCV path (the A/B reference, plus camera + highgui window
+    // + overlay PNGs). Both produce something that implements `engine::FeatureSource`,
+    // so the engine driver below is identical behind the trait (design §3.C).
 
-    let global_features = analyze_global(&img)?;
-    println!("Global features: {:?}", global_features);
+    // OpenCV path: acquire via OpenCV, scan, write overlays, build the PrecomputedSource.
+    #[cfg(feature = "opencv")]
+    let (source, _ocv_img, _ocv_dims) = {
+        let src = resolve_source(&play_args.image);
+        let img = load_image_from_source(&src)?;
+        println!("Image loaded from source (OpenCV).");
 
-    // Full scan → per-step per-instrument features (OpenCV).
-    let steps = scan_image(&img, instrument_count, bar_thickness_frac, num_steps, None)?;
-    println!("Completed scanning image. Steps: {}", steps.len());
+        let global_features = analyze_global(&img)?;
+        println!("Global features: {:?}", global_features);
 
-    // Save overlays for inspection: first / mid / last (OpenCV imwrite).
-    let width = img.cols();
-    let height = img.rows();
-    let indices = vec![0usize, steps.len() / 2, steps.len().saturating_sub(1)];
-    for &si in &indices {
-        let (rect, vertical_default, _bw, _bh) =
-            step_rect(si, steps.len(), width, height, bar_thickness_frac);
-        if let Ok(overlay) =
-            draw_scan_bar_overlay_for_rect(&img, rect, instrument_count, vertical_default)
-        {
-            let out = format!("assets/overlay_step_{}.png", si);
-            if let Err(e) = opencv::imgcodecs::imwrite(&out, &overlay, &opencv::core::Vector::new())
+        let steps = scan_image(&img, instrument_count, bar_thickness_frac, num_steps, None)?;
+        println!("Completed scanning image. Steps: {}", steps.len());
+
+        // Save overlays for inspection: first / mid / last (OpenCV imwrite).
+        let width = img.cols();
+        let height = img.rows();
+        let indices = vec![0usize, steps.len() / 2, steps.len().saturating_sub(1)];
+        for &si in &indices {
+            let (rect, vertical_default, _bw, _bh) =
+                step_rect(si, steps.len(), width, height, bar_thickness_frac);
+            if let Ok(overlay) =
+                draw_scan_bar_overlay_for_rect(&img, rect, instrument_count, vertical_default)
             {
-                println!("Warning: failed to write overlay {}: {}", out, e);
-            } else {
-                println!("Wrote overlay for step {} to {}", si, out);
+                let out = format!("assets/overlay_step_{}.png", si);
+                if let Err(e) =
+                    opencv::imgcodecs::imwrite(&out, &overlay, &opencv::core::Vector::new())
+                {
+                    println!("Warning: failed to write overlay {}: {}", out, e);
+                } else {
+                    println!("Wrote overlay for step {} to {}", si, out);
+                }
             }
         }
-    }
+        (
+            PrecomputedSource::new(&global_features, &steps),
+            img,
+            (width, height),
+        )
+    };
+
+    // DEFAULT (pure) path: acquire + analyze with the pure-Rust `pure_analysis` module.
+    #[cfg(not(feature = "opencv"))]
+    let source = {
+        use audiohax::pure_analysis::{load_pure_image, PureAnalysisSource, PureImageSource};
+        let psrc = match &play_args.image {
+            Some(p) => PureImageSource::UserPath(p.clone()),
+            None => PureImageSource::UserPath(std::path::PathBuf::from("assets/images/example.jpg")),
+        };
+        let img = load_pure_image(&psrc)?;
+        println!(
+            "Image loaded from source (pure-Rust): {}x{}",
+            img.width(),
+            img.height()
+        );
+        let src = PureAnalysisSource::extract(
+            &img,
+            instrument_count,
+            bar_thickness_frac,
+            num_steps,
+            None,
+        )?;
+        println!(
+            "Completed scanning image (pure-Rust). Steps: {}",
+            src.step_count()
+        );
+        println!("Global features: {:?}", src.global_features());
+        src
+    };
 
     // ── Build the engine + feed global features (the engine derives mode/plan) ──
-    let source = PrecomputedSource::new(&global_features, &steps);
     let mut engine = PipelineEngine::new(mappings, engine_config);
     engine.set_features_global(&source.global_features());
     println!("Engine mode: {}", engine.current_state().mode);
 
     // ── Playback ────────────────────────────────────────────────────────────────
-    // `play` always plays (the old overloaded "play" token is gone). The driver loop
-    // pulls per-step decisions from the engine and the ADAPTER applies jitter +
-    // Instant scheduling + highgui overlay (D8 — timing/RNG are the adapter's).
-    let preferred = std::env::var("AUDIOHAX_MIDI_PORT").ok();
-    let preferred_ref = play_args
-        .midi_port
-        .as_deref()
-        .or(preferred.as_deref())
-        .or(Some("AudioHaxOut"));
-    println!("Attempting playback (preferred MIDI = {:?})", preferred_ref);
+    // `play` always plays. The driver loop pulls per-step decisions from the engine
+    // and the ADAPTER applies jitter + Instant scheduling (D8 — timing/RNG are the
+    // adapter's). The OpenCV path additionally draws the highgui scan-bar overlay.
 
+    #[cfg(feature = "opencv")]
     let _ = opencv::highgui::named_window("ScanBar Live", opencv::highgui::WINDOW_AUTOSIZE);
 
     if source.step_count() == 0 {
@@ -292,30 +367,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    println!("Opening MIDI port...");
-    let mut midi = MidiOut::open_first(preferred_ref)?;
-    println!("MIDI opened.");
+    // ── Sink selection by feature ───────────────────────────────────────────────
+    // DEFAULT (synth, no midi-out): the in-process pure-Rust `SynthSink`. The
+    // `midi-out` flag selects the external-MIDI sink (`MidiOut` → midir → DAW/FluidSynth).
+    #[cfg(feature = "midi-out")]
+    let mut sink: Box<dyn AudioSink> = {
+        let preferred = std::env::var("AUDIOHAX_MIDI_PORT").ok();
+        let preferred_ref = play_args
+            .midi_port
+            .as_deref()
+            .or(preferred.as_deref())
+            .or(Some("AudioHaxOut"));
+        println!("Opening external MIDI port (preferred = {:?})...", preferred_ref);
+        let midi = MidiOut::open_first(preferred_ref)?;
+        println!("MIDI opened.");
+        Box::new(midi)
+    };
+
+    #[cfg(not(feature = "midi-out"))]
+    let mut sink: Box<dyn AudioSink> = {
+        println!("Starting in-process synth (rustysynth + cpal, bundled SoundFont)...");
+        let synth = audiohax::synth_sink::SynthSink::with_bundled_soundfont()?;
+        println!("Synth audio stream started @ {} Hz.", synth.sample_rate());
+        Box::new(synth)
+    };
 
     // Initial per-channel programs (same scheme as before: prog = (i*7)%128).
     for i in 0..instrument_count {
         let ch = (i % 16) as u8;
         let prog = ((i * 7) % 128) as u8;
         // via the AudioSink trait so the adapter speaks one vocabulary to the engine's sink.
-        let _ = AudioSink::program_change(&mut midi, ch, prog);
+        let _ = sink.program_change(ch, prog);
     }
 
     let total_steps = source.step_count();
     let mut rng = rand::thread_rng();
 
     for step_idx in 0..total_steps {
-        // 1) Overlay for this step (OpenCV highgui — adapter).
-        let (rect, vertical_default, _bw, _bh) =
-            step_rect(step_idx, total_steps, width, height, bar_thickness_frac);
-        if let Ok(overlay) =
-            draw_scan_bar_overlay_for_rect(&img, rect, instrument_count, vertical_default)
+        // 1) Overlay for this step (OpenCV highgui — adapter; opencv path only).
+        #[cfg(feature = "opencv")]
         {
-            let _ = opencv::highgui::imshow("ScanBar Live", &overlay);
-            let _ = opencv::highgui::wait_key(1);
+            let (width, height) = _ocv_dims;
+            let (rect, vertical_default, _bw, _bh) =
+                step_rect(step_idx, total_steps, width, height, bar_thickness_frac);
+            if let Ok(overlay) =
+                draw_scan_bar_overlay_for_rect(&_ocv_img, rect, instrument_count, vertical_default)
+            {
+                let _ = opencv::highgui::imshow("ScanBar Live", &overlay);
+                let _ = opencv::highgui::wait_key(1);
+            }
         }
 
         // 2) Pure musical decisions from the engine (no jitter, no wall clock).
@@ -361,11 +461,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::thread::sleep(sev.at - now);
             }
             if sev.on {
-                if let Err(e) = AudioSink::note_on(&mut midi, sev.channel, sev.note, sev.vel) {
-                    eprintln!("MIDI note_on error: {}", e);
+                if let Err(e) = sink.note_on(sev.channel, sev.note, sev.vel) {
+                    eprintln!("note_on error: {}", e);
                 }
-            } else if let Err(e) = AudioSink::note_off(&mut midi, sev.channel, sev.note) {
-                eprintln!("MIDI note_off error: {}", e);
+            } else if let Err(e) = sink.note_off(sev.channel, sev.note) {
+                eprintln!("note_off error: {}", e);
             }
         }
     }

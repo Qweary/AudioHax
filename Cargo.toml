@@ -12,9 +12,11 @@ edition = "2021"
 # modem-only bins (channel_sim, make_packetized, modem_encode, modem_decode) are
 # left to autodiscovery so they still build with --no-default-features.
 [[bin]]
-name = "audiohax"          # src/main.rs — the image-to-music app (opencv + image)
+name = "audiohax"          # src/main.rs — the image-to-music app
 path = "src/main.rs"
-required-features = ["opencv", "image"]
+# WS-4 Phase 2 (S11) Lane C: required-features DROPPED. The DEFAULT feature set
+# (`pure-analysis` + `synth`) builds this bin pure-Rust; every `opencv::` /
+# `midi-out` reference in main.rs is `#[cfg(feature=…)]`-gated (design §3.C/§5.2).
 
 [[bin]]
 name = "make_tiled_payload"
@@ -27,10 +29,31 @@ path = "src/bin/unpack_tiled_payload.rs"
 required-features = ["image"]
 
 [features]
-# Default build pulls in the system-library-backed deps (opencv/midir/image) so a
-# normal `cargo build`/`cargo build --release` behaves exactly as before. Building
-# `--no-default-features` yields a pure-Rust library (music + modem) with no system libs.
-default = ["opencv", "midir", "image"]
+# ── WS-4 Phase 2 (S11) Lane C — DEFAULT flipped to PURE RUST (design §5.1). ──
+# A clean Linux/Windows box runs `cargo build`/`cargo run` and gets audible output
+# with NO system OpenCV, NO libclang, NO external FluidSynth, NO virtual MIDI port.
+# (On Linux, cpal's ALSA backend still needs `libasound2-dev` to build — the one
+# surviving, ubiquitous Linux build prereq; design §6.4. Windows/macOS: dep-free.)
+default = ["pure-analysis", "synth"]
+
+# ── WS-4 Phase 2 (S11) Lane A — pure-Rust image-feature analyzer (src/pure_analysis.rs).
+# Pulls `image` + `imageproc` (both pure Rust; build headless with OpenCV off via
+# `--no-default-features --features pure-analysis`).
+pure-analysis = ["image", "dep:imageproc"]
+
+# ── WS-4 Phase 2 (S11) Lane B — in-process pure-Rust SoundFont synth sink
+# (src/synth_sink.rs). Pulls `rustysynth` (SF2 synthesis) + `cpal` (cross-platform
+# audio output) + `rtrb` (the lock-free SPSC engine→audio bridge). All pure Rust.
+synth = ["dep:rustysynth", "dep:cpal", "dep:rtrb"]
+
+# ── OPT-IN legacy/high-fidelity path: OpenCV image analysis + camera + highgui
+# window + overlay PNGs (the A/B reference + the operator's escape hatch).
+# Reintroduces libclang/system-OpenCV. Pulls `image` too (shared with pure-analysis).
+opencv = ["dep:opencv", "image"]
+
+# ── OPT-IN: route NoteEvents to an EXTERNAL MIDI port / DAW / FluidSynth instead of
+# the bundled synth (the exact-FluidSynth-parity reference, and "use my own synth").
+midi-out = ["dep:midir"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -40,10 +63,26 @@ serde_json = "1.0"
 clap = { version = "4", features = ["derive"] }   # unified CLI parser (cli.rs)
 toml = "0.8"                                        # parse audiohax.toml config file
 directories = "5"                                  # platform config dir for the config file
-midir = { version = "0.8", optional = true }
+midir = { version = "0.8", optional = true }     # now opt-in via the `midi-out` feature (was default)
 rand = "0.8"
-opencv = { version = "0.95.1", optional = true }
+opencv = { version = "0.95.1", optional = true } # now opt-in via the `opencv` feature (was default)
 anyhow = "1.0"
+
+# ── WS-4 Phase 2 (S11) Lane B deps — in-process synth sink (pure Rust; gated by `synth`) ──
+# rustysynth: pure-Rust SoundFont (SF2) synthesizer, MIT-licensed, std-only. API used:
+#   SoundFont::new(&mut impl Read) / SynthesizerSettings::new(sample_rate)
+#   Synthesizer::new(&Arc<SoundFont>, &SynthesizerSettings)
+#   process_midi_message(channel:i32, command:i32, data1:i32, data2:i32)
+#   render(&mut [f32] left, &mut [f32] right) / get_block_size() (verified against the resolved 1.3.x).
+rustysynth = { version = "1.3", optional = true }
+# cpal: cross-platform audio output (ALSA/PulseAudio on Linux, WASAPI on Windows,
+# CoreAudio on macOS). Resolved to the latest compatible (design said 0.15 [VERIFY];
+# 0.16+ is current and the API we use — default_host/default_output_device/
+# build_output_stream — is stable across it).
+cpal = { version = "0.16", optional = true }
+# rtrb: realtime-safe lock-free SPSC ring buffer — the engine→audio-thread MidiCmd
+# bridge. AudioSink methods push (non-blocking, allocation-free); the audio callback pops.
+rtrb = { version = "0.3", optional = true }
 
 # Modem / codec related deps
 hound = "3.5.1"          # wav read/write
@@ -58,6 +97,15 @@ twoway = "0.2"
 reed-solomon-erasure = "6"	# Reed-Solomon erasure coding (used for FEC)
 
 image = { version = "0.24", optional = true }           # image loading/resizing and JPEG encoding
+
+# ── WS-4 Phase 2 (S11) Lane A dep — pure-Rust CV ops (Canny/Otsu/connected-components). ──
+# Version pin reconciliation (conflicts with design §5 "imageproc 0.25 [VERIFY]"): 0.25
+# pulls `image 0.25`, a SECOND incompatible major of `image` alongside the project's
+# `image 0.24` — they do not interop across the `image::Rgb<u8>` boundary. 0.23 is the
+# version that depends on `image 0.24`, so Lane A pins 0.23. (Laplacian is hand-rolled in
+# f64 in pure_analysis.rs since 0.23 lacks `filter::laplacian_filter` — closer to OpenCV's
+# CV_64F path anyway. See module header.)
+imageproc = { version = "0.23", optional = true }
 
 # ── WS-4 Phase 3 (S10) — TUI front-end, pure-Rust (build --no-default-features) ──
 # Both are pure-Rust (no system libs) and compile under --no-default-features; they

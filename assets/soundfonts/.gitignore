@@ -1,0 +1,7 @@
+# Bundled SoundFont(s) are excluded from git history pending a distribution
+# decision (commit-in-repo vs git-LFS vs fetch-on-build). See README.md.
+# The default build embeds default.sf2 via include_bytes!, so the file MUST be
+# present locally before building — fetch it per README.md.
+*.sf2
+!.gitignore
+!README.md
