@@ -24,8 +24,43 @@
 use audiohax::chord_engine::{
     realize_step, Chord, ChordEngine, NoteEvent, PerfFeatures, PhrasePosition, StepPlan,
 };
-use audiohax::engine::{EngineConfig, GlobalFeatures, PipelineEngine};
+use audiohax::engine::{
+    CadenceStrength, EngineConfig, GlobalFeatures, KeyTempoPlan, PipelineEngine, Section,
+    StepContext, ThematicRole, ThemeVariation,
+};
 use audiohax::mapping_loader::{load_mappings, MappingTable};
+
+/// S15 seam: a behaviour-neutral default Section/KeyTempoPlan for the articulation
+/// `realize_step` call sites. `theme:None` ⇒ the realizer takes its existing
+/// free-select melody path, so every articulation/diversity assertion below is
+/// byte-identical to the pre-seam behaviour — only the `ctx` argument is added,
+/// no expected value changes. (Mirrors engine_equivalence.rs's default.)
+fn div_section(plan: &[StepPlan]) -> Section {
+    Section {
+        label: "A".to_string(),
+        step_len: plan.len(),
+        thematic_role: ThematicRole::Statement,
+        key_offset_semitones: 0,
+        ms_per_step: 200,
+        mode: "Ionian".to_string(),
+        progression: vec![],
+        theme: None,
+        variation: ThemeVariation::Identity,
+        boundary_cadence: CadenceStrength::Perfect,
+        density: 0.5,
+        steps: plan.to_vec(),
+    }
+}
+
+fn div_key_tempo() -> KeyTempoPlan {
+    KeyTempoPlan {
+        home_root_midi: 60,
+        home_mode: "Ionian".to_string(),
+        base_ms_per_step: 200,
+        key_scheme: vec![0],
+        tempo_scheme: vec![200],
+    }
+}
 
 const MAPPINGS: &str = "assets/mappings.json";
 
@@ -123,11 +158,14 @@ fn perf(edge_density: f32) -> PerfFeatures {
 fn mean_note_frac(edge_density: f32, ms_per_step: u64) -> f32 {
     let plan = interior_plan(4);
     let f = perf(edge_density);
+    let kt = div_key_tempo();
+    let sec = div_section(&plan);
+    let ctx = StepContext::single_section_default(&sec, &kt);
     let mut total = 0.0f32;
     let mut count = 0usize;
     for step in &plan {
         // num_instruments == 1 ⇒ the lone instrument is the Melody (lone line = tune).
-        let events = realize_step(step, 0, 1, &f, ms_per_step);
+        let events = realize_step(step, 0, 1, &f, ms_per_step, &ctx);
         for ev in &events {
             total += ev.hold_ms as f32 / ms_per_step as f32;
             count += 1;
@@ -142,9 +180,12 @@ fn mean_note_frac(edge_density: f32, ms_per_step: u64) -> f32 {
 fn onset_count_multiset(edge_density: f32, ms_per_step: u64) -> Vec<usize> {
     let plan = interior_plan(4);
     let f = perf(edge_density);
+    let kt = div_key_tempo();
+    let sec = div_section(&plan);
+    let ctx = StepContext::single_section_default(&sec, &kt);
     let mut counts: Vec<usize> = plan
         .iter()
-        .map(|step| realize_step(step, 0, 1, &f, ms_per_step).len())
+        .map(|step| realize_step(step, 0, 1, &f, ms_per_step, &ctx).len())
         .collect();
     counts.sort_unstable();
     counts
@@ -360,11 +401,14 @@ fn test_articulation_is_continuous_not_three_bands() {
     // Sweep across the CALM/SUSTAINED region where the continuous curve governs the
     // single sustained melody note (edge_activity <= 0.25 ⇒ one note whose hold
     // rides base_frac). 21 fine samples of raw edge in [0.000 .. 0.0125].
+    let kt = div_key_tempo();
+    let sec = div_section(&interior_plan(1));
+    let ctx = StepContext::single_section_default(&sec, &kt);
     let mut holds: Vec<u64> = Vec::new();
     for k in 0..21 {
         let raw_edge = 0.000625 * k as f32; // 0.0 .. 0.0125 → edge_activity 0.0 .. 0.25
         let plan = interior_plan(1);
-        let events = realize_step(&plan[0], 0, 1, &perf(raw_edge), FIXED_MS);
+        let events = realize_step(&plan[0], 0, 1, &perf(raw_edge), FIXED_MS, &ctx);
         assert_eq!(
             events.len(),
             1,
@@ -433,10 +477,13 @@ fn test_normalization_real_photo_edge_range_is_usable() {
     const FIXED_MS: u64 = 600;
     // The six-image measured raw spread from the spec: 0.005 .. 0.036.
     let raw_edges = [0.005f32, 0.012, 0.020, 0.028, 0.036];
+    let kt = div_key_tempo();
+    let sec = div_section(&interior_plan(1));
+    let ctx = StepContext::single_section_default(&sec, &kt);
     let mut patterns: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     for &e in &raw_edges {
         let plan = interior_plan(1);
-        let events = realize_step(&plan[0], 0, 1, &perf(e), FIXED_MS);
+        let events = realize_step(&plan[0], 0, 1, &perf(e), FIXED_MS, &ctx);
         patterns.insert(events.len()); // onset count distinguishes pattern bands
     }
     assert!(
@@ -450,10 +497,10 @@ fn test_normalization_real_photo_edge_range_is_usable() {
 
     // Also: the endpoints of the real range must produce DIFFERENT note lengths
     // (the activity knob is not saturated at one end across the real spread).
-    let lo_hold = realize_step(&interior_plan(1)[0], 0, 1, &perf(0.005), FIXED_MS)[0].hold_ms;
+    let lo_hold = realize_step(&interior_plan(1)[0], 0, 1, &perf(0.005), FIXED_MS, &ctx)[0].hold_ms;
     // 0.036 still maps below 0.55, so this also stays in the single-note band; if it
     // crosses into a multi-onset band that is itself proof of a usable spread.
-    let hi_events = realize_step(&interior_plan(1)[0], 0, 1, &perf(0.036), FIXED_MS);
+    let hi_events = realize_step(&interior_plan(1)[0], 0, 1, &perf(0.036), FIXED_MS, &ctx);
     let usable_spread = hi_events.len() != 1 || hi_events[0].hold_ms != lo_hold;
     assert!(
         usable_spread,

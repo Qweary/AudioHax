@@ -21,7 +21,18 @@
 //! engine core stays pure. (Escape hatch documented, not built.)
 
 use crate::chord_engine::{self, ChordEngine, NoteEvent, PerfFeatures, PhrasePosition, StepPlan};
-use crate::mapping_loader::{lookup_range_map, MappingTable};
+use crate::composition::{CompositionPlan, CompositionPlanner, ImageUnderstanding};
+use crate::mapping_loader::{lookup_range_map, rebuild_mapping_table, MappingTable};
+
+// S15 Slice 1: re-export the composition layer's types from `engine` so call sites and the
+// equivalence test import them from `audiohax::engine` exactly as they import the rest of the
+// engine surface (spec §1). The single definition lives in `composition.rs`; this is the
+// engine-facing handle to it (`ImageUnderstanding` is the image-free planner input — the same
+// boundary discipline as `GlobalFeatures`).
+pub use crate::composition::{
+    CadenceStrength, Character, CompositionPlan as Plan, KeyTempoPlan, Meter, Section, StepContext,
+    ThematicRole, ThemeSeed, ThemeVariation,
+};
 
 /// Image-free mirror of `image_analysis::GlobalFeatures` (all plain `f32`).
 ///
@@ -270,8 +281,14 @@ enum Transport {
 pub struct PipelineEngine {
     mappings: MappingTable,
     config: EngineConfig,
-    /// Derived from the latest [`GlobalFeatures`]; empty until the first feed.
+    /// Derived from the latest [`GlobalFeatures`]; empty until the first feed. The LEGACY /
+    /// back-compat single-section flat path: when `composition` is `None`, `tick`/`decide_step`
+    /// walk this exactly as before (the `set_features_global` path, byte-frozen).
     plan: Vec<StepPlan>,
+    /// S15 Slice 1: the up-front composition plan. When `Some`, `tick`/`decide_step` walk the
+    /// concrete sections ONCE 0→`total_steps` with NO modulo (the death of `plan[step_idx % len]`);
+    /// when `None`, the legacy flat `plan` path runs unchanged.
+    composition: Option<CompositionPlan>,
     mode: String,
     last_global: Option<GlobalFeatures>,
     scan_position: f32,
@@ -291,6 +308,7 @@ impl PipelineEngine {
             mappings,
             config,
             plan: Vec::new(),
+            composition: None,
             mode: "Ionian".to_string(),
             last_global: None,
             scan_position: 0.0,
@@ -315,6 +333,41 @@ impl PipelineEngine {
     /// equivalence-net tests that want to seed a deterministic plan reference).
     pub fn plan(&self) -> &[StepPlan] {
         &self.plan
+    }
+
+    /// Read-only access to the installed composition plan (S15). `None` until a
+    /// [`set_plan`](PipelineEngine::set_plan) / [`compose_from_image`](PipelineEngine::compose_from_image).
+    pub fn composition(&self) -> Option<&CompositionPlan> {
+        self.composition.as_ref()
+    }
+
+    /// Install a precomputed [`CompositionPlan`] (S15). After this, `tick`/`decide_step` walk
+    /// the plan's concrete sections ONCE 0→`total_steps` (NO modulo) instead of the legacy
+    /// flat looped `plan`. Setting a plan does not touch the legacy `plan` field, so a caller
+    /// can fall back to the flat path by never calling this.
+    pub fn set_plan(&mut self, plan: CompositionPlan) {
+        self.last_phrase = plan
+            .sections
+            .first()
+            .and_then(|s| s.steps.first())
+            .map(|p| p.position)
+            .unwrap_or(PhrasePosition::PhraseStart);
+        self.composition = Some(plan);
+    }
+
+    /// Build a [`CompositionPlan`] from an [`ImageUnderstanding`] via [`CompositionPlanner`]
+    /// and install it (S15). Requires a `composition` block in the loaded `MappingTable`; if
+    /// absent, this is a no-op (the engine stays on the legacy flat path) and returns `false`.
+    /// Returns `true` when a plan was built and installed.
+    pub fn compose_from_image(&mut self, understanding: &ImageUnderstanding) -> bool {
+        let Some(comp) = self.mappings.composition.clone() else {
+            return false;
+        };
+        let planner = CompositionPlanner::new(comp.into());
+        let plan = planner.plan(understanding, &self.mappings);
+        self.mode = plan.key_tempo.home_mode.clone();
+        self.set_plan(plan);
+        true
     }
 
     /// Feed whole-image features. (Re)derives mode → progression → chords → phrase
@@ -417,6 +470,11 @@ impl PipelineEngine {
             });
         }
 
+        // S15 tick restructure (operator decision 6 — BORROWED StepContext). The
+        // section/phrase are resolved from an IMMUTABLE borrow of `self.composition` that is
+        // fully scoped to `decide_step` / `snapshot_phrase` (each returns an OWNED value), so
+        // the borrow ends well before the `&mut self.step_index` write below. Compiles under
+        // NLL, no `unsafe`/`RefCell`/clone.
         let step_idx = self.step_index;
         let decisions = self.decide_step(source, step_idx);
 
@@ -442,19 +500,15 @@ impl PipelineEngine {
                 edge_density: f0.edge_density,
             };
         }
-        let phrase = if self.plan.is_empty() {
-            self.last_phrase
-        } else {
-            self.plan[step_idx % self.plan.len()].position
-        };
+        let phrase = self.snapshot_phrase(step_idx); // short immutable borrow, returns owned
         self.last_phrase = phrase;
         self.last_notes = flat_notes;
 
-        // Advance scan position. step_count() is the batch step total; position is the
-        // fraction THROUGH the scan after completing this step (0-based step k of N →
-        // (k+1)/N), clamped to [0,1].
-        let total = source.step_count().max(1);
-        self.step_index = step_idx + 1;
+        // Advance scan position. When composing, `total_steps` is the authoritative N (the
+        // planner sized the sections to it); otherwise step_count() is the batch step total.
+        // Position is the fraction THROUGH the scan after this step ((k+1)/N), clamped.
+        let total = self.total_steps_or(source).max(1);
+        self.step_index = step_idx + 1; // &mut field write — no live borrow now
         self.scan_position = ((self.step_index as f32) / (total as f32)).clamp(0.0, 1.0);
 
         Ok(EngineTickOutput {
@@ -477,6 +531,54 @@ impl PipelineEngine {
         let num_instruments = self.config.num_instruments;
         let row = source.scan_bar_features(step_idx, num_instruments);
         let mut out = Vec::with_capacity(row.len());
+
+        // S15: COMPOSE PATH. When a CompositionPlan is installed, resolve
+        // `(section, step_in_section)` from the global step_idx by walking section boundaries
+        // with NO MODULO (the death of `plan[step_idx % len]` — the engine never wraps the
+        // global cursor). Build ONE StepContext per step (it is step-relative, not
+        // instrument-relative), borrowed by each per-instrument `decide_instrument_action`.
+        // The realizer still wraps WITHIN a section's own filled `steps` (legacy realizer
+        // behaviour), but the engine cursor is non-looping.
+        if let Some(comp) = &self.composition {
+            if let Some((section, step_in_section)) = comp.locate(step_idx) {
+                let theme = section
+                    .theme
+                    .and_then(|ti| comp.themes.iter().find(|t| t.id == ti));
+                let ctx = StepContext {
+                    section,
+                    step_in_section,
+                    theme,
+                    key_tempo: &comp.key_tempo,
+                };
+                for (inst_idx, f) in row.iter().enumerate() {
+                    out.push(decide_instrument_action(
+                        f,
+                        inst_idx,
+                        step_in_section, // section-local step index into section.steps
+                        num_instruments,
+                        &section.steps,
+                        section.ms_per_step,
+                        &ctx,
+                    ));
+                }
+                return out;
+            }
+            // step_idx past total_steps (the engine should never advance here): silent step.
+            for (inst_idx, _f) in row.iter().enumerate() {
+                out.push(InstrumentDecision {
+                    channel: (inst_idx % 16) as u8,
+                    events: Vec::new(),
+                });
+            }
+            return out;
+        }
+
+        // LEGACY FLAT PATH (byte-frozen). The behaviour-neutral default StepContext over a
+        // throwaway single section keeps `decide_instrument_action` byte-identical to the S13
+        // operating point: `theme:None` + `key_offset:0` takes the existing free-select path.
+        let section = legacy_default_section(&self.plan, self.config.ms_per_step, &self.mode);
+        let key_tempo = legacy_default_key_tempo(self.config.ms_per_step, &self.mode);
+        let ctx = StepContext::single_section_default(&section, &key_tempo);
         for (inst_idx, f) in row.iter().enumerate() {
             out.push(decide_instrument_action(
                 f,
@@ -485,9 +587,39 @@ impl PipelineEngine {
                 num_instruments,
                 &self.plan,
                 self.config.ms_per_step,
+                &ctx,
             ));
         }
         out
+    }
+
+    /// The phrase position of the plan step driving `step_idx` (S15). In compose mode, reads
+    /// the resolved section's local step; in legacy mode, the old `plan[step_idx % len]`
+    /// position. Returns an OWNED [`PhrasePosition`] so the `tick` borrow is short (§4.2).
+    fn snapshot_phrase(&self, step_idx: usize) -> PhrasePosition {
+        if let Some(comp) = &self.composition {
+            if let Some((section, step_in_section)) = comp.locate(step_idx) {
+                if section.steps.is_empty() {
+                    return self.last_phrase;
+                }
+                return section.steps[step_in_section % section.steps.len()].position;
+            }
+            return self.last_phrase;
+        }
+        if self.plan.is_empty() {
+            self.last_phrase
+        } else {
+            self.plan[step_idx % self.plan.len()].position
+        }
+    }
+
+    /// The authoritative time-cursor N: `total_steps` when composing, else the source's
+    /// `step_count()` (S15 §3).
+    fn total_steps_or<S: FeatureSource>(&self, source: &S) -> usize {
+        match &self.composition {
+            Some(comp) => comp.total_steps,
+            None => source.step_count(),
+        }
     }
 
     /// Apply a control command (front-end → engine). Mutates config / transport state.
@@ -564,20 +696,26 @@ pub fn decide_instrument_action(
     inst_idx: usize,
     step_idx: usize,
     num_instruments: usize,
-    plan: &[StepPlan],
+    plan_steps: &[StepPlan],
     ms_per_step: u64,
+    ctx: &StepContext,
 ) -> InstrumentDecision {
     let channel = (inst_idx % 16) as u8;
 
     // Empty-plan guard: emit no events (a silent step) — the minimal safe choice
-    // that never panics and makes no musical decision here (main.rs:72–74).
-    if plan.is_empty() {
+    // that never panics and makes no musical decision here (main.rs:72–74). Unchanged.
+    if plan_steps.is_empty() {
         return InstrumentDecision {
             channel,
             events: Vec::new(),
         };
     }
-    let step = &plan[step_idx % plan.len()];
+    // The step consulted is `plan_steps[step_idx % plan_steps.len()]`. In compose mode
+    // `plan_steps` is the CURRENT SECTION's filled steps and `step_idx` is the section-local
+    // index, so this wraps WITHIN the section (the realizer's own behaviour) — the engine's
+    // global cursor is non-looping (§3). In legacy mode `plan_steps` is the flat `plan` and
+    // this is the original modulo wrap, byte-identical.
+    let step = &plan_steps[step_idx % plan_steps.len()];
 
     // Project image features into the plain-scalar PerfFeatures. ScanBarFeatures
     // fields are f32 and units already match (saturation/brightness 0..=100,
@@ -588,75 +726,47 @@ pub fn decide_instrument_action(
         edge_density: f.edge_density,
     };
 
-    // Single pure entry point; map NoteEvents straight through (main.rs:87–92, but we
-    // keep them as typed NoteEvent rather than re-tupling).
+    // Single pure entry point; map NoteEvents straight through (main.rs:87–92, kept as typed
+    // NoteEvent). S15: the theme-replay DECISION body lives in chord_engine's realizer (Music
+    // Theory owns it); the Implementer THREADS `ctx` into the realizer call. On the
+    // behaviour-neutral default ctx (no theme, home key, identity), the realizer takes its
+    // existing free-select path — byte-identical to today.
     let events =
-        chord_engine::realize_step(step, inst_idx, num_instruments, &features, ms_per_step);
+        chord_engine::realize_step(step, inst_idx, num_instruments, &features, ms_per_step, ctx);
     InstrumentDecision { channel, events }
 }
 
-/// Deep-copy a [`MappingTable`] by hand-rebuilding it from its public fields (all
-/// public, plain `HashMap`/`Vec`/scalar data).
-///
-/// NOTE(s9): `ChordEngine::new` consumes a `MappingTable` BY VALUE, but the engine
-/// must keep its own copy across re-derivations — and `MappingTable` derives only
-/// `Deserialize`, not `Clone`, in `mapping_loader.rs` (out of scope to edit). Rather
-/// than add a `#[derive(Clone)]` there, this helper reconstructs a fresh table from
-/// the public fields (lossless — they are all plain data). If `mapping_loader.rs`
-/// later gains `#[derive(Clone)]`, every call here collapses to `table.clone()`.
-fn rebuild_mapping_table(t: &MappingTable) -> MappingTable {
-    use crate::mapping_loader::{
-        CadenceTrigger, DominantSubTrigger, FineDetailMapping, GlobalMapping,
-        InstrumentSectionMapping, MappingTable as MT, ModalInterchangeTrigger,
-    };
-    MT {
-        global: GlobalMapping {
-            hue_to_mode: t.global.hue_to_mode.clone(),
-            saturation_to_harmonic_complexity: t.global.saturation_to_harmonic_complexity.clone(),
-            brightness_to_tempo_bpm: t.global.brightness_to_tempo_bpm.clone(),
-            // S13 (design-s13 §5): copy the new normalization block so the rebuilt
-            // table stays lossless after M added it to mapping_loader::GlobalMapping.
-            feature_normalization: t.global.feature_normalization.clone(),
-            dominant_substitution_trigger: DominantSubTrigger {
-                edge_complexity_threshold: t
-                    .global
-                    .dominant_substitution_trigger
-                    .edge_complexity_threshold,
-                substitutions: t.global.dominant_substitution_trigger.substitutions.clone(),
-            },
-            modal_interchange_trigger: ModalInterchangeTrigger {
-                brightness_drop_threshold: t
-                    .global
-                    .modal_interchange_trigger
-                    .brightness_drop_threshold,
-                borrowed_chords: t.global.modal_interchange_trigger.borrowed_chords.clone(),
-            },
-            cadence_trigger: CadenceTrigger {
-                stillness_threshold: t.global.cadence_trigger.stillness_threshold,
-                high_motion_cadence: t.global.cadence_trigger.high_motion_cadence.clone(),
-                low_motion_cadence: t.global.cadence_trigger.low_motion_cadence.clone(),
-            },
-            progression_families: t.global.progression_families.clone(),
-        },
-        instrument_section: InstrumentSectionMapping {
-            edge_density_to_rhythm: t.instrument_section.edge_density_to_rhythm.clone(),
-            line_orientation_to_interval: t.instrument_section.line_orientation_to_interval.clone(),
-            contrast_to_articulation: t.instrument_section.contrast_to_articulation.clone(),
-            color_shift_to_chord_extension: t
-                .instrument_section
-                .color_shift_to_chord_extension
-                .clone(),
-            texture_to_modal_color: t.instrument_section.texture_to_modal_color.clone(),
-        },
-        fine_detail: FineDetailMapping {
-            pixel_y_position_to_pitch: t.fine_detail.pixel_y_position_to_pitch.clone(),
-            pixel_brightness_to_velocity: t.fine_detail.pixel_brightness_to_velocity.clone(),
-            local_jaggedness_to_chromaticism: t
-                .fine_detail
-                .local_jaggedness_to_chromaticism
-                .clone(),
-            shape_to_ostinato: t.fine_detail.shape_to_ostinato.clone(),
-        },
+// `rebuild_mapping_table` moved to `mapping_loader.rs` in S15 (so `composition.rs` can also
+// build a transient `ChordEngine` from the shared table); imported above.
+
+/// S15: a throwaway behaviour-neutral [`Section`] over the legacy flat `plan`, so the legacy
+/// `decide_step` path can build a `single_section_default` `StepContext`. Carries `theme:None`
+/// + `key_offset:0` so the realizer takes its existing free-select path (goldens unchanged).
+fn legacy_default_section(plan: &[StepPlan], ms_per_step: u64, mode: &str) -> Section {
+    Section {
+        label: "A".to_string(),
+        step_len: plan.len(),
+        thematic_role: ThematicRole::Statement,
+        key_offset_semitones: 0,
+        ms_per_step,
+        mode: mode.to_string(),
+        progression: Vec::new(),
+        theme: None,
+        variation: ThemeVariation::Identity,
+        boundary_cadence: CadenceStrength::Perfect,
+        density: 0.5,
+        steps: plan.to_vec(),
+    }
+}
+
+/// S15: a throwaway home-key [`KeyTempoPlan`] for the legacy `single_section_default` ctx.
+fn legacy_default_key_tempo(ms_per_step: u64, mode: &str) -> KeyTempoPlan {
+    KeyTempoPlan {
+        home_root_midi: 60,
+        home_mode: mode.to_string(),
+        base_ms_per_step: ms_per_step,
+        key_scheme: vec![0],
+        tempo_scheme: vec![ms_per_step],
     }
 }
 
@@ -799,10 +909,21 @@ mod tests {
         ]
     }
 
+    /// A behaviour-neutral default Section + KeyTempoPlan for the kernel tests (S15). The test
+    /// owns these locals; `single_section_default` borrows them.
+    fn default_ctx_locals(plan: &[StepPlan]) -> (Section, KeyTempoPlan) {
+        (
+            legacy_default_section(plan, 250, "Ionian"),
+            legacy_default_key_tempo(250, "Ionian"),
+        )
+    }
+
     #[test]
     fn decide_instrument_action_empty_plan_is_silent() {
         let f = zero_bar(0);
-        let d = decide_instrument_action(&f, 0, 0, 4, &[], 250);
+        let (sec, kt) = default_ctx_locals(&[]);
+        let ctx = StepContext::single_section_default(&sec, &kt);
+        let d = decide_instrument_action(&f, 0, 0, 4, &[], 250, &ctx);
         assert_eq!(d.channel, 0);
         assert!(d.events.is_empty(), "empty plan must emit no events");
     }
@@ -811,7 +932,9 @@ mod tests {
     fn decide_instrument_action_channel_wraps_mod_16() {
         let f = zero_bar(0);
         let plan = fixed_plan();
-        let d = decide_instrument_action(&f, 17, 0, 32, &plan, 250);
+        let (sec, kt) = default_ctx_locals(&plan);
+        let ctx = StepContext::single_section_default(&sec, &kt);
+        let d = decide_instrument_action(&f, 17, 0, 32, &plan, 250, &ctx);
         assert_eq!(d.channel, 1, "channel must be inst_idx % 16");
     }
 
@@ -819,8 +942,10 @@ mod tests {
     fn decide_instrument_action_is_deterministic_on_fixed_plan() {
         let f = zero_bar(0);
         let plan = fixed_plan();
-        let a = decide_instrument_action(&f, 2, 1, 4, &plan, 250);
-        let b = decide_instrument_action(&f, 2, 1, 4, &plan, 250);
+        let (sec, kt) = default_ctx_locals(&plan);
+        let ctx = StepContext::single_section_default(&sec, &kt);
+        let a = decide_instrument_action(&f, 2, 1, 4, &plan, 250, &ctx);
+        let b = decide_instrument_action(&f, 2, 1, 4, &plan, 250, &ctx);
         assert_eq!(
             a, b,
             "pure kernel must be deterministic for the golden anchor"

@@ -9,8 +9,9 @@
 
 use audiohax::chord_engine::{Chord, NoteEvent, PhrasePosition, StepPlan};
 use audiohax::engine::{
-    decide_instrument_action, AudioSink, AudioSinkError, EngineCommand, EngineConfig,
-    FeatureSource, GlobalFeatures, InteractionEvent, PipelineEngine, ScanBarFeatures,
+    decide_instrument_action, AudioSink, AudioSinkError, CadenceStrength, EngineCommand,
+    EngineConfig, FeatureSource, GlobalFeatures, InteractionEvent, KeyTempoPlan, PipelineEngine,
+    ScanBarFeatures, Section, StepContext, ThematicRole, ThemeVariation,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -303,15 +304,48 @@ fn test_decide_step_is_deterministic() {
     }
 }
 
+/// S15 seam: the behaviour-neutral default Section + KeyTempoPlan this net borrows
+/// into the new `ctx` arg. `theme:None` ⇒ the realizer free-selects exactly as
+/// before — the determinism property is unaffected (mirrors engine_equivalence.rs).
+fn seam_section(plan: &[StepPlan]) -> Section {
+    Section {
+        label: "A".to_string(),
+        step_len: plan.len(),
+        thematic_role: ThematicRole::Statement,
+        key_offset_semitones: 0,
+        ms_per_step: 250,
+        mode: "Ionian".to_string(),
+        progression: vec![],
+        theme: None,
+        variation: ThemeVariation::Identity,
+        boundary_cadence: CadenceStrength::Perfect,
+        density: 0.5,
+        steps: plan.to_vec(),
+    }
+}
+
+fn seam_key_tempo() -> KeyTempoPlan {
+    KeyTempoPlan {
+        home_root_midi: 60,
+        home_mode: "Ionian".to_string(),
+        base_ms_per_step: 250,
+        key_scheme: vec![0],
+        tempo_scheme: vec![250],
+    }
+}
+
 /// Property: the free fn decide_instrument_action is pure — identical args give
 /// byte-identical output, independent of any engine state.
 #[test]
 fn test_decide_instrument_action_is_deterministic() {
     let plan = fixed_plan();
     let f = bar(0, 64.0, 48.0, 0.33);
+    let kt = seam_key_tempo();
+    let sec = seam_section(&plan);
+    let ctx = StepContext::single_section_default(&sec, &kt);
     for &(inst, step) in &[(0usize, 0usize), (1, 1), (2, 5), (7, 3)] {
-        let a = decide_instrument_action(&f, inst, step, 4, &plan, 250);
-        let b = decide_instrument_action(&f, inst, step, 4, &plan, 250);
+        let a = decide_instrument_action(&f, inst, step, 4, &plan, 250, &ctx);
+        let b = decide_instrument_action(&f, inst, step, 4, &plan, 250, &ctx);
         assert_eq!(
             a, b,
             "decide_instrument_action({inst},{step}) not deterministic"

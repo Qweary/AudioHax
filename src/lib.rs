@@ -7,6 +7,10 @@ pub mod modem;
 pub mod chord_engine;
 pub mod mapping_loader;
 
+// S15 Slice 1 — the pure-Rust COMPOSER layer (form catalogue, plan, planner, StepContext).
+// `--no-default-features`-clean: NO image type, NO OpenCV. Builds & unit-tests headlessly.
+pub mod composition;
+
 // WS-4 Phase 1 (S9) — pure-Rust shared core + CLI. Both build & unit-test under
 // `cargo test --lib --no-default-features` (no system libs). The engine holds NO
 // OpenCV/image/midir type; the CLI is the headless-testable clap grammar.

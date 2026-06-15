@@ -85,5 +85,54 @@
       "triangle": "AscendingOstinato",
       "square": "DescendingOstinato"
     }
+  },
+  "composition": {
+    "form_catalogue": [
+      { "id": "rounded_binary", "sections": [
+          {"label":"A",  "role":"Statement","rel_len":1.0,"theme":0,"variation":"Identity","boundary_cadence":"Half"},
+          {"label":"B",  "role":"Contrast", "rel_len":1.0,"theme":null,"variation":"Identity","boundary_cadence":"Half"},
+          {"label":"A'", "role":"Return",   "rel_len":0.75,"theme":0,"variation":"Identity","boundary_cadence":"Perfect"} ] },
+      { "id": "ternary_aba", "sections": [
+          {"label":"A","role":"Statement","rel_len":1.0,"theme":0,"variation":"Identity","boundary_cadence":"Perfect"},
+          {"label":"B","role":"Contrast", "rel_len":1.0,"theme":null,"variation":"Identity","boundary_cadence":"Half"},
+          {"label":"A","role":"Return",   "rel_len":1.0,"theme":0,"variation":"Identity","boundary_cadence":"Perfect"} ] },
+      { "id": "aaba", "sections": [
+          {"label":"A","role":"Statement","rel_len":1.0,"theme":0,"variation":"Identity","boundary_cadence":"Imperfect"},
+          {"label":"A","role":"Statement","rel_len":1.0,"theme":0,"variation":"Identity","boundary_cadence":"Imperfect"},
+          {"label":"B","role":"Contrast", "rel_len":1.0,"theme":null,"variation":"Identity","boundary_cadence":"Half"},
+          {"label":"A","role":"Return",   "rel_len":1.0,"theme":0,"variation":"Identity","boundary_cadence":"Perfect"} ] },
+      { "id": "abac", "sections": [
+          {"label":"A","role":"Statement","rel_len":1.0,"theme":0,"variation":"Identity","boundary_cadence":"Half"},
+          {"label":"B","role":"Contrast", "rel_len":1.0,"theme":null,"variation":"Identity","boundary_cadence":"Imperfect"},
+          {"label":"A","role":"Return",   "rel_len":1.0,"theme":0,"variation":"Identity","boundary_cadence":"Half"},
+          {"label":"C","role":"Coda",     "rel_len":1.0,"theme":null,"variation":"Identity","boundary_cadence":"Perfect"} ] },
+      { "id": "abbac", "sections": [
+          {"label":"A", "role":"Statement","rel_len":1.0,"theme":0,"variation":"Identity","boundary_cadence":"Half"},
+          {"label":"B", "role":"Contrast", "rel_len":1.0,"theme":null,"variation":"Identity","boundary_cadence":"Deceptive"},
+          {"label":"B'","role":"Contrast", "rel_len":1.0,"theme":null,"variation":"Fragmented","boundary_cadence":"Half"},
+          {"label":"A", "role":"Return",   "rel_len":1.0,"theme":0,"variation":"Identity","boundary_cadence":"Imperfect"},
+          {"label":"C", "role":"Coda",     "rel_len":0.75,"theme":null,"variation":"Identity","boundary_cadence":"Plagal"} ] },
+      { "id": "theme_and_variations", "sections": [
+          {"label":"T", "role":"Statement",  "rel_len":1.0,"theme":0,"variation":"Identity","boundary_cadence":"Perfect"},
+          {"label":"V1","role":"Development","rel_len":1.0,"theme":0,"variation":"Fragmented","boundary_cadence":"Imperfect"},
+          {"label":"V2","role":"Development","rel_len":1.0,"theme":0,"variation":"Identity","boundary_cadence":"Perfect"} ] }
+    ],
+    "form": {
+      "default": "rounded_binary",
+      "rules": [
+        { "when": [ {"knob":"complexity","op":"ge","lo":0.66,"hi":0.0}, {"knob":"edge_activity","op":"ge","lo":0.6,"hi":0.0} ], "pick": "theme_and_variations" },
+        { "when": [ {"knob":"quadrant_contrast","op":"ge","lo":0.6,"hi":0.0} ], "pick": "ternary_aba" },
+        { "when": [ {"knob":"aspect_ratio","op":"ge","lo":1.6,"hi":0.0}, {"knob":"palette_bimodality","op":"le","lo":0.3,"hi":0.0} ], "pick": "aaba" },
+        { "when": [ {"knob":"vertical_emphasis","op":"ge","lo":0.6,"hi":0.0} ], "pick": "abac" },
+        { "when": [ {"knob":"edge_activity","op":"ge","lo":0.7,"hi":0.0}, {"knob":"value_key","op":"ge","lo":0.6,"hi":0.0} ], "pick": "abbac" }
+      ]
+    },
+    "theme_behaviour": {
+      "default": "absent",
+      "rules": [ { "when": [ {"knob":"complexity","op":"ge","lo":0.4,"hi":0.0} ], "pick": "fragment" } ]
+    },
+    "character":  { "default": "ballad",    "rules": [] },
+    "meter":      { "default": "four4",     "rules": [] },
+    "key_scheme": { "default": "home_only", "rules": [] }
   }
 }

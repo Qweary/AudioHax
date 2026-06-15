@@ -33,7 +33,10 @@
 //! regression alarm. See the per-constant derivation comments.
 
 use audiohax::chord_engine::{Chord, PhrasePosition, StepPlan};
-use audiohax::engine::{decide_instrument_action, ScanBarFeatures};
+use audiohax::engine::{
+    decide_instrument_action, CadenceStrength, KeyTempoPlan, ScanBarFeatures, Section, StepContext,
+    ThematicRole, ThemeVariation,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures — a FIXED plan (no pick_progression / thread_rng anywhere).
@@ -71,6 +74,37 @@ fn fixed_plan() -> Vec<StepPlan> {
     ]
 }
 
+/// S15: the behaviour-neutral default Section + KeyTempoPlan the net borrows into the new
+/// 7th `ctx` arg. `theme:None` + `key_offset:0` ⇒ the realizer takes its EXISTING free-select
+/// path ⇒ the goldens (240, 114/84, 36/79) do NOT move. The test owns these lifetimes exactly
+/// as it owns `fixed_plan()`. NO assert in this file is relaxed — only an argument is added.
+fn default_section(plan: &[StepPlan]) -> Section {
+    Section {
+        label: "A".to_string(),
+        step_len: plan.len(),
+        thematic_role: ThematicRole::Statement,
+        key_offset_semitones: 0,
+        ms_per_step: MS_PER_STEP,
+        mode: "Ionian".to_string(),
+        progression: vec![],
+        theme: None,
+        variation: ThemeVariation::Identity,
+        boundary_cadence: CadenceStrength::Perfect,
+        density: 0.5,
+        steps: plan.to_vec(),
+    }
+}
+
+fn default_key_tempo() -> KeyTempoPlan {
+    KeyTempoPlan {
+        home_root_midi: 60,
+        home_mode: "Ionian".to_string(),
+        base_ms_per_step: MS_PER_STEP,
+        key_scheme: vec![0],
+        tempo_scheme: vec![MS_PER_STEP],
+    }
+}
+
 fn bar(sat: f32, bright: f32, edge: f32) -> ScanBarFeatures {
     ScanBarFeatures {
         bar_index: 0,
@@ -104,9 +138,12 @@ const G_MELODY_NOTE: u8 = 79;
 #[test]
 fn test_channel_is_inst_idx_mod_16() {
     let plan = fixed_plan();
+    let kt = default_key_tempo();
+    let sec = default_section(&plan);
+    let ctx = StepContext::single_section_default(&sec, &kt);
     let f = bar(60.0, 50.0, 0.2);
     for inst in [0usize, 1, 15, 16, 17, 33] {
-        let d = decide_instrument_action(&f, inst, 0, 4, &plan, MS_PER_STEP);
+        let d = decide_instrument_action(&f, inst, 0, 4, &plan, MS_PER_STEP, &ctx);
         assert_eq!(
             d.channel as usize,
             inst % 16,
@@ -118,10 +155,13 @@ fn test_channel_is_inst_idx_mod_16() {
 /// P2: an empty plan produces a SILENT decision (no events), never a panic.
 #[test]
 fn test_empty_plan_is_silent() {
+    let kt = default_key_tempo();
+    let sec = default_section(&[]);
+    let ctx = StepContext::single_section_default(&sec, &kt);
     let f = bar(70.0, 60.0, 0.4);
     for inst in 0..4usize {
         for step in 0..6usize {
-            let d = decide_instrument_action(&f, inst, step, 4, &[], MS_PER_STEP);
+            let d = decide_instrument_action(&f, inst, step, 4, &[], MS_PER_STEP, &ctx);
             assert_eq!(d.channel as usize, inst % 16);
             assert!(
                 d.events.is_empty(),
@@ -141,10 +181,13 @@ fn test_step_idx_wraps_via_modulo() {
                                   // Melody instrument so the non-cadence vs cadence onset count differs sharply.
     let num = 2;
     let melody = 1;
+    let kt = default_key_tempo();
+    let sec = default_section(&plan);
+    let ctx = StepContext::single_section_default(&sec, &kt);
 
     // Even steps → PhraseStart (index 0), a high-edge melody → ARPEGGIO (3 onsets).
     for even in [0usize, 2, 4] {
-        let d = decide_instrument_action(&f, melody, even, num, &plan, MS_PER_STEP);
+        let d = decide_instrument_action(&f, melody, even, num, &plan, MS_PER_STEP, &ctx);
         assert_eq!(
             d.events.len(),
             3,
@@ -153,7 +196,7 @@ fn test_step_idx_wraps_via_modulo() {
     }
     // Odd steps → Cadence (index 1) → single sustained note (1 onset), edge ignored.
     for odd in [1usize, 3, 5] {
-        let d = decide_instrument_action(&f, melody, odd, num, &plan, MS_PER_STEP);
+        let d = decide_instrument_action(&f, melody, odd, num, &plan, MS_PER_STEP, &ctx);
         assert_eq!(
             d.events.len(),
             1,
@@ -173,11 +216,14 @@ fn test_role_pitch_bass_below_melody_golden() {
     let plan = fixed_plan();
     let f = bar(60.0, 55.0, 0.2); // bright=55 ⇒ the lift used in the golden derivation
     let num = 2;
+    let kt = default_key_tempo();
+    let sec = default_section(&plan);
+    let ctx = StepContext::single_section_default(&sec, &kt);
 
     // Use the cadence step (index 1 → step_idx 1) so the rhythm is a single note —
     // exactly one event per instrument, the pitch is unambiguous.
-    let bass = decide_instrument_action(&f, 0, 1, num, &plan, MS_PER_STEP);
-    let melody = decide_instrument_action(&f, num - 1, 1, num, &plan, MS_PER_STEP);
+    let bass = decide_instrument_action(&f, 0, 1, num, &plan, MS_PER_STEP, &ctx);
+    let melody = decide_instrument_action(&f, num - 1, 1, num, &plan, MS_PER_STEP, &ctx);
 
     assert_eq!(bass.events.len(), 1, "cadence ⇒ one bass note");
     assert_eq!(melody.events.len(), 1, "cadence ⇒ one melody note");
@@ -212,10 +258,13 @@ fn test_role_pitch_bass_below_melody_golden() {
 fn test_cadence_velocity_and_hold_golden() {
     let plan = fixed_plan();
     let num = 2;
+    let kt = default_key_tempo();
+    let sec = default_section(&plan);
+    let ctx = StepContext::single_section_default(&sec, &kt);
 
     // Saturation 100 on the bass: cadence-exempt velocity = round(96 + 18) = 114.
     let hot = bar(100.0, 55.0, 0.5);
-    let d_hot = decide_instrument_action(&hot, 0, 1, num, &plan, MS_PER_STEP);
+    let d_hot = decide_instrument_action(&hot, 0, 1, num, &plan, MS_PER_STEP, &ctx);
     assert_eq!(d_hot.events.len(), 1, "cadence ⇒ single sustained note");
     assert_eq!(
         d_hot.events[0].velocity, 114,
@@ -232,7 +281,7 @@ fn test_cadence_velocity_and_hold_golden() {
 
     // Saturation 0 on the bass: cadence-exempt velocity = round(96 - 12) = 84.
     let cold = bar(0.0, 55.0, 0.5);
-    let d_cold = decide_instrument_action(&cold, 0, 1, num, &plan, MS_PER_STEP);
+    let d_cold = decide_instrument_action(&cold, 0, 1, num, &plan, MS_PER_STEP, &ctx);
     assert_eq!(
         d_cold.events[0].velocity, 84,
         "cadence velocity must drop to floor 96 + sat0 gain -12 = 84"
@@ -246,9 +295,13 @@ fn test_cadence_velocity_and_hold_golden() {
 fn test_saturation_drives_velocity_level_monotonic() {
     let plan = fixed_plan();
     let num = 2;
+    let kt = default_key_tempo();
+    let sec = default_section(&plan);
+    let ctx = StepContext::single_section_default(&sec, &kt);
     let v = |sat: f32| {
-        decide_instrument_action(&bar(sat, 55.0, 0.5), 0, 1, num, &plan, MS_PER_STEP).events[0]
-            .velocity
+        decide_instrument_action(&bar(sat, 55.0, 0.5), 0, 1, num, &plan, MS_PER_STEP, &ctx).events
+            [0]
+        .velocity
     };
     let lo = v(10.0);
     let mid = v(50.0);
@@ -268,10 +321,13 @@ fn test_saturation_drives_velocity_level_monotonic() {
 #[test]
 fn test_single_instrument_is_melody_not_bass() {
     let plan = fixed_plan();
+    let kt = default_key_tempo();
+    let sec = default_section(&plan);
+    let ctx = StepContext::single_section_default(&sec, &kt);
     let f = bar(60.0, 55.0, 0.2);
     // Cadence step ⇒ one note; inst 0 of 1 is the MELODY ⇒ top-tone pitch (G_MELODY),
     // distinctly NOT the bass-register root (G_BASS).
-    let d = decide_instrument_action(&f, 0, 1, 1, &plan, MS_PER_STEP);
+    let d = decide_instrument_action(&f, 0, 1, 1, &plan, MS_PER_STEP, &ctx);
     assert_eq!(d.channel, 0);
     assert_eq!(d.events.len(), 1);
     assert_eq!(
@@ -285,11 +341,14 @@ fn test_single_instrument_is_melody_not_bass() {
 #[test]
 fn test_larger_ensemble_stratifies_and_channels_valid() {
     let plan = fixed_plan();
+    let kt = default_key_tempo();
+    let sec = default_section(&plan);
+    let ctx = StepContext::single_section_default(&sec, &kt);
     let f = bar(60.0, 55.0, 0.2);
     let num = 4;
     let mut notes = Vec::new();
     for inst in 0..num {
-        let d = decide_instrument_action(&f, inst, 1, num, &plan, MS_PER_STEP);
+        let d = decide_instrument_action(&f, inst, 1, num, &plan, MS_PER_STEP, &ctx);
         assert_eq!(
             d.channel as usize,
             inst % 16,
@@ -317,6 +376,9 @@ fn test_larger_ensemble_stratifies_and_channels_valid() {
 #[test]
 fn test_full_golden_sweep_is_byte_identical() {
     let plan = fixed_plan();
+    let kt = default_key_tempo();
+    let sec = default_section(&plan);
+    let ctx = StepContext::single_section_default(&sec, &kt);
     let f = bar(73.0, 41.0, 0.6);
     let sweep = || {
         let mut v = Vec::new();
@@ -329,6 +391,7 @@ fn test_full_golden_sweep_is_byte_identical() {
                     4,
                     &plan,
                     MS_PER_STEP,
+                    &ctx,
                 ));
             }
         }

@@ -26,7 +26,11 @@ const MIXOLYDIAN: [i8; 7] = [0, 2, 4, 5, 7, 9, 10];
 const AEOLIAN: [i8; 7] = [0, 2, 3, 5, 7, 8, 10];
 
 /// Represent a chord as root MIDI note and a vec of intervals (semitones)
-#[derive(Debug, Clone)]
+// PartialEq: required so `composition::Section` (which derives PartialEq and holds a
+// `Vec<StepPlan>` whose `StepPlan` contains a `Chord`) compiles under the locked S15
+// type contract. theory-neutral: a derive only, no field/behavior change — the byte
+// freeze is untouched.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Chord {
     pub name: String,
     pub notes: Vec<u8>, // actual MIDI note numbers
@@ -485,7 +489,9 @@ pub enum PhrasePosition {
 /// later layer) will hang nuance on. It carries only the bare
 /// structural facts — chord, phrase position, and a phrase-position velocity
 /// floor — never any expressive contour (no messa di voce, crescendo, accents).
-#[derive(Debug, Clone)]
+// PartialEq: required by the locked `composition::Section { steps: Vec<StepPlan>, .. }`
+// (S15 §1.2), which derives PartialEq. Derive only — no shape/behavior change.
+#[derive(Debug, Clone, PartialEq)]
 pub struct StepPlan {
     /// The chord sounded on this step, already passed through voice leading.
     pub chord: Chord,
@@ -894,6 +900,7 @@ pub fn realize_step(
     num_instruments: usize,
     features: &PerfFeatures,
     ms_per_step: u64,
+    ctx: &crate::composition::StepContext,
 ) -> Vec<NoteEvent> {
     let role = instrument_role(inst_idx, num_instruments);
     let is_cadence = matches!(
@@ -909,7 +916,26 @@ pub fn realize_step(
     // register; the melody the TOP chord tone in a high register; the fill
     // an inner tone in the middle. brightness nudges the melody/fill octave.
     // ------------------------------------------------------------------
-    let base_note = role_pitch(role, &step.chord, inst_idx, num_instruments, features);
+    //
+    // THE THEME SEAM (§2 / §4.3): before free-selecting the melody pitch, ask the
+    // plan whether THIS step replays the returning theme. theme_melody_pitch
+    // encodes the §2 musical intent and returns one of three outcomes:
+    //   * `Some(None)`   → a theme-driven REST (Fragmented section past its head):
+    //                      the melody role is silent this step — emit no events.
+    //   * `Some(Some(p))`→ the theme PITCH for this step: substitute base_note = p,
+    //                      then run the EXISTING velocity/rhythm/articulation
+    //                      realization unchanged (so a theme note still sings with
+    //                      the same contour/articulation a free-selected note would).
+    //   * `None`         → free-select (bass/fill always; a melody in a Contrast/
+    //                      Coda section, or with no theme, or under the net's default
+    //                      `ctx`): the byte-identical role_pitch path, frozen.
+    // Only the MELODY pitch is touched here — bass/fill/velocity/rhythm/articulation
+    // bodies are untouched (additive musical logic, not a rewrite).
+    let base_note = match theme_melody_pitch(ctx, role, &step.chord, features) {
+        Some(None) => return Vec::new(),
+        Some(Some(p)) => p,
+        None => role_pitch(role, &step.chord, inst_idx, num_instruments, features),
+    };
 
     // ------------------------------------------------------------------
     // DYNAMICS — phrase contour ON the structural floor.
@@ -1091,12 +1117,10 @@ fn realize_velocity(
 const STACCATO_FRAC: f32 = 0.40;
 const PORTATO_FRAC: f32 = 0.70;
 const LEGATO_FRAC: f32 = 0.95;
-/// S13: the LEGATO ceiling for the CONTINUOUS articulation curve — deliberately
-/// > 1.0 so a calm (low-edge) image's notes OVERLAP across the step boundary and
-/// truly sing, instead of the old code snapping every real photo to 0.95 (never
-/// connecting). theory: legato that crosses the bar line is the single biggest
-/// "played vs typed" cue — it is what kills the operator's "uniformly short" complaint.
-const LEGATO_FRAC_HI: f32 = 1.05;
+// S13's LEGATO_FRAC_HI (1.05) — the original continuous-curve legato ceiling — is
+// SUPERSEDED by ARTIC_WINDOW_HI (1.10) below (S15 §4.4). The curve still crosses the
+// bar line for calm images (the "played vs typed" cue), now within the bounded
+// 0.55..=1.10 non-cadence window. See ARTIC_WINDOW_LO / ARTIC_WINDOW_HI.
 /// S13: per-bar edge-density normalization divisor for the articulation curve.
 /// theory: real photos carry raw per-bar edge density ~0.005..0.05; dividing by this
 /// calibrated max maps that into a usable 0..1 ACTIVITY range so the curve actually
@@ -1105,6 +1129,22 @@ const LEGATO_FRAC_HI: f32 = 1.05;
 /// ONLY because `realize_rhythm` is a free fn with no MappingTable handle (the seam
 /// does not carry one into the per-step realization); keep the two values in sync.
 const EDGE_ACTIVITY_RANGE_MAX: f32 = 0.05;
+/// S15 §4.4: the NON-CADENCE articulation window — the perceptually pleasant
+/// hold-fraction range the continuous S13 curve is re-scaled into. theory: a hold
+/// below ~0.55 of the slot reads as a click rather than a sounded tone; a hold above
+/// ~1.10 muds successive notes together and loses articulation. The cadence ring
+/// (1.20, via the `sustained` cap) is a separate, byte-stable structural figure and
+/// is NOT governed by this window. WINDOW_LO replaces STACCATO_FRAC and WINDOW_HI
+/// replaces LEGATO_FRAC_HI as the curve endpoints (the lerp shape is unchanged).
+const ARTIC_WINDOW_LO: f32 = 0.55;
+const ARTIC_WINDOW_HI: f32 = 1.10;
+/// S15 §2.1/§4.4: the per-character articulation bias for Ballad — the slice-1
+/// character. theory: a character centers WHERE in the 0.55..=1.10 window its line
+/// sits (Ballad leans legato, toward the ceiling); edge_activity then varies around
+/// that center. Slice 1 is Ballad-ONLY and this bias is IDENTITY (×1.0), so it is a
+/// deliberate no-op here — it exists as the documented seam the later characters
+/// (March→toward 0.55, Hymn→~1.0) ride on without re-touching the clamp.
+const BALLAD_ARTIC_BIAS: f32 = 1.0;
 /// The ritardando multiplier applied to a phrase-final note's hold. theory: as
 /// the phrase relaxes into its arrival the final note rings longer.
 const RITARDANDO_FACTOR: f32 = 1.30;
@@ -1141,10 +1181,11 @@ fn realize_rhythm(
         && step.position_in_phrase + 2 >= step.phrase_len
         && step.phrase_len >= 2;
 
-    // S13: CONTINUOUS articulation curve, replacing the old 3-band step function.
-    // theory: note length now varies SMOOTHLY with the normalized edge activity —
-    //   edge_activity = 0 (calm)  → LEGATO_FRAC_HI (1.05, overlapping/singing)
-    //   edge_activity = 1 (busy)  → STACCATO_FRAC  (0.40, crisply detached)
+    // S13 CONTINUOUS articulation curve (S15 §4.4 re-scaled the output window).
+    // theory: note length varies SMOOTHLY with the normalized edge activity, now
+    // re-scaled into the bounded non-cadence window (§4.4):
+    //   edge_activity = 0 (calm)  → ARTIC_WINDOW_HI (1.10, overlapping/singing)
+    //   edge_activity = 1 (busy)  → ARTIC_WINDOW_LO (0.55, crisply detached)
     // A continuous lerp means two images of different busyness get different note
     // lengths instead of snapping to one of three values — directly fixing
     // "uniformly short, computer-like." The HarmonicFill still leans connected
@@ -1153,15 +1194,37 @@ fn realize_rhythm(
     // 0.90, texture)` is omitted — `texture_laplacian_var` is not on the per-step
     // PerfFeatures seam and adding it would be a forbidden seam change. The per-bar
     // edge curve alone removes the uniformity; the global texture bias is deferred.
-    let curve_frac = LEGATO_FRAC_HI + (STACCATO_FRAC - LEGATO_FRAC_HI) * edge_activity;
+    // S15 §4.4 — the NON-CADENCE articulation window narrows to a perceptually
+    // pleasant 0.55..=1.10. theory (design-s15 §7): below ~0.55 a note reads as a
+    // click rather than a tone; above ~1.10 successive notes mud together and lose
+    // their articulation. The S13 curve's RESPONSIVENESS is preserved — we RE-SCALE
+    // the same 0→1 edge_activity sweep into the narrower output range rather than
+    // truncate it (a calm image is still more legato than a busy one, just inside
+    // musical bounds). The endpoints move LEGATO_FRAC_HI(1.05)→ARTIC_WINDOW_HI(1.10)
+    // and STACCATO_FRAC(0.40)→ARTIC_WINDOW_LO(0.55); the lerp is otherwise identical.
+    //
+    // The cadence ring is UNTOUCHED: the `is_cadence` early return below at the
+    // `sustained(0, step_ms, LEGATO_FRAC)` line and the `sustained` helper's
+    // `(frac*rit).min(1.20)` cap (the 1.20 cadence-overlap ceiling, the 240 ms golden)
+    // never read `base_frac` — so the cadence goldens stay byte-stable.
+    //
+    // ARTIC_BIAS rides on TOP of the window as a per-character multiplier centering
+    // where in 0.55..=1.10 this character sits (Ballad→toward the 1.10 ceiling). Slice
+    // 1 is Ballad-only and BALLAD_ARTIC_BIAS == 1.0 (identity), so the bias is a no-op
+    // and the window re-scale is the only change this slice makes.
+    let curve_frac = ARTIC_WINDOW_HI + (ARTIC_WINDOW_LO - ARTIC_WINDOW_HI) * edge_activity;
     let base_frac = match role {
         // Fill biases toward the connected end so inner voices sustain under the line.
-        OrchestralRole::HarmonicFill => curve_frac.max(LEGATO_FRAC),
+        // Floor it at the window LOW, not LEGATO_FRAC (0.95): clamping a HarmonicFill
+        // up to 0.95 would punch ABOVE the busy-end of the new window and re-introduce
+        // a discontinuity. The window low (0.55) is the right connected-leaning floor.
+        OrchestralRole::HarmonicFill => curve_frac.max(ARTIC_WINDOW_LO),
         _ => curve_frac,
     }
-    // Clamp to the existing sustained() envelope cap (0.30..=1.20). 0.30 keeps even
-    // the busiest staccato audible; 1.20 matches the cadence-ring overlap ceiling.
-    .clamp(0.30, 1.20);
+    // Apply the per-character articulation bias (slice-1 Ballad == 1.0, no-op), then
+    // clamp back into the window so the bias can't escape the pleasant range.
+    .mul_add(BALLAD_ARTIC_BIAS, 0.0)
+    .clamp(ARTIC_WINDOW_LO, ARTIC_WINDOW_HI);
 
     // Phrase-end ritardando: cadence (and the pre-cadence approach) lengthen the
     // sounding duration so the arrival rings. Applied as a multiplier on the
@@ -1278,6 +1341,288 @@ fn realize_rhythm(
             }
         }
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// S15 SLICE 1 — RETURNING-THEME LAYER (Music Theory Specialist owns)
+//
+// Two responsibilities, per the locked cross-file contract (spec-s15-slice1 §2):
+//   (1) PRODUCE the theme: `resolve_motif` turns a build-time MotifArchetype +
+//       image-derived range/length into the concrete key-relative `Vec<MotifNote>`
+//       the realizer reads. Called by composition.rs at PLAN-BUILD time, NEVER at
+//       tick time. This is the ONE place a melodic contour → degree+duration.
+//   (2) CONSUME the theme: `theme_melody_pitch` is the realizer's theme-replay
+//       decision — on a Statement/Return section it maps the current motif note's
+//       scale degree into a sounding pitch in the section's mode/key; on Fragmented
+//       it plays only the head then rests; on Contrast/None it returns None so the
+//       caller free-selects exactly as today (byte-stable back-compat path).
+//
+// The motif is KEY-RELATIVE (scale degree + duration), so when Stage-5 modulation
+// arrives a section's key_offset transposes it for free — slice 1 stays home (offset
+// 0), so no transposition ever fires here.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The 8 curated melodic-shape archetypes (design-s15 §4.3). Each is a textbook
+/// contour; `resolve_motif` parameterizes it by range and length. This enum is a
+/// BUILD-TIME input only (operator decision 4, spec §7): it is NOT stored on
+/// `ThemeSeed`/`MotifNote` and is NOT read at tick time. The slice-1 ACTIVE subset
+/// is the original four (Arch, Descent, Ascent, NeighborTurn — the contours the
+/// theme-seeding ladder selects in slice 1); the other four ship as variants the
+/// later variation-technique stage pairs with inversion/sequence operations.
+///
+/// theory: bounding the motif vocabulary to known-good shapes is the §1-governor
+/// (a principled default + conditional departures) applied at the motif level —
+/// the image SELECTS and PARAMETERIZES a shape, it never generates a random (and
+/// possibly ugly) interval string.
+/// One motif note — scale/key-relative so it transposes cleanly (spec §1.3, operator
+/// decision 4 — LOCKED shape). theory: a motif stored as scale DEGREE + DURATION (not
+/// absolute pitch) is mode-portable and transposes by simply adding the section key
+/// offset; the realizer (`theme_melody_pitch`) is the one place degree → pitch happens.
+///
+/// CONTRACT NOTE: this type lives HERE in `chord_engine` because (a) `resolve_motif`
+/// (the one-way contour→degree resolver) produces it and the realizer consumes it —
+/// both Music-Theory-owned — and (b) `composition::ThemeSeed.motif` is already typed
+/// `Vec<chord_engine::MotifNote>` and `composition.rs` calls `chord_engine::resolve_motif`
+/// expecting this type. (The duplicate `composition::MotifNote` in the parallel
+/// composition.rs is unused by `ThemeSeed` and should be removed by the Implementer to
+/// avoid two same-named types — flagged in the return summary.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MotifNote {
+    /// Scale degree relative to the section tonic (0 == tonic).
+    pub degree: i8,
+    /// Duration in steps (>= 1).
+    pub dur_steps: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotifArchetype {
+    /// 1 3 5 3 1 — up then down; balanced, singable. The DEFAULT contour.
+    Arch,
+    /// 5 3 1 3 5 — settling then rising; the mirror of Arch (a valley).
+    InvertedArch,
+    /// 5 4 3 2 1 — stepwise fall, "from the light," strongly resolving.
+    Descent,
+    /// 1 2 3 4 5 — stepwise rise, opening/lifting.
+    Ascent,
+    /// 1 2 1 7 1 — upper then lower neighbor around the tonic; gentle, ornamental.
+    NeighborTurn,
+    /// 1 5 4 3 2 — an opening leap then a stepwise gap-fill descent.
+    LeapStep,
+    /// 1 5 1 5 1 — oscillating tonic↔dominant; insistent, two-zone.
+    Pendulum,
+    /// 1 2 3 / 2 3 4 — a rising 3-note cell sequenced up a step; developmental.
+    RisingSequence,
+}
+
+impl MotifArchetype {
+    /// The archetype's contour as a sequence of SCALE-DEGREE OFFSETS from the tonic,
+    /// expressed in a canonical 0-based form (0 == tonic, 4 == the fifth, -1 == the
+    /// leading tone below). `resolve_motif` scales these into the requested range and
+    /// pads/truncates to the requested length. theory: keeping the contour as degree
+    /// offsets (not pitches) is what makes inversion (negate) and transposition (add
+    /// the key offset) clean operations on the SAME data the realizer reads.
+    fn contour(self) -> &'static [i8] {
+        match self {
+            // do=0 frame; the fifth is degree 4, the third degree 2.
+            MotifArchetype::Arch => &[0, 2, 4, 2, 0],
+            MotifArchetype::InvertedArch => &[4, 2, 0, 2, 4],
+            MotifArchetype::Descent => &[4, 3, 2, 1, 0],
+            MotifArchetype::Ascent => &[0, 1, 2, 3, 4],
+            // upper neighbor (1), back to tonic (0), lower neighbor (-1, the leading
+            // tone), resolve to tonic — the classic turn around do.
+            MotifArchetype::NeighborTurn => &[0, 1, 0, -1, 0],
+            MotifArchetype::LeapStep => &[0, 4, 3, 2, 1],
+            MotifArchetype::Pendulum => &[0, 4, 0, 4, 0],
+            // two overlapping rising cells (a real motivic sequence).
+            MotifArchetype::RisingSequence => &[0, 1, 2, 1, 2, 3],
+        }
+    }
+}
+
+/// Resolve a build-time `MotifArchetype` + image-derived range/length into the
+/// concrete key-relative degree+duration sequence the realizer reads (spec §1.5).
+/// THE ONE PLACE contour → `MotifNote` happens. Called by `composition.rs` at plan
+/// build, never at tick time — so `MotifNote` stays frozen and the freeze is safe.
+///
+/// `archetype`    — the chosen melodic shape (image-selected upstream).
+/// `range_degrees`— the span (in scale degrees) the contour is stretched/compressed
+///                  to fill; clamped to a singable 1..=7 (a degree-7 span ≈ an
+///                  octave). theory: edge_activity/complexity sets this band — calm →
+///                  conjunct (small range), busy → wider leaps.
+/// `length_steps` — how many `MotifNote`s the theme runs for; the contour is sampled
+///                  /padded to this length. Clamped to >=1.
+///
+/// Determinism: pure function of its three inputs — no RNG, no clock.
+pub fn resolve_motif(
+    archetype: MotifArchetype,
+    range_degrees: u8,
+    length_steps: usize,
+) -> Vec<MotifNote> {
+    let contour = archetype.contour();
+    // The canonical contour spans degrees 0..=4 (a fifth). Re-scale that native span
+    // to the requested range so a "wide" image stretches the same shape over a larger
+    // ambit without changing the contour's identity. Clamp the range to a singable
+    // 1..=7 (degree 7 ≈ one octave) so we never produce an unsingable leap.
+    let range = range_degrees.clamp(1, 7) as f32;
+    const NATIVE_SPAN: f32 = 4.0; // degrees 0..=4
+    let scale = range / NATIVE_SPAN;
+
+    let len = length_steps.max(1);
+    let n_contour = contour.len();
+
+    // Distribute `len` notes across the contour. If len >= n_contour we hold the
+    // tail; if len < n_contour we sample the FRONT (a natural truncation that still
+    // begins on the tonic — exactly what "head-only" fragmentation wants downstream).
+    (0..len)
+        .map(|i| {
+            // Sample index into the contour: walk the contour once, then hold its
+            // final degree for any extra steps (a sustained arrival, not a wrap —
+            // wrapping would restart the shape and read as a loop).
+            let ci = i.min(n_contour - 1);
+            let raw = contour[ci] as f32 * scale;
+            // Round to the nearest scale degree; the realizer maps degree → pitch.
+            let degree = raw.round() as i8;
+            MotifNote {
+                degree,
+                // Even 1-step durations in slice 1: the per-step rhythm comes from the
+                // realizer's existing rhythm layer, not the motif. theory: keeping the
+                // motif rhythmically plain in slice 1 means augmentation/diminution
+                // (Stage 7) can later scale dur_steps without colliding with a
+                // pre-baked rhythm here.
+                dur_steps: 1,
+            }
+        })
+        .collect()
+}
+
+/// Map a scale degree (relative to the section tonic, 0 == tonic) onto a sounding
+/// MIDI pitch in the section's mode, seated near the melody register. Pure helper
+/// for the theme-replay realizer. theory: a key-relative degree must resolve through
+/// the section's actual MODE (degree 2 is a major third in Ionian but a minor third
+/// in Aeolian) — that is what makes the same motif sound right in any mode.
+fn degree_to_pitch(degree: i8, tonic_pc: u8, mode: &str, register_floor: u8) -> u8 {
+    let scale = match mode {
+        "Ionian" => IONIAN,
+        "Dorian" => DORIAN,
+        "Phrygian" => PHRYGIAN,
+        "Lydian" => LYDIAN,
+        "Mixolydian" => MIXOLYDIAN,
+        "Aeolian" => AEOLIAN,
+        _ => IONIAN, // unknown mode → Ionian, matching generate_chords' fallback
+    };
+    // Decompose the (possibly negative, possibly >6) degree into an octave count and
+    // a 0..=6 index into the 7-note scale. Rust's `%` is truncating, so use rem_euclid
+    // for a correct floored index/octave on negative degrees (e.g. degree -1 = the
+    // leading tone, one scale step BELOW the tonic in the octave below).
+    let n = scale.len() as i32; // 7
+    let d = degree as i32;
+    let idx = d.rem_euclid(n); // 0..=6
+    let octave = d.div_euclid(n); // floored octave offset
+                                  // The pitch CLASS this degree names, then seat that class at/above the register
+                                  // floor (the same one-place seating role_pitch uses), and apply the degree's own
+                                  // octave on top so an ascending motif actually climbs across the octave break.
+    let pc = (tonic_pc as i32 + scale[idx as usize] as i32).rem_euclid(12) as u8;
+    let seated = seat_pc_in_register(pc, register_floor) as i32 + 12 * octave;
+    seated.clamp(24, 108) as u8
+}
+
+/// The realizer's THEME-REPLAY decision (spec §2, task 2). Given the plan-relative
+/// `StepContext`, decide what pitch the MELODY role sounds on this step:
+///
+///   * `thematic_role == Statement | Return` with a theme present → play the motif
+///     note for `ctx.step_in_section` (degree → pitch in the section's mode/key),
+///     returning `Some(pitch)`.
+///   * `variation == Fragmented` → play only the FIRST HALF of the motif; once past
+///     the head the melody role RESTS (returns `Some(None)` semantics via the outer
+///     Option: `Some(SILENT_MELODY)`), so the caller emits no melody note.
+///   * `Contrast | Coda | Development`, or no theme, or a non-Melody role → return
+///     `None`: the caller free-selects exactly as today (byte-stable back-compat).
+///
+/// Returns `Option<Option<u8>>`:
+///   * `None`          → not a theme-replay step; caller takes its existing path.
+///   * `Some(Some(p))` → play the theme pitch `p`.
+///   * `Some(None)`    → theme-driven REST (Fragmented tail); caller emits nothing.
+///
+/// This keeps the realizer's free-select / velocity / rhythm bodies UNTOUCHED — the
+/// theme branch only substitutes (or silences) the melody PITCH; everything else
+/// (the Bass/Fill roles, velocity contour, rhythm patterns) is unchanged.
+pub fn theme_melody_pitch(
+    ctx: &crate::composition::StepContext,
+    role: OrchestralRole,
+    chord: &Chord,
+    features: &PerfFeatures,
+) -> Option<Option<u8>> {
+    use crate::composition::{ThematicRole, ThemeVariation};
+
+    // Only the MELODY role carries the theme; bass/fill keep their existing behavior.
+    if role != OrchestralRole::Melody {
+        return None;
+    }
+    // A theme must be present and the section must STATE or RECALL it. Contrast/Coda/
+    // Development sections (and theme:None) free-select — the spec's "today's behavior."
+    let theme = ctx.theme?;
+    match ctx.section.thematic_role {
+        ThematicRole::Statement | ThematicRole::Return => {}
+        _ => return None,
+    }
+    if theme.motif.is_empty() {
+        return None;
+    }
+
+    // FRAGMENTED (head-then-rest): the B-section continuity gesture. Play only the
+    // first half of the motif; past the head, the melody role rests. theory: head-
+    // only sequencing is the "developing" gesture — it keeps motivic continuity
+    // through a contrast without restating the whole tune (design-s15 §4.1/§4.2).
+    let head_len = match ctx.section.variation {
+        ThemeVariation::Fragmented => (theme.motif.len() + 1) / 2, // ceil(half)
+        _ => theme.motif.len(),
+    };
+    let motif_idx = ctx.step_in_section;
+    if motif_idx >= head_len {
+        // Past the playable span: Identity holds the final motif note (a sustained
+        // arrival, never a wrap-loop); Fragmented rests.
+        return match ctx.section.variation {
+            ThemeVariation::Fragmented => Some(None), // head consumed → melody rests
+            _ => {
+                let last = theme.motif[theme.motif.len() - 1];
+                Some(Some(theme_pitch(last.degree, ctx, chord, features)))
+            }
+        };
+    }
+
+    let note = theme.motif[motif_idx];
+    Some(Some(theme_pitch(note.degree, ctx, chord, features)))
+}
+
+/// Resolve one motif degree to a sounding melody pitch in the CURRENT section's
+/// mode/key, biased toward the chord so the theme note lands as a chord tone when it
+/// can. theory: a motif degree that coincides with a chord tone is consonant; one
+/// that doesn't is a NON-CHORD TONE (passing/neighbor) over the prevailing harmony —
+/// both are musical, and degree-relative-to-key (not snapped-to-chord) is what gives
+/// the theme its recognizable melodic identity across changing chords.
+fn theme_pitch(
+    degree: i8,
+    ctx: &crate::composition::StepContext,
+    chord: &Chord,
+    features: &PerfFeatures,
+) -> u8 {
+    // Tonic pitch-class: section key_offset (always 0 in slice 1) over the home root.
+    let tonic_pc = ((ctx.key_tempo.home_root_midi as i16 + ctx.section.key_offset_semitones as i16)
+        .rem_euclid(12)) as u8;
+    // Brightness raises/lowers the melody register exactly as role_pitch does for the
+    // free-select melody, so theme and free-select notes share one register frame.
+    let bright_octaves = ((features.brightness - 50.0) / 50.0).clamp(-1.0, 1.0);
+    let lift = (bright_octaves * 12.0).round() as i16;
+    let floor = (MELODY_REGISTER_FLOOR as i16 + lift).clamp(24, 96) as u8;
+    let mode = ctx.section.mode.as_str();
+    let mut pitch = degree_to_pitch(degree, tonic_pc, mode, floor);
+    // If the resolved degree is enharmonically a chord tone, prefer the chord's own
+    // octave-seating of that pitch class so a consonant theme note locks to the chord.
+    let pc = pitch % 12;
+    if chord.notes.iter().any(|&n| n % 12 == pc) {
+        pitch = seat_pc_in_register(pc, floor);
+    }
+    pitch.clamp(24, 108)
 }
 
 /// Minimum spacing (in semitones) required between any two ADJACENT upper
@@ -2344,10 +2689,19 @@ mod tests {
         let num_instruments = 3usize;
         let inst_idx = 1usize;
 
+        let (s, k) = neutral_ctx_parts();
+        let ctx = StepContext::single_section_default(&s, &k);
         let mut realized: Vec<u8> = Vec::new();
         let mut floor: Vec<u8> = Vec::new();
         for step in &plan {
-            let events = realize_step(step, inst_idx, num_instruments, &features, ms_per_step);
+            let events = realize_step(
+                step,
+                inst_idx,
+                num_instruments,
+                &features,
+                ms_per_step,
+                &ctx,
+            );
             // Take the step's representative (loudest) realized velocity so a
             // multi-onset step still contributes one contour sample.
             let v = events
@@ -2404,16 +2758,32 @@ mod tests {
             .find(|s| s.phrase_index == 0 && s.position == PhrasePosition::Interior)
             .expect("phrase 0 must have an Interior step");
 
-        let v_start = realize_step(start, inst_idx, num_instruments, &features, ms_per_step)
-            .iter()
-            .map(|e| e.velocity)
-            .max()
-            .unwrap_or(start.velocity) as i32;
-        let v_interior = realize_step(interior, inst_idx, num_instruments, &features, ms_per_step)
-            .iter()
-            .map(|e| e.velocity)
-            .max()
-            .unwrap_or(interior.velocity) as i32;
+        let (s, k) = neutral_ctx_parts();
+        let ctx = StepContext::single_section_default(&s, &k);
+        let v_start = realize_step(
+            start,
+            inst_idx,
+            num_instruments,
+            &features,
+            ms_per_step,
+            &ctx,
+        )
+        .iter()
+        .map(|e| e.velocity)
+        .max()
+        .unwrap_or(start.velocity) as i32;
+        let v_interior = realize_step(
+            interior,
+            inst_idx,
+            num_instruments,
+            &features,
+            ms_per_step,
+            &ctx,
+        )
+        .iter()
+        .map(|e| e.velocity)
+        .max()
+        .unwrap_or(interior.velocity) as i32;
 
         // The realized strong-minus-weak gap must EXCEED the bare structural-floor
         // gap — i.e. the metric accent contributes on top of the floor. On the
@@ -2451,6 +2821,8 @@ mod tests {
         let ms_per_step = 1200u64;
         let num_instruments = 3usize;
 
+        let (s, k) = neutral_ctx_parts();
+        let ctx = StepContext::single_section_default(&s, &k);
         let mut signatures: std::collections::HashSet<Vec<(u64, u64)>> =
             std::collections::HashSet::new();
         for &edge in &[0.05f32, 0.5, 0.95] {
@@ -2461,8 +2833,14 @@ mod tests {
             };
             for inst_idx in 0..num_instruments {
                 for step in &plan {
-                    let events =
-                        realize_step(step, inst_idx, num_instruments, &features, ms_per_step);
+                    let events = realize_step(
+                        step,
+                        inst_idx,
+                        num_instruments,
+                        &features,
+                        ms_per_step,
+                        &ctx,
+                    );
                     let mut sig: Vec<(u64, u64)> =
                         events.iter().map(|e| (e.offset_ms, e.hold_ms)).collect();
                     sig.sort_unstable();
@@ -2499,6 +2877,8 @@ mod tests {
 
         // Quantize hold fraction to 0.05 buckets so we count GENUINELY distinct
         // articulations, not float noise.
+        let (s, k) = neutral_ctx_parts();
+        let ctx = StepContext::single_section_default(&s, &k);
         let mut fractions: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for &edge in &[0.05f32, 0.5, 0.95] {
             let features = PerfFeatures {
@@ -2508,8 +2888,14 @@ mod tests {
             };
             for inst_idx in 0..num_instruments {
                 for step in &plan {
-                    let events =
-                        realize_step(step, inst_idx, num_instruments, &features, ms_per_step);
+                    let events = realize_step(
+                        step,
+                        inst_idx,
+                        num_instruments,
+                        &features,
+                        ms_per_step,
+                        &ctx,
+                    );
                     for e in &events {
                         let frac = e.hold_ms as f64 / ms_per_step as f64;
                         fractions.insert((frac * 20.0).round() as u32);
@@ -2559,10 +2945,12 @@ mod tests {
             .expect("the period must contain at least one cadence step");
         let phrase = cadence.phrase_index;
 
+        let (sec, kt) = neutral_ctx_parts();
+        let ctx = StepContext::single_section_default(&sec, &kt);
         let interior_holds: Vec<u64> = plan
             .iter()
             .filter(|s| s.phrase_index == phrase && s.position == PhrasePosition::Interior)
-            .flat_map(|s| realize_step(s, inst_idx, num_instruments, &features, ms_per_step))
+            .flat_map(|s| realize_step(s, inst_idx, num_instruments, &features, ms_per_step, &ctx))
             .map(|e| e.hold_ms)
             .collect();
         assert!(
@@ -2572,11 +2960,18 @@ mod tests {
         let interior_mean =
             interior_holds.iter().map(|&h| h as f64).sum::<f64>() / interior_holds.len() as f64;
 
-        let cadence_hold = realize_step(cadence, inst_idx, num_instruments, &features, ms_per_step)
-            .iter()
-            .map(|e| e.hold_ms)
-            .max()
-            .expect("cadence step must sound at least one note") as f64;
+        let cadence_hold = realize_step(
+            cadence,
+            inst_idx,
+            num_instruments,
+            &features,
+            ms_per_step,
+            &ctx,
+        )
+        .iter()
+        .map(|e| e.hold_ms)
+        .max()
+        .expect("cadence step must sound at least one note") as f64;
 
         assert!(
             cadence_hold > interior_mean,
@@ -2650,8 +3045,10 @@ mod tests {
             .find(|s| s.position == PhrasePosition::PhraseStart)
             .expect("need a phrase-start step");
 
-        let bass = realize_step(step, 0, num, &features, ms_per_step);
-        let melody = realize_step(step, num - 1, num, &features, ms_per_step);
+        let (s, k) = neutral_ctx_parts();
+        let ctx = StepContext::single_section_default(&s, &k);
+        let bass = realize_step(step, 0, num, &features, ms_per_step, &ctx);
+        let melody = realize_step(step, num - 1, num, &features, ms_per_step, &ctx);
 
         assert!(
             !bass.is_empty() && !melody.is_empty(),
@@ -2850,6 +3247,8 @@ mod tests {
         let plan = ionian_period(&eng);
         let ms_per_step = 1000u64;
         let num = 3usize;
+        let (s, k) = neutral_ctx_parts();
+        let ctx = StepContext::single_section_default(&s, &k);
 
         // Mean hold fraction over the MELODY's CURVE-GOVERNED steps (PhraseStart /
         // Interior — the sustained branch). We exclude the cadence step (a fixed
@@ -2874,10 +3273,11 @@ mod tests {
                 if !curve_governed {
                     continue;
                 }
-                if let Some(max_hold) = realize_step(step, num - 1, num, &features, ms_per_step)
-                    .iter()
-                    .map(|e| e.hold_ms)
-                    .max()
+                if let Some(max_hold) =
+                    realize_step(step, num - 1, num, &features, ms_per_step, &ctx)
+                        .iter()
+                        .map(|e| e.hold_ms)
+                        .max()
                 {
                     fracs.push(max_hold as f64 / ms_per_step as f64);
                 }
@@ -2912,6 +3312,8 @@ mod tests {
         let plan = ionian_period(&eng);
         let ms_per_step = 1200u64;
         let num = 3usize;
+        let (s, k) = neutral_ctx_parts();
+        let ctx = StepContext::single_section_default(&s, &k);
 
         let onset_multiset = |edge_raw: f32| -> std::collections::BTreeMap<usize, usize> {
             let features = PerfFeatures {
@@ -2923,7 +3325,7 @@ mod tests {
                 std::collections::BTreeMap::new();
             for inst in 0..num {
                 for step in &plan {
-                    let n = realize_step(step, inst, num, &features, ms_per_step).len();
+                    let n = realize_step(step, inst, num, &features, ms_per_step, &ctx).len();
                     *counts.entry(n).or_default() += 1;
                 }
             }
@@ -3179,5 +3581,421 @@ mod tests {
         );
         // degenerate range_max fails safe to 0 (no activity), never NaN/inf.
         assert_eq!(FeatureNormalization::normalize(0.5, 0.0), 0.0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // S15 SLICE 1 — RETURNING-THEME LAYER tests (resolve_motif + theme_melody_pitch
+    // + the articulation-clamp window). Musical-property assertions, not execution.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    use crate::composition::{
+        CadenceStrength, KeyTempoPlan, Section, StepContext, ThematicRole, ThemeSeed,
+        ThemeVariation,
+    };
+
+    /// Build a behaviour-neutral home-key section for theme tests.
+    fn theme_section(
+        role: ThematicRole,
+        variation: ThemeVariation,
+        theme: Option<usize>,
+    ) -> Section {
+        Section {
+            label: "A".to_string(),
+            step_len: 8,
+            thematic_role: role,
+            key_offset_semitones: 0,
+            ms_per_step: 200,
+            mode: "Ionian".to_string(),
+            progression: vec![],
+            theme,
+            variation,
+            boundary_cadence: CadenceStrength::Perfect,
+            density: 0.5,
+            steps: vec![],
+        }
+    }
+
+    fn home_key_tempo() -> KeyTempoPlan {
+        KeyTempoPlan {
+            home_root_midi: 60, // C4 → tonic pc 0
+            home_mode: "Ionian".to_string(),
+            base_ms_per_step: 200,
+            key_scheme: vec![0],
+            tempo_scheme: vec![200],
+        }
+    }
+
+    /// The behaviour-neutral owned (Section, KeyTempoPlan) for the PRE-theme
+    /// articulation/velocity/rhythm tests below: theme:None ⇒ realize_step takes its
+    /// existing free-select melody path, so every assertion in those tests is
+    /// byte-identical to its pre-seam value. Built owned so each call site can bind a
+    /// local `ctx = StepContext::single_section_default(&s, &k)` — the ONLY change to
+    /// those tests is adding the `&ctx` argument; no assert/expected value moves.
+    fn neutral_ctx_parts() -> (Section, KeyTempoPlan) {
+        (
+            theme_section(ThematicRole::Statement, ThemeVariation::Identity, None),
+            home_key_tempo(),
+        )
+    }
+
+    fn perf_mid() -> PerfFeatures {
+        PerfFeatures {
+            saturation: 50.0,
+            brightness: 50.0, // bright_octaves 0 → no register lift
+            edge_density: 0.01,
+        }
+    }
+
+    // ── resolve_motif ────────────────────────────────────────────────────
+
+    /// PROPERTY: resolve_motif emits exactly `length_steps` notes (>=1), each with
+    /// a valid duration — the realizer reads a concrete, correctly-sized motif.
+    #[test]
+    fn test_resolve_motif_length_and_duration() {
+        for &len in &[1usize, 4, 5, 8] {
+            let m = resolve_motif(MotifArchetype::Arch, 4, len);
+            assert_eq!(m.len(), len, "must emit exactly the requested length");
+            assert!(
+                m.iter().all(|n| n.dur_steps >= 1),
+                "every motif note must have dur_steps >= 1"
+            );
+        }
+        // length 0 is clamped to 1 (never an empty motif the realizer can't read).
+        assert_eq!(resolve_motif(MotifArchetype::Arch, 4, 0).len(), 1);
+    }
+
+    /// PROPERTY: the Arch contour rises to an apex then falls back to (near) the
+    /// tonic — the defining "up then down" shape. Tests degrees, not pitches.
+    #[test]
+    fn test_resolve_motif_arch_is_up_then_down() {
+        let m = resolve_motif(MotifArchetype::Arch, 4, 5);
+        let degs: Vec<i8> = m.iter().map(|n| n.degree).collect();
+        // 0 .. apex .. 0 : strictly rises to the middle, then falls.
+        assert!(
+            degs[0] <= degs[1] && degs[1] <= degs[2],
+            "must rise to apex: {degs:?}"
+        );
+        assert!(
+            degs[2] >= degs[3] && degs[3] >= degs[4],
+            "must fall from apex: {degs:?}"
+        );
+        assert_eq!(
+            degs[0], degs[4],
+            "an arch returns to its starting degree: {degs:?}"
+        );
+    }
+
+    /// PROPERTY: Ascent rises monotonically; Descent falls monotonically — the two
+    /// gradient-driven directional contours move in opposite directions.
+    #[test]
+    fn test_resolve_motif_ascent_descent_directions() {
+        let asc: Vec<i8> = resolve_motif(MotifArchetype::Ascent, 4, 5)
+            .iter()
+            .map(|n| n.degree)
+            .collect();
+        let desc: Vec<i8> = resolve_motif(MotifArchetype::Descent, 4, 5)
+            .iter()
+            .map(|n| n.degree)
+            .collect();
+        assert!(
+            asc.windows(2).all(|w| w[1] >= w[0]),
+            "Ascent must not fall: {asc:?}"
+        );
+        assert!(
+            desc.windows(2).all(|w| w[1] <= w[0]),
+            "Descent must not rise: {desc:?}"
+        );
+        assert!(asc[asc.len() - 1] > asc[0], "Ascent must net rise");
+        assert!(desc[desc.len() - 1] < desc[0], "Descent must net fall");
+    }
+
+    /// PROPERTY: a WIDER range stretches the contour to a larger ambit (the busy-image
+    /// "wider leaps" knob), while a narrow range stays conjunct. Compare apex degrees.
+    #[test]
+    fn test_resolve_motif_range_widens_ambit() {
+        let narrow = resolve_motif(MotifArchetype::Arch, 2, 5);
+        let wide = resolve_motif(MotifArchetype::Arch, 7, 5);
+        let span = |m: &[MotifNote]| {
+            let lo = m.iter().map(|n| n.degree).min().unwrap();
+            let hi = m.iter().map(|n| n.degree).max().unwrap();
+            hi - lo
+        };
+        assert!(
+            span(&wide) > span(&narrow),
+            "a wider range must produce a larger degree span (wide {} > narrow {})",
+            span(&wide),
+            span(&narrow)
+        );
+    }
+
+    // ── theme_melody_pitch ────────────────────────────────────────────────
+
+    /// PROPERTY: a non-Melody role NEVER takes the theme path (bass/fill keep their
+    /// existing free-select behavior) — returns None so the caller is byte-stable.
+    #[test]
+    fn test_theme_pitch_only_melody_role() {
+        let section = theme_section(ThematicRole::Statement, ThemeVariation::Identity, Some(0));
+        let kt = home_key_tempo();
+        let seed = ThemeSeed {
+            id: 0,
+            motif: resolve_motif(MotifArchetype::Arch, 4, 8),
+        };
+        let ctx = StepContext {
+            section: &section,
+            step_in_section: 0,
+            theme: Some(&seed),
+            key_tempo: &kt,
+        };
+        let chord = c_major_triad();
+        for role in [OrchestralRole::Bass, OrchestralRole::HarmonicFill] {
+            assert!(
+                theme_melody_pitch(&ctx, role, &chord, &perf_mid()).is_none(),
+                "{role:?} must not take the theme path"
+            );
+        }
+    }
+
+    /// PROPERTY: a Contrast section (or theme:None) free-selects — theme path is None.
+    #[test]
+    fn test_theme_pitch_contrast_free_selects() {
+        let kt = home_key_tempo();
+        let seed = ThemeSeed {
+            id: 0,
+            motif: resolve_motif(MotifArchetype::Arch, 4, 8),
+        };
+        let chord = c_major_triad();
+
+        let contrast = theme_section(ThematicRole::Contrast, ThemeVariation::Identity, Some(0));
+        let ctx = StepContext {
+            section: &contrast,
+            step_in_section: 0,
+            theme: Some(&seed),
+            key_tempo: &kt,
+        };
+        assert!(
+            theme_melody_pitch(&ctx, OrchestralRole::Melody, &chord, &perf_mid()).is_none(),
+            "a Contrast section must free-select (theme path None)"
+        );
+
+        // theme:None on a Statement section also free-selects.
+        let no_theme = theme_section(ThematicRole::Statement, ThemeVariation::Identity, None);
+        let ctx2 = StepContext {
+            section: &no_theme,
+            step_in_section: 0,
+            theme: None,
+            key_tempo: &kt,
+        };
+        assert!(
+            theme_melody_pitch(&ctx2, OrchestralRole::Melody, &chord, &perf_mid()).is_none(),
+            "a section with no theme must free-select"
+        );
+    }
+
+    /// PROPERTY: on a Statement/Return Melody step the theme plays a sounding pitch in
+    /// the engine's playable band, and the tonic-degree (0) note resolves to the key's
+    /// tonic pitch class (C, pc 0, for home_root 60).
+    #[test]
+    fn test_theme_pitch_statement_plays_tonic_for_degree_zero() {
+        // Arch motif starts on degree 0 (tonic). At home root C (pc 0), step 0's pitch
+        // must be a C (pc 0), seated in the melody register, in band 24..=108.
+        let section = theme_section(ThematicRole::Statement, ThemeVariation::Identity, Some(0));
+        let kt = home_key_tempo();
+        let seed = ThemeSeed {
+            id: 0,
+            motif: resolve_motif(MotifArchetype::Arch, 4, 8),
+        };
+        let ctx = StepContext {
+            section: &section,
+            step_in_section: 0,
+            theme: Some(&seed),
+            key_tempo: &kt,
+        };
+        let chord = c_major_triad();
+        let got = theme_melody_pitch(&ctx, OrchestralRole::Melody, &chord, &perf_mid());
+        match got {
+            Some(Some(p)) => {
+                assert!((24..=108).contains(&p), "theme pitch {p} out of band");
+                assert_eq!(
+                    p % 12,
+                    0,
+                    "degree-0 (tonic) over C must sound a C, got pc {}",
+                    p % 12
+                );
+            }
+            other => panic!("Statement step must PLAY the theme, got {other:?}"),
+        }
+    }
+
+    /// PROPERTY: Fragmented plays only the FIRST HALF of the motif then RESTS — the
+    /// head-then-silence continuity gesture. Past the head, the melody returns
+    /// `Some(None)` (a theme-driven rest), not a sounded note.
+    #[test]
+    fn test_theme_pitch_fragmented_head_then_rest() {
+        let section = theme_section(ThematicRole::Statement, ThemeVariation::Fragmented, Some(0));
+        let kt = home_key_tempo();
+        let motif = resolve_motif(MotifArchetype::Arch, 4, 8); // len 8 → head = 4
+        let seed = ThemeSeed { id: 0, motif };
+        let chord = c_major_triad();
+        let mk = |step: usize| {
+            let ctx = StepContext {
+                section: &section,
+                step_in_section: step,
+                theme: Some(&seed),
+                key_tempo: &kt,
+            };
+            theme_melody_pitch(&ctx, OrchestralRole::Melody, &chord, &perf_mid())
+        };
+        // Head (steps 0..=3) sounds; tail (4..) rests.
+        for step in 0..4 {
+            assert!(
+                matches!(mk(step), Some(Some(_))),
+                "fragmented head step {step} must sound"
+            );
+        }
+        for step in 4..8 {
+            assert_eq!(
+                mk(step),
+                Some(None),
+                "fragmented tail step {step} must REST (head-then-silence)"
+            );
+        }
+    }
+
+    /// PROPERTY: Identity past the motif end HOLDS the final note (a sustained arrival),
+    /// never wraps/loops back to the head — a loop would read as the mechanical
+    /// repetition the whole theme layer exists to kill.
+    #[test]
+    fn test_theme_pitch_identity_holds_not_loops() {
+        let section = theme_section(ThematicRole::Return, ThemeVariation::Identity, Some(0));
+        let kt = home_key_tempo();
+        let motif = resolve_motif(MotifArchetype::Ascent, 4, 5);
+        let seed = ThemeSeed {
+            id: 0,
+            motif: motif.clone(),
+        };
+        let chord = c_major_triad();
+        let last_idx = motif.len() - 1;
+        let mk = |step: usize| {
+            let ctx = StepContext {
+                section: &section,
+                step_in_section: step,
+                theme: Some(&seed),
+                key_tempo: &kt,
+            };
+            theme_melody_pitch(&ctx, OrchestralRole::Melody, &chord, &perf_mid())
+        };
+        let at_end = mk(last_idx);
+        let past_end = mk(last_idx + 3);
+        assert!(
+            matches!(at_end, Some(Some(_))),
+            "final motif step must sound"
+        );
+        assert_eq!(
+            at_end, past_end,
+            "Identity past the end must HOLD the final note, not loop to the head"
+        );
+    }
+
+    // ── articulation clamp window (S15 §4.4) ───────────────────────────────
+
+    /// PROPERTY: the NON-CADENCE hold fraction stays inside the 0.55..=1.10 window
+    /// for every edge_activity — a calm note never muds (>1.10), a busy note never
+    /// clicks (<0.55). Swept across the full raw-edge range and all three roles.
+    /// (The cadence branch is exempt and tested separately as the byte-stable 240ms.)
+    #[test]
+    fn test_articulation_window_bounds_non_cadence() {
+        let eng = engine();
+        let plan = ionian_period(&eng);
+        let ms = 1000u64;
+        let (sec, kt) = neutral_ctx_parts();
+        let ctx = StepContext::single_section_default(&sec, &kt);
+        for &raw_edge in &[0.0f32, 0.005, 0.01, 0.025, 0.05, 0.2] {
+            let f = PerfFeatures {
+                saturation: 50.0,
+                brightness: 50.0,
+                edge_density: raw_edge,
+            };
+            for inst in 0..3usize {
+                for step in &plan {
+                    let is_cadence = matches!(
+                        step.position,
+                        PhrasePosition::HalfCadence | PhrasePosition::PerfectAuthenticCadence
+                    );
+                    if is_cadence {
+                        continue; // cadence ring is the exempt, byte-stable figure
+                    }
+                    for e in realize_step(step, inst, 3, &f, ms, &ctx) {
+                        let frac = e.hold_ms as f32 / ms as f32;
+                        // The window low (0.55) is the floor; the cadence cap (1.20) is
+                        // the only way >1.10 can appear, and we excluded cadence steps.
+                        // Multi-onset patterns subdivide the slot, so a SUB-note can be
+                        // shorter than 0.55 of the WHOLE step — assert against its own
+                        // slot via the ceiling only (the busy end can't exceed 1.10).
+                        assert!(
+                            frac <= 1.10 + 1e-3,
+                            "non-cadence hold frac {frac:.3} exceeded the 1.10 window \
+                             ceiling (edge={raw_edge}, role inst {inst})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// PROPERTY (golden-discipline witness): the calm-end sustained note still sings
+    /// ABOVE 0.95 of the step — the new window's ceiling (1.10) preserves the S13
+    /// "calm image legato crosses the bar line" cue the diversity net pins. Confirms
+    /// the re-scale RAISED (did not lower) the legato ceiling. Hand value below.
+    #[test]
+    fn test_articulation_window_calm_end_still_legato() {
+        // A near-zero edge (edge_activity ≈ 0) on a sustained melody step.
+        // HAND DERIVATION (new window): base_frac = ARTIC_WINDOW_HI + (LO-HI)*ea
+        //   ea ≈ 0  ⇒ base_frac ≈ 1.10 ; non-cadence rit = 1.0 ; sustained cap min(.,1.20)
+        //   ⇒ hold = round(1000 * 1.10) = 1100 ms ⇒ frac 1.10 (was 1.05 under S13's
+        //   LEGATO_FRAC_HI). The diversity-net assertion `frac > 0.95` is preserved with
+        //   margin BECAUSE the ceiling rose 1.05→1.10; no diversity golden was a pinned
+        //   equality, so none needed re-derivation — only this inequality witness.
+        let eng = engine();
+        let plan = ionian_period(&eng);
+        let ms = 1000u64;
+        let f = PerfFeatures {
+            saturation: 50.0,
+            brightness: 50.0,
+            edge_density: 0.0,
+        };
+        // Find a sustained (interior, non-pre-cadence) melody step and read its hold.
+        let melody = 2usize; // num=3 → inst 2 is Melody
+        let (sec, kt) = neutral_ctx_parts();
+        let ctx = StepContext::single_section_default(&sec, &kt);
+        let mut max_frac = 0.0f32;
+        for step in &plan {
+            if matches!(step.position, PhrasePosition::Interior) {
+                if let Some(h) = realize_step(step, melody, 3, &f, ms, &ctx)
+                    .iter()
+                    .map(|e| e.hold_ms)
+                    .max()
+                {
+                    max_frac = max_frac.max(h as f32 / ms as f32);
+                }
+            }
+        }
+        assert!(
+            max_frac > 0.95,
+            "calm-image sustained melody must still cross into legato (>0.95), got {max_frac:.3} \
+             — the window ceiling 1.10 preserves the S13 cue"
+        );
+        // And it must not exceed the window ceiling.
+        assert!(
+            max_frac <= 1.10 + 1e-3,
+            "calm legato {max_frac:.3} must stay <= 1.10 window"
+        );
+    }
+
+    /// A plain C-major triad fixture for the theme tests (root position).
+    fn c_major_triad() -> Chord {
+        Chord {
+            name: "I".to_string(),
+            notes: vec![60, 64, 67],
+        }
     }
 }

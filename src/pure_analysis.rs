@@ -27,6 +27,7 @@
 
 use image::{GenericImageView, GrayImage, ImageBuffer, Luma, Rgb, RgbImage};
 
+use crate::composition::ImageUnderstanding;
 use crate::engine::{FeatureSource, GlobalFeatures, ScanBarFeatures};
 
 /// Error type for the pure analyzer (empty image, decode failure, zero bars).
@@ -444,6 +445,53 @@ pub fn analyze_global_pure(img: &RgbImage) -> Result<GlobalFeatures, AnalysisErr
         texture_laplacian_var,
         shape_complexity,
         aspect_ratio,
+    })
+}
+
+/// Build the whole-image [`ImageUnderstanding`] — the COMPOSER'S input — from the same RGB
+/// image the [`analyze_global_pure`] producer reads (S15 §1.1). Slice 1: derives the four
+/// energy knobs from the (currently dead) S13 features via the LOCKED clamp formulas + the
+/// cheap palette/balance defaults. NO music logic; this is the image-side producer that emits
+/// the image-free `composition::ImageUnderstanding` mirror by field-copy at the boundary (the
+/// same discipline as `GlobalFeatures`).
+///
+/// The clamp formulas (spec §1.1; the dead-feature → field mapping):
+/// - `edge_activity` = `clamp(edge_density / 0.05, 0, 1)` (0.05 == `EDGE_ACTIVITY_RANGE_MAX`)
+/// - `texture`       = `clamp(texture_laplacian_var / 2000, 0, 1)`
+/// - `complexity`    = `clamp(shape_complexity / 2, 0, 1)`
+/// - `value_key`     = `clamp(1 - avg_brightness/100, 0, 1)` (toward dark)
+/// - `dominant_hue`  = `avg_hue` (argmax upgrade deferred to Stage 8)
+/// - `colorfulness`  = `hue_spread`; `aspect_ratio` = `aspect_ratio` (passthrough)
+///
+/// All other fields take their slice-1 whole-image / sentinel default; the planner treats a
+/// default as "condition not met" so a ladder rule reading a not-yet-extracted knob falls
+/// through to the axis default (honest degradation, not breakage).
+pub fn understand_image_pure(img: &RgbImage) -> Result<ImageUnderstanding, AnalysisError> {
+    // Reuse the existing whole-image extraction (single source of truth for the raw S13
+    // features); then field-copy + clamp into the image-free understanding mirror.
+    let g = analyze_global_pure(img)?;
+
+    let dominant_hue = g.avg_hue;
+    Ok(ImageUnderstanding {
+        edge_activity: (g.edge_density / 0.05).clamp(0.0, 1.0),
+        texture: (g.texture_laplacian_var / 2000.0).clamp(0.0, 1.0),
+        complexity: (g.shape_complexity / 2.0).clamp(0.0, 1.0),
+        dominant_hue,
+        dominant_hue_mass: 1.0,
+        secondary_hue: dominant_hue,
+        palette_bimodality: 0.0,
+        colorfulness: g.hue_spread,
+        value_key: (1.0 - g.avg_brightness / 100.0).clamp(0.0, 1.0),
+        avg_brightness: g.avg_brightness,
+        avg_saturation: g.avg_saturation,
+        mass_centroid: (0.5, 0.5),
+        quadrant_contrast: 0.0,
+        aspect_ratio: g.aspect_ratio,
+        vertical_emphasis: 0.5,
+        subject_size: 1.0,
+        subject_hue: dominant_hue,
+        subject_saturation: g.avg_saturation,
+        fg_bg_contrast: 0.0,
     })
 }
 

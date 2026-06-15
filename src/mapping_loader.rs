@@ -96,17 +96,110 @@ pub struct FineDetailMapping {
     pub shape_to_ostinato: HashMap<String, String>,
 }
 
+/// S15 Slice 1: the loader's deserialize target for the optional `composition` block.
+///
+/// Shape mirrors `composition::PlanMappings` exactly; it deserializes here (the loader owns
+/// JSON schema) and `composition.rs` adapts it via `From<CompositionMappings>` (the planner
+/// owns the planner type). The structural enums/tables it nests
+/// (`SelectTable`/`FormSpec`/…) are DEFINED in `composition.rs` (the musical/structural
+/// authority) and re-used here so there is one definition, not two.
+///
+/// The block is OPTIONAL on `MappingTable` (`#[serde(default)]`), so the OLD `mappings.json`
+/// (no `composition` key) still parses with the new loader — the slice-1 back-compat floor.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CompositionMappings {
+    /// → a `FormSpec.id` from `form_catalogue`.
+    pub form: crate::composition::SelectTable,
+    /// → a `Character` variant name; slice 1 pinned "ballad".
+    pub character: crate::composition::SelectTable,
+    /// → a `Meter` name; slice 1 pinned "four4".
+    pub meter: crate::composition::SelectTable,
+    /// → a key-scheme id; slice 1 pinned "home_only".
+    pub key_scheme: crate::composition::SelectTable,
+    /// → "absent" | "fragment" | "second_theme".
+    pub theme_behaviour: crate::composition::SelectTable,
+    /// The form vocabulary (the 6 slice-1 FormSpec rows).
+    pub form_catalogue: Vec<crate::composition::FormSpec>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct MappingTable {
     pub global: GlobalMapping,
     pub instrument_section: InstrumentSectionMapping,
     pub fine_detail: FineDetailMapping,
+    /// S15 Slice 1: the optional `composition` block (form catalogue + selection tables).
+    /// Absent in the legacy `mappings.json` → `None` (back-compat floor). When present, the
+    /// engine's compose path builds a `CompositionPlanner` from it.
+    #[serde(default)]
+    pub composition: Option<CompositionMappings>,
 }
 
 pub fn load_mappings(path: &str) -> Result<MappingTable, Box<dyn std::error::Error>> {
     let data = fs::read_to_string(path)?;
     let mappings: MappingTable = serde_json::from_str(&data)?;
     Ok(mappings)
+}
+
+/// Deep-copy a [`MappingTable`] by hand-rebuilding it from its public fields (all public,
+/// plain `HashMap`/`Vec`/scalar data + the optional `composition` block, which derives
+/// `Clone`).
+///
+/// NOTE(s9/s15): `ChordEngine::new` consumes a `MappingTable` BY VALUE, but the engine and
+/// the `CompositionPlanner` each must keep their own copy across re-derivations — and
+/// `MappingTable` derives only `Deserialize`, not `Clone`. Rather than add `#[derive(Clone)]`
+/// (the nested triggers do not all derive it), this reconstructs a fresh table from the
+/// public fields (lossless — all plain data). Moved here from `engine.rs` in S15 so
+/// `composition.rs` can also build a transient `ChordEngine` from the shared table.
+pub fn rebuild_mapping_table(t: &MappingTable) -> MappingTable {
+    MappingTable {
+        global: GlobalMapping {
+            hue_to_mode: t.global.hue_to_mode.clone(),
+            saturation_to_harmonic_complexity: t.global.saturation_to_harmonic_complexity.clone(),
+            brightness_to_tempo_bpm: t.global.brightness_to_tempo_bpm.clone(),
+            feature_normalization: t.global.feature_normalization.clone(),
+            dominant_substitution_trigger: DominantSubTrigger {
+                edge_complexity_threshold: t
+                    .global
+                    .dominant_substitution_trigger
+                    .edge_complexity_threshold,
+                substitutions: t.global.dominant_substitution_trigger.substitutions.clone(),
+            },
+            modal_interchange_trigger: ModalInterchangeTrigger {
+                brightness_drop_threshold: t
+                    .global
+                    .modal_interchange_trigger
+                    .brightness_drop_threshold,
+                borrowed_chords: t.global.modal_interchange_trigger.borrowed_chords.clone(),
+            },
+            cadence_trigger: CadenceTrigger {
+                stillness_threshold: t.global.cadence_trigger.stillness_threshold,
+                high_motion_cadence: t.global.cadence_trigger.high_motion_cadence.clone(),
+                low_motion_cadence: t.global.cadence_trigger.low_motion_cadence.clone(),
+            },
+            progression_families: t.global.progression_families.clone(),
+        },
+        instrument_section: InstrumentSectionMapping {
+            edge_density_to_rhythm: t.instrument_section.edge_density_to_rhythm.clone(),
+            line_orientation_to_interval: t.instrument_section.line_orientation_to_interval.clone(),
+            contrast_to_articulation: t.instrument_section.contrast_to_articulation.clone(),
+            color_shift_to_chord_extension: t
+                .instrument_section
+                .color_shift_to_chord_extension
+                .clone(),
+            texture_to_modal_color: t.instrument_section.texture_to_modal_color.clone(),
+        },
+        fine_detail: FineDetailMapping {
+            pixel_y_position_to_pitch: t.fine_detail.pixel_y_position_to_pitch.clone(),
+            pixel_brightness_to_velocity: t.fine_detail.pixel_brightness_to_velocity.clone(),
+            local_jaggedness_to_chromaticism: t
+                .fine_detail
+                .local_jaggedness_to_chromaticism
+                .clone(),
+            shape_to_ostinato: t.fine_detail.shape_to_ostinato.clone(),
+        },
+        // S15: the optional composition block derives Clone, so copy it directly.
+        composition: t.composition.clone(),
+    }
 }
 
 /// Helper: given hue (0..360) find mapping entry key like "91-150" and return value
