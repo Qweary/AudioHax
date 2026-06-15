@@ -133,6 +133,14 @@
     },
     "character":  { "default": "ballad",    "rules": [] },
     "meter":      { "default": "four4",     "rules": [] },
-    "key_scheme": { "default": "home_only", "rules": [] }
+    "key_scheme": { "default": "home_only", "rules": [] },
+    "texture_catalogue": [
+      { "id": "identity", "layers": [], "density": 0.5, "pad_voices": 0 },
+      { "id": "pad_bed",  "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.55, "pad_voices": 3 }
+    ],
+    "texture": {
+      "default": "pad_bed",
+      "rules": []
+    }
   }
 }

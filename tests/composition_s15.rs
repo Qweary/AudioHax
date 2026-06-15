@@ -40,8 +40,8 @@
 
 use audiohax::chord_engine::{resolve_motif, MotifArchetype, MotifNote};
 use audiohax::composition::{
-    CadenceStrength, Character, CompositionPlanner, ImageUnderstanding, Meter, PlanMappings,
-    Section, StepContext, ThematicRole, ThemeVariation,
+    CadenceStrength, Character, CompositionPlanner, ImageUnderstanding, Meter,
+    OrchestrationProfile, PlanMappings, Section, StepContext, ThematicRole, ThemeVariation,
 };
 use audiohax::mapping_loader::{load_mappings, MappingTable};
 
@@ -431,6 +431,9 @@ fn test_default_step_context_is_behaviour_neutral_additive() {
         variation: ThemeVariation::Identity,
         boundary_cadence: CadenceStrength::Perfect,
         density: 0.5,
+        // S17: identity orchestration profile — additive struct-field plumb only (no assert
+        // touched); keeps the behaviour-neutral precondition the equivalence goldens rely on.
+        orchestration: OrchestrationProfile::identity(),
         steps: vec![],
     };
     let kt = audiohax::composition::KeyTempoPlan {

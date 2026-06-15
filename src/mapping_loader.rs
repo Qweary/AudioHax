@@ -118,8 +118,17 @@ pub struct CompositionMappings {
     pub key_scheme: crate::composition::SelectTable,
     /// → "absent" | "fragment" | "second_theme".
     pub theme_behaviour: crate::composition::SelectTable,
+    /// S17 → an `OrchestrationProfile.id` from `texture_catalogue`. `#[serde(default)]` so an
+    /// OLD `composition` block (no `texture` axis) still deserializes — the loader's
+    /// back-compat floor; an absent axis yields an empty `SelectTable` (planner → identity).
+    #[serde(default)]
+    pub texture: crate::composition::SelectTable,
     /// The form vocabulary (the 6 slice-1 FormSpec rows).
     pub form_catalogue: Vec<crate::composition::FormSpec>,
+    /// S17 — the orchestration-profile vocabulary. `#[serde(default)]` (back-compat floor):
+    /// absent → empty catalogue → planner falls back to `OrchestrationProfile::identity()`.
+    #[serde(default)]
+    pub texture_catalogue: Vec<crate::composition::OrchestrationProfile>,
 }
 
 #[derive(Debug, Deserialize)]

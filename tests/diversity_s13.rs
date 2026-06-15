@@ -25,8 +25,8 @@ use audiohax::chord_engine::{
     realize_step, Chord, ChordEngine, NoteEvent, PerfFeatures, PhrasePosition, StepPlan,
 };
 use audiohax::engine::{
-    CadenceStrength, EngineConfig, GlobalFeatures, KeyTempoPlan, PipelineEngine, Section,
-    StepContext, ThematicRole, ThemeVariation,
+    CadenceStrength, EngineConfig, GlobalFeatures, KeyTempoPlan, OrchestrationProfile,
+    PipelineEngine, Section, StepContext, ThematicRole, ThemeVariation,
 };
 use audiohax::mapping_loader::{load_mappings, MappingTable};
 
@@ -48,6 +48,10 @@ fn div_section(plan: &[StepPlan]) -> Section {
         variation: ThemeVariation::Identity,
         boundary_cadence: CadenceStrength::Perfect,
         density: 0.5,
+        // S17: identity orchestration profile — additive struct-field plumb only; the
+        // realizer delegates to `instrument_role` under it, so every diversity assertion
+        // stays byte-identical.
+        orchestration: OrchestrationProfile::identity(),
         steps: plan.to_vec(),
     }
 }

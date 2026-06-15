@@ -178,6 +178,65 @@ pub enum Character {
     Gigue,
 }
 
+/// The layer vocabulary — closed (mechanism), mirrors `chord_engine::OrchestralRole`
+/// 1:1. serde-safe (rejects an unknown layer name). NEW S17. The role-assignment bridge
+/// (`LayerRole` → `OrchestralRole`) lives in the realizer module that owns `OrchestralRole`;
+/// this module only DEFINES the structural vocabulary the planner attaches per section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum LayerRole {
+    Bass,
+    HarmonicFill,
+    Melody,
+    CounterMelody,
+    Pad,
+}
+
+/// One named orchestration/texture profile — pure STRUCTURE, no note content. The planner
+/// attaches one per [`Section`] (selected by the `texture` [`SelectTable`]); the realizer's
+/// role-assignment + Pad branch read it. Adding a profile is a JSON row in `mappings.json`,
+/// not a Rust edit (the `FormSpec` discipline). NEW S17.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct OrchestrationProfile {
+    /// Stable id, e.g. `"identity"` / `"pad_bed"`.
+    pub id: String,
+    /// Which roles sound, in inst-index order; the realizer's `assign_role` maps instruments
+    /// onto this list. serde rejects an unknown [`LayerRole`]. Empty == the identity sentinel.
+    pub layers: Vec<LayerRole>,
+    /// 0..1 density bias the realizer's edge-activity bands MAY shift by. Default `0.5` ==
+    /// no-op (slice 1 does NOT wire this into the bands; reserved schema).
+    #[serde(default = "half_f32")]
+    pub density: f32,
+    /// How many chord tones the Pad holds simultaneously (`0` == no pad). Default `0`.
+    #[serde(default)]
+    pub pad_voices: u8,
+}
+
+/// serde default for [`OrchestrationProfile::density`] — the no-op `0.5` midpoint.
+fn half_f32() -> f32 {
+    0.5
+}
+
+impl OrchestrationProfile {
+    /// The behaviour-neutral profile: today's role split (the realizer's `assign_role`
+    /// delegates to `instrument_role` under it), no pad. The byte-freeze anchor — every
+    /// default Section literal carries this, so the realizer is byte-identical under it.
+    pub fn identity() -> Self {
+        OrchestrationProfile {
+            id: "identity".to_string(),
+            layers: Vec::new(),
+            density: 0.5,
+            pad_voices: 0,
+        }
+    }
+
+    /// `true` iff this is the behaviour-neutral profile: no pad AND no explicit layer split
+    /// (the realizer reads this to take the byte-stable legacy `instrument_role` path).
+    pub fn is_identity(&self) -> bool {
+        self.pad_voices == 0 && self.layers.is_empty()
+    }
+}
+
 /// One section's role in a FORM TEMPLATE — pure structure, no music content. The planner
 /// expands these into concrete [`Section`]s. Loaded from `mappings.json`.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -300,7 +359,11 @@ pub struct SelectRule {
 }
 
 /// One axis's "default + ordered conditional departures." `pick`/`default` are string ids.
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+///
+/// Derives `Default` (empty `default` id + no rules) so an axis can be `#[serde(default)]` on
+/// a parent mapping struct — an absent axis yields a table whose `select` returns `""`, which
+/// matches no catalogue id, so the consumer falls back to its own neutral default (S17).
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 pub struct SelectTable {
     /// The id chosen when no rule matches.
     pub default: String,
@@ -338,8 +401,18 @@ pub struct PlanMappings {
     pub key_scheme: SelectTable,
     /// → "absent" | "fragment" | "second_theme".
     pub theme_behaviour: SelectTable,
+    /// → an `OrchestrationProfile.id` from `texture_catalogue`. NEW S17 — parallel to
+    /// `form`/`form_catalogue`. `#[serde(default)]` so an OLD `mappings.json` (no `texture`
+    /// axis) still parses: the absent default yields an empty `SelectTable` → planner falls
+    /// back to `OrchestrationProfile::identity()` (no pad — honest degradation).
+    #[serde(default)]
+    pub texture: SelectTable,
     /// The form vocabulary.
     pub form_catalogue: Vec<FormSpec>,
+    /// The orchestration-profile vocabulary. NEW S17 — parallel to `form_catalogue`.
+    /// `#[serde(default)]` so an old mappings.json parses (empty → planner uses identity).
+    #[serde(default)]
+    pub texture_catalogue: Vec<OrchestrationProfile>,
 }
 
 impl From<CompositionMappings> for PlanMappings {
@@ -353,7 +426,9 @@ impl From<CompositionMappings> for PlanMappings {
             meter: c.meter,
             key_scheme: c.key_scheme,
             theme_behaviour: c.theme_behaviour,
+            texture: c.texture,
             form_catalogue: c.form_catalogue,
+            texture_catalogue: c.texture_catalogue,
         }
     }
 }
@@ -420,6 +495,12 @@ pub struct Section {
     pub boundary_cadence: CadenceStrength,
     /// Local density bias, 0..1; slice 1 default 0.5 (no-op).
     pub density: f32,
+    /// NEW S17 — the selected orchestration profile for this section. The default paths
+    /// (`legacy_default_section` / `single_section_default` consumers / the planner's
+    /// identity fallback) carry [`OrchestrationProfile::identity()`], so the realizer is
+    /// byte-stable under it; the compose path attaches a non-identity (`pad_voices > 0`)
+    /// profile selected by the `texture` [`SelectTable`].
+    pub orchestration: OrchestrationProfile,
     /// The section's own FILLED phrase plan (`chord_engine` output). This is where the
     /// per-section `StepPlan`s live so the realizer reads the section's own steps, never
     /// `plan[step_idx % len]`.
@@ -604,6 +685,16 @@ impl CompositionPlanner {
         // section harmony matches the legacy single-section derivation.
         let brightness_drop = (0.5 - u.avg_brightness / 100.0).clamp(0.0, 1.0) * 2.0;
 
+        // S17: select the orchestration profile ONCE per plan over the whole-image knobs
+        // (`texture` SelectTable), then look it up in `texture_catalogue`. An absent/unmatched
+        // id falls back to the byte-stable identity profile. Slice 1 selects once per plan (no
+        // saliency knob); section-conditioned selection is a later slice.
+        let texture_id = self.plan_mappings.texture.select(u);
+        let orchestration =
+            lookup_orchestration(&self.plan_mappings.texture_catalogue, &texture_id)
+                .cloned()
+                .unwrap_or_else(OrchestrationProfile::identity);
+
         let mut sections: Vec<Section> = Vec::with_capacity(form_spec.sections.len());
         let mut assigned = 0usize;
         for (i, tpl) in form_spec.sections.iter().enumerate() {
@@ -645,6 +736,7 @@ impl CompositionPlanner {
                 variation: clamp_variation_slice1(tpl.variation),
                 boundary_cadence: tpl.boundary_cadence,
                 density: 0.5,
+                orchestration: orchestration.clone(),
                 steps,
             });
         }
@@ -703,6 +795,16 @@ fn clamp_variation_slice1(v: ThemeVariation) -> ThemeVariation {
 /// Look up a `FormSpec` by id in the catalogue.
 fn lookup_form<'a>(catalogue: &'a [FormSpec], id: &str) -> Option<&'a FormSpec> {
     catalogue.iter().find(|f| f.id == id)
+}
+
+/// Look up an [`OrchestrationProfile`] by id in the texture catalogue (S17). Mirrors
+/// [`lookup_form`]; an absent/unmatched id returns `None` so the planner falls back to
+/// [`OrchestrationProfile::identity()`].
+fn lookup_orchestration<'a>(
+    catalogue: &'a [OrchestrationProfile],
+    id: &str,
+) -> Option<&'a OrchestrationProfile> {
+    catalogue.iter().find(|p| p.id == id)
 }
 
 /// A minimal single-section fallback form so the planner is total when the catalogue is
@@ -943,6 +1045,7 @@ mod tests {
             variation: ThemeVariation::Identity,
             boundary_cadence: CadenceStrength::Perfect,
             density: 0.5,
+            orchestration: OrchestrationProfile::identity(),
             steps: vec![],
         };
         let kt = KeyTempoPlan {

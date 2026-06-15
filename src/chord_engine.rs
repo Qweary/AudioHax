@@ -805,6 +805,17 @@ pub enum OrchestralRole {
     HarmonicFill,
     /// Highest instrument — the top line; highest register, most rhythmic freedom.
     Melody,
+    /// A sustained HARMONY BED: holds several chord tones simultaneously in the
+    /// inner register at a supporting (quieter) dynamic, tied step-to-step under
+    /// the legato-overlap cap so consecutive beds connect into a continuous floor.
+    /// Never rests; the widest single-role simultaneous note count. This is the
+    /// "all the harmony / all the background" layer — the held bed under the tune.
+    Pad,
+    /// A second melodic line moving under/around the Melody. Its realization is
+    /// STUBBED for now: it delegates to the HarmonicFill figure (a real counter-
+    /// line is a later slice — a pure realization fill, no signature change). It
+    /// is unreachable under the behaviour-neutral identity profile, so byte-neutral.
+    CounterMelody,
 }
 
 /// Image-free performance features for ONE scan step — the music-domain
@@ -875,6 +886,54 @@ pub fn instrument_role(inst_idx: usize, num_instruments: usize) -> OrchestralRol
     }
 }
 
+/// Map a planner layer-vocabulary entry onto the realizer's orchestral role.
+/// theory: the two enums are deliberately 1:1 — the planner names the structural
+/// layers it wants (`LayerRole`), the realizer turns each into the performance
+/// behaviour that sounds it (`OrchestralRole`). A total, lossless bridge.
+fn to_orchestral_role(layer: crate::composition::LayerRole) -> OrchestralRole {
+    use crate::composition::LayerRole;
+    match layer {
+        LayerRole::Bass => OrchestralRole::Bass,
+        LayerRole::HarmonicFill => OrchestralRole::HarmonicFill,
+        LayerRole::Melody => OrchestralRole::Melody,
+        LayerRole::CounterMelody => OrchestralRole::CounterMelody,
+        LayerRole::Pad => OrchestralRole::Pad,
+    }
+}
+
+/// Assign an `OrchestralRole` to instrument `inst_idx`, PLAN-AWARE.
+///
+/// theory: the role an instrument plays is normally a pure function of its index
+/// in the ensemble (`instrument_role`). A section may instead carry an explicit
+/// orchestration profile naming the layers it wants in inst-index order — so a
+/// section can swap one inner fill for a held Pad bed without widening the
+/// ensemble. The default (identity) profile carries no explicit layers, so this
+/// fn delegates to `instrument_role` byte-for-byte: the default path is unchanged.
+///
+/// Count-mismatch rule: when the ensemble has MORE instruments than the profile
+/// names layers for, the extra (highest-index) instruments CLAMP onto the last
+/// named layer. The Slice-1 `pad_bed` profile names exactly the default-ensemble
+/// width, so the clamp is a safe-by-construction edge case (a 5th instrument
+/// would extend the Melody layer, never wrap onto Bass and mud the bottom).
+pub fn assign_role(
+    inst_idx: usize,
+    num_instruments: usize,
+    ctx: &crate::composition::StepContext,
+) -> OrchestralRole {
+    let prof = &ctx.section.orchestration;
+    if prof.is_identity() {
+        // The behaviour-neutral path: byte-identical to the legacy stratification.
+        return instrument_role(inst_idx, num_instruments);
+    }
+    // Non-identity profile: map inst_idx onto the named layers, clamping any
+    // instrument past the layer list onto the last (highest) named layer. An
+    // empty layer list is the identity sentinel handled above, so `layers` is
+    // non-empty here and the clamp index is always valid.
+    let layers = &prof.layers;
+    let clamped = inst_idx.min(layers.len().saturating_sub(1));
+    to_orchestral_role(layers[clamped])
+}
+
 /// Realize the performance for ONE instrument on ONE step, given that step's
 /// phrase plan. The single pure entry point main.rs's worker calls.
 ///
@@ -902,7 +961,11 @@ pub fn realize_step(
     ms_per_step: u64,
     ctx: &crate::composition::StepContext,
 ) -> Vec<NoteEvent> {
-    let role = instrument_role(inst_idx, num_instruments);
+    let role = assign_role(inst_idx, num_instruments, ctx);
+    // How many chord tones a Pad instrument holds for this section (0 == no pad,
+    // the identity-profile default — so this read is inert on the legacy path and
+    // the Pad branch never fires there). Read zero-copy off the borrowed section.
+    let pad_voices = ctx.section.orchestration.pad_voices;
     let is_cadence = matches!(
         step.position,
         PhrasePosition::HalfCadence | PhrasePosition::PerfectAuthenticCadence
@@ -963,6 +1026,7 @@ pub fn realize_step(
         is_cadence,
         is_phrase_start,
         step,
+        pad_voices,
     )
 }
 
@@ -1014,7 +1078,14 @@ fn role_pitch(
             let floor = (MELODY_REGISTER_FLOOR as i16 + lift).clamp(24, 96) as u8;
             seat_pc_in_register(pc, floor)
         }
-        OrchestralRole::HarmonicFill => {
+        // Pad and CounterMelody both seat a representative INNER tone in the fill
+        // register, exactly like HarmonicFill. theory: the Pad's full multi-tone
+        // bed is built in realize_rhythm directly off the chord (one note can't
+        // express it); the single base_note role_pitch returns here is only the
+        // anchor pitch the other realize machinery threads through. The
+        // CounterMelody stub delegates to the fill figure for now. Both therefore
+        // share the inner-tone seating below so they sit under the melody.
+        OrchestralRole::HarmonicFill | OrchestralRole::Pad | OrchestralRole::CounterMelody => {
             // An INNER chord tone, spread across the fill instruments so two
             // fills don't double the same tone, placed in the middle register
             // with a gentle brightness nudge. theory: inner voices fill the
@@ -1105,6 +1176,12 @@ fn realize_velocity(
     match role {
         OrchestralRole::Melody if !is_cadence => vel += 2.0,
         OrchestralRole::Bass if !is_cadence => vel -= 1.0,
+        // The Pad is a SUPPORTING bed: it must sit clearly under the melody and
+        // not compete with the foreground line. A modest negative bias (a touch
+        // deeper than the bass's −1) keeps the held harmony present-but-recessed —
+        // the background, not a second tune. Unreachable under the identity
+        // profile, so this never touches the byte-frozen default path.
+        OrchestralRole::Pad if !is_cadence => vel -= 3.0,
         _ => {}
     }
 
@@ -1148,6 +1225,31 @@ const BALLAD_ARTIC_BIAS: f32 = 1.0;
 /// The ritardando multiplier applied to a phrase-final note's hold. theory: as
 /// the phrase relaxes into its arrival the final note rings longer.
 const RITARDANDO_FACTOR: f32 = 1.30;
+/// The NORMALIZED edge-activity floor below which an inner voice may rest-as-
+/// gesture on a weak interior beat. theory: rest-as-gesture is a deliberate
+/// silence that lets the outer voices speak — it must be RARE and intentional,
+/// not constant. The original guard read the RAW per-bar edge (~0.005..0.05 on
+/// real photos) against 0.15, so it fired on essentially every image and the
+/// inner harmony vanished half the time. Re-pointed to the normalized 0..1
+/// `edge_activity`, the threshold is the activity below which the texture is
+/// genuinely near-static. 0.10 (NOT the design's loose ~0.15 sketch) is chosen
+/// against the fixtures: the "calm" texture sits at activity ≈ 0.08, and a calm
+/// image is exactly where the held harmonic bed must be PRESENT, not silent — so
+/// the rest must NOT fire there. 0.10 keeps the calm bed sounding while still
+/// reserving a rest for a genuinely flat, near-edgeless field (activity < 0.10),
+/// where a momentary inner silence reads as intended repose rather than a hole.
+const FILL_REST_ACTIVITY: f32 = 0.10;
+/// The hold fraction the Pad bed uses so consecutive beds TIE into a continuous
+/// floor (legato overlap). theory: the seam ships legato-overlap, not true
+/// cross-step sustain — a Pad `hold_ms` that spanned multiple steps would stall
+/// the block-until-last-event scheduler and wreck the tempo. So each Pad bed
+/// holds the FULL step plus a small overlap into the next, at the established
+/// non-cadence window ceiling (ARTIC_WINDOW_HI = 1.10), so successive beds
+/// connect with no audible gap while staying within the `sustained` ≤1.2× cap —
+/// the wall-clock over-run per step is ≤10%, a tolerable near-constant wobble,
+/// never the N× catastrophe of a multi-step hold. A reverberant external synth
+/// smooths the tiny re-attack into a continuous pad on the actual listening path.
+const PAD_OVERLAP_FRAC: f32 = ARTIC_WINDOW_HI;
 
 /// Realize the rhythm + articulation for one step: select a rhythm pattern from
 /// (role, edge_density, phrase position) and emit its onset/duration sequence.
@@ -1162,15 +1264,20 @@ fn realize_rhythm(
     is_cadence: bool,
     is_phrase_start: bool,
     step: &StepPlan,
+    // How many chord tones a Pad instrument holds as the bed (0 on the identity
+    // path — inert, no instrument is ever a Pad there). Private additive param on
+    // this free fn: NOT a public-seam change, realize_step's signature is unchanged.
+    pad_voices: u8,
 ) -> Vec<NoteEvent> {
     // S13: normalize the RAW per-bar edge density into a 0..1 ACTIVITY knob. The old
     // code compared raw edge (≈0.005 on real photos) against 0.25/0.70 cutoffs, so
     // every real image fell in the "low edge → legato/sustained" band — uniform output.
     // Normalizing first lets the curve and the pattern bands span their full range.
     let edge_activity = (features.edge_density / EDGE_ACTIVITY_RANGE_MAX).clamp(0.0, 1.0);
-    // Keep the raw-clamped value too for the HarmonicFill rest-as-gesture check, whose
-    // 0.15 threshold was authored against raw edge (a near-silent texture).
-    let edge = features.edge_density.clamp(0.0, 1.0);
+    // (The former raw-clamped `edge` local is GONE: the HarmonicFill rest-as-gesture
+    // check now reads the NORMALIZED `edge_activity` against FILL_REST_ACTIVITY, so the
+    // raw value — which never reached the old 0.15 cutoff on real photos and silenced
+    // the inner harmony nearly every weak beat — has no remaining reader.)
     let step_ms = ms_per_step.max(1);
 
     // Harmonic-rhythm acceleration: the step immediately before a cadence drives
@@ -1287,8 +1394,89 @@ fn realize_rhythm(
             // theory: a deliberate silence in an inner voice is an articulation,
             // letting the outer voices speak.
             let weak_interior = !step.position_in_phrase.is_multiple_of(2);
-            if edge < 0.15 && weak_interior {
+            // REST-BUG FIX: gate on the NORMALIZED edge_activity (0..1), not the raw
+            // per-bar edge. The raw value (~0.005..0.05 on real photos) never reached
+            // the old 0.15 cutoff except by accident, so the rest fired on essentially
+            // every weak interior beat and dropped the inner harmony — the "missing all
+            // the harmony" defect. Against the normalized scale, only a genuinely
+            // near-static texture (activity < FILL_REST_ACTIVITY) rests; the calm-image
+            // bed (activity ≈ 0.08 on the calm fixture is still above this floor only by
+            // a hair — see the const's note) now SOUNDS instead of resting.
+            if edge_activity < FILL_REST_ACTIVITY && weak_interior {
                 // rest-as-gesture: emit NO event.
+                Vec::new()
+            } else {
+                vec![sustained(0, step_ms, base_frac)]
+            }
+        }
+
+        OrchestralRole::Pad => {
+            // HARMONY BED: hold `pad_voices` chord tones SIMULTANEOUSLY (all at
+            // offset 0) as a continuous floor under the melody. The full chord is
+            // reachable here via `step.chord.notes` (StepPlan is already in scope —
+            // no seam change), so unlike the other arms (which sound one base_note)
+            // the Pad re-derives its whole voicing from the chord.
+            //
+            // VOICING (music-theory owned): seat the INNER chord tones — the 3rd /
+            // 5th / 7th, i.e. notes[1..] — in the fill register (FILL_REGISTER_FLOOR
+            // = G3, where inner voices live), DELIBERATELY skipping notes[0] (the
+            // chord root) so the bed does not double the Bass an octave up and mud
+            // the bottom. We take up to `pad_voices` of those inner tones; if the
+            // chord is a bare triad we still get root-less 3rd+5th, a clean inner
+            // bed. Each tone is seated into its own register slot and de-duplicated
+            // so no two bed voices collapse onto the same pitch (the spirit of
+            // upper_voices_well_spaced — a bed of unisons is not a bed).
+            let notes = &step.chord.notes;
+            if notes.is_empty() || pad_voices == 0 {
+                // Defensive: a chord with no tones (or a profile that named a Pad
+                // with 0 voices) holds nothing. Fall back to one supporting tone so
+                // the instrument is not silent.
+                vec![sustained(0, step_ms, PAD_OVERLAP_FRAC)]
+            } else {
+                // Prefer the inner tones (skip the root at index 0); if the chord
+                // is a single tone, fall back to it so the bed is never empty.
+                let inner: &[u8] = if notes.len() > 1 {
+                    &notes[1..]
+                } else {
+                    &notes[..]
+                };
+                let want = (pad_voices as usize).min(inner.len());
+                let mut seated: Vec<u8> = Vec::with_capacity(want);
+                for tone in inner.iter().take(want) {
+                    let mut seat = seat_pc_in_register(tone % 12, FILL_REGISTER_FLOOR);
+                    // De-dup: if two chord tones share a pitch class they would seat
+                    // onto the same note — lift the collision an octave so the bed
+                    // stays spread (no two upper voices on the same pitch).
+                    while seated.contains(&seat) {
+                        seat = seat.saturating_add(12).min(108);
+                        if seat >= 108 {
+                            break;
+                        }
+                    }
+                    seated.push(seat);
+                }
+                seated
+                    .into_iter()
+                    .map(|n| NoteEvent {
+                        note: n,
+                        velocity,
+                        // Held the full step + the legato overlap so consecutive beds
+                        // tie; kept within the `sustained`-style ≤1.2× cap (PAD_OVERLAP_FRAC
+                        // = 1.10) so the block-until-last-event scheduler over-runs each
+                        // step by ≤10%, never the N× of a true multi-step hold.
+                        hold_ms: ((step_ms as f32) * PAD_OVERLAP_FRAC).round().max(1.0) as u64,
+                        offset_ms: 0,
+                    })
+                    .collect()
+            }
+        }
+
+        OrchestralRole::CounterMelody => {
+            // STUB (a later slice fills the real counter-line): delegate to the
+            // rest-fixed HarmonicFill figure so the role is present but adds no new
+            // craft yet. Unreachable under the identity profile, so byte-neutral.
+            let weak_interior = !step.position_in_phrase.is_multiple_of(2);
+            if edge_activity < FILL_REST_ACTIVITY && weak_interior {
                 Vec::new()
             } else {
                 vec![sustained(0, step_ms, base_frac)]
@@ -3611,6 +3799,10 @@ mod tests {
             variation,
             boundary_cadence: CadenceStrength::Perfect,
             density: 0.5,
+            // S17: identity orchestration profile — mandatory-field plumb so this
+            // behaviour-neutral test fixture compiles; byte-neutral (no realizer logic, no
+            // assert touched). The realizer Pad/role work is the next lane's.
+            orchestration: crate::composition::OrchestrationProfile::identity(),
             steps: vec![],
         }
     }

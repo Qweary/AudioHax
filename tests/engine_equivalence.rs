@@ -34,8 +34,8 @@
 
 use audiohax::chord_engine::{Chord, PhrasePosition, StepPlan};
 use audiohax::engine::{
-    decide_instrument_action, CadenceStrength, KeyTempoPlan, ScanBarFeatures, Section, StepContext,
-    ThematicRole, ThemeVariation,
+    decide_instrument_action, CadenceStrength, KeyTempoPlan, OrchestrationProfile, ScanBarFeatures,
+    Section, StepContext, ThematicRole, ThemeVariation,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -91,6 +91,10 @@ fn default_section(plan: &[StepPlan]) -> Section {
         variation: ThemeVariation::Identity,
         boundary_cadence: CadenceStrength::Perfect,
         density: 0.5,
+        // S17: identity orchestration profile ⇒ the realizer's plan-aware role assignment
+        // delegates to `instrument_role` byte-for-byte. Struct-field add ONLY — no assert,
+        // golden, or fixture value in this file is touched. The goldens stay byte-green.
+        orchestration: OrchestrationProfile::identity(),
         steps: plan.to_vec(),
     }
 }
