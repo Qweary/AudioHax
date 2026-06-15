@@ -18,8 +18,16 @@
       "31-70": 90,
       "71-100": 120
     },
+    "feature_normalization": {
+      "edge_density_max": 0.05,
+      "texture_laplacian_var_max": 2000.0,
+      "shape_complexity_max": 2.0,
+      "hue_spread_max": 1.0,
+      "avg_brightness_max": 100.0,
+      "avg_saturation_max": 100.0
+    },
     "dominant_substitution_trigger": {
-      "edge_complexity_threshold": 0.7,
+      "edge_complexity_threshold": 0.55,
       "substitutions": ["V/V", "V/ii", "tritone_sub"]
     },
     "modal_interchange_trigger": {

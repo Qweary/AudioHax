@@ -1,4 +1,4 @@
-use crate::mapping_loader::MappingTable;
+use crate::mapping_loader::{lookup_range_map, MappingTable};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 
@@ -30,6 +30,76 @@ const AEOLIAN: [i8; 7] = [0, 2, 3, 5, 7, 8, 10];
 pub struct Chord {
     pub name: String,
     pub notes: Vec<u8>, // actual MIDI note numbers
+}
+
+/// How many chord tones to stack — the harmonic-complexity axis (design-s13 §2).
+///
+/// theory: saturation is the visual correlate of harmonic RICHNESS. A washed-out
+/// image gets bare triads (the plain, "computer-like" sonority the operator flagged);
+/// a vivid image gets 7ths and 9ths — the tones that make harmony *breathe*. The
+/// 7th adds the colour and the dominant pull; the 9th adds shimmer above it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarmonicComplexity {
+    /// Bare root-position triad (root, 3rd, 5th) — 3 tones. Low saturation.
+    Triad,
+    /// Triad + the diatonic 7th — 4 tones. Mid saturation; the chord "opens up".
+    SeventhChord,
+    /// Triad + 7th + 9th — 5 tones. High saturation; lush, shimmering harmony.
+    NinthChord,
+}
+
+impl HarmonicComplexity {
+    /// Map a normalized `saturation01` (0..1) to a complexity level via the JSON
+    /// `saturation_to_harmonic_complexity` bands (keyed in 0..100 space), then
+    /// fall back to fixed thresholds if the map is empty/degenerate.
+    ///
+    /// theory (design-s13 §2): `<0.31`→triad, `0.31..0.71`→add the 7th,
+    /// `≥0.71`→7th + 9th. The JSON bands ("0-30"/"31-70"/"71-100") encode exactly
+    /// this in the 0..100 space the existing `lookup_range_map` understands, so we
+    /// scale the knob up by 100 and reuse that helper (design-s13 §5).
+    fn from_saturation01(
+        map: &std::collections::HashMap<String, String>,
+        saturation01: f32,
+    ) -> Self {
+        let sat = saturation01.clamp(0.0, 1.0);
+        // Reuse the integer-range lookup against the 0..100 band keys.
+        let band = lookup_range_map(map, sat * 100.0);
+        match band.as_deref() {
+            Some("TriadsOnly") => HarmonicComplexity::Triad,
+            Some("TriadsAnd7ths") => HarmonicComplexity::SeventhChord,
+            Some("Triads7thsAndExtensions") => HarmonicComplexity::NinthChord,
+            // Fallback thresholds mirror the JSON bands so behavior is stable even
+            // if the map is renamed/emptied (design-s13 §2 numbers).
+            _ if sat < 0.31 => HarmonicComplexity::Triad,
+            _ if sat < 0.71 => HarmonicComplexity::SeventhChord,
+            _ => HarmonicComplexity::NinthChord,
+        }
+    }
+
+    /// Does this complexity include the chordal 7th? (Used to give the secondary
+    /// dominant a stronger pull when the image is vivid — design-s13 §4.)
+    fn has_seventh(self) -> bool {
+        !matches!(self, HarmonicComplexity::Triad)
+    }
+}
+
+/// Map a (case-insensitive) Roman numeral to its 0-based scale-degree index.
+///
+/// theory: I=tonic(0), ii=supertonic(1), iii=mediant(2), IV=subdominant(3),
+/// V=dominant(4), vi=submediant(5), vii=leading-tone(6). An exhaustive exact match
+/// (not `starts_with`) avoids the order-dependent shadowing that misrouted "iv"/"iii".
+/// An unrecognized numeral falls back to the tonic — a safe diatonic default.
+fn roman_degree(roman: &str) -> u8 {
+    match roman.to_lowercase().as_str() {
+        "i" => 0,
+        "ii" => 1,
+        "iii" => 2,
+        "iv" => 3,
+        "v" => 4,
+        "vi" => 5,
+        "vii" => 6,
+        _ => 0,
+    }
 }
 
 pub struct ChordEngine {
@@ -71,7 +141,28 @@ impl ChordEngine {
     }
 
     /// Generate chords (in MIDI note numbers) given root (C=60) and mode.
-    /// root_midi: MIDI note number for tonic (e.g., 60 = C4)
+    ///
+    /// `root_midi`        — MIDI note number for the tonic (e.g. 60 = C4).
+    /// `edge_complexity`  — RAW global edge density (~0..0.05); normalized
+    ///                      music-side to `edge_activity` (Option-NORM-MAP) and
+    ///                      compared against the recalibrated secondary-dominant
+    ///                      trigger so applied dominants actually fire on real photos.
+    /// `brightness_drop`  — 0..1 "shadow" amount (dark image ⇒ larger); gates the
+    ///                      borrowed minor `iv` (modal interchange).
+    /// `saturation01_raw` — RAW `avg_saturation` (0..100); normalized music-side to
+    ///                      `saturation01` and mapped to HARMONIC COMPLEXITY (triad
+    ///                      → 7th → 7th+9th). This is the core fix for "computer
+    ///                      triads": vivid images now get lush, breathing harmony.
+    /// `colorfulness_raw` — RAW `hue_spread` (~0..1); the COLORFULNESS axis. A
+    ///                      palette-spread image widens toward MODE MIXTURE: extra
+    ///                      borrowed chords decouple harmonic colour from the single
+    ///                      mean-hue mode pick, so diverse palettes stop collapsing.
+    ///
+    /// theory (design-s13 §0): the seam carries RAW physical scalars; this function
+    /// owns normalizing them against the calibrated `feature_normalization` ranges in
+    /// `mappings.json`, so a real photo's tiny edge density (0.005..0.036) lands in a
+    /// usable activity band instead of clustering near zero.
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_chords(
         &self,
         progression: &[String],
@@ -79,6 +170,8 @@ impl ChordEngine {
         mode: &str,
         edge_complexity: f32,
         brightness_drop: f32,
+        saturation01_raw: f32,
+        colorfulness_raw: f32,
     ) -> Vec<Chord> {
         // Select the mode's true scale. Each arm is the canonical diatonic mode;
         // an unrecognized mode string defaults to Ionian (the major scale) as a
@@ -94,82 +187,238 @@ impl ChordEngine {
             _ => IONIAN,
         };
 
-        // helper to convert Roman numeral (basic) to scale degree index
+        let fnorm = &self.mappings.global.feature_normalization;
+
+        // --- Normalization-at-consumption (Option-NORM-MAP, design-s13 §0) ------
+        // RAW edge density → 0..1 ACTIVITY. The old code compared the raw 0.005-ish
+        // value against a 0.7 threshold (two orders of magnitude too high), so the
+        // secondary dominant NEVER fired on a real photo. Normalizing first puts the
+        // busy half of the real set (≈0.51-0.72) above the recalibrated 0.55 trigger.
+        let edge_activity = crate::mapping_loader::FeatureNormalization::normalize(
+            edge_complexity,
+            fnorm.edge_density_max,
+        );
+        // RAW saturation → 0..1 RICHNESS knob, then → a harmonic-complexity level.
+        let saturation01 = crate::mapping_loader::FeatureNormalization::normalize(
+            saturation01_raw,
+            fnorm.avg_saturation_max,
+        );
+        let complexity = HarmonicComplexity::from_saturation01(
+            &self.mappings.global.saturation_to_harmonic_complexity,
+            saturation01,
+        );
+        // RAW hue_spread → 0..1 COLORFULNESS. hue_spread is already ~0..1, so this is
+        // (calibrated) identity; normalizing through the same path keeps it tunable.
+        let colorfulness = crate::mapping_loader::FeatureNormalization::normalize(
+            colorfulness_raw,
+            fnorm.hue_spread_max,
+        );
+
         let mut chords: Vec<Chord> = Vec::new();
 
-        for (i, sym) in progression.iter().enumerate() {
-            // simple modal interchange: if brightness drop is significant and chord is "IV", make it iv
-            let sym_mod = if brightness_drop
-                > self
-                    .mappings
-                    .global
-                    .modal_interchange_trigger
-                    .brightness_drop_threshold
-                && sym == "IV"
-            {
-                "iv".to_string()
-            } else {
-                sym.clone()
-            };
+        // Does this image cross the modal-interchange trigger? (Dark/low-key ⇒
+        // larger brightness_drop ⇒ borrow the shadow subdominant.) Computed once;
+        // applied per-symbol below only where the symbol is the major subdominant.
+        let borrow_minor_iv = brightness_drop
+            > self
+                .mappings
+                .global
+                .modal_interchange_trigger
+                .brightness_drop_threshold;
 
-            // possible secondary dominant insertion: if edge_complexity high and mapping allows, insert V/V before progression chord
-            if edge_complexity
+        for (i, sym) in progression.iter().enumerate() {
+            // Secondary-dominant insertion (the §4 fix): when the image is busy
+            // enough, tonicize the NEXT chord by inserting its own dominant (V/x).
+            // theory: V/x gives root-motion-by-fourth propulsion + the first
+            // non-diatonic colour this engine produces. Gated on the NORMALIZED
+            // edge_activity against the recalibrated 0.55 trigger so it fires on the
+            // busy half of real photos, not only on pathological images.
+            if edge_activity
                 > self
                     .mappings
                     .global
                     .dominant_substitution_trigger
                     .edge_complexity_threshold
+                && i + 1 < progression.len()
             {
-                // heuristic: insert a V of the next chord
-                if i + 1 < progression.len() {
-                    let next = &progression[i + 1];
-                    // compute V of next and insert (very simplified)
-                    let v_chord = self.roman_to_chord("V", root_midi, &scale, "V");
-                    chords.push(v_chord);
-                }
+                // Honor the look-ahead: build V OF the following chord (was the bug —
+                // `next` was computed then discarded in favor of a literal home "V").
+                let next = &progression[i + 1];
+                // A vivid image gets a dominant-SEVENTH secondary (strongest pull);
+                // a washed-out one a bare secondary triad — dovetails complexity.
+                let v_of_next =
+                    self.secondary_dominant_of(next, root_midi, &scale, complexity.has_seventh());
+                chords.push(v_of_next);
             }
 
-            let chord = self.roman_to_chord(&sym_mod, root_midi, &scale, mode);
+            // Modal interchange: a dark/low-key image borrows the MINOR subdominant
+            // — the textbook "shadow" colour — in place of the diatonic (major)
+            // subdominant. theory (design-s13 §2): the borrowed chord is the minor
+            // iv of the parallel minor (Aeolian iv): root on the subdominant scale
+            // degree, with a MINOR third and perfect fifth above it. Relabeling "IV"
+            // → "iv" alone is a no-op in a major-third mode because `roman_degree`
+            // would re-resolve it to the SAME diatonic degree-3 triad (major in
+            // Ionian); we must build the minor triad explicitly so the flattened
+            // third is actually sounded (in C: F-A-C → F-Ab-C). For an already-minor
+            // mode the diatonic iv is already minor, and this builder reproduces that
+            // same minor triad — no double-flatten (mode-general by construction).
+            let chord = if borrow_minor_iv && sym == "IV" {
+                self.borrowed_minor_iv(root_midi, &scale, complexity.has_seventh())
+            } else {
+                self.roman_to_chord_complex(sym, root_midi, &scale, complexity)
+            };
             chords.push(chord);
+        }
+
+        // Mode-mixture widening (design-s13 §5 contract item 4, option ii): a
+        // palette-SPREAD image (high colorfulness) appends a borrowed chord so its
+        // harmonic colour stops being a function of the single mean-hue mode pick.
+        // theory: two images with the SAME mean hue but different spread now differ
+        // in borrowed content — the "colorfulness" axis decouples mode-feel from the
+        // mean, exactly the collapse the diagnosis (§2c) identified. We borrow the
+        // bVI (the bright submediant from the parallel major/minor), a stock mixture
+        // colour, only when the spread is genuinely wide.
+        const MODE_MIXTURE_THRESHOLD: f32 = 0.45;
+        if colorfulness > MODE_MIXTURE_THRESHOLD && !progression.is_empty() {
+            // bVI = a major triad rooted a minor sixth (8 semitones) above the tonic.
+            let borrowed = self.flat_submediant(root_midi, complexity.has_seventh());
+            chords.push(borrowed);
         }
 
         chords
     }
 
-    /// Convert a simple Roman numeral to a Chord (very simplified)
-    fn roman_to_chord(&self, roman: &str, root_midi: u8, scale: &[i8; 7], _mode: &str) -> Chord {
-        // Map a Roman numeral to its scale-degree index (0-based) by exact,
-        // case-insensitive match. An exhaustive `match` on the whole lowercased
-        // numeral avoids the order-dependent `starts_with`/`len` shadowing that
-        // previously misrouted "iv" (subdominant) and "iii" (mediant).
-        // theory: I=tonic, ii=supertonic, iii=mediant, IV=subdominant,
-        //         V=dominant, vi=submediant, vii=leading-tone.
-        let lower = roman.to_lowercase();
-        let degree: u8 = match lower.as_str() {
-            "i" => 0,   // tonic
-            "ii" => 1,  // supertonic
-            "iii" => 2, // mediant (degree 2, NOT shadowed by the "ii" prefix anymore)
-            "iv" => 3,  // subdominant (degree 3, NOT the dominant)
-            "v" => 4,   // dominant
-            "vi" => 5,  // submediant
-            "vii" => 6, // leading tone
-            // theory: unrecognized numeral -> tonic (degree 0), a safe diatonic default.
-            _ => 0,
-        };
+    /// Convert a Roman numeral to a Chord at the requested HARMONIC COMPLEXITY.
+    ///
+    /// theory: the triad (root, 3rd, 5th) is the harmonic skeleton; the diatonic 7th
+    /// is `scale[(degree+6)%7]` and the 9th is `scale[(degree+1)%7]` an octave up —
+    /// both drawn from the SAME scale so the added tones stay diatonic and the chord
+    /// remains in-mode. Higher saturation adds these upper tones, turning bare triads
+    /// into 7th/9th chords (the breathing harmony the operator wanted).
+    fn roman_to_chord_complex(
+        &self,
+        roman: &str,
+        root_midi: u8,
+        scale: &[i8; 7],
+        complexity: HarmonicComplexity,
+    ) -> Chord {
+        let degree = roman_degree(roman);
 
-        // root pitch of chord
-        let root_semitone = scale[degree as usize];
-        let root_note = (root_midi as i16 + root_semitone as i16) as u8;
-
-        // triad (root, 3rd, 5th) using scale steps (simple)
+        // Triad tones (root, 3rd, 5th) by stacking thirds within the scale.
         let third_degree = (degree + 2) % 7;
         let fifth_degree = (degree + 4) % 7;
+        let root_note = (root_midi as i16 + scale[degree as usize] as i16) as u8;
         let third = (root_midi as i16 + scale[third_degree as usize] as i16) as u8;
         let fifth = (root_midi as i16 + scale[fifth_degree as usize] as i16) as u8;
+        let mut notes = vec![root_note, third, fifth];
+
+        if complexity.has_seventh() {
+            // theory: the diatonic 7th sits a third above the 5th — degree+6 mod 7.
+            // It is the colour tone that lifts a plain triad into a 7th chord and
+            // (on a dominant) supplies the leading dissonance that wants to resolve.
+            let seventh_degree = (degree + 6) % 7;
+            let seventh = (root_midi as i16 + scale[seventh_degree as usize] as i16) as u8;
+            notes.push(seventh);
+        }
+        if matches!(complexity, HarmonicComplexity::NinthChord) {
+            // theory: the 9th is the 2nd scale degree above the root (degree+1 mod 7),
+            // voiced an octave UP so it shimmers above the 7th rather than clashing a
+            // step from the root. It is the lush extension a vivid image earns.
+            let ninth_degree = (degree + 1) % 7;
+            let ninth = (root_midi as i16 + scale[ninth_degree as usize] as i16 + 12) as u8;
+            notes.push(ninth);
+        }
 
         Chord {
             name: roman.to_string(),
-            notes: vec![root_note, third, fifth],
+            notes,
+        }
+    }
+
+    /// Build the SECONDARY DOMINANT of `target` (the "V/x"): the major triad (or
+    /// dom7 when `with_seventh`) rooted a perfect fifth above the target's root.
+    ///
+    /// theory: tonicizing the next chord by inserting its own dominant gives
+    /// root-motion-by-fourth propulsion and the first non-diatonic (chromatic) tone
+    /// this engine produces — the raised third of the applied dominant. `with_seventh`
+    /// adds the minor 7th, turning it into a dominant-SEVENTH whose tritone pulls
+    /// strongly into the target. Voicing is left to the downstream phrase planner,
+    /// which re-seats every chord tone into its playable register band.
+    fn secondary_dominant_of(
+        &self,
+        target_roman: &str,
+        root_midi: u8,
+        scale: &[i8; 7],
+        with_seventh: bool,
+    ) -> Chord {
+        // Degree of the target within the home scale, then its absolute root pitch.
+        let target_degree = roman_degree(target_roman) as usize;
+        let target_root = (root_midi as i16 + scale[target_degree] as i16) as u8;
+        // V/x root = a perfect fifth (7 semitones) above the target's root.
+        let v_root = target_root.saturating_add(7);
+        // A MAJOR triad on v_root: root, +4 (major 3rd — the chromatic tone), +7 (P5).
+        let mut notes = vec![v_root, v_root.saturating_add(4), v_root.saturating_add(7)];
+        if with_seventh {
+            // +10 = the minor 7th ⇒ dominant-seventh quality (the strong tritone pull).
+            notes.push(v_root.saturating_add(10));
+        }
+        Chord {
+            name: format!("V/{target_roman}"),
+            notes,
+        }
+    }
+
+    /// Build the borrowed MINOR iv — the "shadow subdominant" of modal interchange.
+    ///
+    /// theory (design-s13 §2): a dark image borrows the minor subdominant from the
+    /// PARALLEL MINOR (Aeolian iv). It is a MINOR triad built on the subdominant
+    /// scale degree (degree 4 ≡ index 3): the root, a MINOR third (root + 3
+    /// semitones), and a perfect fifth (root + 7) above it. In C major the diatonic
+    /// IV is F-A-C (major); the borrow lowers the third a semitone to F-Ab-C — the
+    /// audible darkening the operator's "shadow" colour requires. The third is built
+    /// as `root + 3` (NOT the scale's diatonic third) precisely so the minor quality
+    /// is GUARANTEED regardless of the active mode's diatonic subdominant quality:
+    /// in a major-third mode (Ionian/Lydian/Mixolydian) this flattens the third for
+    /// real; in an already-minor mode (Aeolian/Dorian/Phrygian) the diatonic iv is
+    /// already minor and `root + 3` reproduces that same minor third — no
+    /// double-flatten. `with_seventh` adds the minor 7th (root + 10), the diatonic
+    /// 7th of the borrowed minor subdominant (a iv7 of the parallel minor).
+    fn borrowed_minor_iv(&self, root_midi: u8, scale: &[i8; 7], with_seventh: bool) -> Chord {
+        // Root = the subdominant scale degree (degree 4, 0-based index 3). Drawn from
+        // the active scale so the borrow sits on the mode's own subdominant pitch.
+        let iv_root = (root_midi as i16 + scale[3] as i16) as u8;
+        // Minor triad ON that root: +3 (MINOR third — the borrowed darkening), +7 (P5).
+        let mut notes = vec![
+            iv_root,
+            iv_root.saturating_add(3),
+            iv_root.saturating_add(7),
+        ];
+        if with_seventh {
+            // +10 = the minor 7th above the root (the iv7 of the parallel minor).
+            notes.push(iv_root.saturating_add(10));
+        }
+        Chord {
+            name: "iv".to_string(),
+            notes,
+        }
+    }
+
+    /// Build the borrowed flat-submediant (bVI): a major triad rooted a minor sixth
+    /// (8 semitones) above the tonic, optionally with its major 7th.
+    ///
+    /// theory: bVI is the stock modal-mixture colour borrowed from the parallel
+    /// minor — bright, plagal, and unmistakably "non-diatonic-in-major". Appending it
+    /// when the palette is wide gives a spread image audibly different harmony from a
+    /// monochrome one of the same mean hue.
+    fn flat_submediant(&self, root_midi: u8, with_seventh: bool) -> Chord {
+        let r = root_midi.saturating_add(8); // minor sixth above the tonic
+        let mut notes = vec![r, r.saturating_add(4), r.saturating_add(7)]; // major triad
+        if with_seventh {
+            notes.push(r.saturating_add(11)); // major 7th — the lush mixture colour
+        }
+        Chord {
+            name: "bVI".to_string(),
+            notes,
         }
     }
 }
@@ -842,6 +1091,20 @@ fn realize_velocity(
 const STACCATO_FRAC: f32 = 0.40;
 const PORTATO_FRAC: f32 = 0.70;
 const LEGATO_FRAC: f32 = 0.95;
+/// S13: the LEGATO ceiling for the CONTINUOUS articulation curve — deliberately
+/// > 1.0 so a calm (low-edge) image's notes OVERLAP across the step boundary and
+/// truly sing, instead of the old code snapping every real photo to 0.95 (never
+/// connecting). theory: legato that crosses the bar line is the single biggest
+/// "played vs typed" cue — it is what kills the operator's "uniformly short" complaint.
+const LEGATO_FRAC_HI: f32 = 1.05;
+/// S13: per-bar edge-density normalization divisor for the articulation curve.
+/// theory: real photos carry raw per-bar edge density ~0.005..0.05; dividing by this
+/// calibrated max maps that into a usable 0..1 ACTIVITY range so the curve actually
+/// spans staccato↔legato instead of clustering at one end. This MIRRORS the canonical
+/// `feature_normalization.edge_density_max` in mappings.json — it lives as a const
+/// ONLY because `realize_rhythm` is a free fn with no MappingTable handle (the seam
+/// does not carry one into the per-step realization); keep the two values in sync.
+const EDGE_ACTIVITY_RANGE_MAX: f32 = 0.05;
 /// The ritardando multiplier applied to a phrase-final note's hold. theory: as
 /// the phrase relaxes into its arrival the final note rings longer.
 const RITARDANDO_FACTOR: f32 = 1.30;
@@ -860,6 +1123,13 @@ fn realize_rhythm(
     is_phrase_start: bool,
     step: &StepPlan,
 ) -> Vec<NoteEvent> {
+    // S13: normalize the RAW per-bar edge density into a 0..1 ACTIVITY knob. The old
+    // code compared raw edge (≈0.005 on real photos) against 0.25/0.70 cutoffs, so
+    // every real image fell in the "low edge → legato/sustained" band — uniform output.
+    // Normalizing first lets the curve and the pattern bands span their full range.
+    let edge_activity = (features.edge_density / EDGE_ACTIVITY_RANGE_MAX).clamp(0.0, 1.0);
+    // Keep the raw-clamped value too for the HarmonicFill rest-as-gesture check, whose
+    // 0.15 threshold was authored against raw edge (a near-silent texture).
     let edge = features.edge_density.clamp(0.0, 1.0);
     let step_ms = ms_per_step.max(1);
 
@@ -871,15 +1141,27 @@ fn realize_rhythm(
         && step.position_in_phrase + 2 >= step.phrase_len
         && step.phrase_len >= 2;
 
-    // Articulation fraction for sustained/single-onset notes, before ritardando.
-    // theory: low edge_density (calm texture) -> legato; high -> staccato; the
-    // fill sustains (legato) to support; mid is portato (the neutral default).
+    // S13: CONTINUOUS articulation curve, replacing the old 3-band step function.
+    // theory: note length now varies SMOOTHLY with the normalized edge activity —
+    //   edge_activity = 0 (calm)  → LEGATO_FRAC_HI (1.05, overlapping/singing)
+    //   edge_activity = 1 (busy)  → STACCATO_FRAC  (0.40, crisply detached)
+    // A continuous lerp means two images of different busyness get different note
+    // lengths instead of snapping to one of three values — directly fixing
+    // "uniformly short, computer-like." The HarmonicFill still leans connected
+    // (it supports rather than competes), so it sits a touch above the curve.
+    // NOTE (compromise): the spec's optional global articulation bias `*= lerp(1.10,
+    // 0.90, texture)` is omitted — `texture_laplacian_var` is not on the per-step
+    // PerfFeatures seam and adding it would be a forbidden seam change. The per-bar
+    // edge curve alone removes the uniformity; the global texture bias is deferred.
+    let curve_frac = LEGATO_FRAC_HI + (STACCATO_FRAC - LEGATO_FRAC_HI) * edge_activity;
     let base_frac = match role {
-        OrchestralRole::HarmonicFill => LEGATO_FRAC,
-        _ if edge < 0.25 => LEGATO_FRAC,
-        _ if edge > 0.70 => STACCATO_FRAC,
-        _ => PORTATO_FRAC,
-    };
+        // Fill biases toward the connected end so inner voices sustain under the line.
+        OrchestralRole::HarmonicFill => curve_frac.max(LEGATO_FRAC),
+        _ => curve_frac,
+    }
+    // Clamp to the existing sustained() envelope cap (0.30..=1.20). 0.30 keeps even
+    // the busiest staccato audible; 1.20 matches the cadence-ring overlap ceiling.
+    .clamp(0.30, 1.20);
 
     // Phrase-end ritardando: cadence (and the pre-cadence approach) lengthen the
     // sounding duration so the arrival rings. Applied as a multiplier on the
@@ -928,8 +1210,10 @@ fn realize_rhythm(
                     sustained(two_thirds, step_ms - two_thirds, PORTATO_FRAC),
                 ]
             } else {
-                // One grounded, sustained root for the whole step.
-                vec![sustained(0, step_ms, LEGATO_FRAC)]
+                // One grounded, sustained root for the whole step, its length set by
+                // the CONTINUOUS articulation curve (S13): a calm image's bass sings
+                // across the bar (frac>1.0), a busy image's bass is shorter/detached.
+                vec![sustained(0, step_ms, base_frac)]
             }
         }
 
@@ -949,9 +1233,12 @@ fn realize_rhythm(
         }
 
         OrchestralRole::Melody => {
-            // MELODY: the most rhythmic freedom. Pattern by edge_density band,
-            // with syncopation and pre-cadence acceleration.
-            if pre_cadence || edge > 0.80 {
+            // MELODY: the most rhythmic freedom. Pattern by NORMALIZED edge_activity
+            // band (design-s13 §2), with syncopation and pre-cadence acceleration.
+            // theory: recalibrating the cutoffs against edge_activity (not raw edge)
+            // is what makes "busy image → denser, arpeggiated melody" actually fire on
+            // real photos — under the old raw cutoffs every photo fell in "sustained".
+            if pre_cadence || edge_activity > 0.80 {
                 // ARPEGGIO / acceleration: spread chord-tone onsets evenly across
                 // the step (more onsets, shorter values) — the active, driving
                 // figure. theory: subdividing the beat is the melody's way of
@@ -964,7 +1251,7 @@ fn realize_rhythm(
                         sustained(offset, slot, STACCATO_FRAC)
                     })
                     .collect()
-            } else if edge > 0.55 {
+            } else if edge_activity > 0.55 {
                 // SYNCOPATED: delay the onset off the downbeat by 1/4 step, then
                 // a second onset, pushing against the meter. theory: syncopation
                 // displaces the accent to energize an active-but-not-busy melody.
@@ -973,7 +1260,7 @@ fn realize_rhythm(
                     sustained(quarter, step_ms / 2, PORTATO_FRAC),
                     sustained(step_ms * 3 / 4, step_ms / 4, STACCATO_FRAC),
                 ]
-            } else if edge > 0.25 {
+            } else if edge_activity > 0.25 {
                 // DOTTED: a long-short pair (onsets at 0 and 2/3; holds 2/3 and
                 // 1/3) — the lilting mid-activity figure. theory: the dotted
                 // rhythm is the default expressive subdivision of a singing line.
@@ -983,9 +1270,11 @@ fn realize_rhythm(
                     sustained(two_thirds, step_ms - two_thirds, STACCATO_FRAC),
                 ]
             } else {
-                // SUSTAINED (low edge): one long legato tone — the calm, singing
-                // melody when the texture is sparse.
-                vec![sustained(0, step_ms, LEGATO_FRAC)]
+                // SUSTAINED (low edge_activity): one long tone whose length rides the
+                // CONTINUOUS articulation curve (S13). At low activity base_frac ≈ 1.05,
+                // so the calm melody OVERLAPS across the step boundary and truly sings —
+                // the fix for "uniformly short" notes that the old hard 0.95 cap blocked.
+                vec![sustained(0, step_ms, base_frac)]
             }
         }
     }
@@ -1408,7 +1697,10 @@ mod tests {
     /// out (no RNG, no inserted/borrowed chords).
     fn one_chord(eng: &ChordEngine, roman: &str, mode: &str) -> Chord {
         let prog = vec![roman.to_string()];
-        let mut chords = eng.generate_chords(&prog, ROOT, mode, 0.0, 0.0);
+        // saturation01_raw=0.0 → Triad (3 notes); colorfulness_raw=0.0 → no mixture
+        // append; edge=0.0/drop=0.0 → no secondary dominant / no borrowed iv. So one
+        // symbol yields exactly one root-position triad — the determinism contract.
+        let mut chords = eng.generate_chords(&prog, ROOT, mode, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(
             chords.len(),
             1,
@@ -1459,7 +1751,7 @@ mod tests {
         for mode in modes {
             for prog in progressions {
                 let prog: Vec<String> = prog.iter().map(|s| s.to_string()).collect();
-                let chords = eng.generate_chords(&prog, ROOT, mode, 0.0, 0.0);
+                let chords = eng.generate_chords(&prog, ROOT, mode, 0.0, 0.0, 0.0, 0.0);
                 for chord in &chords {
                     for &note in &chord.notes {
                         assert!(
@@ -1715,7 +2007,7 @@ mod tests {
     /// Deterministic progression -> input chords for the voice-leading layer.
     fn prog_chords(eng: &ChordEngine, romans: &[&str], mode: &str) -> Vec<Chord> {
         let prog: Vec<String> = romans.iter().map(|s| s.to_string()).collect();
-        eng.generate_chords(&prog, ROOT, mode, 0.0, 0.0)
+        eng.generate_chords(&prog, ROOT, mode, 0.0, 0.0, 0.0, 0.0)
     }
 
     // ---------------------------------------------------------------------
@@ -2451,5 +2743,441 @@ mod tests {
                 chord.notes
             );
         }
+    }
+
+    // =====================================================================
+    // S13 — IMAGE→MUSIC DIVERSITY PROPERTY NET (Music Theory Specialist)
+    //
+    // Focused unit tests for the music-side diversity fixes (design-s13 §2/§4/§6):
+    // harmonic complexity from saturation, the CONTINUOUS articulation curve,
+    // per-image rhythmic density, mode-mixture from colorfulness, and the corrected
+    // secondary dominant. These hold the same determinism contract as the nets above
+    // (explicit progressions, fixed ROOT, no RNG, no synth). The cross-cutting
+    // headline net is the Test Engineer's job; these pin MY functions.
+    //
+    // RAW-feature note: generate_chords takes RAW seam scalars (saturation 0..100,
+    // edge 0..~0.05, hue_spread ~0..1) and normalizes them itself, so these tests
+    // feed raw values exactly as the engine would.
+    // =====================================================================
+
+    /// Build chords with all the S13 knobs explicit (raw seam values).
+    #[allow(clippy::too_many_arguments)]
+    fn gen(
+        eng: &ChordEngine,
+        romans: &[&str],
+        mode: &str,
+        edge_raw: f32,
+        drop: f32,
+        sat_raw: f32,
+        color_raw: f32,
+    ) -> Vec<Chord> {
+        let prog: Vec<String> = romans.iter().map(|s| s.to_string()).collect();
+        eng.generate_chords(&prog, ROOT, mode, edge_raw, drop, sat_raw, color_raw)
+    }
+
+    // ---------------------------------------------------------------------
+    // HARMONIC COMPLEXITY — chord-tone count tracks saturation (design-s13 §2).
+    // property: low saturation → bare triads (3 notes); mid → +7th (4); high →
+    // +7th+9th (5). This is the fix for the operator's "computer triads".
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_harmonic_complexity_tracks_saturation() {
+        let eng = engine();
+        // Low sat (raw 20/100 = 0.20 < 0.31) → every chord a 3-note triad.
+        let low = gen(&eng, &["I", "IV", "V", "vi"], "Ionian", 0.0, 0.0, 20.0, 0.0);
+        for c in &low {
+            assert_eq!(
+                c.notes.len(),
+                3,
+                "low-saturation chord {:?} must be a bare triad (3 notes), got {:?}",
+                c.name,
+                c.notes
+            );
+        }
+        // Mid sat (raw 50 = 0.50, band 31-70) → 7th chords (4 notes).
+        let mid = gen(&eng, &["I", "IV", "V", "vi"], "Ionian", 0.0, 0.0, 50.0, 0.0);
+        assert!(
+            mid.iter().all(|c| c.notes.len() == 4),
+            "mid-saturation chords must all carry the diatonic 7th (4 notes): {:?}",
+            mid.iter()
+                .map(|c| (c.name.clone(), c.notes.len()))
+                .collect::<Vec<_>>()
+        );
+        // High sat (raw 90 = 0.90, band 71-100) → 7th+9th (5 notes).
+        let high = gen(&eng, &["I", "IV", "V", "vi"], "Ionian", 0.0, 0.0, 90.0, 0.0);
+        assert!(
+            high.iter().all(|c| c.notes.len() == 5),
+            "high-saturation chords must carry the 7th AND 9th (5 notes): {:?}",
+            high.iter()
+                .map(|c| (c.name.clone(), c.notes.len()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // HARMONIC COMPLEXITY — the added tones are DIATONIC (in-scale).
+    // property: the 7th of Ionian I (C major) is B (pc 11); the 9th is D (pc 2).
+    // The chord must remain in-mode, not reach for chromatic colour.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_seventh_and_ninth_are_diatonic() {
+        let eng = engine();
+        // High-sat tonic in Ionian: I7add9 over C → C E G B D.
+        let chords = gen(&eng, &["I"], "Ionian", 0.0, 0.0, 90.0, 0.0);
+        assert_eq!(
+            chords.len(),
+            1,
+            "single symbol, no inserts/mixture at color=0"
+        );
+        let pcs: std::collections::HashSet<u8> = chords[0].notes.iter().map(|&n| n % 12).collect();
+        // C(0) E(4) G(7) B(11) D(2) — all diatonic to C Ionian.
+        for pc in [0u8, 4, 7, 11, 2] {
+            assert!(
+                pcs.contains(&pc),
+                "Ionian I7add9 must contain diatonic pc {pc} (C E G B D); got pcs {pcs:?}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // ARTICULATION — CONTINUOUS curve: calm image holds LONGER than busy, and a
+    // calm image actually crosses into connected/legato (frac > 0.95). This is
+    // the direct "uniformly short" killer (design-s13 §2 articulation / §6.3).
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_articulation_curve_calm_longer_than_busy_and_crosses_legato() {
+        let eng = engine();
+        let plan = ionian_period(&eng);
+        let ms_per_step = 1000u64;
+        let num = 3usize;
+
+        // Mean hold fraction over the MELODY's CURVE-GOVERNED steps (PhraseStart /
+        // Interior — the sustained branch). We exclude the cadence step (a fixed
+        // LEGATO ring, deliberately byte-stable per spec §7) and the pre-cadence step
+        // (a fixed arpeggiated acceleration). Those are STRUCTURAL figures, not the
+        // articulation curve under test; the operator's "uniformly short" complaint is
+        // about the body of the line, which is exactly these steps. We take each step's
+        // representative (longest) hold so a multi-onset step contributes one sample.
+        let mean_frac = |edge_raw: f32| -> f64 {
+            let features = PerfFeatures {
+                saturation: 50.0,
+                brightness: 50.0,
+                edge_density: edge_raw,
+            };
+            let mut fracs: Vec<f64> = Vec::new();
+            for step in &plan {
+                let curve_governed = matches!(
+                    step.position,
+                    PhrasePosition::PhraseStart | PhrasePosition::Interior
+                ) && !(step.position_in_phrase + 2 >= step.phrase_len
+                    && step.position_in_phrase > 0); // skip pre-cadence
+                if !curve_governed {
+                    continue;
+                }
+                if let Some(max_hold) = realize_step(step, num - 1, num, &features, ms_per_step)
+                    .iter()
+                    .map(|e| e.hold_ms)
+                    .max()
+                {
+                    fracs.push(max_hold as f64 / ms_per_step as f64);
+                }
+            }
+            fracs.iter().sum::<f64>() / fracs.len().max(1) as f64
+        };
+
+        // Calm A: raw per-bar edge 0.004 (edge_activity ≈ 0.08) → near-legato.
+        // Busy B: raw per-bar edge 0.045 (edge_activity ≈ 0.90) → detached/arpeggiated.
+        let frac_a = mean_frac(0.004);
+        let frac_b = mean_frac(0.045);
+        assert!(
+            frac_a - frac_b > 0.05,
+            "calm image mean hold fraction ({frac_a:.3}) must exceed busy ({frac_b:.3}) \
+             by a clear margin — the continuous curve must make note length vary"
+        );
+        assert!(
+            frac_a > 0.95,
+            "a CALM image's mean hold fraction ({frac_a:.3}) must cross into connected/\
+             legato territory (>0.95) — the old code capped legato at 0.95 and snapped \
+             every real photo there, producing 'uniformly short' notes"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // RHYTHMIC DENSITY — busier image yields a DIFFERENT onset-count distribution
+    // (design-s13 §2 density / §6.4). Not "a pattern exists" — the multiset differs.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_rhythmic_density_distribution_differs_with_busyness() {
+        let eng = engine();
+        let plan = ionian_period(&eng);
+        let ms_per_step = 1200u64;
+        let num = 3usize;
+
+        let onset_multiset = |edge_raw: f32| -> std::collections::BTreeMap<usize, usize> {
+            let features = PerfFeatures {
+                saturation: 50.0,
+                brightness: 50.0,
+                edge_density: edge_raw,
+            };
+            let mut counts: std::collections::BTreeMap<usize, usize> =
+                std::collections::BTreeMap::new();
+            for inst in 0..num {
+                for step in &plan {
+                    let n = realize_step(step, inst, num, &features, ms_per_step).len();
+                    *counts.entry(n).or_default() += 1;
+                }
+            }
+            counts
+        };
+
+        let calm = onset_multiset(0.004); // edge_activity ≈ 0.08 → sustained melody
+        let busy = onset_multiset(0.045); // edge_activity ≈ 0.90 → arpeggiated melody
+        assert_ne!(
+            calm, busy,
+            "the per-step onset-count distribution must differ between a calm and a \
+             busy image (busier → more onsets on the melody). calm={calm:?} busy={busy:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // MODE MIXTURE — colorfulness (hue_spread) adds a borrowed chord that a
+    // monochrome image of the SAME mean hue does not get (design-s13 §5 item 4 /
+    // §6.5). Decouples harmonic colour from the single mean-hue mode pick.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_colorfulness_adds_borrowed_chord() {
+        let eng = engine();
+        // Same mode (same mean hue, decided upstream); only colorfulness differs.
+        let mono = gen(&eng, &["I", "IV", "V", "I"], "Ionian", 0.0, 0.0, 20.0, 0.05);
+        let vivid = gen(&eng, &["I", "IV", "V", "I"], "Ionian", 0.0, 0.0, 20.0, 0.65);
+        // The vivid (palette-spread) image appends the borrowed bVI; the mono does not.
+        assert!(
+            !mono.iter().any(|c| c.name == "bVI"),
+            "a low-spread (monochrome) image must NOT borrow bVI: {:?}",
+            mono.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            vivid.iter().any(|c| c.name == "bVI"),
+            "a high-spread (colorful) image MUST add the borrowed bVI mixture chord, \
+             decoupling colour from the mean-hue mode: {:?}",
+            vivid.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            vivid.len() > mono.len(),
+            "the mixture chord must be additive (vivid has more chords than mono)"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // SECONDARY DOMINANT — fires on a busy image, is the V OF the next chord (a
+    // chromatic, non-home tone), and does NOT fire on a calm image (design-s13
+    // §4 / §6.7). Also: it honors the look-ahead (different `next` → different V/x).
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_secondary_dominant_fires_and_targets_next() {
+        let eng = engine();
+        // Busy: raw edge 0.045 → edge_activity ≈ 0.90 > 0.55 trigger.
+        // Progression I → IV: the inserted chord must be V/IV (dominant of IV).
+        let busy = gen(&eng, &["I", "IV"], "Ionian", 0.045, 0.0, 20.0, 0.0);
+        let names: Vec<&str> = busy.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"V/IV"),
+            "busy image must insert the secondary dominant V/IV (dominant of the next \
+             chord), not the home V; got {names:?}"
+        );
+        // V/IV root = a P5 above IV's root. IV root in Ionian = tonic+5 = 65 (F);
+        // V/IV root = 65+7 = 72 (C). The chromatic tone is its major 3rd 72+4 = 76 (E
+        // is diatonic, but the dom7 would bring Bb) — assert the inserted root is 72.
+        let vfour = busy.iter().find(|c| c.name == "V/IV").unwrap();
+        assert_eq!(
+            vfour.notes[0], 72,
+            "V/IV must be rooted a perfect fifth above IV's root (F=65 → C=72); got {:?}",
+            vfour.notes
+        );
+
+        // Look-ahead honored: I → V inserts V/V whose root differs from V/IV's.
+        let busy2 = gen(&eng, &["I", "V"], "Ionian", 0.045, 0.0, 20.0, 0.0);
+        let vfive = busy2
+            .iter()
+            .find(|c| c.name == "V/V")
+            .expect("V/V must be inserted");
+        assert_ne!(
+            vfour.notes[0], vfive.notes[0],
+            "V/IV and V/V must have different roots — proves `next` is actually consumed"
+        );
+
+        // Calm: raw edge 0.004 → edge_activity ≈ 0.08 < 0.55 → NO secondary dominant.
+        let calm = gen(&eng, &["I", "IV"], "Ionian", 0.004, 0.0, 20.0, 0.0);
+        assert!(
+            !calm.iter().any(|c| c.name.starts_with("V/")),
+            "calm image must NOT insert a secondary dominant: {:?}",
+            calm.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // SECONDARY DOMINANT — quality tracks saturation: vivid image → dom7 (4 notes),
+    // washed-out → bare secondary triad (3 notes). Dovetails harmonic complexity.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_secondary_dominant_quality_tracks_saturation() {
+        let eng = engine();
+        // Busy + LOW sat → secondary dominant is a bare triad (3 notes).
+        let low = gen(&eng, &["I", "IV"], "Ionian", 0.045, 0.0, 20.0, 0.0);
+        let v_low = low.iter().find(|c| c.name == "V/IV").unwrap();
+        assert_eq!(
+            v_low.notes.len(),
+            3,
+            "low-sat secondary dominant = bare triad"
+        );
+        // Busy + HIGH sat → dominant SEVENTH (4 notes, the strong tritone pull).
+        let high = gen(&eng, &["I", "IV"], "Ionian", 0.045, 0.0, 90.0, 0.0);
+        let v_high = high.iter().find(|c| c.name == "V/IV").unwrap();
+        assert_eq!(
+            v_high.notes.len(),
+            4,
+            "high-sat secondary dominant must be a dom7 (4 notes) for the strongest pull"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // MODAL INTERCHANGE — a dark image (large brightness_drop) borrows the minor iv
+    // in place of major IV (design-s13 §3 E-2 trigger, M-side consumption / §6.8).
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_modal_interchange_borrows_minor_iv_when_dark() {
+        let eng = engine();
+        // drop=0.6 > 0.25 threshold → IV becomes the borrowed minor iv. Ionian is a
+        // MAJOR-THIRD mode, so the DIATONIC subdominant (major IV) would be F-A-C; the
+        // borrow must actually lower the third to F-Ab-C — the audible darkening.
+        let dark = gen(&eng, &["I", "IV", "V"], "Ionian", 0.0, 0.6, 20.0, 0.0);
+        let iv = dark.iter().find(|c| c.name == "iv").unwrap_or_else(|| {
+            panic!(
+                "a dark image (brightness_drop>threshold) must borrow the minor iv: {:?}",
+                dark.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+            )
+        });
+
+        // PROVE the minor third is SOUNDED, not merely relabeled. The chord is built
+        // root-position (notes[0] = root, notes[1] = third). In C Ionian the iv root is
+        // degree-3 = tonic+5 = 65 (F); the borrowed minor third is 65+3 = 68 (Ab).
+        let root = iv.notes[0];
+        let third = iv.notes[1];
+        assert_eq!(
+            root, 65,
+            "borrowed iv must be rooted on the subdominant (F=65 in C Ionian): {:?}",
+            iv.notes
+        );
+        // The decisive assertion: the interval from root to third is a MINOR third (3
+        // semitones), NOT the major third (4) the diatonic IV of a major mode carries.
+        // This is exactly the no-op the previous symbol-only swap could never satisfy —
+        // it asserts the flattened third is in the pitch set the engine emits.
+        let root_to_third = third as i16 - root as i16;
+        assert_eq!(
+            root_to_third, 3,
+            "borrowed iv MUST sound a MINOR third (3 semitones) above its root, not a \
+             major third — in C: F-Ab-C, not F-A-C. root={root} third={third} chord={:?}",
+            iv.notes
+        );
+        // And concretely: Ab (pc 8) present, A-natural (pc 9 — the diatonic major third) absent.
+        let pcs: std::collections::HashSet<u8> = iv.notes.iter().map(|&n| n % 12).collect();
+        assert!(
+            pcs.contains(&8) && !pcs.contains(&9),
+            "borrowed iv must contain Ab (pc8) and NOT A-natural (pc9): {:?}",
+            iv.notes
+        );
+
+        // A bright image keeps the major IV (no borrow): F-A-C, a MAJOR third (4 st).
+        let bright = gen(&eng, &["I", "IV", "V"], "Ionian", 0.0, 0.0, 20.0, 0.0);
+        let major_iv = bright
+            .iter()
+            .find(|c| c.name == "IV")
+            .expect("a bright image must keep major IV, not borrow iv");
+        assert!(
+            !bright.iter().any(|c| c.name == "iv"),
+            "a bright image must not borrow iv: {:?}",
+            bright.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            major_iv.notes[1] as i16 - major_iv.notes[0] as i16,
+            4,
+            "the diatonic IV in a major mode keeps its MAJOR third (4 semitones): {:?}",
+            major_iv.notes
+        );
+
+        // MODE-GENERALITY: borrowing into an already-MINOR mode must NOT double-flatten.
+        // Aeolian's diatonic iv is already minor (F-Ab-C); the borrow reproduces that
+        // same minor third (3 semitones) — never a diminished/double-flat third (2).
+        let dark_minor = gen(&eng, &["I", "IV", "V"], "Aeolian", 0.0, 0.6, 20.0, 0.0);
+        let iv_minor = dark_minor
+            .iter()
+            .find(|c| c.name == "iv")
+            .expect("Aeolian dark image borrows iv too");
+        assert_eq!(
+            iv_minor.notes[1] as i16 - iv_minor.notes[0] as i16,
+            3,
+            "borrowing the minor iv into an already-minor mode must stay a MINOR third \
+             (3 semitones), not double-flatten: {:?}",
+            iv_minor.notes
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // SECONDARY-DOMINANT REGISTER SAFETY — even after the +7/+10 stack and the
+    // voice-leading re-seat, the FINAL realized chord tones stay in 24..=108
+    // (design-s13 §7 risk: register blowout). Run a busy, high-sat plan end-to-end.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_busy_vivid_plan_notes_stay_in_playable_range() {
+        let eng = engine();
+        // Busy + vivid → secondary dominants + 7th/9th chords + mixture, the densest
+        // harmony the engine produces. Voice-lead and assert every note is in band.
+        let chords = gen(
+            &eng,
+            &["I", "IV", "V", "vi", "ii", "V", "I"],
+            "Ionian",
+            0.045,
+            0.0,
+            90.0,
+            0.65,
+        );
+        let led = eng.voice_lead_sequence(&chords);
+        for c in &led {
+            for &n in &c.notes {
+                assert!(
+                    (24..=108).contains(&n),
+                    "note {n} in chord {:?} out of playable range 24..=108 after \
+                     voice leading: {:?}",
+                    c.name,
+                    c.notes
+                );
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // FEATURE NORMALIZATION — the calibrated knobs land where the diagnosis says.
+    // Guards the contract values in mappings.json (design-s13 §0).
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_feature_normalization_calibration() {
+        use crate::mapping_loader::FeatureNormalization;
+        let eng = engine();
+        let f = &eng.mappings.global.feature_normalization;
+        // edge_density: raw 0.005..0.036 must map into ≈0.10..0.72 (the usable band).
+        let lo = FeatureNormalization::normalize(0.005, f.edge_density_max);
+        let hi = FeatureNormalization::normalize(0.036, f.edge_density_max);
+        assert!(
+            (0.08..0.12).contains(&lo) && (0.70..0.74).contains(&hi),
+            "edge_density 0.005/0.036 must normalize to ≈0.10/0.72; got {lo}/{hi}"
+        );
+        // clamp protects the top: a busier-than-calibration image saturates at 1.0.
+        assert_eq!(
+            FeatureNormalization::normalize(0.20, f.edge_density_max),
+            1.0,
+            "edge_activity must clamp at 1.0 for an over-range image"
+        );
+        // degenerate range_max fails safe to 0 (no activity), never NaN/inf.
+        assert_eq!(FeatureNormalization::normalize(0.5, 0.0), 0.0);
     }
 }

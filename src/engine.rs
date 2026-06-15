@@ -330,17 +330,47 @@ impl PipelineEngine {
         let mode = lookup_range_map(&self.mappings.global.hue_to_mode, global.avg_hue)
             .unwrap_or_else(|| "Ionian".to_string());
 
+        // S13: image-driven tempo. brightness → BPM via the (previously dead)
+        // brightness_to_tempo_bpm map, continuously interpolated, then BPM → ms/step
+        // (one step = one beat). This is the plan-derivation path, NOT the decision
+        // kernel; the new ms_per_step flows to decide_instrument_action through the
+        // existing parameter at decide_step. engine_equivalence.rs is unaffected (it
+        // passes MS_PER_STEP explicitly and never calls this path).
+        //
+        // Rationale (brightness→tempo): luminance is the canonical visual correlate of
+        // energy/arousal — bright images feel fast/energetic, dark images slow/calm
+        // (the standard film-scoring intuition). Interpolating CONTINUOUSLY across the
+        // JSON anchor points (rather than 3 buckets) means two bright-but-different
+        // images still differ in tempo, which is the per-image diversity S13 targets.
+        let bpm = interp_tempo_bpm(
+            &self.mappings.global.brightness_to_tempo_bpm,
+            global.avg_brightness,
+        );
+        self.config.ms_per_step = (60_000.0 / bpm.max(1.0)).round() as u64;
+
         // 2) progression → chords → phrase plan (main.rs:373–384). ChordEngine::new
         //    consumes the MappingTable by value, so build a transient engine from a
         //    clone of our mappings, derive the plan, and keep the plan.
         let chord_engine = ChordEngine::new(rebuild_mapping_table(&self.mappings));
         let progression = chord_engine.pick_progression(&mode);
+        // S13: real modal-interchange trigger. Dark/low-key image ⇒ larger "drop" ⇒
+        // borrow the minor iv (the shadow subdominant). Was hardcoded 0.0 (never fired).
+        // M owns recalibrating the threshold this drop is compared against.
+        let brightness_drop = (0.5 - global.avg_brightness / 100.0).clamp(0.0, 1.0) * 2.0;
         let chords = chord_engine.generate_chords(
             &progression,
             self.config.root_midi,
             &mode,
-            global.edge_density,
-            0.0,
+            global.edge_density, // unchanged: M recalibrates the threshold side
+            brightness_drop,     // S13: was 0.0
+            // S13 (M coordination): raw avg_saturation (0..100) flows through so the
+            // music layer can normalize it to saturation01 and drive harmonic
+            // complexity (triad → 7th → 7th+9th). The seam still carries a plain
+            // raw scalar; normalization happens in chord_engine (Option-NORM-MAP).
+            global.avg_saturation,
+            // S13 (M coordination): raw hue_spread (~0..1) for the colorfulness axis
+            // (mode-mixture / borrowed-chord widening) — also normalized music-side.
+            global.hue_spread,
         );
         // plan_phrases runs voice_lead_sequence internally, so the shared plan carries
         // the voice-led chords — no separate voice-leading call (matches main.rs:380–383).
@@ -584,6 +614,9 @@ fn rebuild_mapping_table(t: &MappingTable) -> MappingTable {
             hue_to_mode: t.global.hue_to_mode.clone(),
             saturation_to_harmonic_complexity: t.global.saturation_to_harmonic_complexity.clone(),
             brightness_to_tempo_bpm: t.global.brightness_to_tempo_bpm.clone(),
+            // S13 (design-s13 §5): copy the new normalization block so the rebuilt
+            // table stays lossless after M added it to mapping_loader::GlobalMapping.
+            feature_normalization: t.global.feature_normalization.clone(),
             dominant_substitution_trigger: DominantSubTrigger {
                 edge_complexity_threshold: t
                     .global
@@ -625,6 +658,48 @@ fn rebuild_mapping_table(t: &MappingTable) -> MappingTable {
             shape_to_ostinato: t.fine_detail.shape_to_ostinato.clone(),
         },
     }
+}
+
+/// S13 helper: continuous brightness(0..100) → BPM over the JSON anchor map.
+///
+/// `brightness_to_tempo_bpm` is a `HashMap<String, u32>` keyed by string ranges
+/// (`"0-30"` / `"31-70"` / `"71-100"`). This parses each `"lo-hi": bpm` entry into a
+/// `(range-midpoint, bpm)` anchor point, sorts by midpoint, and LINEARLY interpolates
+/// (clamped at the ends). A continuous map (not 3 buckets) is what lets two
+/// bright-but-different images land on different tempos — the S13 diversity goal.
+///
+/// Returns a BPM as `f32` (the caller converts to `ms_per_step`). A degenerate/empty
+/// map falls back to 240 BPM, which is exactly `60000 / 250` — preserving today's
+/// legacy 250 ms default tempo so an empty map is a no-op rather than a surprise.
+fn interp_tempo_bpm(map: &std::collections::HashMap<String, u32>, brightness: f32) -> f32 {
+    let mut anchors: Vec<(f32, f32)> = map
+        .iter()
+        .filter_map(|(k, v)| {
+            let mut it = k.split('-');
+            let lo: f32 = it.next()?.trim().parse().ok()?;
+            let hi: f32 = it.next()?.trim().parse().ok()?;
+            Some(((lo + hi) * 0.5, *v as f32))
+        })
+        .collect();
+    anchors.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    if anchors.is_empty() {
+        return 60_000.0 / 250.0; // == 240 BPM ⇒ preserves the legacy 250 ms default
+    }
+    if brightness <= anchors[0].0 {
+        return anchors[0].1;
+    }
+    if brightness >= anchors[anchors.len() - 1].0 {
+        return anchors[anchors.len() - 1].1;
+    }
+    for w in anchors.windows(2) {
+        let (x0, y0) = w[0];
+        let (x1, y1) = w[1];
+        if brightness >= x0 && brightness <= x1 {
+            let t = (brightness - x0) / (x1 - x0);
+            return y0 + t * (y1 - y0);
+        }
+    }
+    anchors[anchors.len() - 1].1
 }
 
 #[cfg(test)]
@@ -880,5 +955,105 @@ mod tests {
         assert_eq!(c.ms_per_step, 250);
         assert!((c.bar_thickness_frac - 0.10).abs() < 1e-6);
         assert_eq!(c.root_midi, 60);
+    }
+
+    /// The canonical S13 tempo anchors from assets/mappings.json: "0-30"→60,
+    /// "31-70"→90, "71-100"→120 BPM (midpoints 15 / 50.5 / 85.5).
+    fn tempo_anchors() -> std::collections::HashMap<String, u32> {
+        let mut m = std::collections::HashMap::new();
+        m.insert("0-30".to_string(), 60u32);
+        m.insert("31-70".to_string(), 90u32);
+        m.insert("71-100".to_string(), 120u32);
+        m
+    }
+
+    #[test]
+    fn interp_tempo_bpm_dark_image_is_slow() {
+        // brightness below the lowest midpoint clamps to the slowest anchor (60 BPM).
+        let m = tempo_anchors();
+        assert!((interp_tempo_bpm(&m, 0.0) - 60.0).abs() < 1e-6);
+        assert!((interp_tempo_bpm(&m, 15.0) - 60.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn interp_tempo_bpm_bright_image_is_fast() {
+        // brightness at/above the highest midpoint clamps to the fastest anchor (120 BPM).
+        let m = tempo_anchors();
+        assert!((interp_tempo_bpm(&m, 85.5) - 120.0).abs() < 1e-6);
+        assert!((interp_tempo_bpm(&m, 100.0) - 120.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn interp_tempo_bpm_is_continuous_and_monotonic() {
+        // Sweeping brightness up must never DECREASE BPM (bright→fast), and the
+        // interior must interpolate (not snap into 3 buckets): a value between two
+        // midpoints lands strictly between the two anchor BPMs.
+        let m = tempo_anchors();
+        let mut prev = interp_tempo_bpm(&m, 0.0);
+        let mut saw_interior_value = false;
+        let mut b = 0.0f32;
+        while b <= 100.0 {
+            let cur = interp_tempo_bpm(&m, b);
+            assert!(
+                cur + 1e-4 >= prev,
+                "BPM must be monotonic non-decreasing in brightness (b={b}: {prev}->{cur})"
+            );
+            prev = cur;
+            b += 1.0;
+        }
+        // Midpoint between anchors 15 (60 BPM) and 50.5 (90 BPM): expect a strictly
+        // interpolated value, proving continuity rather than bucketing.
+        let mid = interp_tempo_bpm(&m, 32.75);
+        if mid > 60.0 + 1e-3 && mid < 90.0 - 1e-3 {
+            saw_interior_value = true;
+        }
+        assert!(
+            saw_interior_value,
+            "interior brightness must interpolate strictly between anchors, got {mid}"
+        );
+    }
+
+    #[test]
+    fn interp_tempo_bpm_empty_map_preserves_legacy_250ms() {
+        // Degenerate/empty map ⇒ 240 BPM ⇒ 60000/240 = 250 ms, today's default tempo.
+        let empty: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let bpm = interp_tempo_bpm(&empty, 50.0);
+        let ms = (60_000.0 / bpm.max(1.0)).round() as u64;
+        assert_eq!(
+            ms, 250,
+            "empty tempo map must preserve the legacy 250 ms default"
+        );
+    }
+
+    #[test]
+    fn set_features_global_makes_tempo_per_image() {
+        // Regression guard on E-1: a dark image must yield a SLOWER (larger ms_per_step)
+        // tempo than a bright image. Pre-S13 this was constant (always the CLI default).
+        let mappings =
+            crate::mapping_loader::load_mappings("assets/mappings.json").expect("mappings load");
+        let mut engine = PipelineEngine::new(mappings, EngineConfig::default());
+        let dark = GlobalFeatures {
+            avg_hue: 40.0,
+            avg_saturation: 30.0,
+            avg_brightness: 25.0,
+            edge_density: 0.004,
+            hue_spread: 0.05,
+            texture_laplacian_var: 300.0,
+            shape_complexity: 0.02,
+            aspect_ratio: 1.0,
+        };
+        let bright = GlobalFeatures {
+            avg_brightness: 85.0,
+            ..dark
+        };
+        engine.set_features_global(&dark);
+        let ms_dark = engine.config().ms_per_step;
+        engine.set_features_global(&bright);
+        let ms_bright = engine.config().ms_per_step;
+        assert_ne!(ms_dark, ms_bright, "tempo must vary per image");
+        assert!(
+            ms_dark > ms_bright,
+            "darker image must be slower (larger ms_per_step): dark={ms_dark} bright={ms_bright}"
+        );
     }
 }
