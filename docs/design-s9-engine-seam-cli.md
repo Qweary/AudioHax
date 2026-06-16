@@ -2,11 +2,11 @@
 
 Status: DESIGN / SPECIFICATION ONLY. No source modified. This document is the precise spec the
 Test Engineer writes RED tests against and the Implementer codes against. Author role: Rust
-Architect (Swaram). Grounded against the working tree at `21fd304` (`src/main.rs`, `src/lib.rs`,
+Architect. Grounded against the working tree at `21fd304` (`src/main.rs`, `src/lib.rs`,
 `src/image_analysis.rs`, `src/image_source.rs`, `src/midi_output.rs`, `src/chord_engine.rs`,
 `src/mapping_loader.rs`, `src/bin/*`, `Cargo.toml`) and reconciled against the two prior design
 docs: `AudioHax/docs/assessment-ws4-ux-crossplatform.md` (§4.1/§4.2 — the governing WS-4 plan)
-and `Swaram/docs/interactive-architecture.md` (the prior `PipelineEngine` sketch).
+and `docs/interactive-architecture.md` (sibling design repo) (the prior `PipelineEngine` sketch).
 
 > Convention: Rust signatures give the SHAPE of each seam. **No implementation bodies are
 > written.** Framework/version claims that cannot be verified against the tree are marked

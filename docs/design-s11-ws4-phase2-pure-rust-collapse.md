@@ -1,7 +1,7 @@
 # Design S11 — WS-4 Phase 2: Pure-Rust Dependency Collapse + Cross-Platform Build
 
 Status: DESIGN / SPECIFICATION ONLY. No source modified. This is the spec the Test Engineer writes
-RED tests against and two parallel Implementers code against. Author role: Rust Architect (Swaram).
+RED tests against and two parallel Implementers code against. Author role: Rust Architect.
 Grounded against the working tree at session start (`src/engine.rs`, `src/main.rs`,
 `src/image_analysis.rs`, `src/image_source.rs`, `src/midi_output.rs`, `src/chord_engine.rs`,
 `src/lib.rs`, `src/tui.rs`, `Cargo.toml`, `assets/`) and reconciled against the two prior design

@@ -1,6 +1,6 @@
 # Quality Gate Review — WS-4 Phase 3 (S10): ratatui TUI seam-proof
 
-**Reviewer:** Quality Gate (Swaram specialist, TMP-orchestrated)
+**Reviewer:** Quality Gate
 **Date:** 2026-06-13
 **Base:** `29d6848` (clean S9 head)
 **Verdict:** **PASS**

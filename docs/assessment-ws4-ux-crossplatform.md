@@ -1,10 +1,10 @@
 # WS-4 Assessment — Usability, Cross-Platform, Packaging & Interface Architecture
 
 Status: DESIGN / ASSESSMENT ONLY. No source modified. This document is the plan WS-4 builds against.
-Author role: Rust Architect (Swaram). Grounded against the working tree at the time of writing
+Author role: Rust Architect. Grounded against the working tree at the time of writing
 (`Cargo.toml`, `src/main.rs`, `src/lib.rs`, `src/image_analysis.rs`, `src/image_source.rs`,
 `src/chord_engine.rs`, `src/midi_output.rs`, `src/bin/*`, `README.md`, `Cargo.lock`) and against
-the two prior design documents in the sibling Swaram repo (`docs/interactive-architecture.md`,
+the two prior design documents in the sibling design repo (`docs/interactive-architecture.md`,
 `docs/ROADMAP.md`) so it does not contradict prior design intent.
 
 > Convention in this doc: Rust signatures and ASCII diagrams give the SHAPE of proposed seams.
@@ -538,7 +538,7 @@ higher *cross-platform* lever, but it depends on the seam Phase 1 defines, so Ph
 
 ## 7. The Future UX/GUI Specialist (define the target; do NOT write the prompt)
 
-The Swaram roster (`docs/agent-specialist-library.md`) has Rust Architect, Rust Implementer, Music Theory,
+The specialist roster (`docs/agent-specialist-library.md`) has Rust Architect, Rust Implementer, Music Theory,
 Signal Processing, Test Engineer, Quality Gate, Game-Integration — **no UX/GUI specialist.** One should be
 fabricated when Phase 4 (GUI implementation) begins. Target definition:
 
@@ -617,8 +617,8 @@ fabricated when Phase 4 (GUI implementation) begins. Target definition:
   `PhrasePosition` 219–230, `realize_step` 642 (the image-free music-domain seam).
 - `README.md`: per-OS install (OpenCV/libclang/ALSA/FluidSynth/virtual-MIDI) — confirms FluidSynth + virtual
   port are external, hand-wired runtime steps.
-- Sibling Swaram `docs/interactive-architecture.md`: prior `PipelineEngine` (`tick`/`update_image`/
+- Sibling design-repo `docs/interactive-architecture.md`: prior `PipelineEngine` (`tick`/`update_image`/
   `inject_event`/`current_state`) + batch→reactive refactor (consistent with §4 here).
-- Sibling Swaram `docs/ROADMAP.md`: music-quality Phase 1 (done through S6), modem hardening Phase 3,
+- Sibling design-repo `docs/ROADMAP.md`: music-quality Phase 1 (done through S6), modem hardening Phase 3,
   interactive track as concept — WS-4 is the cross-platform/UX layer those phases never covered.
-- Sibling Swaram `docs/agent-specialist-library.md`: roster has no UX/GUI specialist (basis for §7).
+- Sibling design-repo `docs/agent-specialist-library.md`: roster has no UX/GUI specialist (basis for §7).
