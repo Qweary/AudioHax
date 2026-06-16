@@ -129,6 +129,12 @@ pub struct CompositionMappings {
     /// absent → empty catalogue → planner falls back to `OrchestrationProfile::identity()`.
     #[serde(default)]
     pub texture_catalogue: Vec<crate::composition::OrchestrationProfile>,
+    /// S20 — the figuration vocabulary. `#[serde(default)]` back-compat floor: absent → empty
+    /// catalogue → unresolved figuration handle falls back to the block bed. This is the struct
+    /// that actually deserializes `assets/mappings.json`; the `From<CompositionMappings>` impl
+    /// carries it onto `PlanMappings`.
+    #[serde(default)]
+    pub figuration_catalogue: Vec<crate::composition::FigurationSpec>,
 }
 
 #[derive(Debug, Deserialize)]

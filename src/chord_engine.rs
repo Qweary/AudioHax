@@ -1461,19 +1461,37 @@ fn realize_rhythm(
                     }
                     seated.push(seat);
                 }
-                seated
-                    .into_iter()
-                    .map(|n| NoteEvent {
-                        note: n,
-                        velocity,
-                        // Held the full step + the legato overlap so consecutive beds
-                        // tie; kept within the `sustained`-style ≤1.2× cap (PAD_OVERLAP_FRAC
-                        // = 1.10) so the block-until-last-event scheduler over-runs each
-                        // step by ≤10%, never the N× of a true multi-step hold.
-                        hold_ms: ((step_ms as f32) * PAD_OVERLAP_FRAC).round().max(1.0) as u64,
-                        offset_ms: 0,
-                    })
-                    .collect()
+                // S20 Slice-3a — ACCOMPANIMENT FIGURATION. When this section's resolved
+                // figuration is present and non-empty, ANIMATE the held bed: expand the
+                // seated inner tones into the figure's bounded multi-onset burst within
+                // this single step (an in-beat broken-chord / Alberti cell). When it is
+                // None/empty the EXISTING sustained block bed runs BYTE-UNCHANGED — the
+                // figured branch is purely ADDITIVE (the `block_bed_unchanged_when_
+                // figuration_none` witness). The figure animates the SAME `seated`
+                // root-less inner voicing the block bed already built, so it is
+                // chord-tones-only and stays in the fill band [55, 67) by construction
+                // (it never re-derives pitches or leaves the band). Unreachable under
+                // the identity profile (no instrument is ever a Pad there → byte-freeze
+                // intact); the cadence early-return above fires before this role match,
+                // so a cadence step is never figured.
+                match ctx.section.orchestration.figuration_resolved.as_ref() {
+                    Some(spec) if !spec.onsets.is_empty() => {
+                        figured_bed(spec, &seated, velocity, step_ms)
+                    }
+                    _ => seated
+                        .into_iter()
+                        .map(|n| NoteEvent {
+                            note: n,
+                            velocity,
+                            // Held the full step + the legato overlap so consecutive beds
+                            // tie; kept within the `sustained`-style ≤1.2× cap (PAD_OVERLAP_FRAC
+                            // = 1.10) so the block-until-last-event scheduler over-runs each
+                            // step by ≤10%, never the N× of a true multi-step hold.
+                            hold_ms: ((step_ms as f32) * PAD_OVERLAP_FRAC).round().max(1.0) as u64,
+                            offset_ms: 0,
+                        })
+                        .collect(),
+                }
             }
         }
 
@@ -1614,6 +1632,88 @@ fn realize_rhythm(
             }
         }
     }
+}
+
+/// Expand ONE held chord into the figure's bounded multi-onset burst within a SINGLE
+/// step — the S20 Slice-3a accompaniment-figuration mapper (Music Theory Specialist
+/// owns). Animates the held Pad bed with an in-beat broken-chord / Alberti cell so the
+/// inner harmony stops being rhythmically inert under the tune.
+///
+/// `spec`     — the resolved figuration (guaranteed non-empty `onsets`, 2..=4 entries;
+///              the caller only enters here on a present, non-empty spec).
+/// `seated`   — the inner chord tones the block bed ALREADY seated (root-skipped, fill
+///              register, de-duped — reused verbatim). The figure animates exactly these,
+///              so it is chord-tones-only and stays in the fill band [55, 67) by
+///              construction: it never re-derives a pitch or leaves the band.
+/// `velocity` — the Pad's supporting velocity for this step, used UNCHANGED (no `-3`
+///              trim in 3a — the only audible delta this slice introduces is rhythm, not
+///              dynamics; a supporting-velocity trim is a later dynamics slice).
+/// `step_ms`  — the step duration; all onsets + holds live within it (plus the ≤10% Pad
+///              over-run the block bed already permits).
+///
+/// Returns a bounded `Vec<NoteEvent>` of exactly `onsets.len()` events (2..=4, defensively
+/// truncated to 4), each WITHIN the step.
+///
+/// MUSIC-OWNED BUILD-TIME RULE (the non-triad modulo rule): each onset names a SEATED
+/// inner-voice index (`onset.tone`); the index is taken MODULO the seated voice count
+/// (`onset.tone % seated.len()`). On a TRIAD the bed seats 2 inner tones (3rd, 5th), so a
+/// 4-onset Alberti cell {0,2,1,2} reads indices {0, 2%2=0, 1, 2%2=0} = [3rd, 3rd, 5th,
+/// 3rd] — it degrades sanely to the two available tones and NEVER indexes out of bounds.
+/// On a 7th chord the bed seats 3 (3rd, 5th, 7th), so {0,2,1,2} reads the full low-high-
+/// mid-high Alberti shape [3rd, 7th, 5th, 7th]. The catalogue's Alberti row is authored for
+/// the 3-voice case; the modulo is what makes it cycle correctly on any seated voice count.
+fn figured_bed(
+    spec: &crate::composition::FigurationSpec,
+    seated: &[u8],
+    velocity: u8,
+    step_ms: u64,
+) -> Vec<NoteEvent> {
+    // The seated bed is guaranteed non-empty by the caller (`notes.is_empty() ||
+    // pad_voices == 0` already returned the defensive path), so `% n` is always safe.
+    let n = seated.len().max(1);
+    // The per-onset hold ceiling: REUSE the block bed's overlap cap (PAD_OVERLAP_FRAC =
+    // 1.10) so a figured note never over-runs the step more than the block bed already
+    // does (≤10%). No new cap constant is introduced. 1.10 ≤ 1.20 satisfies the legato
+    // steer with margin.
+    let cap = ((step_ms as f32) * PAD_OVERLAP_FRAC).round() as u64;
+
+    // Bound the burst to 4 (the catalogue guarantees 2..=4; truncate defensively so the
+    // helper can never emit an unbounded count even on a malformed row).
+    let onsets = &spec.onsets[..spec.onsets.len().min(4)];
+
+    onsets
+        .iter()
+        .enumerate()
+        .map(|(i, onset)| {
+            // Onset time: a fraction of the step, snapped to whole ms. For Alberti this
+            // lands on 0, step_ms/4, step_ms/2, 3·step_ms/4 — slot boundaries, so the
+            // figure reads as rhythm, not jitter.
+            let offset_ms = (onset.at.clamp(0.0, 1.0) * step_ms as f32).round() as u64;
+            // Tone selection — the non-triad modulo rule (see the fn doc).
+            let idx = (onset.tone as usize) % n;
+            let note = seated[idx];
+            // Hold: a fraction of the GAP to the next onset (the in-step articulation).
+            // The last onset fills to the step end. theory: with the default hold_frac
+            // 1.0 each note holds to the next onset, giving a continuous figure; only the
+            // last onset's hold may reach the overlap cap.
+            let next_offset_ms = if i + 1 < onsets.len() {
+                (onsets[i + 1].at.clamp(0.0, 1.0) * step_ms as f32).round() as u64
+            } else {
+                step_ms
+            };
+            let gap_ms = next_offset_ms.saturating_sub(offset_ms);
+            let raw_hold = (gap_ms as f32 * onset.hold_frac.clamp(0.0, 1.0)).round() as u64;
+            // Per-onset cap: clamp so offset_ms + hold_ms ≤ step_ms × PAD_OVERLAP_FRAC,
+            // identical to the block bed's ceiling. Never below 1 ms (a sounding note).
+            let hold_ms = raw_hold.min(cap.saturating_sub(offset_ms)).max(1);
+            NoteEvent {
+                note,
+                velocity,
+                hold_ms,
+                offset_ms,
+            }
+        })
+        .collect()
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -4698,6 +4798,10 @@ mod tests {
             ],
             density: 0.6,
             pad_voices: 3,
+            // S20 — mechanical additive fixture fields (this counter net is NOT figured:
+            // no figuration, so the Pad arm takes the byte-unchanged block bed).
+            figuration: None,
+            figuration_resolved: None,
         }
     }
 

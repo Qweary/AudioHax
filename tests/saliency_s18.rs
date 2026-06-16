@@ -381,6 +381,8 @@ fn pad_bed_counter() -> OrchestrationProfile {
         ],
         density: 0.6,
         pad_voices: 3,
+        figuration: None,
+        figuration_resolved: None,
     }
 }
 

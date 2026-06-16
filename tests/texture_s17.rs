@@ -122,6 +122,8 @@ fn pad_bed() -> OrchestrationProfile {
         ],
         density: 0.55,
         pad_voices: 3,
+        figuration: None,
+        figuration_resolved: None,
     }
 }
 
@@ -407,6 +409,8 @@ fn test_countermelody_is_no_longer_harmonicfill_delegate() {
         layers: vec![LayerRole::CounterMelody],
         density: 0.5,
         pad_voices: 0,
+        figuration: None,
+        figuration_resolved: None,
     };
     // A strong (even) interior beat with real edge so the HarmonicFill SOUNDS (a single
     // onset at 0). The single-step fixture has no prior step (step_in_section == 0), so

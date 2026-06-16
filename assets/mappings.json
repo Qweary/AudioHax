@@ -137,11 +137,25 @@
     "texture_catalogue": [
       { "id": "identity", "layers": [], "density": 0.5, "pad_voices": 0 },
       { "id": "pad_bed",  "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.55, "pad_voices": 3 },
-      { "id": "pad_bed_counter", "layers": ["Bass","Pad","CounterMelody","Melody"], "density": 0.6, "pad_voices": 3 }
+      { "id": "pad_bed_counter", "layers": ["Bass","Pad","CounterMelody","Melody"], "density": 0.6, "pad_voices": 3 },
+      { "id": "pad_figured", "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.62, "pad_voices": 3, "figuration": "alberti" }
+    ],
+    "figuration_catalogue": [
+      { "id": "block",   "onsets": [] },
+      { "id": "alberti", "voices": 3,
+        "onsets": [
+          { "at": 0.0,  "tone": 0 },
+          { "at": 0.25, "tone": 2 },
+          { "at": 0.5,  "tone": 1 },
+          { "at": 0.75, "tone": 2 }
+        ] }
     ],
     "texture": {
       "default": "pad_bed",
       "rules": [
+        { "when": [ {"knob":"subject_energy","op":"ge","lo":0.45,"hi":0.0},
+                    {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ],
+          "pick": "pad_figured" },
         { "when": [ {"knob":"foreground_energy","op":"ge","lo":0.35,"hi":0.0},
                     {"knob":"fg_bg_contrast","op":"ge","lo":0.20,"hi":0.0} ],
           "pick": "pad_bed_counter" }

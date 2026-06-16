@@ -219,6 +219,19 @@ pub struct OrchestrationProfile {
     /// How many chord tones the Pad holds simultaneously (`0` == no pad). Default `0`.
     #[serde(default)]
     pub pad_voices: u8,
+    /// NEW S20 — id of a `figuration_catalogue` row this profile's Pad animates with, or None
+    /// for the S17 block bed. `#[serde(default)]` (== None) so EVERY old profile parses unchanged
+    /// → byte-identical to S18. The planner resolves this handle (into `figuration_resolved`);
+    /// the realizer reads the RESOLVED spec, never this raw handle.
+    #[serde(default)]
+    pub figuration: Option<String>,
+    /// NEW S20 — the RESOLVED figuration spec for this section, filled by the planner from
+    /// `figuration` against `figuration_catalogue`. NOT loaded from JSON (`#[serde(skip)]` →
+    /// always `None` at deserialize); the planner sets it. The realizer reads THIS, never the
+    /// raw `figuration` handle. `#[serde(skip)]` keeps mappings.json byte-shape unchanged and
+    /// keeps `PartialEq`/`Clone` total.
+    #[serde(skip)]
+    pub figuration_resolved: Option<FigurationSpec>,
 }
 
 /// serde default for [`OrchestrationProfile::density`] — the no-op `0.5` midpoint.
@@ -236,6 +249,8 @@ impl OrchestrationProfile {
             layers: Vec::new(),
             density: 0.5,
             pad_voices: 0,
+            figuration: None,
+            figuration_resolved: None,
         }
     }
 
@@ -244,6 +259,48 @@ impl OrchestrationProfile {
     pub fn is_identity(&self) -> bool {
         self.pad_voices == 0 && self.layers.is_empty()
     }
+}
+
+/// One named accompaniment-figuration pattern — pure STRUCTURE, no note content. Animates a
+/// held chord into a bounded rhythmic burst within ONE step. Lives as a row in
+/// `figuration_catalogue`; an [`OrchestrationProfile`] references it BY ID. Adding a pattern is a
+/// JSON row, NOT a Rust edit (the `FormSpec`/`OrchestrationProfile` content-as-data discipline). NEW S20.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct FigurationSpec {
+    /// Stable id, e.g. "alberti" / "block" (block == the no-op sustained bed: empty `onsets`).
+    pub id: String,
+    /// Per-step onset template, in TIME ORDER (ascending `at`). 2..=4 entries (the bounded
+    /// burst). Empty == a block bed (no-op). serde rejects a malformed `FigurationOnset` entry.
+    #[serde(default)]
+    pub onsets: Vec<FigurationOnset>,
+    /// How many DISTINCT inner chord tones the figure draws from (Alberti = 3). The mapper
+    /// clamps this to the seated inner-tone count at realize time. Default 1.
+    #[serde(default = "one_u8")]
+    pub voices: u8,
+}
+
+/// One onset of a figure: WHEN it sounds (fraction of step_ms), WHICH seated inner-voice index
+/// it sounds (cycled modulo the seated voice count), and how long it holds. NEW S20.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+pub struct FigurationOnset {
+    /// Onset time as a fraction of step_ms, 0.0..1.0 (0.0 == downbeat, 0.25 == the off-beat).
+    pub at: f32,
+    /// Seated inner-voice index this onset sounds; cycled modulo the seated voice count.
+    pub tone: u8,
+    /// Hold as a fraction of the GAP to the next onset (0.0..1.0), the in-step articulation.
+    /// Default 1.0 (legato: fill the whole gap up to the per-onset cap).
+    #[serde(default = "one_f32")]
+    pub hold_frac: f32,
+}
+
+/// serde default for [`FigurationSpec::voices`].
+fn one_u8() -> u8 {
+    1
+}
+
+/// serde default for [`FigurationOnset::hold_frac`].
+fn one_f32() -> f32 {
+    1.0
 }
 
 /// One section's role in a FORM TEMPLATE — pure structure, no music content. The planner
@@ -428,6 +485,11 @@ pub struct PlanMappings {
     /// `#[serde(default)]` so an old mappings.json parses (empty → planner uses identity).
     #[serde(default)]
     pub texture_catalogue: Vec<OrchestrationProfile>,
+    /// NEW S20 — the figuration vocabulary, parallel to `form_catalogue`/`texture_catalogue`.
+    /// `#[serde(default)]` (empty Vec) so an OLD mappings.json with no `figuration_catalogue`
+    /// key parses; an unresolved profile handle then falls back to the block bed.
+    #[serde(default)]
+    pub figuration_catalogue: Vec<FigurationSpec>,
 }
 
 impl From<CompositionMappings> for PlanMappings {
@@ -444,6 +506,7 @@ impl From<CompositionMappings> for PlanMappings {
             texture: c.texture,
             form_catalogue: c.form_catalogue,
             texture_catalogue: c.texture_catalogue,
+            figuration_catalogue: c.figuration_catalogue,
         }
     }
 }
@@ -705,10 +768,17 @@ impl CompositionPlanner {
         // id falls back to the byte-stable identity profile. Slice 1 selects once per plan (no
         // saliency knob); section-conditioned selection is a later slice.
         let texture_id = self.plan_mappings.texture.select(u);
-        let orchestration =
+        let mut orchestration =
             lookup_orchestration(&self.plan_mappings.texture_catalogue, &texture_id)
                 .cloned()
                 .unwrap_or_else(OrchestrationProfile::identity);
+        // S20: resolve the figuration handle ONCE per plan against the catalogue. An unresolved /
+        // None handle leaves `figuration_resolved == None` → the realizer takes the block bed.
+        orchestration.figuration_resolved = orchestration
+            .figuration
+            .as_deref()
+            .and_then(|id| lookup_figuration(&self.plan_mappings.figuration_catalogue, id))
+            .cloned();
 
         let mut sections: Vec<Section> = Vec::with_capacity(form_spec.sections.len());
         let mut assigned = 0usize;
@@ -820,6 +890,13 @@ fn lookup_orchestration<'a>(
     id: &str,
 ) -> Option<&'a OrchestrationProfile> {
     catalogue.iter().find(|p| p.id == id)
+}
+
+/// Look up a [`FigurationSpec`] by id in the figuration catalogue (S20). Mirrors
+/// [`lookup_orchestration`]; an absent/unmatched id returns `None` so the planner leaves
+/// `figuration_resolved == None` and the realizer falls back to the block bed.
+fn lookup_figuration<'a>(catalogue: &'a [FigurationSpec], id: &str) -> Option<&'a FigurationSpec> {
+    catalogue.iter().find(|f| f.id == id)
 }
 
 /// A minimal single-section fallback form so the planner is total when the catalogue is
