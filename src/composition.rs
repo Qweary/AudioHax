@@ -79,6 +79,12 @@ pub struct ImageUnderstanding {
     pub subject_saturation: f32,
     /// Foreground/background contrast — slice 1 default `0.0`.
     pub fg_bg_contrast: f32,
+    /// Energy (edge activity) in the salient subject region, 0..1. NEW S18.
+    pub subject_energy: f32,
+    /// Energy in the foreground band (the non-subject central/edge-mid cells), 0..1. NEW S18.
+    pub foreground_energy: f32,
+    /// Energy in the background band (the corner cells minus the subject), 0..1. NEW S18.
+    pub background_energy: f32,
 }
 
 impl ImageUnderstanding {
@@ -105,6 +111,9 @@ impl ImageUnderstanding {
             subject_hue: 0.0,
             subject_saturation: 50.0,
             fg_bg_contrast: 0.0,
+            subject_energy: 0.0,
+            foreground_energy: 0.0,
+            background_energy: 0.0,
         }
     }
 }
@@ -284,6 +293,9 @@ pub enum Knob {
     AspectRatio,
     SubjectSize,
     FgBgContrast,
+    SubjectEnergy,
+    ForegroundEnergy,
+    BackgroundEnergy,
 }
 
 impl Knob {
@@ -305,6 +317,9 @@ impl Knob {
             Knob::AspectRatio => u.aspect_ratio,
             Knob::SubjectSize => u.subject_size,
             Knob::FgBgContrast => u.fg_bg_contrast,
+            Knob::SubjectEnergy => u.subject_energy,
+            Knob::ForegroundEnergy => u.foreground_energy,
+            Knob::BackgroundEnergy => u.background_energy,
         }
     }
 }
@@ -931,6 +946,77 @@ mod tests {
         assert_eq!(table.select(&u_with(0.95, 0.0)), "high");
         assert_eq!(table.select(&u_with(0.5, 0.0)), "mid");
         assert_eq!(table.select(&u_with(0.1, 0.0)), "d");
+    }
+
+    /// S18 Slice 2: the texture axis selects the CounterMelody-bearing `pad_bed_counter`
+    /// profile when the foreground is busy AND a real subject/ground stratification exists
+    /// (both predicates AND), else falls back to the `pad_bed` default. RNG-free, no planner —
+    /// directly over the loaded `texture` SelectTable.
+    #[test]
+    fn texture_selects_pad_bed_counter_on_busy_foreground_subject() {
+        let pm: PlanMappings = mappings()
+            .composition
+            .clone()
+            .expect("composition block present")
+            .into();
+        let texture = &pm.texture;
+
+        // Busy foreground (≥0.35) AND real subject (fg_bg_contrast ≥0.20) → pad_bed_counter.
+        let counter = ImageUnderstanding {
+            foreground_energy: 0.5,
+            fg_bg_contrast: 0.3,
+            ..ImageUnderstanding::neutral()
+        };
+        assert_eq!(texture.select(&counter), "pad_bed_counter");
+
+        // Quiet foreground → the rule does NOT fire; default pad_bed (no counter).
+        let quiet = ImageUnderstanding {
+            foreground_energy: 0.1,
+            fg_bg_contrast: 0.3,
+            ..ImageUnderstanding::neutral()
+        };
+        assert_eq!(texture.select(&quiet), "pad_bed");
+
+        // Busy foreground but no real subject (low contrast) → rule does NOT fire; default.
+        let no_subject = ImageUnderstanding {
+            foreground_energy: 0.5,
+            fg_bg_contrast: 0.05,
+            ..ImageUnderstanding::neutral()
+        };
+        assert_eq!(texture.select(&no_subject), "pad_bed");
+
+        // The catalogue carries the new profile with a CounterMelody layer.
+        let prof = pm
+            .texture_catalogue
+            .iter()
+            .find(|p| p.id == "pad_bed_counter")
+            .expect("pad_bed_counter profile present");
+        assert!(
+            prof.layers.contains(&LayerRole::CounterMelody),
+            "pad_bed_counter carries a CounterMelody layer"
+        );
+    }
+
+    /// S17 §11.7 back-compat ride-along: a texture axis whose `default`/rules name no profile
+    /// present in `texture_catalogue` resolves to the identity profile (the `lookup_orchestration`
+    /// → identity fallback). An OLD mappings.json with an empty/absent texture catalogue → no pad.
+    #[test]
+    fn texture_unknown_id_falls_back_to_identity() {
+        // An empty catalogue (the absent-axis / old-mappings shape).
+        assert!(super::lookup_orchestration(&[], "pad_bed").is_none());
+        // A non-empty catalogue that does not carry the requested id.
+        let cat = vec![OrchestrationProfile::identity()];
+        assert!(super::lookup_orchestration(&cat, "pad_bed_counter").is_none());
+        // The found case still works.
+        assert!(super::lookup_orchestration(&cat, "identity").is_some());
+        // The consumer's `.unwrap_or_else(identity)` therefore yields identity (no pad).
+        let resolved = super::lookup_orchestration(&[], "pad_bed")
+            .cloned()
+            .unwrap_or_else(OrchestrationProfile::identity);
+        assert!(
+            resolved.is_identity(),
+            "unknown texture id degrades to identity (no pad)"
+        );
     }
 
     /// InRange predicate uses lo..=hi inclusive.

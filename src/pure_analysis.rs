@@ -416,6 +416,176 @@ fn shape_complexity_pure(gray: &GrayImage) -> f32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Saliency region reader (S18 Slice 2 — pure-Rust, deterministic, no ML, no new dep)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One region's cheap perceptual stats — the SAME kernels `analyze_global_pure` uses,
+/// computed over a sub-rectangle. Pure-Rust; no new dependency. Deterministic.
+///
+/// honest fidelity note (carry the module's `:13` discipline): a region's stats are a
+/// contrast/center-bias PROXY for saliency, not segmentation. The DoG-mask upgrade into
+/// the same fields is a later slice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RegionStats {
+    /// Region centroid in normalized image coords (0..1, 0..1).
+    center: (f32, f32),
+    /// Area fraction of the whole image, 0..1.
+    area_frac: f32,
+    /// Luminance 0..100 (`to_gray` mean over the cell).
+    mean_value: f32,
+    /// Saturation 0..100 (`hsv_means` over the cell).
+    mean_saturation: f32,
+    /// Edge energy 0..1 (`edge_density_pure` over the cell's gray).
+    edge_energy: f32,
+    /// Dominant hue 0..360 (`hsv_means` circular hue over the cell).
+    dominant_hue: f32,
+}
+
+/// Decompose `img` into a `(cols, rows)` rule-of-thirds grid (LOCK: (3,3)) and compute each
+/// cell's stats by cropping the sub-rectangle (`crop_imm(..).to_image()`, the same owned-buffer
+/// path `analyze_section_pure` already consumes) and running the existing kernels. Returns the
+/// `cols*rows` cells in row-major order. ONE extra pass over the pixels. Pure, deterministic.
+///
+/// Cell extents partition `[0,w)×[0,h)` by thirds; the last row/col absorbs the rounding
+/// remainder (the same last-section rule `scan_steps` uses at `:665`/`:681`).
+fn analyze_regions_pure(img: &RgbImage, grid: (u32, u32)) -> Vec<RegionStats> {
+    let (cols, rows) = grid;
+    let (w, h) = img.dimensions();
+    let cols = cols.max(1);
+    let rows = rows.max(1);
+    let total_area = (w as f32) * (h as f32);
+
+    // Per-axis cell boundaries: floor-divide, last cell absorbs the remainder.
+    let bounds = |n: u32, parts: u32| -> Vec<(u32, u32)> {
+        let per = (n / parts).max(1);
+        let mut out = Vec::with_capacity(parts as usize);
+        for i in 0..parts {
+            let start = (i * per).min(n);
+            let end = if i + 1 == parts {
+                n
+            } else {
+                ((i + 1) * per).min(n)
+            };
+            // Guard against a zero-width cell when n < parts (degenerate tiny image).
+            let end = end.max(start + 1).min(n.max(start + 1));
+            out.push((start, end.min(n)));
+        }
+        out
+    };
+    let x_bounds = bounds(w, cols);
+    let y_bounds = bounds(h, rows);
+
+    let mut cells = Vec::with_capacity((cols as usize) * (rows as usize));
+    for (y0, y1) in y_bounds.iter().copied() {
+        for (x0, x1) in x_bounds.iter().copied() {
+            let cw = x1
+                .saturating_sub(x0)
+                .max(1)
+                .min(w.saturating_sub(x0).max(1));
+            let ch = y1
+                .saturating_sub(y0)
+                .max(1)
+                .min(h.saturating_sub(y0).max(1));
+            let cell = image::imageops::crop_imm(img, x0, y0, cw, ch).to_image();
+            let (hue, sat, val) = hsv_means(cell.pixels().copied(), false);
+            let gray = to_gray(&cell);
+            let edge = edge_density_pure(&gray);
+            // Normalized centroid of the cell rect.
+            let cx = ((x0 as f32) + (cw as f32) / 2.0) / (w as f32);
+            let cy = ((y0 as f32) + (ch as f32) / 2.0) / (h as f32);
+            let area_frac = if total_area > 0.0 {
+                ((cw as f32) * (ch as f32)) / total_area
+            } else {
+                0.0
+            };
+            cells.push(RegionStats {
+                center: (cx, cy),
+                area_frac,
+                mean_value: val,
+                mean_saturation: sat,
+                edge_energy: edge,
+                dominant_hue: hue,
+            });
+        }
+    }
+    cells
+}
+
+/// The center-surround saliency blend → `(subject_region_index, saliency_score)`. Assumes a
+/// 3×3 grid (9 cells row-major; center = idx 4, edge-mids = {1,3,5,7}, corners = {0,2,6,8}).
+///
+/// LOCK: subject_region = argmax over cells of
+///   score(cell) = W_CENTER * center_bias(cell)
+///               + W_CONTRAST * local_contrast(cell, neighbours)
+///               + W_SAT      * (cell.mean_saturation/100 - border_mean_saturation/100).clamp(0,1)
+/// where center_bias = 1.0 (center 4), 0.5 (edge-mids 1,3,5,7), 0.0 (corners 0,2,6,8);
+///       local_contrast = (|cell.mean_value - mean of the 8 other cells' value|/100)
+///                        + cell.edge_energy, clamped 0..1;
+///       border_mean_saturation = mean mean_saturation over the 8 cells ≠ this one.
+/// First-match-wins argmax; on a tie pick the MOST-CENTRAL cell (lowest |center-(0.5,0.5)|),
+/// so a flat field deterministically resolves to the center. Pure arithmetic, NO learned model.
+/// LOCKED weights: W_CENTER = 0.5, W_CONTRAST = 0.35, W_SAT = 0.15 (center-bias dominant).
+fn pick_subject_region(regions: &[RegionStats]) -> (usize, f32) {
+    const W_CENTER: f32 = 0.5;
+    const W_CONTRAST: f32 = 0.35;
+    const W_SAT: f32 = 0.15;
+
+    if regions.is_empty() {
+        return (0, 0.0);
+    }
+    let n = regions.len();
+
+    // center_bias prior for the 3×3 rule-of-thirds layout (idx → bias). Any non-9 grid
+    // (degenerate) falls back to a flat 1.0/0.0 center/non-center prior.
+    let center_bias = |idx: usize| -> f32 {
+        if n == 9 {
+            match idx {
+                4 => 1.0,
+                1 | 3 | 5 | 7 => 0.5,
+                _ => 0.0,
+            }
+        } else if idx == n / 2 {
+            1.0
+        } else {
+            0.0
+        }
+    };
+
+    let mut best_idx = 0usize;
+    let mut best_score = f32::NEG_INFINITY;
+    for (idx, cell) in regions.iter().enumerate() {
+        // Mean value / saturation over the other 8 cells (the "surround").
+        let mut sum_v = 0.0f32;
+        let mut sum_s = 0.0f32;
+        for (j, other) in regions.iter().enumerate() {
+            if j != idx {
+                sum_v += other.mean_value;
+                sum_s += other.mean_saturation;
+            }
+        }
+        let others = (n - 1).max(1) as f32;
+        let surround_value = sum_v / others;
+        let surround_sat = sum_s / others;
+
+        let local_contrast =
+            (((cell.mean_value - surround_value).abs() / 100.0) + cell.edge_energy).clamp(0.0, 1.0);
+        let sat_pop = ((cell.mean_saturation / 100.0) - (surround_sat / 100.0)).clamp(0.0, 1.0);
+
+        let score = W_CENTER * center_bias(idx) + W_CONTRAST * local_contrast + W_SAT * sat_pop;
+
+        let dist = |c: (f32, f32)| (c.0 - 0.5).abs() + (c.1 - 0.5).abs();
+        // First-match-wins argmax; tie → most-central cell.
+        if score > best_score
+            || (score == best_score && dist(cell.center) < dist(regions[best_idx].center))
+        {
+            best_score = score;
+            best_idx = idx;
+        }
+    }
+    (best_idx, best_score)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Whole-image + per-section feature assembly
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -471,6 +641,99 @@ pub fn understand_image_pure(img: &RgbImage) -> Result<ImageUnderstanding, Analy
     // features); then field-copy + clamp into the image-free understanding mirror.
     let g = analyze_global_pure(img)?;
 
+    // ── S18 Slice 2 saliency region pass (3×3 rule-of-thirds; spec §1.1–§1.3) ──
+    let regions = analyze_regions_pure(img, (3, 3));
+    let (subj_idx, _score) = pick_subject_region(&regions);
+    let subj = regions[subj_idx];
+    // border ring = all cells EXCEPT the chosen subject cell (not just the geometric
+    // border — the subject may have resolved to an edge-mid cell; "background" is
+    // everything-but-subject). Spec §1.2.
+    let border: Vec<&RegionStats> = regions
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != subj_idx)
+        .map(|(_, r)| r)
+        .collect();
+    let mean = |xs: &[f32]| -> f32 {
+        if xs.is_empty() {
+            0.0
+        } else {
+            xs.iter().sum::<f32>() / (xs.len() as f32)
+        }
+    };
+    let border_value = mean(&border.iter().map(|r| r.mean_value).collect::<Vec<_>>());
+    let border_saturation = mean(&border.iter().map(|r| r.mean_saturation).collect::<Vec<_>>());
+    let border_edge = mean(&border.iter().map(|r| r.edge_energy).collect::<Vec<_>>());
+
+    // fg_bg_contrast: value/saturation/edge contrast of the subject cell vs the border ring.
+    let fg_bg_contrast = (((subj.mean_value - border_value).abs() / 100.0)
+        + ((subj.mean_saturation - border_saturation).abs() / 100.0)
+        + (subj.edge_energy - border_edge).abs())
+    .clamp(0.0, 1.0);
+
+    // mass_centroid: luminance-weighted centroid of the 9 cell mean_values over their centers.
+    let v_sum: f32 = regions.iter().map(|r| r.mean_value).sum();
+    let mass_centroid = if v_sum > 0.0 {
+        let mx = regions
+            .iter()
+            .map(|r| r.mean_value * r.center.0)
+            .sum::<f32>()
+            / v_sum;
+        let my = regions
+            .iter()
+            .map(|r| r.mean_value * r.center.1)
+            .sum::<f32>()
+            / v_sum;
+        (mx, my)
+    } else {
+        (0.5, 0.5)
+    };
+
+    // vertical_emphasis: upper-third (top row, cells 0,1,2) mass fraction.
+    let vertical_emphasis = if regions.len() == 9 && v_sum > 0.0 {
+        ((regions[0].mean_value + regions[1].mean_value + regions[2].mean_value) / v_sum)
+            .clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+
+    // quadrant_contrast: normalized population std-dev of the 9 cell mean_values.
+    let quadrant_contrast = {
+        let n = regions.len() as f32;
+        let m = if n > 0.0 { v_sum / n } else { 0.0 };
+        let var = if n > 0.0 {
+            regions
+                .iter()
+                .map(|r| (r.mean_value - m) * (r.mean_value - m))
+                .sum::<f32>()
+                / n
+        } else {
+            0.0
+        };
+        (var.sqrt() / 50.0).clamp(0.0, 1.0)
+    };
+
+    // Energy triplet (edge_energy as the cheap activity proxy; spec §1.3). The 3×3 layout
+    // defines foreground = edge-mid cells {1,3,5,7}, background = corner cells {0,2,6,8},
+    // each minus the subject cell.
+    let subject_energy = subj.edge_energy;
+    let band_energy = |idxs: &[usize]| -> Option<f32> {
+        let vals: Vec<f32> = idxs
+            .iter()
+            .filter(|&&i| i != subj_idx && i < regions.len())
+            .map(|&i| regions[i].edge_energy)
+            .collect();
+        if vals.is_empty() {
+            None
+        } else {
+            Some(mean(&vals))
+        }
+    };
+    // Fall back to border_edge if the band is fully the subject (impossible for a single
+    // argmax) or the grid is degenerate.
+    let foreground_energy = band_energy(&[1, 3, 5, 7]).unwrap_or(border_edge);
+    let background_energy = band_energy(&[0, 2, 6, 8]).unwrap_or(border_edge);
+
     let dominant_hue = g.avg_hue;
     Ok(ImageUnderstanding {
         edge_activity: (g.edge_density / 0.05).clamp(0.0, 1.0),
@@ -484,14 +747,17 @@ pub fn understand_image_pure(img: &RgbImage) -> Result<ImageUnderstanding, Analy
         value_key: (1.0 - g.avg_brightness / 100.0).clamp(0.0, 1.0),
         avg_brightness: g.avg_brightness,
         avg_saturation: g.avg_saturation,
-        mass_centroid: (0.5, 0.5),
-        quadrant_contrast: 0.0,
+        mass_centroid,
+        quadrant_contrast,
         aspect_ratio: g.aspect_ratio,
-        vertical_emphasis: 0.5,
-        subject_size: 1.0,
-        subject_hue: dominant_hue,
-        subject_saturation: g.avg_saturation,
-        fg_bg_contrast: 0.0,
+        vertical_emphasis,
+        subject_size: subj.area_frac,
+        subject_hue: subj.dominant_hue,
+        subject_saturation: subj.mean_saturation,
+        fg_bg_contrast,
+        subject_energy,
+        foreground_energy,
+        background_energy,
     })
 }
 
@@ -1081,5 +1347,89 @@ mod tests {
         let img = PureImage::from_rgb(solid(20, 20, [0, 128, 200]));
         let src = PureAnalysisSource::extract(&img, 3, 0.10, 5, None).expect("extract");
         assert_eq!(takes_source(&src), 5);
+    }
+
+    // ── S18 Slice 2: saliency region reader ──────────────────────────────────
+
+    /// A bright/high-edge square blob at the given pixel rect on a flat dark field.
+    fn blob_on(w: u32, h: u32, rect: (u32, u32, u32, u32), bg: [u8; 3]) -> RgbImage {
+        let mut img = RgbImage::from_pixel(w, h, Rgb(bg));
+        let (bx, by, bw, bh) = rect;
+        // Fill with a 1px checkerboard so the blob carries strong edge energy too.
+        for y in by..(by + bh).min(h) {
+            for x in bx..(bx + bw).min(w) {
+                let c = if (x + y) % 2 == 0 { 255u8 } else { 0u8 };
+                img.put_pixel(x, y, Rgb([c, c, c]));
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn analyze_regions_pure_cell_count_and_geometry() {
+        // Divisible size → 9 cells, areas sum to ~1.0, centers are the thirds-centroids.
+        let img = solid(30, 30, [120, 120, 120]);
+        let cells = analyze_regions_pure(&img, (3, 3));
+        assert_eq!(cells.len(), 9, "3×3 grid → 9 cells");
+        let area: f32 = cells.iter().map(|c| c.area_frac).sum();
+        assert!((area - 1.0).abs() < 1e-4, "areas sum to ~1.0, got {area}");
+        // center cell (idx 4) centroid ≈ (0.5, 0.5).
+        let (cx, cy) = cells[4].center;
+        assert!(
+            (cx - 0.5).abs() < 0.06 && (cy - 0.5).abs() < 0.06,
+            "center cell ≈ (0.5,0.5)"
+        );
+
+        // Non-divisible size → last row/col absorbs the remainder; still 9 cells summing to 1.
+        let img31 = solid(31, 31, [120, 120, 120]);
+        let cells31 = analyze_regions_pure(&img31, (3, 3));
+        assert_eq!(cells31.len(), 9, "31×31 → still 9 cells");
+        let area31: f32 = cells31.iter().map(|c| c.area_frac).sum();
+        assert!(
+            (area31 - 1.0).abs() < 1e-4,
+            "31×31 areas sum to ~1.0, got {area31}"
+        );
+    }
+
+    #[test]
+    fn pick_subject_region_center_surround() {
+        // Flat field → center cell (idx 4) wins by the center-bias tie-break.
+        let flat = analyze_regions_pure(&solid(30, 30, [120, 120, 120]), (3, 3));
+        let (flat_idx, _) = pick_subject_region(&flat);
+        assert_eq!(flat_idx, 4, "flat field resolves to the center cell");
+
+        // Bright/high-edge blob in the CENTER → center cell wins with a high score.
+        let center = analyze_regions_pure(&blob_on(30, 30, (12, 12, 6, 6), [10, 10, 10]), (3, 3));
+        let (cidx, cscore) = pick_subject_region(&center);
+        assert_eq!(cidx, 4, "central blob → center cell");
+        let (_, flat_score) = pick_subject_region(&flat);
+        assert!(
+            cscore > flat_score,
+            "central blob scores higher than flat center"
+        );
+
+        // Bright/high-edge blob in a CORNER. DEVIATION FROM SPEC §1.4 test #2 (documented):
+        // under the LOCKED weights (W_CENTER=0.5, W_CONTRAST=0.35, W_SAT=0.15) a corner cell's
+        // MAX score is 0.35*1 + 0.15*1 = 0.50, which can only TIE — never exceed — the center
+        // cell's center_bias contribution of 0.5*1 = 0.50; ties resolve to the most-central
+        // cell. So a corner blob CANNOT beat a flat center with these weights (the spec's
+        // narrative "contrast beats center-bias" is unreachable given its own locked weights).
+        // We honor the LOCKED weights over the narrative and instead pin the saliency SIGNAL:
+        // the corner cell's own score RISES sharply with the blob (contrast is captured), even
+        // though the center prior still claims the subject. The fields the reader fills
+        // (fg_bg_contrast etc.) are what carry the corner's saliency downstream.
+        let corner = analyze_regions_pure(&blob_on(30, 30, (0, 0, 9, 9), [10, 10, 10]), (3, 3));
+        let (coidx, coscore) = pick_subject_region(&corner);
+        // The center prior still claims the subject under the locked weights.
+        assert_eq!(coidx, 4, "center prior claims subject under locked weights");
+        assert!(coscore >= 0.5, "the winning (center) score is well-formed");
+        // But the corner blob IS perceptually distinct from a flat corner — the saliency
+        // SIGNAL is captured (it flows into the fg_bg_contrast / energy fields downstream),
+        // even though the center-bias prior dominates the argmax.
+        assert!(
+            corner[0].edge_energy > corner[2].edge_energy
+                || (corner[0].mean_value - corner[2].mean_value).abs() > 1.0,
+            "the corner blob makes cell 0 perceptually distinct from a flat corner cell"
+        );
     }
 }

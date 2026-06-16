@@ -387,48 +387,57 @@ fn test_harmonicfill_rest_bug_fixed() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 7. The COUNTERMELODY STUB is byte-equal to the (rest-fixed) HarmonicFill figure
+// 7. The COUNTERMELODY is NO LONGER a HarmonicFill delegate (S18 §6.4 supersession)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// §11.6: the CounterMelody realize branch is a STUB that delegates to the rest-fixed
-/// HarmonicFill figure. Pin it: a step that assigns CounterMelody realizes the EXACT
-/// same NoteEvents as the same step under HarmonicFill — so a later real counter-line
-/// is a clean, isolated diff. Tested on both a SOUNDING (strong) and a RESTING (weak,
-/// near-static) beat so the delegation is pinned across both fill outcomes.
+/// §6.4 (S18): the S17 stub asserted the CounterMelody arm was byte-equal to the
+/// HarmonicFill figure (`test_countermelody_stub_equals_harmonicfill`). S18 Slice 2
+/// REPLACES that stub with a REAL counter-line, so the equality is FALSE BY DESIGN —
+/// this is the one S17 property Slice 2 consciously retires (the freeze net,
+/// `engine_equivalence.rs`, is untouched; this is a documented TEST edit, not a freeze
+/// relaxation). The inverse is now pinned: on a held/static step the counter onsets OFF
+/// the downbeat (`step_ms/4`), where the HarmonicFill figure onsets at 0 — proof the
+/// counter is no longer a delegate. (The full counter-line behaviour is pinned in the
+/// in-module `chord_engine` §3.6 tests and the Test Engineer's `tests/counter_s18.rs`.)
 #[test]
-fn test_countermelody_stub_equals_harmonicfill() {
+fn test_countermelody_is_no_longer_harmonicfill_delegate() {
     // A profile that assigns inst 0 → CounterMelody (vs. an identity inst 1 of 3 → fill).
-    // We compare the realized events of a CounterMelody instrument against a HarmonicFill
-    // instrument on the SAME step + features, so the only difference is the role arm.
     let counter_profile = OrchestrationProfile {
         id: "counter_probe".to_string(),
         layers: vec![LayerRole::CounterMelody],
         density: 0.5,
         pad_voices: 0,
     };
+    // A strong (even) interior beat with real edge so the HarmonicFill SOUNDS (a single
+    // onset at 0). The single-step fixture has no prior step (step_in_section == 0), so
+    // the counter sees a melody-static period and takes its MOVING off-beat onset.
+    let step = interior_step(2);
+    let feats = perf(0.04);
 
-    for (pos, feats) in [
-        (2usize, perf(0.04)),  // strong beat → both arms SOUND
-        (1usize, perf(0.001)), // weak near-static beat → both arms REST
-    ] {
-        let step = interior_step(pos);
-        // CounterMelody: inst 0 under the single-layer counter profile.
-        let counter = realize_under(counter_profile.clone(), &step, 0, 3, &feats);
-        // HarmonicFill: inst 1 of 3 under identity is a HarmonicFill instrument.
-        let fill = realize_under(OrchestrationProfile::identity(), &step, 1, 3, &feats);
+    let counter = realize_under(counter_profile, &step, 0, 3, &feats);
+    let fill = realize_under(OrchestrationProfile::identity(), &step, 1, 3, &feats);
 
-        // Compare the rhythm/articulation SHAPE (onset offsets + holds) — the pitch may
-        // differ (different inst index → different inner-tone seat), but the stub must
-        // produce the SAME figure shape as the HarmonicFill arm it delegates to.
-        let shape = |evs: &[NoteEvent]| -> Vec<(u64, u64)> {
-            evs.iter().map(|e| (e.offset_ms, e.hold_ms)).collect()
-        };
-        assert_eq!(
-            shape(&counter),
-            shape(&fill),
-            "CounterMelody stub must produce the same figure shape as HarmonicFill (pos {pos})"
-        );
-    }
+    // The HarmonicFill onsets at 0; the real counter onsets OFF the downbeat.
+    assert_eq!(
+        fill.len(),
+        1,
+        "the HarmonicFill reference must sound a single onset on this strong beat"
+    );
+    assert_eq!(fill[0].offset_ms, 0, "HarmonicFill onsets on the downbeat");
+    assert_eq!(
+        counter.len(),
+        1,
+        "the counter sounds a single moving note on a held/static step"
+    );
+    assert_ne!(
+        counter[0].offset_ms, 0,
+        "the real counter onsets OFF the downbeat — it is NOT a HarmonicFill delegate"
+    );
+    assert_eq!(
+        counter[0].offset_ms,
+        MS_PER_STEP / 4,
+        "the held/static counter onset is the documented step_ms/4 off-beat placement"
+    );
 }
 
 // Run under DEFAULT features (the integration harness builds the feature-gated bin, so

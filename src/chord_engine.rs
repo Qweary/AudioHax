@@ -1027,6 +1027,7 @@ pub fn realize_step(
         is_phrase_start,
         step,
         pad_voices,
+        ctx,
     )
 }
 
@@ -1268,6 +1269,11 @@ fn realize_rhythm(
     // path — inert, no instrument is ever a Pad there). Private additive param on
     // this free fn: NOT a public-seam change, realize_step's signature is unchanged.
     pad_voices: u8,
+    // The borrowed plan-relative context (S18, additive). The CounterMelody arm
+    // reads `ctx.section.steps` + `ctx.step_in_section` + the recomputed melody
+    // pitch off it; mirrors the `pad_voices` precedent — a private-fn param, NOT a
+    // realize_step signature change. Inert on the identity path (no Counter inst).
+    ctx: &crate::composition::StepContext,
 ) -> Vec<NoteEvent> {
     // S13: normalize the RAW per-bar edge density into a 0..1 ACTIVITY knob. The old
     // code compared raw edge (≈0.005 on real photos) against 0.25/0.70 cutoffs, so
@@ -1472,14 +1478,93 @@ fn realize_rhythm(
         }
 
         OrchestralRole::CounterMelody => {
-            // STUB (a later slice fills the real counter-line): delegate to the
-            // rest-fixed HarmonicFill figure so the role is present but adds no new
-            // craft yet. Unreachable under the identity profile, so byte-neutral.
-            let weak_interior = !step.position_in_phrase.is_multiple_of(2);
-            if edge_activity < FILL_REST_ACTIVITY && weak_interior {
-                Vec::new()
+            // THE REAL COUNTER-LINE (S18 §3) — a genuine second moving line, not the
+            // HarmonicFill delegate the stub was. Everything it needs is RE-COMPUTED
+            // deterministically off `ctx` (no plan-time counter storage, no cross-step
+            // state): the melody pitch this/prev step (via the Melody role's own pitch
+            // path), the prior `StepPlan` (via `ctx.section.steps`), and a non-recursive
+            // prior-chord seed for the line's previous pitch. Unreachable under the
+            // identity profile (no Counter inst), so byte-neutral on the freeze path.
+            let si = ctx.step_in_section;
+            // The prior step's plan, or None at a section start (no contrary constraint).
+            let prev: Option<&StepPlan> = si.checked_sub(1).and_then(|p| ctx.section.steps.get(p));
+
+            // Melody pitch THIS step and the PREVIOUS step, recomputed exactly as the
+            // Melody instrument computes it. Some(p) == sounds p; None == the melody
+            // rests this step (treated as Hold for the contrary rule, a gap for rhythm).
+            let m_now = melody_pitch_for(ctx, step, features);
+            let m_prev = prev.and_then(|p| melody_pitch_for_step(ctx, p, features));
+            let mel_dir = motion_dir(m_prev, m_now);
+
+            // Held-period / melody-static detection (§3.4 — the "empty periods" answer).
+            let held_chord = prev.is_some_and(|p| p.chord.notes == step.chord.notes);
+            let melody_static = mel_dir == MotionDir::Hold || m_now.is_none();
+
+            // How many consecutive PRIOR steps already sounded THIS exact chord — the
+            // step's position WITHIN the current held run (0 at the run's first step).
+            // Bounded by HELD_RUN_SEED_CAP so this stays O(cap) per step, never O(run
+            // length): a held run only needs ~one rotation through the chord's band
+            // tones to read as a moving line, so the cap is the rotation period, not the
+            // whole section. Deterministic (a pure scan of plan chords, no RNG).
+            let held_run_index = held_run_position(ctx.section, si);
+
+            // PITCH: contrary/oblique, chord-tone, no parallel perfects vs the melody
+            // (§3.2). Two seed modes drive `pick_counter_pitch`:
+            //   * INSIDE a held run (held_run_index >= 1): seat the ADVANCING ROTATION
+            //     TARGET (a non-root band tone that walks with the run position) as the
+            //     pick's previous pitch with force_move OFF, so the pick LANDS on that
+            //     rotated tone — each held step sounds a NEW inner tone, the moving line
+            //     the operator's "empty period" verdict demanded. The no-parallel-perfects
+            //     reject still guards it.
+            //   * OTHERWISE (run start / changing chord): the §3.1 LOCK nearest-prior-chord
+            //     seed with force_move = held_chord||melody_static, byte-identical to the
+            //     as-built impl on every non-held-run step.
+            // The advancing held-run TARGET (Some inside a held run), or None on a run
+            // start / changing chord. When present it is the chord tone the held line
+            // should SOUND this step (the rotation already chose the musically-correct,
+            // non-root, moving tone); `pick_counter_pitch` lands on it unless it would
+            // form a parallel perfect against the melody, in which case it falls back to
+            // the scored pick. When None, the seed + force_move path is the as-built impl.
+            let held_target = advancing_seed_counter(step, held_run_index);
+            let prev_counter = seed_prev_counter(prev, step);
+            let cnt = pick_counter_pitch(
+                &step.chord,
+                prev_counter,
+                m_prev,
+                m_now,
+                mel_dir,
+                held_chord || melody_static,
+                held_target,
+            );
+
+            let with_note = |ev: NoteEvent| NoteEvent { note: cnt, ..ev };
+
+            // RHYTHM (§3.3) + HELD-PERIOD ACTIVATION (§3.4).
+            if held_chord || melody_static {
+                // MOVING mode: a GUARANTEED off-beat onset (no rest-as-gesture), a
+                // single delayed note at step_ms/4 — the moving line that weaves under
+                // the held/static harmony and fills the operator's "empty period."
+                let offset = step_ms / 4;
+                let slot = step_ms - offset;
+                let mut ev = sustained(offset, slot, base_frac);
+                ev = with_note(ev);
+                vec![ev]
+            } else if edge_activity > 0.55 {
+                // The melody is ACTIVE (it subdivides — arpeggio/syncopated bands): the
+                // counter holds ONE sustained tone underneath (the OBLIQUE case), staying
+                // out of the melody's way. Onset 0, one note for the full step.
+                vec![with_note(sustained(0, step_ms, base_frac))]
             } else {
-                vec![sustained(0, step_ms, base_frac)]
+                // Both voices calm and the chord is changing: the texture may breathe —
+                // rest-as-gesture on a weak interior beat, gated on FILL_REST_ACTIVITY
+                // exactly like the fill, so a genuinely near-static image gets the
+                // occasional counter-rest. Otherwise one sustained tone.
+                let weak_interior = !step.position_in_phrase.is_multiple_of(2);
+                if edge_activity < FILL_REST_ACTIVITY && weak_interior {
+                    Vec::new()
+                } else {
+                    vec![with_note(sustained(0, step_ms, base_frac))]
+                }
             }
         }
 
@@ -1980,6 +2065,408 @@ fn has_parallel_perfects(a: &[u8], b: &[u8]) -> bool {
         }
     }
     false
+}
+
+// =========================================================================
+// S18 SLICE 2 — REAL COUNTER-MELODY HELPERS (Music Theory Specialist owns)
+//
+// The counter-line is a SECOND moving line under the Melody. It re-uses the
+// existing voice-leading craft (`upper_voice_candidates` / `has_parallel_perfects`)
+// and the existing melody-pitch path (`theme_melody_pitch` / `role_pitch`) so it
+// stays connected and contrapuntally clean WITHOUT any new cross-step state — every
+// datum is RE-DERIVED from the borrowed `StepContext` (spec §3.1). All helpers are
+// pure, deterministic, and reached ONLY from the CounterMelody realize arm (never on
+// the identity/freeze path).
+// =========================================================================
+
+/// The melody-register floor a CounterMelody must sit UNDER (so the second line
+/// reads as inner/counter, not as a second tune in the soprano). == MELODY_REGISTER_FLOOR.
+const COUNTER_CEILING: u8 = MELODY_REGISTER_FLOOR; // 67 (G4) — the counter stays below this
+
+/// The contrary-motion bonus subtracted from a counter candidate's score when its
+/// motion OPPOSES (or obliques, while the melody moves) the melody's motion. theory:
+/// contrary motion is the strongest independence between two lines; rewarding it
+/// makes the counter a genuine second voice rather than a parallel shadow. Sized to
+/// dominate the conjunct-motion (≤P5) score term so a contrary leap beats a similar
+/// step, but not so large it overrides the no-parallel-perfects HARD reject (a
+/// separate boolean gate, not a score term).
+const CONTRARY_BONUS: i32 = 24;
+/// A heavy penalty added when a counter candidate would double the melody's pitch in
+/// the same octave (a unison-double erases the two-line texture). theory: the counter
+/// must remain audibly distinct from the melody; an octave/unison double is the one
+/// vertical the line must never pick when any other chord tone is available.
+const COUNTER_UNISON_PENALTY: i32 = 1000;
+/// A small tie-breaking bias against seating the counter on the chord ROOT pc. theory:
+/// the counter is an inner/upper line that leans on the 3rd/5th; the root in the
+/// counter register is legal (not a bass double) but should yield to a non-root inner
+/// tone when the choice is otherwise equal. Kept far below CONTRARY_BONUS so it only
+/// breaks ties, never overrides counterpoint.
+const ROOT_PC_BIAS: i32 = 2;
+
+/// The cap on how far back the held-run scan looks (and the rotation period of the
+/// advancing held-period seed). theory: a held run needs only ~one rotation through
+/// the chord's band tones to read as a genuine moving line, so bounding the scan at a
+/// small cap keeps the arm O(cap) per step (never O(run length) → never O(n²) over a
+/// held section) while still cycling the seed through every reachable chord tone. A
+/// bare triad offers ≤3 band tones, so 4 covers a full rotation with margin.
+const HELD_RUN_SEED_CAP: usize = 4;
+
+/// True iff MIDI note `n`'s pitch class is the chord ROOT (`notes[0]`'s pc) — the
+/// counter de-prioritizes (but does not forbid) the root, so it stays an inner line
+/// without starving the held-period mover of reachable tones.
+fn is_root_pc(chord: &Chord, n: u8) -> bool {
+    chord.notes.first().is_some_and(|&r| r % 12 == n % 12)
+}
+
+/// Melodic motion direction between two (optional) pitches. A rest is folded into
+/// `Hold` by the callers (a rest neither rises nor falls — it is a static gap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MotionDir {
+    Up,
+    Down,
+    Hold,
+}
+
+/// The direction from `prev` to `now`. A missing pitch on EITHER side (a rest, or no
+/// prior step) is `Hold` — there is no contrary constraint to honor across a gap.
+fn motion_dir(prev: Option<u8>, now: Option<u8>) -> MotionDir {
+    match (prev, now) {
+        (Some(p), Some(n)) if n > p => MotionDir::Up,
+        (Some(p), Some(n)) if n < p => MotionDir::Down,
+        _ => MotionDir::Hold,
+    }
+}
+
+/// Recompute the MELODY role's sounding pitch for the CURRENT step (the step whose
+/// `ctx.step_in_section` `ctx` already points at) — the SAME value the Melody
+/// instrument computes in `realize_step`. `None` == the melody RESTS this step.
+///
+/// theory: the counter must see the melody to move against it, but `realize_step` is
+/// stateless per-instrument and never receives the melody's pitch. It IS re-derivable:
+/// the melody pitch is a pure function of (ctx, chord, features) via the same theme
+/// seam (`theme_melody_pitch`) and free-select (`role_pitch`) the Melody arm uses.
+fn melody_pitch_for(
+    ctx: &crate::composition::StepContext,
+    step: &StepPlan,
+    features: &PerfFeatures,
+) -> Option<u8> {
+    match theme_melody_pitch(ctx, OrchestralRole::Melody, &step.chord, features) {
+        Some(None) => None,       // theme-driven rest → the melody is silent this step
+        Some(Some(p)) => Some(p), // theme pitch
+        // Free-select: inst_idx/num are irrelevant for the Melody arm of role_pitch
+        // (it seats the chord's TOP tone, independent of index), so a synthetic
+        // (idx 0, num 1) is correct and avoids guessing the real ensemble width.
+        None => Some(role_pitch(
+            OrchestralRole::Melody,
+            &step.chord,
+            0,
+            1,
+            features,
+        )),
+    }
+}
+
+/// Recompute the MELODY pitch for an ARBITRARY prior step `p`, by re-pointing the
+/// borrowed context's `step_in_section` at that step so the theme seam reads the
+/// right motif index. Pure: only the `step_in_section` field is overridden (a Copy
+/// of the borrowed context), nothing is mutated through the references.
+fn melody_pitch_for_step(
+    ctx: &crate::composition::StepContext,
+    p: &StepPlan,
+    features: &PerfFeatures,
+) -> Option<u8> {
+    // Find this StepPlan's index within the section so theme_melody_pitch reads the
+    // correct motif note. The section's steps are the authoritative list; locate by
+    // identity of plan position (the prior step is steps[step_in_section - 1]).
+    let prior_idx = ctx.step_in_section.saturating_sub(1);
+    let mut prior_ctx = *ctx;
+    prior_ctx.step_in_section = prior_idx;
+    melody_pitch_for(&prior_ctx, p, features)
+}
+
+/// Seed the counter's "previous pitch" non-recursively (spec §3.1 LOCK): the chord
+/// tone the counter WOULD seat off the PRIOR step's chord, from a neutral anchor in
+/// the counter register. This keeps the line connected (each step picks near where it
+/// just was) without a recursive self-call, so the arm stays O(1) per step.
+///
+/// theory: the line's continuity comes from "nearest chord tone to where I was";
+/// seeding the prior pitch off the prior chord (rather than recursing the whole arm)
+/// is sufficient for a connected line and exactly the cheaper LOCK the spec chose.
+fn seed_prev_counter(prev: Option<&StepPlan>, step: &StepPlan) -> u8 {
+    // The chord to seat the seed off: the PRIOR chord if there is one (so the line
+    // approaches the current chord from where it sat last step), else THIS chord (a
+    // section-start anchor with no prior — the counter simply opens on a chord tone).
+    let seed_chord = prev.map(|p| &p.chord).unwrap_or(&step.chord);
+    // A neutral anchor in the middle of the counter register (between FILL and the
+    // melody floor) — the seating reference the nearest-tone pick measures from.
+    let anchor = (FILL_REGISTER_FLOOR + COUNTER_CEILING) / 2;
+    nearest_counter_tone(seed_chord, anchor).unwrap_or(anchor)
+}
+
+/// The step's position WITHIN its current held run: the count of consecutive PRIOR
+/// steps in `section` (ending at `si - 1`) whose chord notes equal `section.steps[si]`'s,
+/// capped at `HELD_RUN_SEED_CAP`. 0 means `si` opens a run (its prior chord differs, or
+/// it is the section start). theory: this is the deterministic phase that advances the
+/// held-period seed so consecutive identical-chord steps seat from different pitches.
+///
+/// Bounded: the scan walks back at most `HELD_RUN_SEED_CAP` steps, so it is O(cap) per
+/// step, never O(run length) — a held run of any length costs O(cap·run), i.e. linear,
+/// not the O(n²) a full recursive seed back to the run start would cost. RNG-free.
+fn held_run_position(section: &crate::composition::Section, si: usize) -> usize {
+    let Some(cur) = section.steps.get(si) else {
+        return 0;
+    };
+    let mut count = 0usize;
+    let mut idx = si;
+    while count < HELD_RUN_SEED_CAP {
+        let Some(prev_idx) = idx.checked_sub(1) else {
+            break; // section start — no further history
+        };
+        match section.steps.get(prev_idx) {
+            Some(p) if p.chord.notes == cur.chord.notes => {
+                count += 1;
+                idx = prev_idx;
+            }
+            _ => break, // chord changed (or missing) — the held run ends here
+        }
+    }
+    count
+}
+
+/// The ADVANCING held-run TARGET pitch — the chord tone the counter should SOUND on
+/// step `held_run_index` of a held run, or `None` when this step is not inside a held
+/// run (`held_run_index == 0`: a run start or a changing chord) and the caller should
+/// use the §3.1 LOCK seed + `force_move` exactly as the as-built impl does.
+///
+/// INSIDE a held run (`held_run_index >= 1`) the target ROTATES through the chord's
+/// non-root counter-band tones by the run position: step N lands on ring tone N (mod
+/// ring length), so consecutive held steps sound DIFFERENT inner tones (e.g. 3rd → 5th
+/// → 3rd …) — a moving inner line woven through the static harmony rather than one
+/// re-struck stab. Preferring the non-root ring keeps the held line off the bass-doubling
+/// root (the same intent `ROOT_PC_BIAS` encodes), falling back to the full band set only
+/// for a degenerate chord that cannot offer two non-root tones. The caller seats this
+/// target as the pick's previous pitch with `force_move` OFF so the pick LANDS on it
+/// (still subject to the no-parallel-perfects reject). Deterministic (pure function of
+/// plan position + chord, no RNG) and bounded (the ring is a small band-seated chord-tone
+/// list; the run index is capped at `HELD_RUN_SEED_CAP`).
+fn advancing_seed_counter(step: &StepPlan, held_run_index: usize) -> Option<u8> {
+    if held_run_index == 0 {
+        return None; // run start / changing chord — caller uses the §3.1 LOCK seed
+    }
+    // The band tones the held line may visit, PREFERRING non-root inner tones (the
+    // counter is an inner line, not a bass double — the same de-prioritized-root intent
+    // ROOT_PC_BIAS encodes). A bare triad seats {root, 3rd, 5th}; dropping the root pc
+    // leaves the 3rd and 5th, the two tones a moving inner line should oscillate between.
+    // Only fall back to the full set (including root) if non-root tones cannot offer a
+    // moving choice (degenerate chord), so the line is never starved.
+    let anchor = (FILL_REGISTER_FLOOR + COUNTER_CEILING) / 2;
+    let all = counter_candidate_pitches(&step.chord, anchor);
+    let non_root: Vec<u8> = all
+        .iter()
+        .copied()
+        .filter(|&c| !is_root_pc(&step.chord, c))
+        .collect();
+    let ring = if non_root.len() >= 2 { &non_root } else { &all };
+    if ring.len() <= 1 {
+        return None; // nothing to rotate through — fall back to the §3.1 seed (force_move)
+    }
+    // Deterministic rotation by the held-run position. The run's FIRST appearance
+    // (run_index 0, NOT a held step) sounds via the force_move path, which lands on the
+    // ring's LAST tone (the contrary-motion bonus prefers the farther-from-seed non-root
+    // tone); so the held steps start the rotation at ring[0] — `held_run_index - 1` — to
+    // step AWAY from that first sound and then cycle. Each held step thus lands on a tone
+    // different from BOTH its neighbours, weaving a moving inner line through the static
+    // harmony. RNG-free; bounded by the small ring and the capped run index.
+    Some(ring[(held_run_index - 1) % ring.len()])
+}
+
+/// The chord tone of `chord` (pitch class) seated NEAREST `anchor` within the counter
+/// register band (FILL_REGISTER_FLOOR ..< COUNTER_CEILING), preferring INNER/upper
+/// tones (the counter is not a bass double, so the root pc is skipped when the chord
+/// has more than one tone). `None` only for an empty chord.
+fn nearest_counter_tone(chord: &Chord, anchor: u8) -> Option<u8> {
+    counter_candidate_pitches(chord, anchor)
+        .into_iter()
+        .min_by_key(|&n| (n as i16 - anchor as i16).abs())
+}
+
+/// All chord-tone candidate pitches for the counter near `from`, seated in the counter
+/// register [FILL_REGISTER_FLOOR, COUNTER_CEILING). Reuses `upper_voice_candidates`
+/// (the same nearest-tone octave-enumeration search `voice_lead_one` uses) over each
+/// chord pitch class, keeping only seatings inside the counter band. ALL chord tones
+/// are candidates — the counter is an inner/upper line, and a root PC seated in the
+/// counter register (≈55..66) is NOT a bass double (the actual bass sounds at C2≈36);
+/// `pick_counter_pitch` de-prioritizes the root pc on a tie so non-root inner tones are
+/// preferred, honoring the "inner line, not a bass double" intent WITHOUT starving the
+/// held-period moving line of tones to step to. Deduped, sorted.
+///
+/// Per-pc seatings are enumerated with an OCTAVE window (12) rather than the ≤P5 cap:
+/// the ~12-semitone counter band ITSELF bounds the leap, and the wider window is what
+/// makes all three triad tones reachable in that narrow band (a bare triad must offer
+/// ≥2 distinct tones, or the held-period mover has nowhere to step). A direct band-seat
+/// fallback keeps the set non-empty for any pathological chord.
+fn counter_candidate_pitches(chord: &Chord, from: u8) -> Vec<u8> {
+    let notes = &chord.notes;
+    if notes.is_empty() {
+        return Vec::new();
+    }
+    let mut cands: Vec<u8> = Vec::new();
+    for &n in notes {
+        let pc = n % 12;
+        for c in upper_voice_candidates(pc, from, 12) {
+            if (FILL_REGISTER_FLOOR..COUNTER_CEILING).contains(&c) {
+                cands.push(c);
+            }
+        }
+    }
+    if cands.is_empty() {
+        // Defensive: seat each pc directly in the counter register so the line is never
+        // empty — a connected chord tone is always available.
+        for &n in notes {
+            let seat = seat_pc_in_register(n % 12, FILL_REGISTER_FLOOR);
+            if (FILL_REGISTER_FLOOR..COUNTER_CEILING).contains(&seat) {
+                cands.push(seat);
+            }
+        }
+    }
+    cands.sort_unstable();
+    cands.dedup();
+    cands
+}
+
+/// Pick the counter's sounding pitch for this step (spec §3.2): a chord tone near the
+/// counter's previous pitch, scored for CONTRARY/OBLIQUE motion against the melody,
+/// HARD-rejecting similar motion into a parallel perfect fifth/octave with the melody.
+///
+/// theory: the counter is a real second voice — it must be a chord tone (first-species
+/// floor), move smoothly from where it was (≤P5), and stay independent of the melody
+/// (prefer contrary motion, never parallel perfects, never a unison double). The
+/// no-parallel-perfects check is the same `has_parallel_perfects` the voice-leading
+/// core uses, applied AS-IS to the 2-voice [melody, counter] pair across T→T+1 (a NEW
+/// call site, not an edit to that fn).
+fn pick_counter_pitch(
+    chord: &Chord,
+    prev_counter: u8,
+    m_prev: Option<u8>,
+    m_now: Option<u8>,
+    mel_dir: MotionDir,
+    // True during a held-chord / melody-static period (§3.4): the counter is the ONLY
+    // thing that should move underneath, so STAYING on its previous pitch is the
+    // "re-struck stab" the operator rejected — penalize a no-op so the line steps to a
+    // NEW chord tone each step. False on a changing-chord step where holding (an
+    // oblique common tone under a moving melody) is musically correct.
+    force_move: bool,
+    // INSIDE a held run: the rotation's chosen SOUNDING tone for this step (a non-root
+    // band chord tone that walks with the run position). When `Some(t)`, the line LANDS
+    // on `t` — the rotation already chose the musically-correct moving tone, so the line
+    // visits a new tone each held step — UNLESS `t` would form a parallel perfect against
+    // the melody, in which case the scored pick below takes over (legality wins). `None`
+    // on a run start / changing chord → the scored seed+force_move path is unchanged from
+    // the as-built impl, so every non-held-run step is byte-identical.
+    held_target: Option<u8>,
+) -> u8 {
+    let cands = counter_candidate_pitches(chord, prev_counter);
+    if cands.is_empty() {
+        return prev_counter; // defensive: no chord tone at all → hold (never panics)
+    }
+    // HELD-RUN TARGET FAST-PATH: land on the rotation's chosen tone iff it is a legal
+    // chord-tone candidate AND does not create a parallel perfect against the melody.
+    // This is what makes the held line actually ADVANCE to a new tone each step (the
+    // rotation owns "which tone"); the scored path's contrary-while-static bonus would
+    // otherwise pull the pick off the target. Legality (no parallel perfect) still wins.
+    if let Some(t) = held_target {
+        if cands.contains(&t) {
+            let creates_parallel = match (m_prev, m_now) {
+                (Some(mp), Some(mn)) => has_parallel_perfects(&[mp, prev_counter], &[mn, t]),
+                _ => false,
+            };
+            if !creates_parallel {
+                return t;
+            }
+        }
+    }
+    // If a forced move is required but the ONLY candidate is the held pitch, there is
+    // nothing to move to — accept the hold rather than emit a non-chord-tone.
+    let can_move = force_move && cands.iter().any(|&c| c != prev_counter);
+
+    let mut best: Option<(i32, u8)> = None;
+    for cand in cands {
+        // HARD REJECT: similar motion into a parallel P5/P8 with the melody. Only
+        // checkable when both the prior melody pitch and prior counter pitch exist;
+        // at a section opening (m_prev None) there is no prior pair to parallel.
+        if let (Some(mp), Some(mn)) = (m_prev, m_now) {
+            let before = [mp, prev_counter];
+            let after = [mn, cand];
+            if has_parallel_perfects(&before, &after) {
+                continue; // never emit a parallel perfect against the melody
+            }
+        }
+
+        // Score (lower wins): conjunct preference (motion size, like voice_lead_one)...
+        let motion = (cand as i32 - prev_counter as i32).abs();
+        let mut score = motion;
+
+        // ...minus a contrary/oblique bonus vs the melody. cnt_dir Hold while the
+        // melody moves is OBLIQUE (still independent); cnt_dir opposing mel_dir is
+        // CONTRARY. Either earns the bonus; SIMILAR motion (same direction) does not.
+        let cnt_dir = motion_dir(Some(prev_counter), Some(cand));
+        let independent = match (mel_dir, cnt_dir) {
+            // melody static: no contrary axis — the held-period mover just steps; give
+            // a small bonus for actually MOVING (cnt_dir != Hold) so it doesn't stall.
+            (MotionDir::Hold, MotionDir::Hold) => false,
+            (MotionDir::Hold, _) => true,
+            // melody moving: reward opposing direction (contrary) or holding (oblique).
+            (MotionDir::Up, MotionDir::Down) | (MotionDir::Down, MotionDir::Up) => true,
+            (_, MotionDir::Hold) => true,
+            _ => false, // similar motion — no bonus
+        };
+        if independent {
+            score -= CONTRARY_BONUS;
+        }
+
+        // ...plus a heavy penalty for doubling the melody's exact pitch (no unison).
+        if Some(cand) == m_now {
+            score += COUNTER_UNISON_PENALTY;
+        }
+
+        // ...plus a held-period MOVE penalty: under a held/static period, holding the
+        // previous pitch is the forbidden re-struck stab — penalize the no-op so a
+        // different chord tone always wins (the moving line through the held harmony).
+        // Only when an alternative chord tone actually exists (can_move).
+        if can_move && cand == prev_counter {
+            score += COUNTER_UNISON_PENALTY;
+        }
+
+        // ...plus a SMALL root-pc bias: the counter is an inner line that leans on the
+        // 3rd/5th. A root pc seated in the counter register is legal (not a bass double)
+        // but should lose a tie to a non-root inner tone — a gentle nudge, far smaller
+        // than the contrary bonus, so it only breaks otherwise-equal choices.
+        if is_root_pc(chord, cand) {
+            score += ROOT_PC_BIAS;
+        }
+
+        match best {
+            Some((bs, _)) if bs <= score => {}
+            _ => best = Some((score, cand)),
+        }
+    }
+
+    // Every candidate rejected as a parallel (rare): fall back to the nearest oblique
+    // candidate — HOLD the previous pitch if it is still a chord tone, else the nearest
+    // chord tone. Never emit a parallel; this branch keeps the line legal.
+    best.map(|(_, c)| c).unwrap_or_else(|| {
+        let oblique = counter_candidate_pitches(chord, prev_counter);
+        // Prefer holding prev_counter if it is itself a chord tone (a true oblique),
+        // else the nearest chord tone to it.
+        if oblique.contains(&prev_counter) {
+            prev_counter
+        } else {
+            oblique
+                .into_iter()
+                .min_by_key(|&n| (n as i16 - prev_counter as i16).abs())
+                .unwrap_or(prev_counter)
+        }
+    })
 }
 
 /// Re-voice `next` to connect smoothly from the already-voiced `prev`.
@@ -4189,5 +4676,377 @@ mod tests {
             name: "I".to_string(),
             notes: vec![60, 64, 67],
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // S18 SLICE 2 — REAL COUNTER-MELODY tests (spec §3.6). Hand-built, RNG-free,
+    // no planner/loader. Build a CounterMelody-bearing section BY HAND and drive
+    // realize_step for the counter instrument, asserting the contrary/oblique +
+    // held-period-fill + slice-ceiling behaviour the real counter-line must show.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// A CounterMelody-bearing profile: inst 0→Bass, 1→Pad, 2→CounterMelody, 3→Melody
+    /// (the `pad_bed_counter` shape, built by hand so this net never loads mappings.json).
+    fn counter_profile() -> crate::composition::OrchestrationProfile {
+        crate::composition::OrchestrationProfile {
+            id: "pad_bed_counter".to_string(),
+            layers: vec![
+                crate::composition::LayerRole::Bass,
+                crate::composition::LayerRole::Pad,
+                crate::composition::LayerRole::CounterMelody,
+                crate::composition::LayerRole::Melody,
+            ],
+            density: 0.6,
+            pad_voices: 3,
+        }
+    }
+
+    /// One interior StepPlan carrying the given chord (phrase position chosen so it is a
+    /// plain interior beat — never a cadence/start, so the counter arm is reached).
+    fn counter_step(chord: Chord, position_in_phrase: usize) -> StepPlan {
+        StepPlan {
+            chord,
+            phrase_index: 0,
+            position_in_phrase,
+            phrase_len: 8,
+            position: PhrasePosition::Interior,
+            velocity: 76,
+        }
+    }
+
+    /// Build a 2-step CounterMelody section (the prior step + the current step), a home
+    /// key-tempo, and return a `StepContext` pointing at step index 1 (so the counter
+    /// arm sees a real prior step via `ctx.section.steps[0]`). The melody is FREE-SELECT
+    /// (theme None) so `melody_pitch_for` recomputes the top-chord-tone melody.
+    fn counter_ctx_parts(s0: StepPlan, s1: StepPlan) -> (Section, KeyTempoPlan) {
+        let section = Section {
+            label: "A".to_string(),
+            step_len: 2,
+            thematic_role: ThematicRole::Statement,
+            key_offset_semitones: 0,
+            ms_per_step: 1000,
+            mode: "Ionian".to_string(),
+            progression: vec![],
+            theme: None,
+            variation: ThemeVariation::Identity,
+            boundary_cadence: CadenceStrength::Perfect,
+            density: 0.6,
+            orchestration: counter_profile(),
+            steps: vec![s0, s1],
+        };
+        (section, home_key_tempo())
+    }
+
+    /// Realize the COUNTER instrument (inst 2 of 4) for the section's step index 1.
+    fn realize_counter(
+        section: &Section,
+        kt: &KeyTempoPlan,
+        features: &PerfFeatures,
+    ) -> Vec<NoteEvent> {
+        let ctx = StepContext {
+            section,
+            step_in_section: 1,
+            theme: None,
+            key_tempo: kt,
+        };
+        // inst 2 of 4 under counter_profile() == CounterMelody. The step is steps[1].
+        realize_step(&section.steps[1], 2, 4, features, section.ms_per_step, &ctx)
+    }
+
+    /// A G-major triad (the dominant) — a chord change from C so a held-vs-changing
+    /// distinction can be drawn against the C-major tonic.
+    fn g_major_triad() -> Chord {
+        Chord {
+            name: "V".to_string(),
+            notes: vec![67, 71, 74],
+        }
+    }
+
+    /// §3.6 test 3 (and a guard for every counter pitch): the realized counter pitch is
+    /// always a chord-tone pitch class of the step's chord, seated in the counter band
+    /// (FILL_REGISTER_FLOOR ≤ note < MELODY_REGISTER_FLOOR).
+    #[test]
+    fn test_counter_is_chord_tone_in_counter_register() {
+        let chord = c_major_triad();
+        let (sec, kt) = counter_ctx_parts(
+            counter_step(g_major_triad(), 0),
+            counter_step(chord.clone(), 1),
+        );
+        let evs = realize_counter(&sec, &kt, &perf_mid());
+        assert!(
+            !evs.is_empty(),
+            "the counter must sound on this interior step"
+        );
+        let chord_pcs: Vec<u8> = chord.notes.iter().map(|n| n % 12).collect();
+        for e in &evs {
+            assert!(
+                chord_pcs.contains(&(e.note % 12)),
+                "counter note {} (pc {}) must be a chord tone of {:?}",
+                e.note,
+                e.note % 12,
+                chord_pcs
+            );
+            assert!(
+                (FILL_REGISTER_FLOOR..MELODY_REGISTER_FLOOR).contains(&e.note),
+                "counter note {} must sit in the counter band [{FILL_REGISTER_FLOOR}, {MELODY_REGISTER_FLOOR})",
+                e.note
+            );
+        }
+    }
+
+    /// §3.6 test 7 (the Slice-2 ceiling): the counter emits AT MOST one NoteEvent per
+    /// step — never an arpeggio/comping figure. Pins the ceiling so Slice-3 figuration
+    /// is a clean future diff. Swept across calm/busy and held/changing configurations.
+    #[test]
+    fn test_counter_at_most_one_event_per_step() {
+        for chord_pair in [
+            (c_major_triad(), c_major_triad()), // held chord
+            (g_major_triad(), c_major_triad()), // changing chord
+        ] {
+            for &raw_edge in &[0.0f32, 0.01, 0.04, 0.2] {
+                let (sec, kt) = counter_ctx_parts(
+                    counter_step(chord_pair.0.clone(), 0),
+                    counter_step(chord_pair.1.clone(), 1),
+                );
+                let f = PerfFeatures {
+                    saturation: 50.0,
+                    brightness: 50.0,
+                    edge_density: raw_edge,
+                };
+                let evs = realize_counter(&sec, &kt, &f);
+                assert!(
+                    evs.len() <= 1,
+                    "the counter must emit at most ONE event (Slice-2 ceiling), got {} \
+                     (edge={raw_edge})",
+                    evs.len()
+                );
+            }
+        }
+    }
+
+    /// §3.6 test 4 (the operator "empty periods" verdict — the load-bearing one): two
+    /// consecutive steps on the SAME voiced chord (`held_chord == true`) → the counter
+    /// SOUNDS on the held step with an off-beat onset (`offset_ms == step_ms/4`), and its
+    /// pitch DIFFERS from the seed it would carry from the prior step (something moves
+    /// underneath the held chord — not a re-struck stab, not a rest).
+    #[test]
+    fn test_counter_held_period_fills_and_moves() {
+        // SAME voiced chord on both steps → held period. A near-static melody (free-
+        // select top tone is identical across identical chords → mel_dir Hold).
+        let held = c_major_triad();
+        let (sec, kt) =
+            counter_ctx_parts(counter_step(held.clone(), 0), counter_step(held.clone(), 1));
+        let f = perf_mid(); // calm-ish; held-period activation must override any rest
+        let evs = realize_counter(&sec, &kt, &f);
+        assert_eq!(
+            evs.len(),
+            1,
+            "a held-period counter must SOUND (no rest-as-gesture), got {} events",
+            evs.len()
+        );
+        let step_ms = sec.ms_per_step;
+        assert_eq!(
+            evs[0].offset_ms,
+            step_ms / 4,
+            "a held-period counter must onset OFF the downbeat at step_ms/4"
+        );
+        // The moving-line guarantee: the held step's counter pitch differs from what the
+        // PRIOR step of the held run actually sounds — the line STEPS to a new chord tone
+        // (the advancing seed rotates the seat each held step), so consecutive held steps
+        // are NOT the same re-struck stab. Compared against the prior step's ACTUAL
+        // realized pitch (step index 0), not a static prior-chord seed proxy.
+        let prev_ctx = StepContext {
+            section: &sec,
+            step_in_section: 0,
+            theme: None,
+            key_tempo: &kt,
+        };
+        let prev_evs = realize_step(&sec.steps[0], 2, 4, &f, sec.ms_per_step, &prev_ctx);
+        assert_eq!(
+            prev_evs.len(),
+            1,
+            "the prior held step also sounds one note"
+        );
+        assert_ne!(
+            evs[0].note, prev_evs[0].note,
+            "the counter must step to a NEW chord tone across the held run (moving line, \
+             not a re-struck stab): step1 note {} == step0 note {}",
+            evs[0].note, prev_evs[0].note
+        );
+    }
+
+    /// §3.4 ADVANCING-SEED PROOF (the load-bearing fix): across a REAL multi-step held
+    /// run (C→C→C, three identical-chord steps) the SOUNDING counter pitch must visit
+    /// ≥2 distinct pitches — a genuine moving line weaving through the static harmony,
+    /// not the as-built re-struck stab where the held-period pitch was identical every
+    /// step (the 64/64/64 gap `tests/saliency_s18.rs` pinned). The advancing seed rotates
+    /// through the chord's band tones by the held-run position, so consecutive held steps
+    /// seat from different pitches and the pick lands somewhere new.
+    #[test]
+    fn test_counter_held_run_advances_across_three_steps() {
+        let held = c_major_triad();
+        // A real 3-step held section, all C-major: steps 1 and 2 are inside the held run.
+        let section = Section {
+            label: "A".to_string(),
+            step_len: 3,
+            thematic_role: ThematicRole::Statement,
+            key_offset_semitones: 0,
+            ms_per_step: 1000,
+            mode: "Ionian".to_string(),
+            progression: vec![],
+            theme: None,
+            variation: ThemeVariation::Identity,
+            boundary_cadence: CadenceStrength::Perfect,
+            density: 0.6,
+            orchestration: counter_profile(),
+            steps: vec![
+                counter_step(held.clone(), 0),
+                counter_step(held.clone(), 1),
+                counter_step(held.clone(), 2),
+            ],
+        };
+        let kt = home_key_tempo();
+        let f = perf_mid();
+        let mut pitches = Vec::new();
+        for si in 0..3 {
+            let ctx = StepContext {
+                section: &section,
+                step_in_section: si,
+                theme: None,
+                key_tempo: &kt,
+            };
+            let evs = realize_step(&section.steps[si], 2, 4, &f, section.ms_per_step, &ctx);
+            assert_eq!(
+                evs.len(),
+                1,
+                "each held step sounds exactly one counter note"
+            );
+            assert_eq!(
+                evs[0].offset_ms,
+                section.ms_per_step / 4,
+                "every held step onsets off the downbeat (rhythmic fill still holds)"
+            );
+            // The Slice-2 contract still holds per step: chord tone in the counter band.
+            let chord_pcs: Vec<u8> = held.notes.iter().map(|n| n % 12).collect();
+            assert!(
+                chord_pcs.contains(&(evs[0].note % 12)),
+                "held-run counter note {} must be a chord tone of {:?}",
+                evs[0].note,
+                chord_pcs
+            );
+            assert!(
+                (FILL_REGISTER_FLOOR..MELODY_REGISTER_FLOOR).contains(&evs[0].note),
+                "held-run counter note {} must sit in the counter band",
+                evs[0].note
+            );
+            pitches.push(evs[0].note);
+        }
+        let mut distinct = pitches.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() >= 2,
+            "the held run must WEAVE a moving line (≥2 distinct sounding pitches), got \
+             sequence {pitches:?} (distinct {distinct:?}) — the advancing seed did not move"
+        );
+    }
+
+    /// §3.6 test 1 (the core counterpoint rule): when the melody moves UP across the
+    /// step boundary, the counter must NOT move strictly UP with it (contrary/oblique,
+    /// never similar). Built by recomputing the melody from the two chords and asserting
+    /// the realized counter's direction vs its seed opposes/obliques the melody.
+    #[test]
+    fn test_counter_contrary_or_oblique_vs_melody() {
+        // Prior chord C (melody top tone C5-ish), current chord G (melody top tone D5-ish
+        // — higher) → the melody moves UP. The counter must not also move strictly up.
+        let s0 = counter_step(c_major_triad(), 0);
+        let s1 = counter_step(g_major_triad(), 1);
+        let (sec, kt) = counter_ctx_parts(s0, s1);
+        let f = PerfFeatures {
+            saturation: 50.0,
+            brightness: 50.0,
+            edge_density: 0.04, // a sounding (changing-chord) step
+        };
+        // Confirm the premise: the recomputed melody actually rises across the boundary.
+        let ctx_now = StepContext {
+            section: &sec,
+            step_in_section: 1,
+            theme: None,
+            key_tempo: &kt,
+        };
+        let m_now = melody_pitch_for(&ctx_now, &sec.steps[1], &f);
+        let m_prev = melody_pitch_for_step(&ctx_now, &sec.steps[0], &f);
+        let mel_dir = motion_dir(m_prev, m_now);
+        // Only assert the contrary rule when the melody genuinely moves (premise holds).
+        if mel_dir == MotionDir::Up {
+            let evs = realize_counter(&sec, &kt, &f);
+            assert_eq!(
+                evs.len(),
+                1,
+                "the counter must sound on a changing-chord step"
+            );
+            let seed = seed_prev_counter(Some(&sec.steps[0]), &sec.steps[1]);
+            let cnt_dir = motion_dir(Some(seed), Some(evs[0].note));
+            assert_ne!(
+                cnt_dir,
+                MotionDir::Up,
+                "the counter must move CONTRARY/OBLIQUE (not strictly up with the melody): \
+                 seed {seed} → note {}",
+                evs[0].note
+            );
+        }
+    }
+
+    /// §3.6 test 6 (section-start guard): at `step_in_section == 0` (no prior step) the
+    /// counter still produces a valid chord-tone note — no panic, no parallel check
+    /// against a missing prior.
+    #[test]
+    fn test_counter_section_start_no_panic() {
+        let chord = c_major_triad();
+        let (sec, kt) = counter_ctx_parts(
+            counter_step(chord.clone(), 0),
+            counter_step(chord.clone(), 1),
+        );
+        // Point at step 0 (no prior) directly.
+        let ctx = StepContext {
+            section: &sec,
+            step_in_section: 0,
+            theme: None,
+            key_tempo: &kt,
+        };
+        let evs = realize_step(&sec.steps[0], 2, 4, &perf_mid(), sec.ms_per_step, &ctx);
+        // A start with no prior: melody_static is true (m_prev None → mel_dir Hold), so
+        // the counter SOUNDS (held/static activation) — a valid chord tone, no panic.
+        assert_eq!(
+            evs.len(),
+            1,
+            "section-start counter must produce one valid note"
+        );
+        let chord_pcs: Vec<u8> = chord.notes.iter().map(|n| n % 12).collect();
+        assert!(
+            chord_pcs.contains(&(evs[0].note % 12)),
+            "section-start counter note must be a chord tone"
+        );
+    }
+
+    /// §3.6 test 5 / §6.4 (the supersession witness): on a held-chord/static-melody step
+    /// the counter onsets OFF the downbeat (step_ms/4), where the OLD HarmonicFill stub
+    /// would have onset at 0 — so the counter is NO LONGER a HarmonicFill delegate. This
+    /// is the in-file analogue of the retired texture_s17 stub-equals assertion.
+    #[test]
+    fn test_counter_no_longer_harmonicfill_delegate() {
+        let held = c_major_triad();
+        let (sec, kt) =
+            counter_ctx_parts(counter_step(held.clone(), 0), counter_step(held.clone(), 1));
+        let f = perf_mid();
+        let counter = realize_counter(&sec, &kt, &f);
+        assert_eq!(counter.len(), 1, "counter sounds on the held step");
+        assert_ne!(
+            counter[0].offset_ms, 0,
+            "the real counter onsets OFF the downbeat (step_ms/4) on a held/static step — \
+             the HarmonicFill figure would onset at 0; the stub is superseded"
+        );
+        // And it is the documented step_ms/4 offset.
+        assert_eq!(counter[0].offset_ms, sec.ms_per_step / 4);
     }
 }

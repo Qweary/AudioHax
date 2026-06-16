@@ -136,11 +136,16 @@
     "key_scheme": { "default": "home_only", "rules": [] },
     "texture_catalogue": [
       { "id": "identity", "layers": [], "density": 0.5, "pad_voices": 0 },
-      { "id": "pad_bed",  "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.55, "pad_voices": 3 }
+      { "id": "pad_bed",  "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.55, "pad_voices": 3 },
+      { "id": "pad_bed_counter", "layers": ["Bass","Pad","CounterMelody","Melody"], "density": 0.6, "pad_voices": 3 }
     ],
     "texture": {
       "default": "pad_bed",
-      "rules": []
+      "rules": [
+        { "when": [ {"knob":"foreground_energy","op":"ge","lo":0.35,"hi":0.0},
+                    {"knob":"fg_bg_contrast","op":"ge","lo":0.20,"hi":0.0} ],
+          "pick": "pad_bed_counter" }
+      ]
     }
   }
 }
