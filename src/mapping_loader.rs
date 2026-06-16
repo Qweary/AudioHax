@@ -140,6 +140,14 @@ pub struct CompositionMappings {
     /// `PlanMappings` by the `From<CompositionMappings>` impl in composition.rs.
     #[serde(default)]
     pub affect: crate::composition::AffectMappings,
+    /// S23 — the prominence SelectTable. `#[serde(default)]` back-compat floor: absent →
+    /// empty → planner falls to uniform (byte-stable). Carried onto `PlanMappings` by the
+    /// `From<CompositionMappings>` impl in composition.rs.
+    #[serde(default)]
+    pub prominence: crate::composition::SelectTable,
+    /// S23 — the prominence-profile vocabulary. `#[serde(default)]` empty Vec.
+    #[serde(default)]
+    pub prominence_catalogue: Vec<crate::composition::ProminenceProfile>,
 }
 
 #[derive(Debug, Deserialize)]

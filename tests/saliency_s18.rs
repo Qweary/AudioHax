@@ -383,6 +383,7 @@ fn pad_bed_counter() -> OrchestrationProfile {
         pad_voices: 3,
         figuration: None,
         figuration_resolved: None,
+        prominence: Vec::new(),
     }
 }
 

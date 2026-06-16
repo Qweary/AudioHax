@@ -99,6 +99,7 @@ fn pad_figured() -> OrchestrationProfile {
         pad_voices: 3,
         figuration: Some("alberti".to_string()),
         figuration_resolved: Some(alberti()),
+        prominence: Vec::new(),
     }
 }
 
@@ -117,6 +118,7 @@ fn pad_bed() -> OrchestrationProfile {
         pad_voices: 3,
         figuration: None,
         figuration_resolved: None,
+        prominence: Vec::new(),
     }
 }
 
@@ -135,6 +137,7 @@ fn pad_figured_unresolved() -> OrchestrationProfile {
         pad_voices: 3,
         figuration: Some("nope".to_string()),
         figuration_resolved: None,
+        prominence: Vec::new(),
     }
 }
 

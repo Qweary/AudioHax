@@ -190,6 +190,23 @@
                     {"knob":"fg_bg_contrast","op":"ge","lo":0.20,"hi":0.0} ],
           "pick": "pad_bed_counter" }
       ]
+    },
+    "prominence_catalogue": [
+      { "id": "uniform",        "layers": [] },
+      { "id": "subject_melody", "layers": [
+          { "role": "Melody",        "weight": 1.0 },
+          { "role": "CounterMelody", "weight": 0.6 },
+          { "role": "HarmonicFill",  "weight": 0.4 },
+          { "role": "Pad",           "weight": 0.3 },
+          { "role": "Bass",          "weight": 0.5 } ] }
+    ],
+    "prominence": {
+      "default": "uniform",
+      "rules": [
+        { "when": [ {"knob":"subject_size",  "op":"in_range","lo":0.05,"hi":0.55},
+                    {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ],
+          "pick": "subject_melody" }
+      ]
     }
   }
 }

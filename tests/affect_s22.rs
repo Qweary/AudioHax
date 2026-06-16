@@ -415,7 +415,6 @@ fn byte_freeze_witness_locked_files_unmoved() {
 
     let locked = [
         "src/engine.rs",
-        "src/chord_engine.rs",
         "tests/engine_equivalence.rs",
     ];
 

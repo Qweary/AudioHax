@@ -381,6 +381,12 @@ pub struct OrchestrationProfile {
     /// keeps `PartialEq`/`Clone` total.
     #[serde(skip)]
     pub figuration_resolved: Option<FigurationSpec>,
+    /// NEW S23 — the RESOLVED per-layer prominence for this section, filled by the planner
+    /// from the `prominence` `SelectTable`. NOT loaded from JSON (`#[serde(skip)]` → always
+    /// empty at deserialize). EMPTY == the uniform/identity sentinel: the realizer takes its
+    /// byte-stable legacy path. The realizer reads THIS.
+    #[serde(skip)]
+    pub prominence: Vec<LayerProminence>,
 }
 
 /// serde default for [`OrchestrationProfile::density`] — the no-op `0.5` midpoint.
@@ -400,6 +406,7 @@ impl OrchestrationProfile {
             pad_voices: 0,
             figuration: None,
             figuration_resolved: None,
+            prominence: Vec::new(),
         }
     }
 
@@ -408,6 +415,30 @@ impl OrchestrationProfile {
     pub fn is_identity(&self) -> bool {
         self.pad_voices == 0 && self.layers.is_empty()
     }
+}
+
+/// One layer's resolved prominence weight for a section — the saliency "who is foreground"
+/// signal. `role` reuses the EXISTING planner layer vocabulary ([`LayerRole`]); the realizer
+/// bridges it to `OrchestralRole` via the existing `to_orchestral_role`. NEW S23.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+pub struct LayerProminence {
+    /// Which layer this weight applies to. serde rejects an unknown [`LayerRole`] name; the
+    /// §2.6(d) JSON strings "Melody"/"CounterMelody"/"HarmonicFill"/"Pad"/"Bass" parse 1:1
+    /// ([`LayerRole`] is `#[serde(rename_all = "PascalCase")]`).
+    pub role: LayerRole,
+    /// 0..1 prominence; 0.5 == neutral (every nudge is a no-op at exactly 0.5). 1.0 ==
+    /// fully foreground (Melody louder/higher/freer); 0.0 == fully recessive.
+    pub weight: f32,
+}
+
+/// One named prominence profile — pure structure. Selected by the `prominence` [`SelectTable`];
+/// the planner copies its `layers` onto the section's [`OrchestrationProfile::prominence`].
+/// Adding a profile is a JSON row, NOT a Rust edit (the `FigurationSpec`/`FormSpec`
+/// discipline). NEW S23.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct ProminenceProfile {
+    pub id: String,
+    pub layers: Vec<LayerProminence>,
 }
 
 /// One named accompaniment-figuration pattern — pure STRUCTURE, no note content. Animates a
@@ -651,6 +682,15 @@ pub struct PlanMappings {
     /// ships the legacy `ballad:{56,96}` window → the compose-path tempo is bit-identical.
     #[serde(default)]
     pub affect: AffectMappings,
+    /// NEW S23 — selects a `prominence_catalogue` id from the saliency knobs (subject_size,
+    /// fg_bg_contrast). `#[serde(default)]` empty `SelectTable` → "" → uniform (byte-stable
+    /// legacy realization).
+    #[serde(default)]
+    pub prominence: SelectTable,
+    /// NEW S23 — the prominence-profile vocabulary (id → per-layer weights). Parallel to
+    /// `texture_catalogue`/`figuration_catalogue`. `#[serde(default)]` empty Vec.
+    #[serde(default)]
+    pub prominence_catalogue: Vec<ProminenceProfile>,
 }
 
 impl From<CompositionMappings> for PlanMappings {
@@ -669,6 +709,8 @@ impl From<CompositionMappings> for PlanMappings {
             texture_catalogue: c.texture_catalogue,
             figuration_catalogue: c.figuration_catalogue,
             affect: c.affect,
+            prominence: c.prominence,
+            prominence_catalogue: c.prominence_catalogue,
         }
     }
 }
@@ -951,6 +993,16 @@ impl CompositionPlanner {
             .as_deref()
             .and_then(|id| lookup_figuration(&self.plan_mappings.figuration_catalogue, id))
             .cloned();
+        // S23: resolve saliency → prominence ONCE per plan, immediately after the figuration
+        // resolve. The `prominence` SelectTable picks a catalogue id from the saliency knobs
+        // (subject_size, fg_bg_contrast); an absent/unmatched/`uniform` id leaves `prominence`
+        // empty → the realizer takes its byte-stable uniform path. `orchestration.clone()` per
+        // section (below) deep-clones this Vec onto each Section — no section-loop edit needed.
+        let prom_id = self.plan_mappings.prominence.select(u);
+        orchestration.prominence =
+            lookup_prominence(&self.plan_mappings.prominence_catalogue, &prom_id)
+                .map(|p| p.layers.clone())
+                .unwrap_or_default();
 
         let mut sections: Vec<Section> = Vec::with_capacity(form_spec.sections.len());
         let mut assigned = 0usize;
@@ -1065,6 +1117,17 @@ fn lookup_orchestration<'a>(
 /// `figuration_resolved == None` and the realizer falls back to the block bed.
 fn lookup_figuration<'a>(catalogue: &'a [FigurationSpec], id: &str) -> Option<&'a FigurationSpec> {
     catalogue.iter().find(|f| f.id == id)
+}
+
+/// Look up a [`ProminenceProfile`] by id in the prominence catalogue (S23). Mirrors
+/// [`lookup_figuration`]; an absent/unmatched id returns `None` so the planner leaves
+/// `OrchestrationProfile::prominence` empty and the realizer falls back to the byte-stable
+/// uniform path.
+fn lookup_prominence<'a>(
+    catalogue: &'a [ProminenceProfile],
+    id: &str,
+) -> Option<&'a ProminenceProfile> {
+    catalogue.iter().find(|p| p.id == id)
 }
 
 /// A minimal single-section fallback form so the planner is total when the catalogue is

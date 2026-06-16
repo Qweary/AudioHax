@@ -901,6 +901,71 @@ fn to_orchestral_role(layer: crate::composition::LayerRole) -> OrchestralRole {
     }
 }
 
+// ----------------------------------------------------------------------------
+// S23 SLICE B — saliency → role PROMINENCE (the realizer half).
+//
+// A salient image subject pushes the MELODY forward (louder, higher, rhythmically
+// freer) while recessive regions recede into a quieter, plainer background bed.
+// The realizer reads a per-role prominence WEIGHT `w in [0,1]` (0.5 == neutral)
+// off `ctx.section.orchestration.prominence` and applies THREE CENTERED nudges,
+// each EXACTLY 0.0 when w == 0.5. That centering is load-bearing: under identity
+// the prominence Vec is EMPTY, `prominence_weight` returns PROMINENCE_NEUTRAL, and
+// every nudge evaluates to `(0.5-0.5)*SPAN == 0.0` — so the realization is
+// byte-for-byte today's, independent of the SPAN magnitudes below.
+// ----------------------------------------------------------------------------
+
+/// The neutral prominence weight — the freeze pivot. FIXED, not tunable: it is the
+/// value `prominence_weight` returns under identity, where every nudge becomes
+/// `(0.5-0.5)*SPAN == 0.0` exactly. Changing this would break the byte-freeze.
+const PROMINENCE_NEUTRAL: f32 = 0.5;
+
+/// Velocity span (MIDI units) of the centered prominence nudge. At full foreground
+/// (w=1.0) the melody gains `0.5*VEL_SPAN = +9` over neutral; a fully recessive Pad
+/// (w=0.3) loses `0.2*VEL_SPAN ≈ -3.6`. Layered on the existing +2 Melody / -3 Pad
+/// bias, the Melody-vs-Pad gap widens by ~12 — an audible "the subject is speaking
+/// up, the bed is stepping back" without clipping typical mid-velocities after the
+/// 1..=127 clamp. Finalized by ear at 18.0 (a touch above the 16.0 seed): on a real
+/// strong-subject image the +9 reads as a clear dynamic foreground — a mezzo line
+/// rising to forte — where +8 still left the bed crowding the tune.
+const PROMINENCE_VEL_SPAN: f32 = 18.0;
+
+/// Register span (semitones) of the centered prominence lift. Max foreground lift is
+/// `0.5*REG_SPAN = +2` semitones. Deliberately small so the SUMMED melody lift stays
+/// in range: MELODY_REGISTER_FLOOR(67) + max bright lift(12) + max prom lift(2) = 81,
+/// well under the 96 clamp ceiling — so the melody never clamps flat at the top of
+/// 24..=108 and `no_inversion_invariant` cannot break. A whole-tone lift is enough to
+/// hear the subject "sit on top" of the bed (a step up out of the accompaniment's
+/// register) without the muddy range-compression a +5 would risk. DO NOT raise REG_SPAN
+/// without re-deriving that 81 ≪ 96 margin (spec §2.2 / design-s21 §C.3 Risk 1).
+const PROMINENCE_REG_SPAN: f32 = 4.0;
+
+/// Rhythm band-cutoff shift (in edge_activity units) of the centered prominence nudge.
+/// At full foreground (w=1.0) the shift is `0.5*RHY_SHIFT = 0.05`: the melody's arpeggio
+/// cutoff drops 0.80→0.75, syncopated 0.55→0.50, dotted 0.25→0.20 — the foreground
+/// subdivides more readily (rhythmically freer); a recessive melody raises them (plainer,
+/// more sustained). Kept at 0.10 (the seed): a modest, audible bias toward subdivision
+/// that nudges a borderline-busy subject into an arpeggiated/syncopated figure without
+/// collapsing the four bands into one. Larger would erase the calm/busy distinction the
+/// continuous curve carries.
+const PROMINENCE_RHY_SHIFT: f32 = 0.10;
+
+/// Prominence weight (0..1) for `role`, read off `ctx.section.orchestration.prominence`.
+/// theory: returns PROMINENCE_NEUTRAL (0.5) when the section's prominence is EMPTY
+/// (identity / uniform) OR the role is unlisted — so the legacy realization is
+/// byte-identical whenever prominence is absent (every centered nudge is then a no-op).
+/// Pure. Bridges the planner's LayerRole → the realizer's OrchestralRole via the
+/// EXISTING `to_orchestral_role` (no new bridge).
+fn prominence_weight(ctx: &crate::composition::StepContext, role: OrchestralRole) -> f32 {
+    let prom = &ctx.section.orchestration.prominence;
+    if prom.is_empty() {
+        return PROMINENCE_NEUTRAL;
+    }
+    prom.iter()
+        .find(|lp| to_orchestral_role(lp.role) == role)
+        .map(|lp| lp.weight)
+        .unwrap_or(PROMINENCE_NEUTRAL)
+}
+
 /// Assign an `OrchestralRole` to instrument `inst_idx`, PLAN-AWARE.
 ///
 /// theory: the role an instrument plays is normally a pure function of its index
@@ -962,6 +1027,13 @@ pub fn realize_step(
     ctx: &crate::composition::StepContext,
 ) -> Vec<NoteEvent> {
     let role = assign_role(inst_idx, num_instruments, ctx);
+    // S23 prominence: the per-role weight for THIS step, computed once and threaded
+    // down to role_pitch (register) and realize_velocity (dynamics) as an additive
+    // PRIVATE param — the already-blessed pad_voices/ctx additive-private-param route,
+    // so realize_step's PUBLIC signature is unchanged. realize_rhythm recomputes the
+    // weight itself from its already-borrowed ctx. Under identity the prominence Vec is
+    // empty → this is PROMINENCE_NEUTRAL (0.5) for every role → every nudge is 0.0.
+    let prominence_w = prominence_weight(ctx, role);
     // How many chord tones a Pad instrument holds for this section (0 == no pad,
     // the identity-profile default — so this read is inert on the legacy path and
     // the Pad branch never fires there). Read zero-copy off the borrowed section.
@@ -997,7 +1069,14 @@ pub fn realize_step(
     let base_note = match theme_melody_pitch(ctx, role, &step.chord, features) {
         Some(None) => return Vec::new(),
         Some(Some(p)) => p,
-        None => role_pitch(role, &step.chord, inst_idx, num_instruments, features),
+        None => role_pitch(
+            role,
+            &step.chord,
+            inst_idx,
+            num_instruments,
+            features,
+            prominence_w,
+        ),
     };
 
     // ------------------------------------------------------------------
@@ -1009,7 +1088,7 @@ pub fn realize_step(
     // what makes the realized series' variance STRICTLY EXCEED the floor's
     // (the contour adds variation to the NON-cadence steps).
     // ------------------------------------------------------------------
-    let velocity = realize_velocity(step, features, is_cadence, role);
+    let velocity = realize_velocity(step, features, is_cadence, role, prominence_w);
 
     // ------------------------------------------------------------------
     // RHYTHM + ARTICULATION — choose a rhythm pattern from (role,
@@ -1048,6 +1127,10 @@ fn role_pitch(
     inst_idx: usize,
     num_instruments: usize,
     features: &PerfFeatures,
+    // S23 prominence weight (0..1; 0.5 neutral) for this role. Additive PRIVATE param
+    // (the pad_voices precedent) — realize_step's signature is unchanged. Drives the
+    // centered register lift; at 0.5 the lift is exactly 0 (byte-frozen identity).
+    prominence_w: f32,
 ) -> u8 {
     let notes = &chord.notes;
     if notes.is_empty() {
@@ -1076,7 +1159,13 @@ fn role_pitch(
             let top = *notes.iter().max().unwrap();
             let pc = top % 12;
             let lift = (bright_octaves * 12.0).round() as i16;
-            let floor = (MELODY_REGISTER_FLOOR as i16 + lift).clamp(24, 96) as u8;
+            // S23 prominence: a foreground melody (w>0.5) lifts UP; w==0.5 → 0 (identity).
+            // Risk-1 (design-s21 §C.3): clamp the SUM of (brightness lift + prominence
+            // lift), never each independently — the single .clamp(24,96) below IS that
+            // sum-clamp. REG_SPAN is kept small so floor(67)+lift(≤12)+prom_lift(≤2)=81 ≪
+            // 96, so the melody never clamps flat at the top (no_inversion_invariant holds).
+            let prom_lift = ((prominence_w - PROMINENCE_NEUTRAL) * PROMINENCE_REG_SPAN).round() as i16;
+            let floor = (MELODY_REGISTER_FLOOR as i16 + lift + prom_lift).clamp(24, 96) as u8;
             seat_pc_in_register(pc, floor)
         }
         // Pad and CounterMelody both seat a representative INNER tone in the fill
@@ -1103,7 +1192,15 @@ fn role_pitch(
             };
             let pc = notes[pick.min(notes.len() - 1)] % 12;
             let lift = ((bright_octaves * 6.0).round() as i16).clamp(-12, 12);
-            let floor = (FILL_REGISTER_FLOOR as i16 + lift).clamp(24, 96) as u8;
+            // S23 prominence (Risk-1, design-s21 §C.3): the recessive bed is NEVER lowered.
+            // A recessive role (w<0.5) would yield a negative lift — clamp it at >=0 so
+            // prominence can only ever RAISE the bed toward neutral, never sink it below
+            // the bass and invert figure-ground. A foreground (w>0.5) could rise. At w==0.5
+            // the lift is exactly 0 (identity). The summed lift+prom_lift rides the SINGLE
+            // .clamp(24,96) below (the Risk-1 sum-clamp), not an independent clamp.
+            let prom_lift =
+                (((prominence_w - PROMINENCE_NEUTRAL) * PROMINENCE_REG_SPAN).round() as i16).max(0);
+            let floor = (FILL_REGISTER_FLOOR as i16 + lift + prom_lift).clamp(24, 96) as u8;
             seat_pc_in_register(pc, floor)
         }
     }
@@ -1125,6 +1222,10 @@ fn realize_velocity(
     features: &PerfFeatures,
     is_cadence: bool,
     role: OrchestralRole,
+    // S23 prominence weight (0..1; 0.5 neutral) for this role. Additive PRIVATE param
+    // (the pad_voices precedent) — realize_step's signature is unchanged. Drives the
+    // centered velocity nudge; at 0.5 the nudge is exactly 0 (byte-frozen identity).
+    prominence_w: f32,
 ) -> u8 {
     // Overall LEVEL from saturation: map 0..=100 to roughly [-12, +18] velocity
     // added to the floor — a dull bar still respects the floor's phrase marking,
@@ -1184,6 +1285,17 @@ fn realize_velocity(
         // profile, so this never touches the byte-frozen default path.
         OrchestralRole::Pad if !is_cadence => vel -= 3.0,
         _ => {}
+    }
+
+    // S23 prominence: centered velocity nudge, applied AFTER the existing per-role bias
+    // so saliency WIDENS the gap the realizer already opens (+2 Melody / -3 Pad). A
+    // foreground role (w>0.5) gets louder, a recessive role (w<0.5) quieter. EXACTLY 0
+    // at w==0.5: (0.5-0.5)*VEL_SPAN == 0.0 — the byte-frozen identity nudge. Guarded on
+    // !is_cadence so the cadence goldens (114/84) stay byte-stable even under a future
+    // non-0.5 cadence weight; moot under identity (the term is already 0). The final
+    // round().clamp(1,127) below satisfies the 1..=127 bound.
+    if !is_cadence {
+        vel += (prominence_w - PROMINENCE_NEUTRAL) * PROMINENCE_VEL_SPAN;
     }
 
     vel.round().clamp(1.0, 127.0) as u8
@@ -1592,7 +1704,17 @@ fn realize_rhythm(
             // theory: recalibrating the cutoffs against edge_activity (not raw edge)
             // is what makes "busy image → denser, arpeggiated melody" actually fire on
             // real photos — under the old raw cutoffs every photo fell in "sustained".
-            if pre_cadence || edge_activity > 0.80 {
+            //
+            // S23 prominence: shift the three band cutoffs by a CENTERED term. A
+            // foreground melody (w>0.5) LOWERS the cutoffs so it subdivides more readily
+            // (rhythmically freer — arpeggio/syncopation reached sooner); a recessive
+            // melody (w<0.5) raises them (plainer, more sustained). EXACTLY 0 at w==0.5:
+            // (0.5-0.5)*RHY_SHIFT == 0.0 → cutoffs are exactly 0.80/0.55/0.25, byte-stable.
+            // The `pre_cadence ||` disjunct is UNCHANGED so the cadence acceleration path
+            // is never shifted (protects the cadence golden).
+            let prom_shift =
+                (prominence_weight(ctx, role) - PROMINENCE_NEUTRAL) * PROMINENCE_RHY_SHIFT;
+            if pre_cadence || edge_activity > (0.80 - prom_shift) {
                 // ARPEGGIO / acceleration: spread chord-tone onsets evenly across
                 // the step (more onsets, shorter values) — the active, driving
                 // figure. theory: subdividing the beat is the melody's way of
@@ -1605,7 +1727,7 @@ fn realize_rhythm(
                         sustained(offset, slot, STACCATO_FRAC)
                     })
                     .collect()
-            } else if edge_activity > 0.55 {
+            } else if edge_activity > (0.55 - prom_shift) {
                 // SYNCOPATED: delay the onset off the downbeat by 1/4 step, then
                 // a second onset, pushing against the meter. theory: syncopation
                 // displaces the accent to energize an active-but-not-busy melody.
@@ -1614,7 +1736,7 @@ fn realize_rhythm(
                     sustained(quarter, step_ms / 2, PORTATO_FRAC),
                     sustained(step_ms * 3 / 4, step_ms / 4, STACCATO_FRAC),
                 ]
-            } else if edge_activity > 0.25 {
+            } else if edge_activity > (0.25 - prom_shift) {
                 // DOTTED: a long-short pair (onsets at 0 and 2/3; holds 2/3 and
                 // 1/3) — the lilting mid-activity figure. theory: the dotted
                 // rhythm is the default expressive subdivision of a singing line.
@@ -2262,6 +2384,10 @@ fn melody_pitch_for(
             0,
             1,
             features,
+            // S23: the theme/counter path computes the Melody weight off the same ctx —
+            // the SAME value realize_step threads for the Melody role, so a theme note
+            // lifts identically to a free-selected one. Empty prominence → 0.5 → no lift.
+            prominence_weight(ctx, OrchestralRole::Melody),
         )),
     }
 }
@@ -4802,6 +4928,10 @@ mod tests {
             // no figuration, so the Pad arm takes the byte-unchanged block bed).
             figuration: None,
             figuration_resolved: None,
+            // S23 — empty prominence: this existing counter net is a UNIFORM fixture, so
+            // every role's weight is PROMINENCE_NEUTRAL (0.5) and the three prominence
+            // nudges are all 0.0 — this test stays byte-identical (additive freeze).
+            prominence: Vec::new(),
         }
     }
 
