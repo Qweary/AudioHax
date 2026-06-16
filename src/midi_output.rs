@@ -168,6 +168,22 @@ impl MidiOut {
         Ok(())
     }
 
+    /// Emit a thorough "MIDI panic" across the connection: for every channel 0..16,
+    /// send CC 123 (All Notes Off) AND CC 120 (All Sound Off). CC 123 releases held
+    /// notes (they enter their release tail); CC 120 cuts any sound still in its
+    /// release tail. Sending both guarantees nothing keeps sounding in an EXTERNAL
+    /// synth (Qsynth/FluidSynth/DAW) after this process goes away.
+    ///
+    /// Send errors are returned (non-fatal-friendly) so callers can decide; `Drop`
+    /// ignores them. The exact bytes are produced by the pure [`all_sound_off_messages`]
+    /// so they can be unit-tested without opening a real MIDI port.
+    pub fn all_sound_off(&mut self) -> Result<(), Box<dyn Error>> {
+        for msg in all_sound_off_messages() {
+            self.conn.send(&msg)?;
+        }
+        Ok(())
+    }
+
     /// Play a simple arpeggio for a chord on a channel. Pre-existing helper, unused by
     /// the engine driver (the adapter schedules note_on/note_off directly);
     /// `#[allow(dead_code)]` because S12's default-feature promotion now surfaces it.
@@ -185,5 +201,98 @@ impl MidiOut {
             self.note_off(channel, n)?;
         }
         Ok(())
+    }
+}
+
+/// PURE byte generator for the "MIDI panic": the exact wire bytes [`MidiOut::all_sound_off`]
+/// sends, with no I/O. Returns 32 messages = 16 channels (0..16) × 2 CCs, in this order
+/// per channel: CC 123 (All Notes Off) = `[0xB0 | ch, 123, 0]`, then CC 120 (All Sound
+/// Off) = `[0xB0 | ch, 120, 0]`. Status nibble `0xB0` is Control Change; the low nibble
+/// carries the channel. Pure + deterministic so it can be unit-tested headlessly.
+pub fn all_sound_off_messages() -> Vec<[u8; 3]> {
+    let mut msgs = Vec::with_capacity(32);
+    for ch in 0u8..16 {
+        let status = 0xB0 | (ch & 0x0F);
+        msgs.push([status, 123, 0]); // All Notes Off
+        msgs.push([status, 120, 0]); // All Sound Off
+    }
+    msgs
+}
+
+/// Best-effort flush on ANY scope exit (normal return, early `?`, or a graceful break
+/// out of the playback loop after a Ctrl-C). `Drop` cannot return a `Result`, so a send
+/// failure here is logged and swallowed — by the time we are dropping, the connection
+/// may already be torn down, and a noisy panic would be worse than a missed flush.
+impl Drop for MidiOut {
+    fn drop(&mut self) {
+        if let Err(e) = self.all_sound_off() {
+            eprintln!("MIDI all-sound-off on shutdown failed (non-fatal): {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Byte-level correctness of the "MIDI panic" sent on shutdown ─────────────
+    // These pin the exact wire bytes of all_sound_off_messages so a stuck-note
+    // regression (an external synth left sounding after an abrupt exit) is caught
+    // without opening a real MIDI port. 16 channels × 2 Control-Change messages.
+
+    #[test]
+    fn all_sound_off_yields_exactly_32_messages() {
+        assert_eq!(all_sound_off_messages().len(), 32);
+    }
+
+    #[test]
+    fn every_message_is_a_control_change() {
+        for msg in all_sound_off_messages() {
+            assert_eq!(msg[0] & 0xF0, 0xB0, "status nibble must be Control Change");
+        }
+    }
+
+    #[test]
+    fn cc_numbers_are_only_123_and_120_and_both_present_per_channel() {
+        let msgs = all_sound_off_messages();
+        // Only CC 123 (All Notes Off) and CC 120 (All Sound Off) may appear.
+        for msg in &msgs {
+            assert!(
+                msg[1] == 123 || msg[1] == 120,
+                "unexpected CC number {}",
+                msg[1]
+            );
+        }
+        // BOTH CCs must be present for EVERY channel 0..16.
+        for ch in 0u8..16 {
+            let status = 0xB0 | ch;
+            assert!(
+                msgs.contains(&[status, 123, 0]),
+                "missing CC 123 for channel {ch}"
+            );
+            assert!(
+                msgs.contains(&[status, 120, 0]),
+                "missing CC 120 for channel {ch}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_data_byte_is_zero() {
+        for msg in all_sound_off_messages() {
+            assert_eq!(msg[2], 0, "Control Change data byte must be 0");
+        }
+    }
+
+    #[test]
+    fn channel_nibble_covers_all_16_channels() {
+        let mut seen = [false; 16];
+        for msg in all_sound_off_messages() {
+            seen[(msg[0] & 0x0F) as usize] = true;
+        }
+        assert!(
+            seen.iter().all(|&s| s),
+            "channel nibble must span all of 0..=15"
+        );
     }
 }

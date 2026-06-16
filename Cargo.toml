@@ -74,6 +74,13 @@ midir = { version = "0.8", optional = true }     # now opt-in via the `midi-out`
 rand = "0.8"
 opencv = { version = "0.95.1", optional = true } # now opt-in via the `opencv` feature (was default)
 anyhow = "1.0"
+# BUG-01: graceful SIGINT/Ctrl-C handling so the external-MIDI path can flush an
+# all-sound-off on shutdown (pure-Rust, cross-platform: Linux/Windows/macOS — matches
+# the project's OS-agnostic posture). Regular (non-optional) dep: the handler is wired
+# in main.rs regardless of which output sink is selected. The "termination" feature
+# routes SIGTERM (kill) and SIGHUP (terminal-window-close) through the same handler as
+# SIGINT (Ctrl-C), so all catchable quit paths flush the MIDI panic (BUG-01).
+ctrlc = { version = "3.4", features = ["termination"] }
 
 # ── WS-4 Phase 2 (S11) Lane B deps — in-process synth sink (pure Rust; gated by `synth`) ──
 # rustysynth: pure-Rust SoundFont (SF2) synthesizer, MIT-licensed, std-only. API used:

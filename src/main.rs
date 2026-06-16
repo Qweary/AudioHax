@@ -65,6 +65,8 @@ use audiohax::engine::AudioSinkError;
 use midi_output::MidiOut;
 
 use rand::Rng;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Scheduled MIDI event (time-based) — adapter-owned wall-clock playback unit.
@@ -348,7 +350,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         use audiohax::pure_analysis::{load_pure_image, PureAnalysisSource, PureImageSource};
         let psrc = match &play_args.image {
             Some(p) => PureImageSource::UserPath(p.clone()),
-            None => PureImageSource::UserPath(std::path::PathBuf::from("assets/images/example.jpg")),
+            None => {
+                PureImageSource::UserPath(std::path::PathBuf::from("assets/images/example.jpg"))
+            }
         };
         let img = load_pure_image(&psrc)?;
         println!(
@@ -417,6 +421,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(synth)
     };
 
+    // ── Graceful-shutdown wiring (BUG-01) ───────────────────────────────────────
+    // An abrupt exit (Ctrl-C / SIGINT) while a note is still sounding on the external
+    // `--output midi` path would otherwise leave that note sustaining forever in the
+    // EXTERNAL synth — the synth is a separate process that outlives us and never gets
+    // the note-off. We convert SIGINT into a graceful return: the handler only flips an
+    // AtomicBool, the playback loop polls it and BREAKS within ~one step, the function
+    // returns normally, the `MidiOut` is dropped, and its `Drop` fires the all-sound-off
+    // panic. We avoid trying to move the (non-Send) sink into the handler thread; the
+    // flag + break + Drop path is the clean, portable route. For the in-process synth
+    // path this simply lets the process exit cleanly (the cpal stream is self-healing).
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = Arc::clone(&shutdown);
+        // First Ctrl-C requests a graceful stop. If the handler is somehow installed
+        // more than once (it is not, here), `set_handler` would error — surface it.
+        if let Err(e) = ctrlc::set_handler(move || {
+            shutdown.store(true, Ordering::SeqCst);
+        }) {
+            eprintln!("could not install Ctrl-C handler (continuing without it): {e}");
+        }
+    }
+
     // Initial per-channel programs (same scheme as before: prog = (i*7)%128).
     for i in 0..instrument_count {
         let ch = (i % 16) as u8;
@@ -429,6 +455,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rng = rand::thread_rng();
 
     for step_idx in 0..total_steps {
+        // BUG-01: a Ctrl-C between steps stops promptly — the function then returns
+        // normally and the sink's Drop runs the all-sound-off panic.
+        if shutdown.load(Ordering::SeqCst) {
+            println!("Shutdown requested — stopping playback.");
+            break;
+        }
+
         // 1) Overlay for this step (OpenCV highgui — adapter; opencv path only).
         #[cfg(feature = "opencv")]
         {
@@ -481,6 +514,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 4) Time-order and execute (single-threaded wall-clock playback — adapter).
         events.sort_by_key(|e| e.at);
         for sev in events {
+            // BUG-01: also poll inside the per-step event loop so a Ctrl-C lands within
+            // (at most) one event's sleep rather than waiting out the whole step's worth
+            // of scheduled note_on/note_off events.
+            if shutdown.load(Ordering::SeqCst) {
+                break;
+            }
             let now = Instant::now();
             if sev.at > now {
                 std::thread::sleep(sev.at - now);
