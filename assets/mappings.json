@@ -14,9 +14,9 @@
       "71-100": "Triads7thsAndExtensions"
     },
     "brightness_to_tempo_bpm": {
-      "0-30": 60,
-      "31-70": 90,
-      "71-100": 120
+      "0-30": 72,
+      "31-70": 108,
+      "71-100": 150
     },
     "feature_normalization": {
       "edge_density_max": 0.05,
@@ -131,7 +131,37 @@
       "default": "absent",
       "rules": [ { "when": [ {"knob":"complexity","op":"ge","lo":0.4,"hi":0.0} ], "pick": "fragment" } ]
     },
-    "character":  { "default": "ballad",    "rules": [] },
+    "affect": {
+      "arousal_weights": {
+        "avg_saturation": 0.45,
+        "colorfulness":   0.25,
+        "edge_activity":  0.20,
+        "complexity":     0.10
+      },
+      "valence_weights": {
+        "avg_brightness":  0.70,
+        "avg_saturation":  0.20,
+        "fg_bg_contrast":  0.10
+      },
+      "character_tempo": {
+        "ballad":   { "bpm_min": 56,  "bpm_max": 96  },
+        "scherzo":  { "bpm_min": 120, "bpm_max": 168 },
+        "march":    { "bpm_min": 96,  "bpm_max": 132 },
+        "lament":   { "bpm_min": 44,  "bpm_max": 66  },
+        "hymn":     { "bpm_min": 60,  "bpm_max": 92  },
+        "nocturne": { "bpm_min": 50,  "bpm_max": 80  }
+      }
+    },
+    "character": {
+      "default": "ballad",
+      "rules": [
+        { "when": [ {"knob":"arousal","op":"ge","lo":0.60,"hi":0.0}, {"knob":"valence","op":"ge","lo":0.55,"hi":0.0} ], "pick": "scherzo" },
+        { "when": [ {"knob":"arousal","op":"ge","lo":0.60,"hi":0.0}, {"knob":"valence","op":"lt","lo":0.45,"hi":0.0} ], "pick": "march" },
+        { "when": [ {"knob":"arousal","op":"le","lo":0.30,"hi":0.0}, {"knob":"valence","op":"lt","lo":0.35,"hi":0.0} ], "pick": "lament" },
+        { "when": [ {"knob":"arousal","op":"le","lo":0.30,"hi":0.0}, {"knob":"valence","op":"ge","lo":0.55,"hi":0.0} ], "pick": "hymn" },
+        { "when": [ {"knob":"arousal","op":"le","lo":0.35,"hi":0.0}, {"knob":"valence","op":"in_range","lo":0.35,"hi":0.47} ], "pick": "nocturne" }
+      ]
+    },
     "meter":      { "default": "four4",     "rules": [] },
     "key_scheme": { "default": "home_only", "rules": [] },
     "texture_catalogue": [

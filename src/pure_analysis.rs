@@ -758,6 +758,8 @@ pub fn understand_image_pure(img: &RgbImage) -> Result<ImageUnderstanding, Analy
         subject_energy,
         foreground_energy,
         background_energy,
+        affect_arousal: -1.0,
+        affect_valence: -1.0,
     })
 }
 

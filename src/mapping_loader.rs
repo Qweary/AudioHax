@@ -135,6 +135,11 @@ pub struct CompositionMappings {
     /// carries it onto `PlanMappings`.
     #[serde(default)]
     pub figuration_catalogue: Vec<crate::composition::FigurationSpec>,
+    /// S22 — the affect weights + per-character tempo windows. `#[serde(default)]` back-compat
+    /// floor: absent → `AffectMappings::default()` (legacy Ballad window). Carried onto
+    /// `PlanMappings` by the `From<CompositionMappings>` impl in composition.rs.
+    #[serde(default)]
+    pub affect: crate::composition::AffectMappings,
 }
 
 #[derive(Debug, Deserialize)]

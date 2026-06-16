@@ -85,6 +85,16 @@ pub struct ImageUnderstanding {
     pub foreground_energy: f32,
     /// Energy in the background band (the corner cells minus the subject), 0..1. NEW S18.
     pub background_energy: f32,
+    /// NEW S22 — the planner-computed arousal composite (0..1). NOT extracted from pixels and
+    /// NOT deserialized; `pure_analysis::understand_image_pure` and `neutral()` leave it at the
+    /// `-1.0` sentinel ("not yet computed"), and the planner overwrites it via `affect_composite`
+    /// before the character/tempo ladders run. `Knob::Arousal` reads this. Keeping it off the
+    /// pixel producer holds the module boundary (`pure_analysis.rs` writes the sentinel, never
+    /// a real value). The `-1.0` sentinel is below any real 0..1 value, so a `Ge`/`Gt` ladder
+    /// rule reading an unfilled composite never spuriously fires.
+    pub affect_arousal: f32,
+    /// NEW S22 — the planner-computed valence composite (0..1). Same sentinel discipline.
+    pub affect_valence: f32,
 }
 
 impl ImageUnderstanding {
@@ -114,7 +124,146 @@ impl ImageUnderstanding {
             subject_energy: 0.0,
             foreground_energy: 0.0,
             background_energy: 0.0,
+            affect_arousal: -1.0,
+            affect_valence: -1.0,
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §S22 Affect — valence/arousal composite + per-character tempo windows
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The affect composite — the image's valence/arousal coordinates, each 0..1 (0.5 neutral),
+/// derived purely from the perceptual scalars already on `ImageUnderstanding`. NO new image
+/// extraction. Computed ONCE per plan in `composition.rs` (the planner's module). Pure: no
+/// pixels, no RNG, no clock.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Affect {
+    /// Arousal / energy, 0 (calm) .. 1 (energetic). Saturation-led.
+    pub arousal: f32,
+    /// Valence / mood, 0 (dark/tense) .. 1 (bright/pleasant). Brightness-led.
+    pub valence: f32,
+}
+
+/// One character's tempo window (BPM), loaded from `affect.character_tempo.<character>`.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+pub struct CharacterTempo {
+    pub bpm_min: f32,
+    pub bpm_max: f32,
+}
+
+/// The `affect` mapping block: composite weights + per-character tempo windows. All fields
+/// `#[serde(default)]` so a partial/absent block still parses. NEW S22.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct AffectMappings {
+    /// Weight per ImageUnderstanding field name (snake_case JSON keys) for the arousal blend.
+    #[serde(default)]
+    pub arousal_weights: std::collections::HashMap<String, f32>,
+    /// Weight per ImageUnderstanding field name for the valence blend. The `fg_bg_contrast`
+    /// term is fed through the `0.5 + 0.5*x` fluency transform INSIDE `affect_composite`
+    /// (NOT pre-transformed in JSON).
+    #[serde(default)]
+    pub valence_weights: std::collections::HashMap<String, f32>,
+    /// Per-character tempo windows, keyed by lowercase character name ("ballad","scherzo",…).
+    #[serde(default)]
+    pub character_tempo: std::collections::HashMap<String, CharacterTempo>,
+}
+
+impl Default for AffectMappings {
+    /// The no-`affect`-block floor: empty weight maps (the composite then degenerates to a
+    /// neutral 0.5/0.5 — harmless, since with no `affect` block the character ladder is also
+    /// empty and the plan stays Ballad) AND the SINGLE legacy `ballad:{56,96}` tempo window,
+    /// so `character_tempo_bpm(raw, Ballad, default)` == the old `clamp(56,96)` byte-for-byte.
+    fn default() -> Self {
+        let mut character_tempo = std::collections::HashMap::new();
+        character_tempo.insert(
+            "ballad".to_string(),
+            CharacterTempo {
+                bpm_min: 56.0,
+                bpm_max: 96.0,
+            },
+        );
+        AffectMappings {
+            arousal_weights: std::collections::HashMap::new(),
+            valence_weights: std::collections::HashMap::new(),
+            character_tempo,
+        }
+    }
+}
+
+/// Pure. Weighted blend of EXISTING `ImageUnderstanding` scalars under the JSON weights.
+/// The two HSV scalars (`avg_saturation`, `avg_brightness`) are 0..100 and divided by 100;
+/// the rest are already 0..1. Output each clamped to 0..1.
+///
+/// AROUSAL = 0.45*(avg_saturation/100) + 0.25*colorfulness + 0.20*edge_activity + 0.10*complexity
+/// VALENCE = 0.70*(avg_brightness/100) + 0.20*(avg_saturation/100) + 0.10*(0.5 + 0.5*fg_bg_contrast)
+///
+/// The weights come from `weights.arousal_weights` / `weights.valence_weights` keyed by the
+/// snake_case field name. For each weighted field the term is `weight * normalized_field`,
+/// where normalization is: `avg_saturation`→/100, `avg_brightness`→/100, `fg_bg_contrast`→
+/// fluency transform (`0.5 + 0.5*x`), all others→identity. Sum, then clamp 0..1. When a weight
+/// map is EMPTY (the default floor / no-affect-block path) the corresponding axis returns the
+/// neutral 0.5 (an empty blend has no terms; seed it to 0.5 so a `Ge`/`Le` rule reads "neutral").
+fn affect_composite(u: &ImageUnderstanding, weights: &AffectMappings) -> Affect {
+    /// Normalize one knob field for the affect blend (mirrors the §3.2 field-name table).
+    fn normalized_field(name: &str, u: &ImageUnderstanding) -> f32 {
+        match name {
+            "avg_saturation" => u.avg_saturation / 100.0,
+            "avg_brightness" => u.avg_brightness / 100.0,
+            "fg_bg_contrast" => 0.5 + 0.5 * u.fg_bg_contrast,
+            "colorfulness" => u.colorfulness,
+            "edge_activity" => u.edge_activity,
+            "complexity" => u.complexity,
+            // Any other field falls back to its raw value (no §4 weight row uses these).
+            _ => 0.0,
+        }
+    }
+    /// Sum `weight * normalized_field` over a weight map; an EMPTY map → neutral 0.5.
+    fn blend(map: &std::collections::HashMap<String, f32>, u: &ImageUnderstanding) -> f32 {
+        if map.is_empty() {
+            return 0.5;
+        }
+        let sum: f32 = map
+            .iter()
+            .map(|(name, w)| w * normalized_field(name, u))
+            .sum();
+        sum.clamp(0.0, 1.0)
+    }
+    Affect {
+        arousal: blend(&weights.arousal_weights, u),
+        valence: blend(&weights.valence_weights, u),
+    }
+}
+
+/// Clamp the raw brightness→BPM into the selected character's window from
+/// `affect.character_tempo.<character>`. An ABSENT window (character name not in the map)
+/// means "no clamp" — return `raw_bpm` unchanged (the legacy flat-path behaviour, which never
+/// clamped). With the default `AffectMappings` (no-affect-block floor), the only window present
+/// is `ballad:{56,96}`, so `character_tempo_bpm(raw, Ballad, default)` == the old
+/// `clamp(56,96)` byte-for-byte. Pure. Replaces the hard clamp at composition.rs:727.
+fn character_tempo_bpm(raw_bpm: f32, character: Character, affect: &AffectMappings) -> f32 {
+    let key = character_tempo_key(character);
+    match affect.character_tempo.get(key) {
+        Some(w) => raw_bpm.clamp(w.bpm_min, w.bpm_max),
+        None => raw_bpm,
+    }
+}
+
+/// The lowercase JSON key for a [`Character`] in `affect.character_tempo` (matches the §4(b)
+/// rows). Total over the closed enum.
+fn character_tempo_key(character: Character) -> &'static str {
+    match character {
+        Character::Ballad => "ballad",
+        Character::Hymn => "hymn",
+        Character::Nocturne => "nocturne",
+        Character::Drone => "drone",
+        Character::March => "march",
+        Character::Lament => "lament",
+        Character::Waltz => "waltz",
+        Character::Scherzo => "scherzo",
+        Character::Lilt => "lilt",
+        Character::Gigue => "gigue",
     }
 }
 
@@ -353,6 +502,11 @@ pub enum Knob {
     SubjectEnergy,
     ForegroundEnergy,
     BackgroundEnergy,
+    /// NEW S22 — the planner-computed arousal composite (0..1). Reads the runtime-only
+    /// `affect_arousal` field the planner fills via `affect_composite` (NOT a pixel field).
+    Arousal,
+    /// NEW S22 — the planner-computed valence composite (0..1). Same discipline.
+    Valence,
 }
 
 impl Knob {
@@ -377,6 +531,8 @@ impl Knob {
             Knob::SubjectEnergy => u.subject_energy,
             Knob::ForegroundEnergy => u.foreground_energy,
             Knob::BackgroundEnergy => u.background_energy,
+            Knob::Arousal => u.affect_arousal,
+            Knob::Valence => u.affect_valence,
         }
     }
 }
@@ -490,6 +646,11 @@ pub struct PlanMappings {
     /// key parses; an unresolved profile handle then falls back to the block bed.
     #[serde(default)]
     pub figuration_catalogue: Vec<FigurationSpec>,
+    /// NEW S22 — the affect weights + per-character tempo windows (§3.1). `#[serde(default)]`
+    /// so an OLD mappings.json (no `affect` key) parses → `AffectMappings::default()`, which
+    /// ships the legacy `ballad:{56,96}` window → the compose-path tempo is bit-identical.
+    #[serde(default)]
+    pub affect: AffectMappings,
 }
 
 impl From<CompositionMappings> for PlanMappings {
@@ -507,6 +668,7 @@ impl From<CompositionMappings> for PlanMappings {
             form_catalogue: c.form_catalogue,
             texture_catalogue: c.texture_catalogue,
             figuration_catalogue: c.figuration_catalogue,
+            affect: c.affect,
         }
     }
 }
@@ -695,6 +857,15 @@ impl CompositionPlanner {
     /// `pick_progression`/`generate_chords`/`plan_phrases` and the home root/tempo lookups, so
     /// the section harmony matches what `set_features_global` would derive.
     pub fn plan(&self, u: &ImageUnderstanding, mappings: &MappingTable) -> CompositionPlan {
+        // S22: compute the affect composite once and seat it on a local working copy so the
+        // character/tempo ladders read the real arousal/valence (the input `u` is borrowed `&`,
+        // and the pixel producer left the affect fields at the -1.0 sentinel).
+        let affect = affect_composite(u, &self.plan_mappings.affect);
+        let mut u = u.clone();
+        u.affect_arousal = affect.arousal;
+        u.affect_valence = affect.valence;
+        let u = &u; // shadow back to a shared borrow for the rest of plan (minimal blast radius)
+
         // 1) form id (first-match-wins, else default).
         let form_id = self.plan_mappings.form.select(u);
         // 2) character / meter / key_scheme / theme_behaviour. Slice 1: pinned.
@@ -722,9 +893,10 @@ impl CompositionPlanner {
             crate::mapping_loader::lookup_range_map(&mappings.global.hue_to_mode, u.dominant_hue)
                 .unwrap_or_else(|| "Ionian".to_string());
         let home_root_midi = 60; // C4 seed (EngineConfig.root_midi default); offsets are all 0.
-        let bpm = interp_tempo_bpm(&mappings.global.brightness_to_tempo_bpm, u.avg_brightness);
-        // Ballad tempo window (slice 1 character==Ballad): keep the BPM musical (slow-to-mid).
-        let bpm = bpm.clamp(BALLAD_BPM_MIN, BALLAD_BPM_MAX);
+        let raw_bpm = interp_tempo_bpm(&mappings.global.brightness_to_tempo_bpm, u.avg_brightness);
+        // Per-character tempo window (de-caps the legacy Ballad 56..96 clamp): the chosen
+        // character selects the window; brightness positions BPM within it. Absent window → no clamp.
+        let bpm = character_tempo_bpm(raw_bpm, character, &self.plan_mappings.affect);
         let base_ms_per_step = (60_000.0 / bpm.max(1.0)).round() as u64;
 
         // 5) total_steps from a base budget × section count, image-influenced (edge_activity
@@ -846,10 +1018,6 @@ impl CompositionPlanner {
         }
     }
 }
-
-/// Ballad tempo window (slice 1 character == Ballad): keep brightness→BPM musical.
-const BALLAD_BPM_MIN: f32 = 56.0;
-const BALLAD_BPM_MAX: f32 = 96.0;
 
 /// Choose a melodic archetype from the image. Slice-1 ACTIVE subset is the original four
 /// (Arch, Descent, Ascent, NeighborTurn); hue picks the broad shape and edge_activity tips
