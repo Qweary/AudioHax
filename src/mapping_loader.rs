@@ -148,6 +148,11 @@ pub struct CompositionMappings {
     /// S23 — the prominence-profile vocabulary. `#[serde(default)]` empty Vec.
     #[serde(default)]
     pub prominence_catalogue: Vec<crate::composition::ProminenceProfile>,
+    /// S24 — the key-scheme vocabulary. `#[serde(default)]` empty Vec (back-compat floor):
+    /// absent → only "home_only" reachable → byte-stable. Carried onto `PlanMappings` by the
+    /// `From<CompositionMappings>` impl in composition.rs.
+    #[serde(default)]
+    pub key_scheme_catalogue: Vec<crate::composition::KeyScheme>,
 }
 
 #[derive(Debug, Deserialize)]

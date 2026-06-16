@@ -441,6 +441,29 @@ pub struct ProminenceProfile {
     pub layers: Vec<LayerProminence>,
 }
 
+/// One section's offset RULE within a key scheme (S24). The catalogue carries the RULE (data,
+/// byte-stable); the planner computes the NUMBER once per plan via [`resolve_key_scheme`].
+/// `offset_rule` is a small tagged string parsed in the planner: "home" → 0;
+/// "region_related:b" → the more-energetic non-subject region's menu entry; "region_related:c"
+/// → the OTHER non-subject region (K2 only). Unknown → 0 (byte-stable degrade).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct KeySchemeSection {
+    /// Informational label ("A","B","A'","C") — NOT the match key. The planner aligns by
+    /// section ORDER within the chosen form's section list; `thematic_role` is the safety check.
+    pub label: String,
+    /// "home" | "region_related:b" | "region_related:c". Unknown → "home" (byte-stable degrade).
+    pub offset_rule: String,
+}
+
+/// A named per-section offset rule set (S24). "home_only" (empty `sections`) is the identity
+/// anchor. Parallel to [`ProminenceProfile`]; resolved once per plan by [`resolve_key_scheme`].
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct KeyScheme {
+    pub id: String,
+    #[serde(default)]
+    pub sections: Vec<KeySchemeSection>,
+}
+
 /// One named accompaniment-figuration pattern — pure STRUCTURE, no note content. Animates a
 /// held chord into a bounded rhythmic burst within ONE step. Lives as a row in
 /// `figuration_catalogue`; an [`OrchestrationProfile`] references it BY ID. Adding a pattern is a
@@ -691,6 +714,11 @@ pub struct PlanMappings {
     /// `texture_catalogue`/`figuration_catalogue`. `#[serde(default)]` empty Vec.
     #[serde(default)]
     pub prominence_catalogue: Vec<ProminenceProfile>,
+    /// NEW S24 — the key-scheme vocabulary (id → per-section offset rules). Parallel to
+    /// `prominence_catalogue`. `#[serde(default)]` empty Vec → only "home_only" reachable →
+    /// byte-stable.
+    #[serde(default)]
+    pub key_scheme_catalogue: Vec<KeyScheme>,
 }
 
 impl From<CompositionMappings> for PlanMappings {
@@ -711,6 +739,7 @@ impl From<CompositionMappings> for PlanMappings {
             affect: c.affect,
             prominence: c.prominence,
             prominence_catalogue: c.prominence_catalogue,
+            key_scheme_catalogue: c.key_scheme_catalogue,
         }
     }
 }
@@ -913,7 +942,7 @@ impl CompositionPlanner {
         // 2) character / meter / key_scheme / theme_behaviour. Slice 1: pinned.
         let character = parse_character(&self.plan_mappings.character.select(u));
         let meter = parse_meter(&self.plan_mappings.meter.select(u));
-        let _key_scheme_id = self.plan_mappings.key_scheme.select(u); // slice 1: "home_only"
+        let key_scheme_id = self.plan_mappings.key_scheme.select(u); // S24: image-selected scheme id
         let theme_behaviour = self.plan_mappings.theme_behaviour.select(u);
 
         // 3) lookup the chosen form; fall back to the default id, then to a minimal 1-section
@@ -934,7 +963,17 @@ impl CompositionPlanner {
         let home_mode =
             crate::mapping_loader::lookup_range_map(&mappings.global.hue_to_mode, u.dominant_hue)
                 .unwrap_or_else(|| "Ionian".to_string());
-        let home_root_midi = 60; // C4 seed (EngineConfig.root_midi default); offsets are all 0.
+        let home_root_midi = 60; // C4 seed (EngineConfig.root_midi default); A/Return stay home.
+                                 // S24: resolve the per-section key offsets ONCE per plan, now that the form_spec and
+                                 // home_mode are chosen (mirrors the S23 prominence resolve). `home_only`/absent scheme →
+                                 // all-zero (byte-stable). The section loop reads `offsets[i]`; the KeyTempoPlan spine
+                                 // clones this Vec.
+        let offsets = resolve_key_scheme(
+            lookup_key_scheme(&self.plan_mappings.key_scheme_catalogue, &key_scheme_id),
+            &form_spec.sections,
+            u,
+            &home_mode,
+        );
         let raw_bpm = interp_tempo_bpm(&mappings.global.brightness_to_tempo_bpm, u.avg_brightness);
         // Per-character tempo window (de-caps the legacy Ballad 56..96 clamp): the chosen
         // character selects the window; brightness positions BPM within it. Absent window → no clamp.
@@ -1035,7 +1074,7 @@ impl CompositionPlanner {
                 label: tpl.label.clone(),
                 step_len,
                 thematic_role: tpl.role,
-                key_offset_semitones: 0, // LOCKED slice 1
+                key_offset_semitones: offsets.get(i).copied().unwrap_or(0), // S24: image key plan
                 ms_per_step: base_ms_per_step,
                 mode: home_mode.clone(),
                 progression,
@@ -1050,7 +1089,7 @@ impl CompositionPlanner {
             });
         }
 
-        let key_scheme = vec![0i8; sections.len()];
+        let key_scheme = offsets.clone(); // S24: section_index → offset; home_only ⇒ all zeros
         let tempo_scheme = vec![base_ms_per_step; sections.len()];
 
         CompositionPlan {
@@ -1128,6 +1167,140 @@ fn lookup_prominence<'a>(
     id: &str,
 ) -> Option<&'a ProminenceProfile> {
     catalogue.iter().find(|p| p.id == id)
+}
+
+/// Look up a [`KeyScheme`] by id in the key-scheme catalogue (S24). Mirrors
+/// [`lookup_prominence`]; an absent/unmatched id returns `None` so the planner falls to the
+/// all-zero identity (byte-stable home).
+fn lookup_key_scheme<'a>(catalogue: &'a [KeyScheme], id: &str) -> Option<&'a KeyScheme> {
+    catalogue.iter().find(|k| k.id == id)
+}
+
+/// The relative-key tonic offset, mode-family-aware (S24, Decision 6). Major/Ionian-family home
+/// → `−3` (down to the relative minor's pitch class); minor/Aeolian-family home → `+3` (up to
+/// the relative major's). Computed from `home_mode`, never hardcoded, so it composes with the
+/// hue-selected mode. Under Decision 6 the mode label does NOT flip; only the tonic shifts.
+fn relative_offset(home_mode: &str) -> i8 {
+    // Minor/flat-family modes whose relative is UP a minor third; everything else (the
+    // major/Ionian-family) goes DOWN a minor third.
+    let m = home_mode.to_ascii_lowercase();
+    let minor_family = m.contains("aeolian")
+        || m.contains("minor")
+        || m.contains("dorian")
+        || m.contains("phrygian")
+        || m.contains("locrian");
+    if minor_family {
+        3
+    } else {
+        -3
+    }
+}
+
+/// The B/C excursion offset for one non-subject region (S24, Decisions 2/3/4). PURE.
+///
+/// - Direction reads the whole-image S21 `affect_valence` (the only valence axis on
+///   `ImageUnderstanding`): high valence → the bright side (dominant +7 near / relative on
+///   strong contrast); low valence → the flat side (subdominant +5 near / relative on strong
+///   contrast). Because mode (valence-owned) and this direction read the SAME axis, they cannot
+///   fight.
+/// - Near-vs-relative reads hue distance: a B-region hue CLOSE to the subject's picks the near
+///   key (dominant/subdominant); a STRONG hue contrast picks the relative (±3) — "different but
+///   still related."
+///
+/// Field reality (design Risk 3): per-region *brightness* is not first-class, so direction uses
+/// the whole-image `affect_valence` proxy; the non-subject region's hue uses `secondary_hue`
+/// (the closest available non-subject hue field — `dominant_hue`/`subject_hue` are the subject
+/// side). Energy-ordering (which region is B) is the caller's concern; it does not change the
+/// menu math here because no per-region valence/hue split exists yet.
+fn excursion_offset(u: &ImageUnderstanding, home_mode: &str) -> i8 {
+    // Hue distance subject ↔ non-subject region, on the 0..360 circle (wrap-aware, 0..180).
+    let raw = (u.subject_hue - u.secondary_hue).abs() % 360.0;
+    let hue_dist = if raw > 180.0 { 360.0 - raw } else { raw };
+    const STRONG_CONTRAST_DEG: f32 = 60.0; // beyond this, the regions are a distinct color.
+
+    // Three-band valence direction (pinned doc docs/input-s25-k1-keyplan-harmony.md §3 seeds):
+    //   high  affect_valence >= HIGH_VALENCE_MIN (0.60) → dominant +7
+    //   mid   open interval (LOW_VALENCE_MAX, HIGH_VALENCE_MIN) = (0.40, 0.60) → dominant +7 ("go to V and come back")
+    //   low   affect_valence <= LOW_VALENCE_MAX (0.40, inclusive) → subdominant +5
+    // High AND mid both resolve to +7; only low resolves to +5 — so the near split collapses to
+    //   affect_valence > LOW_VALENCE_MAX → +7, else (<= LOW_VALENCE_MAX) → +5.
+    // Boundary handling: exactly 0.40 (τ_lo) is LOW (inclusive); exactly 0.60 (τ_hi) is HIGH.
+    const LOW_VALENCE_MAX: f32 = 0.40; // τ_lo: at/below → LOW (subdominant +5).
+    const HIGH_VALENCE_MIN: f32 = 0.60; // τ_hi: at/above → HIGH (dominant +7).
+
+    // Classify into the doc's three bands, then collapse: HIGH and MID both lift to +7, only LOW
+    // settles to +5. Naming both bands keeps the τ_lo/τ_hi seeds explicit even though the +7/+5
+    // split only turns on the τ_lo boundary.
+    let high = u.affect_valence >= HIGH_VALENCE_MIN; // >= 0.60 → HIGH.
+    let low = u.affect_valence <= LOW_VALENCE_MAX; // <= 0.40 → LOW (inclusive).
+    let mid = !high && !low; // open interval (0.40, 0.60) → MID.
+    if hue_dist >= STRONG_CONTRAST_DEG {
+        // Strong color contrast → the relative (the "different but still related" move).
+        relative_offset(home_mode)
+    } else if high || mid {
+        7 // near + (HIGH >= 0.60 OR MID open (0.40,0.60)) → dominant lift ("go to V and come back").
+    } else {
+        5 // near + LOW (<= τ_lo 0.40) → subdominant settle (+5 = IV up a perfect fourth; pitch-class correct).
+    }
+}
+
+/// Resolve a [`KeyScheme`]'s per-section offset RULES into concrete `key_offset_semitones`
+/// (S24). Returns one `i8` per section IN ORDER, length == `sections.len()`. "home" → 0;
+/// "region_related:b" → the more-energetic non-subject region's menu entry; "region_related:c"
+/// → the OTHER non-subject region (K2). A `None`/empty scheme or any unknown rule → all-zero
+/// (the identity / byte-freeze path). PURE: no clock, no RNG.
+///
+/// The energy-ordered region pick (Decision 2): B reads the more-energetic of
+/// `background_energy`/`foreground_energy`, C reads the other. In v1 the menu math
+/// ([`excursion_offset`]) is the same for either region (no per-region valence/hue split is
+/// available yet — design Risk 3), so the rule tag selects which region label is conceptually
+/// the source; the resolved offset is identical until per-region affect lands. The returned
+/// length always equals the form's section count (zero-pad/truncate on mismatch; a debug-only
+/// role-alignment assertion fires per Risk 6).
+fn resolve_key_scheme(
+    scheme: Option<&KeyScheme>,
+    sections: &[SectionTemplate],
+    u: &ImageUnderstanding,
+    home_mode: &str,
+) -> Vec<i8> {
+    let n = sections.len();
+    let scheme = match scheme {
+        Some(s) if !s.sections.is_empty() => s,
+        _ => return vec![0i8; n], // None / empty (home_only) → all-zero identity.
+    };
+
+    // Energy-order the two non-subject regions (Decision 2). In v1 both regions feed the same
+    // menu math, so this records intent; the per-region split is a later slice.
+    let b_is_background = u.background_energy >= u.foreground_energy;
+    let _b_region_background = b_is_background; // documents the energy-order pick (Risk 3).
+
+    let mut offsets: Vec<i8> = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = match scheme.sections.get(i).map(|s| s.offset_rule.as_str()) {
+            Some("home") => 0,
+            Some("region_related:b") | Some("region_related:c") => excursion_offset(u, home_mode),
+            _ => 0, // unknown rule OR scheme shorter than the form → home (byte-stable degrade).
+        };
+        offsets.push(off);
+    }
+
+    // Risk 6 role-alignment witness (debug only, never panics in release; the length mismatch is
+    // already tolerated by the pad/truncate above): a "home" rule must land on a home role
+    // (Statement/Return), and a "region_related:*" rule must land on a non-home role
+    // (Contrast/Development/Coda). A mismatch means the scheme and the form disagree on structure.
+    for (i, tpl) in sections.iter().enumerate() {
+        if let Some(rule) = scheme.sections.get(i) {
+            let role_is_home = matches!(tpl.role, ThematicRole::Statement | ThematicRole::Return);
+            let rule_is_home = rule.offset_rule == "home";
+            debug_assert_eq!(
+                rule_is_home, role_is_home,
+                "key scheme rule/role mismatch at section {} (role {:?}, rule {:?})",
+                i, tpl.role, rule.offset_rule
+            );
+        }
+    }
+
+    offsets
 }
 
 /// A minimal single-section fallback form so the planner is total when the catalogue is

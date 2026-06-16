@@ -163,7 +163,24 @@
       ]
     },
     "meter":      { "default": "four4",     "rules": [] },
-    "key_scheme": { "default": "home_only", "rules": [] },
+    "key_scheme_catalogue": [
+      { "id": "home_only", "sections": [] },
+      { "id": "aba_excursion", "sections": [
+          { "label": "A", "offset_rule": "home" },
+          { "label": "B", "offset_rule": "region_related:b" },
+          { "label": "A", "offset_rule": "home" } ] },
+      { "id": "abac_rondo", "sections": [
+          { "label": "A", "offset_rule": "home" },
+          { "label": "B", "offset_rule": "region_related:b" },
+          { "label": "A", "offset_rule": "home" },
+          { "label": "C", "offset_rule": "region_related:c" } ] }
+    ],
+    "key_scheme": {
+      "default": "home_only",
+      "rules": [
+        { "when": [ {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ], "pick": "aba_excursion" }
+      ]
+    },
     "texture_catalogue": [
       { "id": "identity", "layers": [], "density": 0.5, "pad_voices": 0 },
       { "id": "pad_bed",  "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.55, "pad_voices": 3 },
