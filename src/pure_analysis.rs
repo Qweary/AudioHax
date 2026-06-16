@@ -735,6 +735,27 @@ pub fn understand_image_pure(img: &RgbImage) -> Result<ImageUnderstanding, Analy
     let background_energy = band_energy(&[0, 2, 6, 8]).unwrap_or(border_edge);
 
     let dominant_hue = g.avg_hue;
+
+    // ── S26 per-region affect (re-surfacing values analyze_regions_pure ALREADY computed) ──
+    // The foreground band {1,3,5,7} and background band {0,2,6,8}, each minus the subject cell,
+    // get their OWN mean brightness (0..1) and circular-mean dominant hue (0..360) so the planner
+    // can travel each excursion by THAT region's affect, not the whole image. NO new pixel pass,
+    // NO new dependency — the per-cell mean_value/dominant_hue already exist on RegionStats.
+    // Brightness fallback is whole-image avg_brightness/100; hue fallback is whole-image dominant_hue.
+    let (foreground_brightness, foreground_hue) = band_affect(
+        &regions,
+        &[1, 3, 5, 7],
+        subj_idx,
+        (g.avg_brightness / 100.0).clamp(0.0, 1.0),
+        dominant_hue,
+    );
+    let (background_brightness, background_hue) = band_affect(
+        &regions,
+        &[0, 2, 6, 8],
+        subj_idx,
+        (g.avg_brightness / 100.0).clamp(0.0, 1.0),
+        dominant_hue,
+    );
     Ok(ImageUnderstanding {
         edge_activity: (g.edge_density / 0.05).clamp(0.0, 1.0),
         texture: (g.texture_laplacian_var / 2000.0).clamp(0.0, 1.0),
@@ -758,9 +779,58 @@ pub fn understand_image_pure(img: &RgbImage) -> Result<ImageUnderstanding, Analy
         subject_energy,
         foreground_energy,
         background_energy,
+        foreground_brightness,
+        background_brightness,
+        foreground_hue,
+        background_hue,
         affect_arousal: -1.0,
         affect_valence: -1.0,
     })
+}
+
+/// Mean brightness (0..1) and circular-mean dominant hue (0..360) over a band of region cells,
+/// EXCLUDING the subject cell (S26). Reuses the per-cell [`RegionStats::mean_value`] (0..100,
+/// scaled to 0..1) and [`RegionStats::dominant_hue`] (0..360) that [`analyze_regions_pure`]
+/// already produced — NO new pixel pass, NO new dependency. Hue is averaged CIRCULARLY (the same
+/// unit-vector mean [`hsv_means`] uses) so the red wrap (0≈360) is handled. Returns
+/// `(brightness01, hue_deg)`. A fully-degenerate band (all listed cells are the subject, or none
+/// are in range — impossible for a single argmax over a 3×3 grid) falls back to the whole-image
+/// values the caller passes (`fallback_brightness01`, `fallback_hue_deg`) — the honest degrade to
+/// K1 whole-image behavior. `idxs` is the band's cell indices (`{1,3,5,7}` foreground,
+/// `{0,2,6,8}` background). PURE, deterministic.
+fn band_affect(
+    regions: &[RegionStats],
+    idxs: &[usize],
+    subj_idx: usize,
+    fallback_brightness01: f32,
+    fallback_hue_deg: f32,
+) -> (f32, f32) {
+    let mut n: u32 = 0;
+    let mut sum_v = 0.0f64; // brightness (mean_value 0..100) accumulator
+    let mut sum_cos = 0.0f64; // circular hue accumulators
+    let mut sum_sin = 0.0f64;
+    for &i in idxs {
+        if i == subj_idx || i >= regions.len() {
+            continue;
+        }
+        let r = regions[i];
+        n += 1;
+        sum_v += r.mean_value as f64;
+        let rad = (r.dominant_hue as f64).to_radians();
+        sum_cos += rad.cos();
+        sum_sin += rad.sin();
+    }
+    if n == 0 {
+        return (fallback_brightness01, fallback_hue_deg);
+    }
+    let nf = n as f64;
+    let brightness01 = ((sum_v / nf) / 100.0).clamp(0.0, 1.0) as f32;
+    // Circular mean angle, normalized into 0..360 (atan2 of the summed unit vectors).
+    let mut ang = (sum_sin / nf).atan2(sum_cos / nf).to_degrees();
+    if ang < 0.0 {
+        ang += 360.0;
+    }
+    (brightness01, ang as f32)
 }
 
 /// One scan-bar section's features over a sub-view. Mirrors the per-section work in
@@ -1433,5 +1503,88 @@ mod tests {
                 || (corner[0].mean_value - corner[2].mean_value).abs() > 1.0,
             "the corner blob makes cell 0 perceptually distinct from a flat corner cell"
         );
+    }
+
+    // ── S26 band_affect: per-region brightness + circular-mean hue re-surfacing ──
+
+    /// Build a `RegionStats` with only the fields `band_affect` reads set; the rest are inert.
+    fn rs(mean_value: f32, dominant_hue: f32) -> RegionStats {
+        RegionStats {
+            center: (0.5, 0.5),
+            area_frac: 1.0 / 9.0,
+            mean_value,
+            mean_saturation: 50.0,
+            edge_energy: 0.0,
+            dominant_hue,
+        }
+    }
+
+    #[test]
+    fn band_affect_means_brightness_and_hue() {
+        // 9 cells; foreground band {1,3,5,7} all 80% bright, hue 30°; subject cell 4 excluded.
+        let mut regions = vec![rs(0.0, 0.0); 9];
+        for &i in &[1usize, 3, 5, 7] {
+            regions[i] = rs(80.0, 30.0);
+        }
+        let (b, h) = band_affect(&regions, &[1, 3, 5, 7], 4, 0.5, 200.0);
+        assert!((b - 0.80).abs() < 1e-4, "band brightness = 0.80, got {b}");
+        assert!((h - 30.0).abs() < 1e-2, "band hue = 30°, got {h}");
+    }
+
+    #[test]
+    fn band_affect_excludes_subject_cell() {
+        // Cell 1 is the subject and carries an outlier hue/brightness; it must be excluded so
+        // the band reads only cells {3,5,7}.
+        let mut regions = vec![rs(40.0, 10.0); 9];
+        regions[1] = rs(100.0, 350.0); // subject outlier — must NOT contribute
+        let (b, h) = band_affect(&regions, &[1, 3, 5, 7], 1, 0.5, 200.0);
+        assert!(
+            (b - 0.40).abs() < 1e-4,
+            "subject excluded → band brightness = 0.40, got {b}"
+        );
+        assert!(
+            (h - 10.0).abs() < 1e-2,
+            "subject excluded → band hue = 10°, got {h}"
+        );
+    }
+
+    #[test]
+    fn band_affect_circular_hue_wrap() {
+        // Hues 350° and 10° (10° each side of 0) → circular mean ≈ 0°/360°, NOT the arithmetic 180°.
+        let mut regions = vec![rs(50.0, 0.0); 9];
+        regions[1] = rs(50.0, 350.0);
+        regions[3] = rs(50.0, 10.0);
+        let (_b, h) = band_affect(&regions, &[1, 3], 4, 0.5, 200.0);
+        let near_zero = h < 1.0 || h > 359.0;
+        assert!(
+            near_zero,
+            "circular mean of 350° and 10° ≈ 0°, got {h} (arithmetic would be 180°)"
+        );
+    }
+
+    #[test]
+    fn band_affect_degenerate_band_falls_back() {
+        // Every listed cell IS the subject → no contributors → fallback verbatim.
+        let regions = vec![rs(80.0, 30.0); 9];
+        let (b, h) = band_affect(&regions, &[4], 4, 0.123, 222.0);
+        assert!(
+            (b - 0.123).abs() < 1e-6,
+            "degenerate band → fallback brightness, got {b}"
+        );
+        assert!(
+            (h - 222.0).abs() < 1e-4,
+            "degenerate band → fallback hue, got {h}"
+        );
+    }
+
+    #[test]
+    fn band_affect_deterministic() {
+        let mut regions = vec![rs(0.0, 0.0); 9];
+        for &i in &[0usize, 2, 6, 8] {
+            regions[i] = rs(60.0, 120.0);
+        }
+        let a = band_affect(&regions, &[0, 2, 6, 8], 4, 0.5, 200.0);
+        let b = band_affect(&regions, &[0, 2, 6, 8], 4, 0.5, 200.0);
+        assert_eq!(a, b, "band_affect is deterministic on identical input");
     }
 }

@@ -85,6 +85,22 @@ pub struct ImageUnderstanding {
     pub foreground_energy: f32,
     /// Energy in the background band (the corner cells minus the subject), 0..1. NEW S18.
     pub background_energy: f32,
+    /// NEW S26 — mean brightness (0..1) of the foreground band (the non-subject edge-mid cells
+    /// {1,3,5,7} minus the subject cell). Per-region valence proxy: lets the planner travel the
+    /// foreground excursion by the foreground's OWN brightness, not the whole image. Pure pixel
+    /// stat re-surfaced from the existing region pass. Defaults to whole-image `avg_brightness/100`
+    /// in `neutral()` and when the band is degenerate (honest fallback → K1 whole-image behavior).
+    pub foreground_brightness: f32,
+    /// NEW S26 — mean brightness (0..1) of the background band (corner cells {0,2,6,8} minus the
+    /// subject cell). Same per-region discipline as `foreground_brightness`.
+    pub background_brightness: f32,
+    /// NEW S26 — dominant hue (0..360) of the foreground band. Per-region hue, so the
+    /// near-vs-relative hue-distance test (`region_excursion_offset`) measures the FOREGROUND's
+    /// hue against the subject, not the whole image. Defaults to `secondary_hue`.
+    pub foreground_hue: f32,
+    /// NEW S26 — dominant hue (0..360) of the background band. Same discipline; defaults to
+    /// `secondary_hue`.
+    pub background_hue: f32,
     /// NEW S22 — the planner-computed arousal composite (0..1). NOT extracted from pixels and
     /// NOT deserialized; `pure_analysis::understand_image_pure` and `neutral()` leave it at the
     /// `-1.0` sentinel ("not yet computed"), and the planner overwrites it via `affect_composite`
@@ -124,6 +140,12 @@ impl ImageUnderstanding {
             subject_energy: 0.0,
             foreground_energy: 0.0,
             background_energy: 0.0,
+            // S26 per-region affect: whole-image fallbacks (avg_brightness/100, secondary_hue) so a
+            // neutral understanding reproduces K1 whole-image behavior.
+            foreground_brightness: 0.5, // == avg_brightness (50.0) / 100.0
+            background_brightness: 0.5,
+            foreground_hue: 0.0, // == secondary_hue
+            background_hue: 0.0,
             affect_arousal: -1.0,
             affect_valence: -1.0,
         }
@@ -455,13 +477,50 @@ pub struct KeySchemeSection {
     pub offset_rule: String,
 }
 
-/// A named per-section offset rule set (S24). "home_only" (empty `sections`) is the identity
-/// anchor. Parallel to [`ProminenceProfile`]; resolved once per plan by [`resolve_key_scheme`].
+/// How a key scheme ENDS — the operator's "lands home vs stays open" decision, per scheme
+/// (S26). Open/off-home endings are a DELIBERATE feature, not a defect: some forms (and some
+/// images routed onto them) legitimately end unresolved. The policy is DATA (a JSON enum tag),
+/// resolved by the planner; the realizer reads only the per-section offsets + the pivot/land
+/// flags derived from it. `Resolve` is the byte-stable default (it is what every K1 scheme does
+/// implicitly today — the final section is "home"). NEW S26.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionPolicy {
+    /// The FINAL section's offset is forced to 0 (home) regardless of its `offset_rule`, and the
+    /// realizer's land-home cadence (K3) is armed for that boundary. This realizes Invariant A:
+    /// a Coda on new material still resolves to the HOME key. The K1 / default behavior.
+    Resolve,
+    /// The final section keeps its own `offset_rule`-derived offset (may be non-zero → ends
+    /// OFF-home). The land-home cadence is NOT armed. This is the deliberate open ending.
+    Open,
+}
+
+impl Default for ResolutionPolicy {
+    /// Absent in JSON → `Resolve` (the byte-stable, ends-home default; matches every K1 scheme).
+    fn default() -> Self {
+        ResolutionPolicy::Resolve
+    }
+}
+
+/// A named per-section offset rule set (S24, GENERALIZED S26). "home_only" (empty `sections`) is
+/// the identity anchor. Parallel to [`ProminenceProfile`]; resolved once per plan by
+/// [`resolve_key_scheme`]. NOW carries a resolution policy (lands-home vs open) and an opt-in
+/// realizer-pivot flag — both `#[serde(default)]` so old JSON parses byte-identically.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct KeyScheme {
     pub id: String,
     #[serde(default)]
     pub sections: Vec<KeySchemeSection>,
+    /// NEW S26 — how the scheme ends. `#[serde(default)]` → `Resolve` (ends home; the K1
+    /// behavior). `Open` lets the final section stay off-home (the deliberate open ending).
+    #[serde(default)]
+    pub resolution: ResolutionPolicy,
+    /// NEW S26 — opt-in: when `true`, the realizer (K3) inserts a witnessed pivot chord at each
+    /// modulating section boundary and a land-home cadence at a `Resolve` final return. `false`
+    /// (the default) keeps the K1 direct-modulation behavior AND is the realizer byte-freeze
+    /// gate — with `pivot == false` the realizer inserts NOTHING. `#[serde(default)]` → `false`.
+    #[serde(default)]
+    pub pivot: bool,
 }
 
 /// One named accompaniment-figuration pattern — pure STRUCTURE, no note content. Animates a
@@ -556,6 +615,14 @@ pub enum Knob {
     SubjectEnergy,
     ForegroundEnergy,
     BackgroundEnergy,
+    /// NEW S26 — mean brightness (0..1) of the foreground band. Reads `foreground_brightness`.
+    ForegroundBrightness,
+    /// NEW S26 — mean brightness (0..1) of the background band. Reads `background_brightness`.
+    BackgroundBrightness,
+    /// NEW S26 — dominant hue (0..360) of the foreground band. Reads `foreground_hue`.
+    ForegroundHue,
+    /// NEW S26 — dominant hue (0..360) of the background band. Reads `background_hue`.
+    BackgroundHue,
     /// NEW S22 — the planner-computed arousal composite (0..1). Reads the runtime-only
     /// `affect_arousal` field the planner fills via `affect_composite` (NOT a pixel field).
     Arousal,
@@ -585,6 +652,10 @@ impl Knob {
             Knob::SubjectEnergy => u.subject_energy,
             Knob::ForegroundEnergy => u.foreground_energy,
             Knob::BackgroundEnergy => u.background_energy,
+            Knob::ForegroundBrightness => u.foreground_brightness,
+            Knob::BackgroundBrightness => u.background_brightness,
+            Knob::ForegroundHue => u.foreground_hue,
+            Knob::BackgroundHue => u.background_hue,
             Knob::Arousal => u.affect_arousal,
             Knob::Valence => u.affect_valence,
         }
@@ -1058,10 +1129,20 @@ impl CompositionPlanner {
             assigned += step_len;
 
             // Fill this section's harmony via the EXISTING chord_engine craft.
+            // S26 §4.1(i) PLANNER RE-ROOT: generate this section's chords at the per-section root
+            // `home_root_midi + key_offset_semitones` (NOT the literal home root), so the HARMONY
+            // travels with the melody's transposed tonic instead of sounding in the home key. This
+            // is a PLANNER change — `chord_engine::generate_chords` is called with a different root
+            // arg; its body is untouched. BYTE-IDENTICAL at offset 0 (home_root + 0 = same root →
+            // identical chords → the `home_only`/identity path is unchanged). Saturating i16 cast
+            // keeps the root a valid MIDI byte for the menu offsets {+7,+5,+3,−3}.
+            let section_offset = offsets.get(i).copied().unwrap_or(0);
+            let section_root_midi =
+                (home_root_midi as i16 + section_offset as i16).clamp(0, 127) as u8;
             let progression = chord_engine.pick_progression(&home_mode);
             let chords = chord_engine.generate_chords(
                 &progression,
-                home_root_midi,
+                section_root_midi,
                 &home_mode,
                 u.edge_activity * EDGE_ACTIVITY_RANGE_MAX, // raw edge density
                 brightness_drop,
@@ -1074,7 +1155,7 @@ impl CompositionPlanner {
                 label: tpl.label.clone(),
                 step_len,
                 thematic_role: tpl.role,
-                key_offset_semitones: offsets.get(i).copied().unwrap_or(0), // S24: image key plan
+                key_offset_semitones: section_offset, // S24: image key plan (S26-resolved)
                 ms_per_step: base_ms_per_step,
                 mode: home_mode.clone(),
                 progression,
@@ -1196,67 +1277,120 @@ fn relative_offset(home_mode: &str) -> i8 {
     }
 }
 
-/// The B/C excursion offset for one non-subject region (S24, Decisions 2/3/4). PURE.
+/// The recognized `offset_rule` grammar (S26). Parsed in [`resolve_key_scheme`]; an unrecognized
+/// string degrades to `Home` (offset 0 — byte-stable). This is the string contract expressed as
+/// an internal enum the planner maps the string onto; it is NOT a serde type (the JSON stays a
+/// string so old/unknown rules degrade rather than fail to parse).
 ///
-/// - Direction reads the whole-image S21 `affect_valence` (the only valence axis on
-///   `ImageUnderstanding`): high valence → the bright side (dominant +7 near / relative on
-///   strong contrast); low valence → the flat side (subdominant +5 near / relative on strong
-///   contrast). Because mode (valence-owned) and this direction read the SAME axis, they cannot
-///   fight.
-/// - Near-vs-relative reads hue distance: a B-region hue CLOSE to the subject's picks the near
-///   key (dominant/subdominant); a STRONG hue contrast picks the relative (±3) — "different but
-///   still related."
-///
-/// Field reality (design Risk 3): per-region *brightness* is not first-class, so direction uses
-/// the whole-image `affect_valence` proxy; the non-subject region's hue uses `secondary_hue`
-/// (the closest available non-subject hue field — `dominant_hue`/`subject_hue` are the subject
-/// side). Energy-ordering (which region is B) is the caller's concern; it does not change the
-/// menu math here because no per-region valence/hue split exists yet.
-fn excursion_offset(u: &ImageUnderstanding, home_mode: &str) -> i8 {
-    // Hue distance subject ↔ non-subject region, on the 0..360 circle (wrap-aware, 0..180).
-    let raw = (u.subject_hue - u.secondary_hue).abs() % 360.0;
-    let hue_dist = if raw > 180.0 { 360.0 - raw } else { raw };
-    const STRONG_CONTRAST_DEG: f32 = 60.0; // beyond this, the regions are a distinct color.
+/// - `"home"`             → `Home`              (offset 0; binds a Statement/Return/home role)
+/// - `"region_related:b"` → `Excursion(rank 0)` (the MOST-energetic non-subject region)
+/// - `"region_related:c"` → `Excursion(rank 1)` (the SECOND-most-energetic non-subject region)
+/// - `"region_related:d"` → `Excursion(rank 2)` (… extends to N excursions; reserved)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffsetRule {
+    /// Home key, offset 0 (binds a home role).
+    Home,
+    /// `rank` indexes into the energy-DESCENDING ordering of the non-subject regions: rank 0 =
+    /// most energetic (the eye's first stop), rank 1 = next, … Each rank reads THAT region's own
+    /// affect (S26 §3) so distinct ranks travel to genuinely distinct keys.
+    Excursion(u8),
+}
 
-    // Three-band valence direction (pinned doc docs/input-s25-k1-keyplan-harmony.md §3 seeds):
-    //   high  affect_valence >= HIGH_VALENCE_MIN (0.60) → dominant +7
-    //   mid   open interval (LOW_VALENCE_MAX, HIGH_VALENCE_MIN) = (0.40, 0.60) → dominant +7 ("go to V and come back")
-    //   low   affect_valence <= LOW_VALENCE_MAX (0.40, inclusive) → subdominant +5
-    // High AND mid both resolve to +7; only low resolves to +5 — so the near split collapses to
-    //   affect_valence > LOW_VALENCE_MAX → +7, else (<= LOW_VALENCE_MAX) → +5.
+/// Parse an `offset_rule` string into the closed [`OffsetRule`] grammar (S26). Unknown → `Home`
+/// (byte-stable degrade). Pure, total.
+fn parse_offset_rule(s: &str) -> OffsetRule {
+    match s {
+        "home" => OffsetRule::Home,
+        "region_related:b" => OffsetRule::Excursion(0),
+        "region_related:c" => OffsetRule::Excursion(1),
+        "region_related:d" => OffsetRule::Excursion(2),
+        _ => OffsetRule::Home, // unknown rule → home (byte-stable degrade).
+    }
+}
+
+/// One non-subject region's affect, energy-ranked (S26). The planner builds an energy-DESCENDING
+/// list of these from the per-region fields (§3) so [`resolve_key_scheme`] can address "the
+/// rank-th region." Pure data; no music.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RegionAffect {
+    /// Region brightness 0..1 (per-region valence proxy; from §3 `*_brightness`).
+    valence: f32,
+    /// Region dominant hue 0..360 (from §3 `*_hue`).
+    hue: f32,
+    /// Region energy 0..1 (the existing `foreground_energy`/`background_energy`), the rank key.
+    energy: f32,
+}
+
+/// The B/C/… excursion offset for ONE specific non-subject region (S24 Decisions 3/4,
+/// REGIONALIZED S26). Same menu math as the K1 `excursion_offset`, but reads the GIVEN region's
+/// own valence/hue (from §3) instead of whole-image affect, and the hue distance is measured
+/// against the SUBJECT hue. Direction: high region-valence → dominant +7 (near) / relative on
+/// strong hue contrast; low → subdominant +5 (near) / relative on strong contrast. Returns a
+/// value in the v1 menu `{+7, +5, +3, −3}`. PURE.
+///
+/// GENERALIZATION INVARIANT: when called with a `RegionAffect` built from WHOLE-IMAGE affect
+/// (`valence = affect_valence`, `hue = secondary_hue`) it reproduces the K1 `excursion_offset`
+/// EXACTLY — same hue-distance test (subject_hue ↔ region hue), same three-band valence collapse
+/// (high/mid → +7, low → +5), same `relative_offset` on strong contrast. The thresholds are the
+/// pinned S25 seeds (`docs/input-s25-k1-keyplan-harmony.md` §3): τ_lo 0.40 (inclusive LOW),
+/// τ_hi 0.60 (HIGH), τ_contrast 60°.
+fn region_excursion_offset(region: &RegionAffect, subject_hue: f32, home_mode: &str) -> i8 {
+    // Hue distance subject ↔ this region, on the 0..360 circle (wrap-aware, 0..180).
+    let raw = (subject_hue - region.hue).abs() % 360.0;
+    let hue_dist = if raw > 180.0 { 360.0 - raw } else { raw };
+    const STRONG_CONTRAST_DEG: f32 = 60.0; // τ_contrast: beyond this, a distinct color → relative.
+
+    // Three-band valence direction (pinned S25 §3 seeds). HIGH and MID both lift to +7; only LOW
+    // settles to +5 — the same collapse K1 shipped (the +7/+5 split turns on the τ_lo boundary).
     // Boundary handling: exactly 0.40 (τ_lo) is LOW (inclusive); exactly 0.60 (τ_hi) is HIGH.
     const LOW_VALENCE_MAX: f32 = 0.40; // τ_lo: at/below → LOW (subdominant +5).
     const HIGH_VALENCE_MIN: f32 = 0.60; // τ_hi: at/above → HIGH (dominant +7).
 
-    // Classify into the doc's three bands, then collapse: HIGH and MID both lift to +7, only LOW
-    // settles to +5. Naming both bands keeps the τ_lo/τ_hi seeds explicit even though the +7/+5
-    // split only turns on the τ_lo boundary.
-    let high = u.affect_valence >= HIGH_VALENCE_MIN; // >= 0.60 → HIGH.
-    let low = u.affect_valence <= LOW_VALENCE_MAX; // <= 0.40 → LOW (inclusive).
+    let high = region.valence >= HIGH_VALENCE_MIN; // >= 0.60 → HIGH.
+    let low = region.valence <= LOW_VALENCE_MAX; // <= 0.40 → LOW (inclusive).
     let mid = !high && !low; // open interval (0.40, 0.60) → MID.
     if hue_dist >= STRONG_CONTRAST_DEG {
         // Strong color contrast → the relative (the "different but still related" move).
         relative_offset(home_mode)
     } else if high || mid {
-        7 // near + (HIGH >= 0.60 OR MID open (0.40,0.60)) → dominant lift ("go to V and come back").
+        7 // near + (HIGH or MID) → dominant lift ("go to V and come back").
     } else {
-        5 // near + LOW (<= τ_lo 0.40) → subdominant settle (+5 = IV up a perfect fourth; pitch-class correct).
+        5 // near + LOW → subdominant settle (+5 = IV up a perfect fourth; pitch-class correct).
     }
 }
 
-/// Resolve a [`KeyScheme`]'s per-section offset RULES into concrete `key_offset_semitones`
-/// (S24). Returns one `i8` per section IN ORDER, length == `sections.len()`. "home" → 0;
-/// "region_related:b" → the more-energetic non-subject region's menu entry; "region_related:c"
-/// → the OTHER non-subject region (K2). A `None`/empty scheme or any unknown rule → all-zero
-/// (the identity / byte-freeze path). PURE: no clock, no RNG.
+/// The B/C excursion offset reading WHOLE-IMAGE affect — the K1 shim (S24, GENERALIZED S26).
+/// Builds a whole-image [`RegionAffect`] (`valence = affect_valence`, `hue = secondary_hue`) and
+/// delegates to [`region_excursion_offset`], which by the GENERALIZATION INVARIANT reproduces the
+/// K1 menu math byte-for-byte. Kept as the documented equivalence anchor and the fallback path
+/// when no per-region affect is available. PURE.
+fn excursion_offset(u: &ImageUnderstanding, home_mode: &str) -> i8 {
+    let whole_image = RegionAffect {
+        valence: u.affect_valence,
+        hue: u.secondary_hue,
+        energy: 0.0, // energy is the ranking key only; irrelevant to the menu math.
+    };
+    region_excursion_offset(&whole_image, u.subject_hue, home_mode)
+}
+
+/// Resolve a [`KeyScheme`]'s per-section offset RULES into concrete `key_offset_semitones` (S24,
+/// GENERALIZED S26). Returns one `i8` per section IN ORDER, length == `sections.len()`.
 ///
-/// The energy-ordered region pick (Decision 2): B reads the more-energetic of
-/// `background_energy`/`foreground_energy`, C reads the other. In v1 the menu math
-/// ([`excursion_offset`]) is the same for either region (no per-region valence/hue split is
-/// available yet — design Risk 3), so the rule tag selects which region label is conceptually
-/// the source; the resolved offset is identical until per-region affect lands. The returned
-/// length always equals the form's section count (zero-pad/truncate on mismatch; a debug-only
-/// role-alignment assertion fires per Risk 6).
+/// - `"home"` → 0 (binds a home role: Statement/Return).
+/// - `"region_related:b|c|d"` → `Excursion(rank)`: the menu offset computed from the rank-th
+///   most-energetic NON-SUBJECT region's OWN affect (per-region brightness/hue from §3), so
+///   distinct ranks travel to genuinely distinct keys (the "eye sweeps twice" intent).
+/// - The `scheme.resolution` policy is applied LAST: `Resolve` forces the FINAL section's offset
+///   to 0 (Invariant A — a Coda on new material still lands home); `Open` leaves it as resolved
+///   (the deliberate off-home ending).
+/// - A `None`/empty (`home_only`) scheme, or any unknown rule, yields all-zero (the identity /
+///   byte-freeze path). PURE: no clock, no RNG.
+///
+/// The energy-DESCENDING region ranking (Decision 2 generalized) is computed once from the two
+/// non-subject regions (foreground / background band affect); rank `k` selects the k-th region.
+/// A rank beyond the available regions falls back to whole-image affect (K1 behavior). The
+/// returned length always equals the form's section count (zero-pad/truncate on mismatch; the
+/// debug-only role-alignment assertion fires per Risk 6).
 fn resolve_key_scheme(
     scheme: Option<&KeyScheme>,
     sections: &[SectionTemplate],
@@ -1269,29 +1403,68 @@ fn resolve_key_scheme(
         _ => return vec![0i8; n], // None / empty (home_only) → all-zero identity.
     };
 
-    // Energy-order the two non-subject regions (Decision 2). In v1 both regions feed the same
-    // menu math, so this records intent; the per-region split is a later slice.
-    let b_is_background = u.background_energy >= u.foreground_energy;
-    let _b_region_background = b_is_background; // documents the energy-order pick (Risk 3).
+    // Energy-DESCENDING ranking of the two non-subject regions (Decision 2 generalized). Each
+    // RegionAffect carries that region's OWN per-region brightness (valence proxy) + hue (§3) so
+    // a distinct rank travels to a genuinely distinct key. Stable tiebreak: foreground before
+    // background when energies tie (deterministic; Risk 5).
+    let fg = RegionAffect {
+        valence: u.foreground_brightness,
+        hue: u.foreground_hue,
+        energy: u.foreground_energy,
+    };
+    let bg = RegionAffect {
+        valence: u.background_brightness,
+        hue: u.background_hue,
+        energy: u.background_energy,
+    };
+    let ranked: [RegionAffect; 2] = if bg.energy > fg.energy {
+        // background strictly more energetic → it is rank 0 (the eye's first stop).
+        [bg, fg]
+    } else {
+        // foreground >= background (stable tiebreak → foreground first).
+        [fg, bg]
+    };
+
+    // Whole-image fallback for any rank beyond the two ranked regions (K1 behavior).
+    let whole_image = RegionAffect {
+        valence: u.affect_valence,
+        hue: u.secondary_hue,
+        energy: 0.0,
+    };
 
     let mut offsets: Vec<i8> = Vec::with_capacity(n);
     for i in 0..n {
-        let off = match scheme.sections.get(i).map(|s| s.offset_rule.as_str()) {
-            Some("home") => 0,
-            Some("region_related:b") | Some("region_related:c") => excursion_offset(u, home_mode),
-            _ => 0, // unknown rule OR scheme shorter than the form → home (byte-stable degrade).
+        let rule = scheme
+            .sections
+            .get(i)
+            .map(|s| parse_offset_rule(s.offset_rule.as_str()))
+            .unwrap_or(OffsetRule::Home); // scheme shorter than the form → home (byte-stable degrade).
+        let off = match rule {
+            OffsetRule::Home => 0,
+            OffsetRule::Excursion(rank) => {
+                let region = ranked.get(rank as usize).unwrap_or(&whole_image);
+                region_excursion_offset(region, u.subject_hue, home_mode)
+            }
         };
         offsets.push(off);
+    }
+
+    // S26 resolution policy, applied LAST. `Resolve` forces the FINAL section's offset to 0
+    // (Invariant A — a Coda on new material still lands home, the byte-stable K1 default);
+    // `Open` leaves the final offset as resolved (the deliberate off-home ending). On an empty
+    // form (n == 0) there is no final section to touch.
+    if n > 0 && scheme.resolution == ResolutionPolicy::Resolve {
+        offsets[n - 1] = 0;
     }
 
     // Risk 6 role-alignment witness (debug only, never panics in release; the length mismatch is
     // already tolerated by the pad/truncate above): a "home" rule must land on a home role
     // (Statement/Return), and a "region_related:*" rule must land on a non-home role
-    // (Contrast/Development/Coda). A mismatch means the scheme and the form disagree on structure.
+    // (Contrast/Development/Coda — Coda is allowed a non-home rule now, the Option A change).
     for (i, tpl) in sections.iter().enumerate() {
         if let Some(rule) = scheme.sections.get(i) {
             let role_is_home = matches!(tpl.role, ThematicRole::Statement | ThematicRole::Return);
-            let rule_is_home = rule.offset_rule == "home";
+            let rule_is_home = parse_offset_rule(rule.offset_rule.as_str()) == OffsetRule::Home;
             debug_assert_eq!(
                 rule_is_home, role_is_home,
                 "key scheme rule/role mismatch at section {} (role {:?}, rule {:?})",
@@ -1626,5 +1799,269 @@ mod tests {
         assert!(ctx.theme.is_none());
         assert_eq!(ctx.key_tempo.home_root_midi, 60);
         assert_eq!(ctx.section.key_offset_semitones, 0);
+    }
+
+    // ── S26 generalized key-plan: parse_offset_rule / region_excursion_offset / resolve ──
+
+    #[test]
+    fn parse_offset_rule_grammar() {
+        assert_eq!(parse_offset_rule("home"), OffsetRule::Home);
+        assert_eq!(
+            parse_offset_rule("region_related:b"),
+            OffsetRule::Excursion(0)
+        );
+        assert_eq!(
+            parse_offset_rule("region_related:c"),
+            OffsetRule::Excursion(1)
+        );
+        assert_eq!(
+            parse_offset_rule("region_related:d"),
+            OffsetRule::Excursion(2)
+        );
+        // Unknown / malformed → Home (byte-stable degrade).
+        assert_eq!(parse_offset_rule("region_related:z"), OffsetRule::Home);
+        assert_eq!(parse_offset_rule(""), OffsetRule::Home);
+        assert_eq!(parse_offset_rule("garbage"), OffsetRule::Home);
+    }
+
+    /// `region_excursion_offset` built from WHOLE-IMAGE affect must reproduce the K1
+    /// `excursion_offset` EXACTLY (the GENERALIZATION INVARIANT — keeps K1 tests green).
+    #[test]
+    fn region_excursion_reproduces_k1_on_whole_image() {
+        // Sweep valence bands × hue contrast × mode families; the whole-image RegionAffect path
+        // must equal the K1 shim for every combination.
+        for &valence in &[0.0f32, 0.39, 0.40, 0.41, 0.59, 0.60, 0.61, 1.0] {
+            for &(subj, sec) in &[(0.0f32, 0.0f32), (10.0, 30.0), (0.0, 90.0), (10.0, 200.0)] {
+                for mode in &["Ionian", "Aeolian", "Dorian", "Lydian", "Mixolydian"] {
+                    let mut u = ImageUnderstanding::neutral();
+                    u.affect_valence = valence;
+                    u.subject_hue = subj;
+                    u.secondary_hue = sec;
+                    let k1 = excursion_offset(&u, mode);
+                    let region = RegionAffect {
+                        valence,
+                        hue: sec,
+                        energy: 0.0,
+                    };
+                    let generalized = region_excursion_offset(&region, subj, mode);
+                    assert_eq!(
+                        k1, generalized,
+                        "K1 reproduction failed: valence={valence} subj={subj} sec={sec} mode={mode}"
+                    );
+                    // Menu membership.
+                    assert!(
+                        [7i8, 5, 3, -3].contains(&generalized),
+                        "offset {generalized} not in the v1 menu"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `region_excursion_offset` direction: high region-valence → +7, low → +5 (near, no strong
+    /// hue contrast); strong hue contrast → relative.
+    #[test]
+    fn region_excursion_direction_from_region_affect() {
+        // Near (hue_dist 0), high valence → +7.
+        let hi = RegionAffect {
+            valence: 0.9,
+            hue: 30.0,
+            energy: 0.5,
+        };
+        assert_eq!(region_excursion_offset(&hi, 30.0, "Ionian"), 7);
+        // Near, low valence → +5.
+        let lo = RegionAffect {
+            valence: 0.1,
+            hue: 30.0,
+            energy: 0.5,
+        };
+        assert_eq!(region_excursion_offset(&lo, 30.0, "Ionian"), 5);
+        // Strong contrast (90° apart) → relative (major-family → −3).
+        let contrast = RegionAffect {
+            valence: 0.9,
+            hue: 120.0,
+            energy: 0.5,
+        };
+        assert_eq!(region_excursion_offset(&contrast, 0.0, "Ionian"), -3);
+        // Strong contrast, minor-family home → relative +3.
+        assert_eq!(region_excursion_offset(&contrast, 0.0, "Aeolian"), 3);
+    }
+
+    /// Two regions with DIFFERENT brightness travel to DIFFERENT keys (the core S26 win): the
+    /// rank-0 (more energetic) and rank-1 regions read their OWN affect.
+    #[test]
+    fn resolve_diverges_b_and_c_on_distinct_region_affect() {
+        // ABAC-shaped scheme: home / b / home / c, resolution Open so C keeps its own offset.
+        let scheme = KeyScheme {
+            id: "t".into(),
+            sections: vec![
+                KeySchemeSection {
+                    label: "A".into(),
+                    offset_rule: "home".into(),
+                },
+                KeySchemeSection {
+                    label: "B".into(),
+                    offset_rule: "region_related:b".into(),
+                },
+                KeySchemeSection {
+                    label: "A".into(),
+                    offset_rule: "home".into(),
+                },
+                KeySchemeSection {
+                    label: "C".into(),
+                    offset_rule: "region_related:c".into(),
+                },
+            ],
+            resolution: ResolutionPolicy::Open,
+            pivot: false,
+        };
+        let sections = vec![
+            st("A", ThematicRole::Statement, "home"),
+            st("B", ThematicRole::Contrast, "region_related:b"),
+            st("A", ThematicRole::Return, "home"),
+            st("C", ThematicRole::Coda, "region_related:c"),
+        ];
+        let mut u = ImageUnderstanding::neutral();
+        // foreground = rank-0 (more energetic), BRIGHT (→ +7); background = rank-1, DARK (→ +5).
+        u.foreground_energy = 0.9;
+        u.foreground_brightness = 0.9; // high valence → dominant +7
+        u.foreground_hue = 0.0; // near subject (subject_hue 0) → near path
+        u.background_energy = 0.3;
+        u.background_brightness = 0.1; // low valence → subdominant +5
+        u.background_hue = 0.0;
+        u.subject_hue = 0.0;
+        let offs = resolve_key_scheme(Some(&scheme), &sections, &u, "Ionian");
+        assert_eq!(offs.len(), 4);
+        assert_eq!(offs[0], 0, "A is home");
+        assert_eq!(offs[1], 7, "B (rank-0, bright) → dominant +7");
+        assert_eq!(offs[2], 0, "interior A is home");
+        assert_eq!(
+            offs[3], 5,
+            "C (rank-1, dark) → subdominant +5 — DISTINCT from B"
+        );
+        assert_ne!(
+            offs[1], offs[3],
+            "B and C travel to genuinely distinct keys"
+        );
+    }
+
+    /// `Resolve` forces the FINAL section's offset to 0 even on a region_related rule (Invariant
+    /// A); `Open` keeps it.
+    #[test]
+    fn resolve_policy_resolve_vs_open() {
+        let mk = |res: ResolutionPolicy| KeyScheme {
+            id: "t".into(),
+            sections: vec![
+                KeySchemeSection {
+                    label: "A".into(),
+                    offset_rule: "home".into(),
+                },
+                KeySchemeSection {
+                    label: "B".into(),
+                    offset_rule: "region_related:b".into(),
+                },
+                KeySchemeSection {
+                    label: "C".into(),
+                    offset_rule: "region_related:c".into(),
+                },
+            ],
+            resolution: res,
+            pivot: false,
+        };
+        let sections = vec![
+            st("A", ThematicRole::Statement, "home"),
+            st("B", ThematicRole::Contrast, "region_related:b"),
+            st("C", ThematicRole::Coda, "region_related:c"),
+        ];
+        let mut u = ImageUnderstanding::neutral();
+        u.foreground_energy = 0.9;
+        u.foreground_brightness = 0.9;
+        u.background_energy = 0.3;
+        u.background_brightness = 0.9; // both bright so the rule, not affect, drives the final-0 test
+        let resolved = resolve_key_scheme(
+            Some(&mk(ResolutionPolicy::Resolve)),
+            &sections,
+            &u,
+            "Ionian",
+        );
+        assert_eq!(
+            resolved[2], 0,
+            "Resolve forces the FINAL offset to 0 (Invariant A)"
+        );
+        assert_ne!(resolved[1], 0, "the non-final excursion still travels");
+        let open = resolve_key_scheme(Some(&mk(ResolutionPolicy::Open)), &sections, &u, "Ionian");
+        assert_ne!(open[2], 0, "Open keeps the final off-home offset");
+    }
+
+    /// A `None`/empty (`home_only`) scheme and an unknown rule both degrade to all-zero (the
+    /// byte-freeze identity path).
+    #[test]
+    fn resolve_home_only_and_unknown_are_all_zero() {
+        let sections = vec![
+            st("A", ThematicRole::Statement, "home"),
+            st("B", ThematicRole::Contrast, "home"),
+        ];
+        let u = ImageUnderstanding::neutral();
+        // None scheme.
+        assert_eq!(
+            resolve_key_scheme(None, &sections, &u, "Ionian"),
+            vec![0, 0]
+        );
+        // Empty (home_only) scheme.
+        let empty = KeyScheme {
+            id: "home_only".into(),
+            sections: vec![],
+            resolution: ResolutionPolicy::Resolve,
+            pivot: false,
+        };
+        assert_eq!(
+            resolve_key_scheme(Some(&empty), &sections, &u, "Ionian"),
+            vec![0, 0]
+        );
+        // Unknown rule → home (0). Both sections carry a HOME role so the unknown→Home degrade is
+        // exercised WITHOUT tripping the role-alignment debug witness (an unknown rule degrades to
+        // Home, so it must sit on a home role to stay aligned).
+        let home_sections = vec![
+            st("A", ThematicRole::Statement, "home"),
+            st("A2", ThematicRole::Return, "home"),
+        ];
+        let unknown = KeyScheme {
+            id: "x".into(),
+            sections: vec![
+                KeySchemeSection {
+                    label: "A".into(),
+                    offset_rule: "home".into(),
+                },
+                KeySchemeSection {
+                    label: "A2".into(),
+                    offset_rule: "region_related:zzz".into(),
+                },
+            ],
+            resolution: ResolutionPolicy::Open,
+            pivot: false,
+        };
+        assert_eq!(
+            resolve_key_scheme(Some(&unknown), &home_sections, &u, "Ionian"),
+            vec![0, 0],
+            "unknown rule degrades to home (0)"
+        );
+    }
+
+    /// `ResolutionPolicy` defaults to `Resolve` (the byte-stable ends-home default).
+    #[test]
+    fn resolution_policy_default_is_resolve() {
+        assert_eq!(ResolutionPolicy::default(), ResolutionPolicy::Resolve);
+    }
+
+    /// Helper: build a `SectionTemplate` for the resolve tests.
+    fn st(label: &str, role: ThematicRole, _rule: &str) -> SectionTemplate {
+        SectionTemplate {
+            label: label.into(),
+            role,
+            rel_len: 1.0,
+            theme: None,
+            variation: ThemeVariation::Identity,
+            boundary_cadence: CadenceStrength::Perfect,
+        }
     }
 }

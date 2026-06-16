@@ -561,19 +561,40 @@ fn energy_ordered_b_region() {
 // §5.9 — valence_direction (high → dominant +7; low → subdominant +5)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// §5.9 (Decision 4): a HIGH-valence firing image picks the dominant (+7); a LOW-valence one
-/// (with a SMALL hue distance so it stays on the near path and does not divert to the relative)
-/// picks the subdominant (+5). Valence is steered through `avg_brightness` (the planner
-/// overwrites `affect_valence` via `affect_composite`): brightness 90 → valence ≈ 0.79 (HIGH);
-/// brightness 20 → valence ≈ 0.30 (LOW). subject_hue == secondary_hue (hue distance 0 < 60°) so
-/// BOTH are firmly on the near path — isolating the valence axis from the near-vs-relative axis.
+/// §5.9 (Decision 4), RE-AUTHORED FOR K2a (the §5.8 caveat's anticipated landing):
+///
+/// K2a makes `region_excursion_offset` read the B-region's OWN per-region affect
+/// (`foreground_*`/`background_*`) instead of the WHOLE-IMAGE `affect_valence`/`secondary_hue`.
+/// The pre-K2a version of this test steered valence ONLY through `avg_brightness` (and left the
+/// per-region fields at their `neutral()` whole-image fallback, hue 0.0). Under K2a the B region
+/// (the rank-0 / more-energetic non-subject region) reads its OWN brightness as valence and its
+/// OWN hue against the subject hue — so a struct that names a non-zero `subject_hue` but leaves
+/// the region hue at the 0.0 default lands a spurious ≥60° hue contrast and routes to the
+/// RELATIVE (−3), NOT the +7/+5 the test means to exercise. That is the intended "per-region
+/// affect landed" change the suite header's §5.8 caveat predicted.
+///
+/// The fix speaks PER-REGION while keeping the MUSICAL intent untouched — it still validates
+/// direction-from-affect (HIGH region valence → dominant +7, LOW → subdominant +5), but now the
+/// valence is the B-region's own brightness and the near path is held by setting the B-region's
+/// own hue equal to the subject hue (distance 0 < 60°). The `aba_excursion` scheme's B uses
+/// `region_related:b` == rank 0; with `background_energy (0.6) > foreground_energy (0.4)` the
+/// BACKGROUND band is rank 0, so the B region reads `background_brightness`/`background_hue`. To
+/// make the test robust to the energy tiebreak we set BOTH regions' hue to the subject hue (the
+/// near path holds whichever region wins rank 0) and drive ONLY the rank-0 region's brightness
+/// across the high/low boundary — isolating the per-region valence axis from the
+/// near-vs-relative axis exactly as the K1 version isolated whole-image valence.
 #[test]
 fn valence_direction() {
     let m = mappings();
     let planner = CompositionPlanner::new(plan_mappings(&m));
 
-    // HIGH valence, near key ⇒ dominant +7.
-    let hi = craft(0.30, 90.0, 120.0, 120.0, 120.0, 0.0, 0.6, 0.4);
+    // HIGH per-region valence on the rank-0 (background) B region, near key ⇒ dominant +7.
+    // background_brightness 0.9 (>= 0.60 → HIGH); both region hues == subject_hue (120) → near.
+    let mut hi = craft(0.30, 90.0, 120.0, 120.0, 120.0, 0.0, 0.6, 0.4);
+    hi.background_brightness = 0.9; // rank-0 region's OWN valence (HIGH → +7)
+    hi.foreground_brightness = 0.9; // tiebreak-robust: foreground also HIGH
+    hi.background_hue = 120.0; // rank-0 region hue == subject_hue → hue dist 0 (near path)
+    hi.foreground_hue = 120.0;
     let plan_hi = planner.plan(&hi, &m);
     let b_hi = plan_hi
         .sections
@@ -583,13 +604,18 @@ fn valence_direction() {
         .key_offset_semitones;
     assert_eq!(
         b_hi, 7,
-        "high-valence (bright) near image must go to the DOMINANT (+7); got {b_hi} \
-         (scheme {:?})",
+        "HIGH per-region valence (rank-0 region brightness) on the near path must go to the \
+         DOMINANT (+7); got {b_hi} (scheme {:?})",
         plan_hi.key_tempo.key_scheme
     );
 
-    // LOW valence, near key ⇒ subdominant +5.
-    let lo = craft(0.30, 20.0, 120.0, 120.0, 120.0, 0.0, 0.6, 0.4);
+    // LOW per-region valence on the rank-0 (background) B region, near key ⇒ subdominant +5.
+    // background_brightness 0.1 (<= 0.40 → LOW); hues still == subject_hue (near path held).
+    let mut lo = craft(0.30, 20.0, 120.0, 120.0, 120.0, 0.0, 0.6, 0.4);
+    lo.background_brightness = 0.1; // rank-0 region's OWN valence (LOW → +5)
+    lo.foreground_brightness = 0.1; // tiebreak-robust: foreground also LOW
+    lo.background_hue = 120.0; // near path held
+    lo.foreground_hue = 120.0;
     let plan_lo = planner.plan(&lo, &m);
     let b_lo = plan_lo
         .sections
@@ -599,15 +625,16 @@ fn valence_direction() {
         .key_offset_semitones;
     assert_eq!(
         b_lo, 5,
-        "low-valence (dark) near image must go to the SUBDOMINANT (+5); got {b_lo} \
-         (scheme {:?})",
+        "LOW per-region valence (rank-0 region brightness) on the near path must go to the \
+         SUBDOMINANT (+5); got {b_lo} (scheme {:?})",
         plan_lo.key_tempo.key_scheme
     );
 
-    // The two genuinely DIVERGE on the valence axis (the direction read is live, not constant).
+    // The two genuinely DIVERGE on the per-region valence axis (the direction read is live, not
+    // constant) — the same musical property the K1 version asserted, now read per-region.
     assert_ne!(
         b_hi, b_lo,
-        "valence must STEER the B direction (+7 vs +5), not collapse to one key"
+        "per-region valence must STEER the B direction (+7 vs +5), not collapse to one key"
     );
 }
 
