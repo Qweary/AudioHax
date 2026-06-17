@@ -1,0 +1,109 @@
+#!/bin/sh
+# play — frictionless one-liner for AudioHax (image -> music, zero MIDI routing).
+#
+#   ./play [IMAGE] [extra flags...]
+#
+# Always drives the CURRENT source via `cargo run --release` (rebuilds if stale, so
+# "up to date" is guaranteed) and plays through the default in-process pure-Rust
+# synth — no external MIDI engine, no port wiring, nothing to set up. For the
+# max-quality external-MIDI route see `docs/midi-routing.md` (recap in `./play --help`).
+#
+# Zero-source-change wrapper: it only DRIVES the existing `audiohax play` binary.
+set -eu
+
+# Repo root = this script's own directory, so `./play` works from anywhere.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SAMPLE_IMAGE="assets/images/example.jpg"
+
+usage() {
+  cat <<'EOF'
+play — turn an image into music with one command (zero MIDI routing).
+
+USAGE
+  ./play [IMAGE] [extra flags...]
+
+WHAT IT DOES
+  Builds the latest source (cargo run --release, rebuilds if stale) and plays the
+  image through the built-in pure-Rust synth — it "just works" on this box with no
+  external MIDI engine, virtual port, or routing to configure.
+
+EXAMPLES
+  ./play                              # play the bundled sample image
+  ./play path/to/your-image.jpg       # play your own image
+  ./play my.png --instruments 6       # extra flags pass straight through to `play`
+  ./play my.png --ms-per-step 180     # ...e.g. slower/faster scan
+
+AUDIO A/B (in-process synth) — swap font / toggle reverb / set level, no rebuild:
+  ./play my.png --soundfont FluidR3_GM.sf2   # use a better SF2 (rustysynth is SF2-only)
+  ./play my.png --reverb off                 # reverb+chorus default ON; this goes dry
+  ./play my.png --gain 1.5                    # master gain + soft-clip (1.0 = unchanged)
+  Render configs to WAV for offline blind comparison:
+      audiohax render my.png --wav out.wav [--soundfont … --reverb off --gain 1.5]
+      tools/ab-render.sh my.png [SOUNDFONT.sf2]   # renders several configs at once
+
+MAX-QUALITY (optional) — route into an external synth/DAW for reverb+effects:
+  ./play my.png --midi-virtual        # creates an ALSA port, then wire it to FluidSynth
+  ./play my.png --output midi --midi-port FLUID
+  Full guide: docs/midi-routing.md   (this is output plumbing only; do NOT need it to hear sound)
+
+NOTES
+  Requires cargo on PATH. If you hit "cargo: not found", run:
+      export PATH="$HOME/.cargo/bin:$PATH"
+EOF
+}
+
+# Wrapper-level help (before we require cargo / a build).
+case "${1:-}" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+esac
+
+# cargo must be on PATH (userspace-only install on this box).
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "play: error: 'cargo' is not on your PATH." >&2
+  echo "play: hint: cargo is installed in your home dir — run this first, then retry:" >&2
+  echo '    export PATH="$HOME/.cargo/bin:$PATH"' >&2
+  exit 127
+fi
+
+# Run from the repo root so the binary's relative asset paths resolve.
+cd "$SCRIPT_DIR"
+
+# Decide the image argument.
+if [ "$#" -eq 0 ]; then
+  # No arg → play the committed sample image.
+  if [ ! -f "$SAMPLE_IMAGE" ]; then
+    echo "play: no image given and bundled sample '$SAMPLE_IMAGE' is missing." >&2
+    echo "play: usage: ./play path/to/image.jpg" >&2
+    exit 2
+  fi
+  echo "play: no image given — using bundled sample '$SAMPLE_IMAGE'."
+  echo "play: building/running latest (cargo run --release)…"
+  exec cargo run --release -- play "$SAMPLE_IMAGE"
+fi
+
+# First arg is the image; the rest pass through to `audiohax play`.
+IMAGE="$1"
+shift
+
+# Validate the image path early with a clear message (don't fail obscurely later).
+# Skip the existence check if the user passed a flag instead of a path (e.g.
+# `./play --list-midi-ports`), letting the binary handle/validate it.
+case "$IMAGE" in
+  -*)
+    echo "play: building/running latest (cargo run --release)…"
+    exec cargo run --release -- play "$IMAGE" "$@"
+    ;;
+esac
+
+if [ ! -f "$IMAGE" ]; then
+  echo "play: error: image not found: $IMAGE" >&2
+  echo "play: give a real path, e.g.:  ./play assets/images/example.jpg" >&2
+  exit 2
+fi
+
+echo "play: image '$IMAGE' → in-process synth (zero routing)."
+echo "play: building/running latest (cargo run --release)…"
+exec cargo run --release -- play "$IMAGE" "$@"

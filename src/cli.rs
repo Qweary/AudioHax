@@ -108,11 +108,62 @@ impl Default for PipelineArgs {
 /// rebuild. clap renders the variants kebab-cased as `synth` / `midi`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 pub enum OutputSink {
-    /// In-process pure-Rust SoundFont synth (rustysynth + cpal). Dry; the default.
+    /// In-process pure-Rust SoundFont synth (rustysynth + cpal). The default. NOTE:
+    /// rustysynth 1.3.6 ships reverb+chorus ON by default (a moderate per-channel
+    /// reverb send) — this path is NOT bone-dry. Toggle it with `--reverb on|off`.
     #[default]
     Synth,
     /// Route NoteEvents to an external MIDI port / DAW / FluidSynth / Qsynth.
     Midi,
+}
+
+/// On/off toggle for a binary audio effect (rustysynth exposes only a binary reverb
+/// toggle — there is no room/wet/damp parameter to expose).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum Toggle {
+    /// Effect enabled.
+    #[default]
+    On,
+    /// Effect disabled.
+    Off,
+}
+
+impl Toggle {
+    /// `true` when the toggle is `on`.
+    pub fn is_on(self) -> bool {
+        matches!(self, Toggle::On)
+    }
+}
+
+/// Shared in-process-synth audio A/B controls (S31). Flattened into `play` and
+/// `render`. DEFAULTS REPRODUCE TODAY'S BEHAVIOR EXACTLY: no `--soundfont` ⇒ the
+/// bundled GM font, `--reverb on` ⇒ rustysynth's default, `--gain 1.0` ⇒ unity (a
+/// guaranteed no-op). These only affect the in-process `synth` path; `--output midi`
+/// ignores them (the external engine owns its own font/effects/level).
+#[derive(Debug, Args, PartialEq, Clone)]
+pub struct AudioArgs {
+    /// Path to a `.sf2` SoundFont to use instead of the bundled GM font. rustysynth is
+    /// SF2-only (no SF3/compressed). A missing/unreadable/non-SF2 file fails loudly.
+    #[arg(long, value_name = "PATH")]
+    pub soundfont: Option<PathBuf>,
+    /// Reverb+chorus: `on` (default, rustysynth's own default) or `off` (bone-dry).
+    /// Binary only — rustysynth exposes no room/wet/damp control.
+    #[arg(long, value_enum, default_value_t = Toggle::On)]
+    pub reverb: Toggle,
+    /// Master gain applied in our audio callback, followed by a `tanh` soft-clip so
+    /// boosting can't hard-clip. `1.0` (default) is unity AND a bit-exact no-op.
+    #[arg(long, default_value_t = 1.0)]
+    pub gain: f32,
+}
+
+impl Default for AudioArgs {
+    fn default() -> Self {
+        AudioArgs {
+            soundfont: None,
+            reverb: Toggle::On,
+            gain: 1.0,
+        }
+    }
 }
 
 /// Args for `audiohax play`.
@@ -139,15 +190,28 @@ pub struct PlayArgs {
     pub midi_virtual: Option<String>,
     #[command(flatten)]
     pub pipeline: PipelineArgs,
+    #[command(flatten)]
+    pub audio: AudioArgs,
 }
 
 /// Args for `audiohax render`.
+///
+/// S31: gains a `--wav <PATH>` offline render-to-WAV mode (the deterministic A/B
+/// harness output) plus the shared [`AudioArgs`] so the SAME composition can be
+/// rendered apples-to-apples through different soundfont/reverb/gain configs.
 #[derive(Debug, Args, PartialEq)]
 pub struct RenderArgs {
     /// Image path; omit to use the example image.
     pub image: Option<PathBuf>,
+    /// Render the synthesized audio of this image to a WAV at this path (offline,
+    /// no audio device), honoring `--soundfont`/`--reverb`/`--gain`. Deterministic:
+    /// the same image+config always yields a byte-identical WAV — for blind A/B.
+    #[arg(long, value_name = "PATH")]
+    pub wav: Option<PathBuf>,
     #[command(flatten)]
     pub pipeline: PipelineArgs,
+    #[command(flatten)]
+    pub audio: AudioArgs,
 }
 
 /// Args for `audiohax analyze`.
@@ -784,6 +848,103 @@ mod tests {
     #[test]
     fn output_sink_default_is_synth() {
         assert_eq!(OutputSink::default(), OutputSink::Synth);
+    }
+
+    // ── S31: audio A/B controls (--soundfont / --reverb / --gain / render --wav) ──
+
+    #[test]
+    fn play_audio_defaults_preserve_current_behavior() {
+        // No audio flags ⇒ bundled font, reverb on, unity gain (the must-not-break path).
+        let cli = Cli::try_parse_from(["audiohax", "play", "pic.png"]).expect("parse play");
+        match cli.command {
+            Command::Play(p) => {
+                assert_eq!(p.audio, AudioArgs::default());
+                assert_eq!(p.audio.soundfont, None, "bundled font by default");
+                assert_eq!(p.audio.reverb, Toggle::On, "reverb on by default");
+                assert_eq!(p.audio.gain, 1.0, "unity gain by default");
+            }
+            other => panic!("expected Play, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn play_accepts_soundfont_reverb_gain() {
+        let cli = Cli::try_parse_from([
+            "audiohax",
+            "play",
+            "pic.png",
+            "--soundfont",
+            "/fonts/FluidR3_GM.sf2",
+            "--reverb",
+            "off",
+            "--gain",
+            "1.5",
+        ])
+        .expect("parse audio flags");
+        match cli.command {
+            Command::Play(p) => {
+                assert_eq!(
+                    p.audio.soundfont,
+                    Some(PathBuf::from("/fonts/FluidR3_GM.sf2"))
+                );
+                assert_eq!(p.audio.reverb, Toggle::Off);
+                assert!(!p.audio.reverb.is_on());
+                assert!((p.audio.gain - 1.5).abs() < 1e-6);
+            }
+            other => panic!("expected Play, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn play_rejects_unknown_reverb_variant() {
+        let r = Cli::try_parse_from(["audiohax", "play", "--reverb", "loud"]);
+        assert!(r.is_err(), "--reverb only accepts on|off");
+    }
+
+    #[test]
+    fn render_accepts_wav_and_audio_flags() {
+        let cli = Cli::try_parse_from([
+            "audiohax",
+            "render",
+            "pic.png",
+            "--wav",
+            "out.wav",
+            "--soundfont",
+            "f.sf2",
+            "--reverb",
+            "off",
+            "--gain",
+            "2.0",
+        ])
+        .expect("parse render --wav");
+        match cli.command {
+            Command::Render(r) => {
+                assert_eq!(r.wav, Some(PathBuf::from("out.wav")));
+                assert_eq!(r.audio.soundfont, Some(PathBuf::from("f.sf2")));
+                assert_eq!(r.audio.reverb, Toggle::Off);
+                assert!((r.audio.gain - 2.0).abs() < 1e-6);
+            }
+            other => panic!("expected Render, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn render_audio_defaults_when_no_flags() {
+        let cli = Cli::try_parse_from(["audiohax", "render", "pic.png"]).expect("parse render");
+        match cli.command {
+            Command::Render(r) => {
+                assert_eq!(r.wav, None);
+                assert_eq!(r.audio, AudioArgs::default());
+            }
+            other => panic!("expected Render, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn toggle_is_on_helper() {
+        assert!(Toggle::On.is_on());
+        assert!(!Toggle::Off.is_on());
+        assert_eq!(Toggle::default(), Toggle::On);
     }
 
     #[test]

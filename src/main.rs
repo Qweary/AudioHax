@@ -40,7 +40,7 @@ mod image_source;
 // is chosen at RUNTIME (see the `--output`/`--midi-virtual` branch below), not by cfg.
 mod midi_output;
 
-use audiohax::cli::{pipeline_to_engine_config, Cli, Command, OutputSink, PlayArgs};
+use audiohax::cli::{pipeline_to_engine_config, Cli, Command, OutputSink, PlayArgs, RenderArgs};
 use audiohax::engine::{AudioSink, FeatureSource, PipelineEngine};
 use audiohax::mapping_loader::load_mappings;
 use clap::Parser;
@@ -235,6 +235,138 @@ fn step_rect(
     (rect, vertical_default, bar_w, bar_h)
 }
 
+/// S31 A/B harness: render `render_args.image` to a WAV at `wav_path`, OFFLINE (no audio
+/// device) and DETERMINISTICALLY (no jitter, no RNG, no wall clock), honoring
+/// `--soundfont`/`--reverb`/`--gain`. Because the engine's per-step decisions are
+/// deterministic and we lay them out on a fixed `ms_per_step` grid WITHOUT the live
+/// jitter, the same image+config always yields a byte-identical WAV — which is exactly
+/// the apples-to-apples property an A/B comparison needs.
+///
+/// This reuses the SAME engine + feature-source path as `play` (so the rendered music is
+/// the real composition, not a stand-in); only the SINK differs (offline rustysynth →
+/// WAV instead of the live cpal stream / external MIDI).
+fn run_render_wav(
+    render_args: RenderArgs,
+    wav_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use audiohax::synth_sink::{
+        render_events_to_stereo, write_stereo_wav, MidiCmd, SoundFontSource, SynthConfig,
+        TimedMidiEvent,
+    };
+
+    let mappings = load_mappings("assets/mappings.json")?;
+    let engine_config = pipeline_to_engine_config(&render_args.pipeline);
+    let instrument_count = engine_config.num_instruments;
+    let bar_thickness_frac = engine_config.bar_thickness_frac;
+    let ms_per_step = engine_config.ms_per_step;
+    let num_steps = render_args.pipeline.steps;
+
+    // ── Acquire the feature source (same selection as `play`; opencv vs pure). ──
+    #[cfg(feature = "opencv")]
+    let source = {
+        let src = resolve_source(&render_args.image);
+        let img = load_image_from_source(&src)?;
+        let global_features = analyze_global(&img)?;
+        let steps = scan_image(&img, instrument_count, bar_thickness_frac, num_steps, None)?;
+        PrecomputedSource::new(&global_features, &steps)
+    };
+    #[cfg(not(feature = "opencv"))]
+    let source = {
+        use audiohax::pure_analysis::{load_pure_image, PureAnalysisSource, PureImageSource};
+        let psrc = match &render_args.image {
+            Some(p) => PureImageSource::UserPath(p.clone()),
+            None => {
+                PureImageSource::UserPath(std::path::PathBuf::from("assets/images/example.jpg"))
+            }
+        };
+        let img = load_pure_image(&psrc)?;
+        PureAnalysisSource::extract(&img, instrument_count, bar_thickness_frac, num_steps, None)?
+    };
+
+    let mut engine = PipelineEngine::new(mappings, engine_config);
+    engine.set_features_global(&source.global_features());
+
+    let total_steps = source.step_count();
+    println!(
+        "render --wav: {} steps, {} instruments → {}",
+        total_steps,
+        instrument_count,
+        wav_path.display()
+    );
+
+    // ── Lay decisions onto an absolute ms grid (NO jitter ⇒ deterministic). ──
+    let mut events: Vec<TimedMidiEvent> = Vec::new();
+    // Initial per-channel programs (same scheme as the live path: prog = (i*7)%128).
+    for i in 0..instrument_count {
+        let ch = (i % 16) as u8;
+        let prog = ((i * 7) % 128) as u8;
+        events.push(TimedMidiEvent {
+            at_ms: 0,
+            cmd: MidiCmd::ProgramChange {
+                channel: ch,
+                program: prog,
+            },
+        });
+    }
+    for step_idx in 0..total_steps {
+        let step_base_ms = step_idx as u64 * ms_per_step;
+        for dec in engine.decide_step(&source, step_idx) {
+            for ev in &dec.events {
+                let on_ms = step_base_ms + ev.offset_ms;
+                events.push(TimedMidiEvent {
+                    at_ms: on_ms,
+                    cmd: MidiCmd::NoteOn {
+                        channel: dec.channel,
+                        note: ev.note,
+                        velocity: ev.velocity,
+                    },
+                });
+                events.push(TimedMidiEvent {
+                    at_ms: on_ms + ev.hold_ms,
+                    cmd: MidiCmd::NoteOff {
+                        channel: dec.channel,
+                        note: ev.note,
+                    },
+                });
+            }
+        }
+    }
+
+    // ── Synthesize offline + write the WAV, honoring the A/B controls. ──
+    let synth_config = SynthConfig {
+        enable_reverb_and_chorus: render_args.audio.reverb.is_on(),
+        gain: render_args.audio.gain,
+    };
+    let font_src = match &render_args.audio.soundfont {
+        Some(p) => SoundFontSource::Path(p.as_path()),
+        None => SoundFontSource::Bundled,
+    };
+    let sample_rate = 44_100u32;
+    // 1.5 s tail so the final notes' release + reverb don't get truncated.
+    let interleaved = render_events_to_stereo(font_src, synth_config, sample_rate, events, 1_500)?;
+    write_stereo_wav(wav_path, sample_rate, &interleaved)?;
+
+    let secs = interleaved.len() as f32 / 2.0 / sample_rate as f32;
+    println!(
+        "render --wav: wrote {} ({:.1}s, font={}, reverb={}, gain={})",
+        wav_path.display(),
+        secs,
+        render_args
+            .audio
+            .soundfont
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "bundled".into()),
+        if synth_config.enable_reverb_and_chorus {
+            "on"
+        } else {
+            "off"
+        },
+        synth_config.gain
+    );
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── CLI (shared clap grammar) ───────────────────────────────────────────────
     let cli = Cli::parse();
@@ -245,8 +377,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rather than silently doing nothing.
     let play_args: PlayArgs = match cli.command {
         Command::Play(p) => p,
-        Command::Render(_) | Command::Analyze(_) => {
-            println!("`render`/`analyze` are recognized but not yet wired in Phase 1; use `play`.");
+        // S31: `render --wav <PATH>` does an offline, deterministic synth-to-WAV render
+        // (the A/B harness output). `render` without `--wav` keeps the Phase-1 message.
+        Command::Render(r) => {
+            if let Some(wav_path) = r.wav.clone() {
+                return run_render_wav(r, &wav_path);
+            }
+            println!(
+                "`render` without `--wav` is recognized but not yet wired; pass `--wav <PATH>` \
+                 to render the synthesized audio to a WAV (offline A/B), or use `play`."
+            );
+            return Ok(());
+        }
+        Command::Analyze(_) => {
+            println!("`analyze` is recognized but not yet wired in Phase 1; use `play`.");
             return Ok(());
         }
         Command::Modem(_) => {
@@ -415,8 +559,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("MIDI output ready.");
         Box::new(midi)
     } else {
-        println!("Starting in-process synth (rustysynth + cpal, bundled SoundFont)...");
-        let synth = audiohax::synth_sink::SynthSink::with_bundled_soundfont()?;
+        // S31: honor the A/B controls. No flags ⇒ SynthConfig::default() + Bundled font
+        // ⇒ byte-identical to the pre-S31 path. `--soundfont` swaps the font (loaded by
+        // path; a bad path fails loudly); `--reverb`/`--gain` set the config.
+        use audiohax::synth_sink::{SoundFontSource, SynthConfig, SynthSink};
+        let synth_config = SynthConfig {
+            enable_reverb_and_chorus: play_args.audio.reverb.is_on(),
+            gain: play_args.audio.gain,
+        };
+        let font_src = match &play_args.audio.soundfont {
+            Some(p) => SoundFontSource::Path(p.as_path()),
+            None => SoundFontSource::Bundled,
+        };
+        match &play_args.audio.soundfont {
+            Some(p) => println!(
+                "Starting in-process synth (rustysynth + cpal, SoundFont {})...",
+                p.display()
+            ),
+            None => {
+                println!("Starting in-process synth (rustysynth + cpal, bundled SoundFont)...")
+            }
+        }
+        println!(
+            "  reverb/chorus = {}, master gain = {}",
+            if synth_config.enable_reverb_and_chorus {
+                "on"
+            } else {
+                "off"
+            },
+            synth_config.gain
+        );
+        let synth = SynthSink::new_with_config(font_src, synth_config)?;
         println!("Synth audio stream started @ {} Hz.", synth.sample_rate());
         Box::new(synth)
     };

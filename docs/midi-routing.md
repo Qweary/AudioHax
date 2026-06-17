@@ -1,11 +1,20 @@
 # Routing AudioHax MIDI into a real synth (Qsynth / FluidSynth / DAW)
 
-The built-in `--output synth` path is **dry** — a bare in-process SoundFont with no
-reverb or chorus. To judge the music properly (and to use your own synths/effects),
-route AudioHax's note events into an external MIDI engine with `--output midi`.
+The built-in `--output synth` path runs a bundled GM SoundFont in-process. It is **not
+bone-dry**: the synthesizer (rustysynth 1.3.6) ships reverb + chorus **on by default**,
+with a moderate per-channel reverb send. You can toggle that with `--reverb on|off`,
+swap the SoundFont with `--soundfont <PATH>`, and set the master level with
+`--gain <f32>` (see `./play --help`). Its ceiling is still General-MIDI sample playback,
+so to use your own better-sampled instruments + effects, route AudioHax's note events
+into an external MIDI engine with `--output midi`.
 
 This is **output plumbing only**: AudioHax emits the same NoteEvents either way; the
 external engine just renders them through better synths + effects.
+
+> Tip: to A/B soundfonts/effects offline (no audio device), use
+> `audiohax render <IMAGE> --wav out.wav [--soundfont … --reverb on|off --gain …]` —
+> it renders the same composition deterministically to a WAV per config. The helper
+> `tools/ab-render.sh <IMAGE> [SOUNDFONT.sf2]` renders several configs at once.
 
 > All examples assume you are in the repo root and the toolchain is on your `PATH`
 > (`export PATH="$HOME/.cargo/bin:$PATH"`). `cargo run` (no `--bin`) resolves to the

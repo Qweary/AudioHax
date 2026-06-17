@@ -123,6 +123,31 @@ AudioHax/
 
 ---
 
+## Running it (the easy way)
+
+On Linux, the fastest path is the bundled `./play` wrapper — it builds the latest
+source and plays through the **in-process pure-Rust synth with zero MIDI routing**
+(no loopMIDI / FluidSynth / virtual port to set up — it just makes sound):
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"   # once per shell, if cargo isn't already on PATH
+./play                                 # play the bundled sample image
+./play path/to/your-image.jpg          # play your own image
+./play my.png --instruments 6          # extra flags pass straight through to `play`
+./play --help                          # short help, incl. the optional MIDI route
+```
+
+`./play` always runs the current source via `cargo run --release` (rebuilding if
+stale), so you never play a stale binary. `just play` / `just play-image <path>`
+wrap the same script if you have [`just`](https://github.com/casey/just) installed.
+
+For the **max-quality external-MIDI route** (route into Qsynth/FluidSynth/a DAW for
+reverb + effects), use `--output midi` / `--midi-virtual` and follow
+[`docs/midi-routing.md`](docs/midi-routing.md). That is output plumbing only — you do
+not need it to hear sound.
+
+---
+
 ## Running
 
 ---

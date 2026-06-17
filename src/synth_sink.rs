@@ -105,6 +105,56 @@ pub enum SoundFontSource<'a> {
     Bytes(&'a [u8]),
 }
 
+/// Audio-output configuration for the synth sink — the A/B controls (S31).
+///
+/// Each field's default is the EXACT current behavior, so [`SynthConfig::default`]
+/// reproduces today's audio path byte-for-byte:
+///   * `enable_reverb_and_chorus = true`  → rustysynth 1.3.6's own default (reverb +
+///     chorus ON; the "dry" prose elsewhere was stale — see [`SynthSink::new_with_config`]),
+///   * `gain = 1.0`                        → unity; the post-render gain+soft-clip stage
+///     is SHORT-CIRCUITED at exactly 1.0 (a literal no-op), so the default render is
+///     bit-identical to the pre-S31 path.
+///
+/// Only a binary reverb toggle exists in rustysynth (no room/wet/damp setter — those
+/// are private crate constants), so `enable_reverb_and_chorus` is the whole reverb lever.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SynthConfig {
+    /// Map to `SynthesizerSettings::enable_reverb_and_chorus`. Default `true` =
+    /// rustysynth's default = current behavior. `false` renders the bone-dry voice.
+    pub enable_reverb_and_chorus: bool,
+    /// Master gain applied in OUR cpal callback (rustysynth has no public master-volume
+    /// setter). `1.0` is unity AND a guaranteed no-op (the gain+soft-clip stage is
+    /// skipped at exactly 1.0). Non-unity multiplies each sample then soft-clips with
+    /// `tanh` so boosting can never hard-clip.
+    pub gain: f32,
+}
+
+impl Default for SynthConfig {
+    fn default() -> Self {
+        // The single source of truth for "today's audio behavior": reverb on, unity gain.
+        SynthConfig {
+            enable_reverb_and_chorus: true,
+            gain: 1.0,
+        }
+    }
+}
+
+/// Apply the master gain + soft-clip to one rendered sample.
+///
+/// CONTRACT (the must-not-break property): at `gain == 1.0` this returns `s`
+/// UNCHANGED (a literal short-circuit — `tanh` is NOT identity, so we must not run it
+/// at unity or the default path would drift). For any other gain it multiplies then
+/// soft-clips via `tanh`, which is smooth, monotonic, and bounded to (-1, 1), so a
+/// boosted signal saturates gracefully instead of hard-clipping.
+#[inline]
+pub fn apply_gain_softclip(s: f32, gain: f32) -> f32 {
+    if gain == 1.0 {
+        s
+    } else {
+        (s * gain).tanh()
+    }
+}
+
 /// In-process SoundFont synth sink (design-s11 §3.B.2).
 ///
 /// Owns the PRODUCER end of the SPSC command queue and keeps the cpal [`cpal::Stream`]
@@ -138,7 +188,23 @@ impl SynthSink {
     /// stream-build error, play error) maps into [`engine::AudioSinkError`] so the
     /// caller speaks one error vocabulary. A box with no working output device
     /// surfaces a clean error — it never panics.
+    ///
+    /// Uses [`SynthConfig::default`] (reverb on, unity gain) — identical to the
+    /// pre-S31 audio path. For the A/B controls (`--reverb`/`--gain`) call
+    /// [`SynthSink::new_with_config`].
     pub fn new(font: SoundFontSource<'_>) -> Result<Self, AudioSinkError> {
+        Self::new_with_config(font, SynthConfig::default())
+    }
+
+    /// Build the sink with explicit audio-output [`SynthConfig`] (the S31 A/B controls).
+    ///
+    /// `config.enable_reverb_and_chorus` is threaded into `SynthesizerSettings` at
+    /// construction; `config.gain` is applied (with a `tanh` soft-clip) in our cpal
+    /// callback. With [`SynthConfig::default`] this is exactly [`SynthSink::new`].
+    pub fn new_with_config(
+        font: SoundFontSource<'_>,
+        synth_config: SynthConfig,
+    ) -> Result<Self, AudioSinkError> {
         // 1) Load + parse the SoundFont (cheap-to-fail, do it before touching audio HW).
         let sound_font = Arc::new(load_soundfont(font)?);
 
@@ -158,8 +224,11 @@ impl SynthSink {
         let channels = config.channels as usize;
 
         // 4) Construct the synthesizer at the negotiated sample rate. It is MOVED into
-        //    the audio callback closure below — owned solely by the audio thread.
-        let settings = SynthesizerSettings::new(sample_rate as i32);
+        //    the audio callback closure below — owned solely by the audio thread. The
+        //    reverb/chorus toggle is the only reverb lever rustysynth exposes; default
+        //    `true` reproduces today's behavior (rustysynth 1.3.6 ships both effects ON).
+        let mut settings = SynthesizerSettings::new(sample_rate as i32);
+        settings.enable_reverb_and_chorus = synth_config.enable_reverb_and_chorus;
         let mut synth = Synthesizer::new(&sound_font, &settings)
             .map_err(|e| AudioSinkError::msg(format!("synthesizer init failed: {e}")))?;
 
@@ -171,9 +240,15 @@ impl SynthSink {
         //    stereo block of `frames` samples and interleave/downmix into it.
         let err_fn = |e: cpal::StreamError| eprintln!("audiohax synth stream error: {e}");
         let stream = match sample_format {
-            cpal::SampleFormat::F32 => {
-                build_f32_stream(&device, &config, channels, synth, rx, err_fn)
-            }
+            cpal::SampleFormat::F32 => build_f32_stream(
+                &device,
+                &config,
+                channels,
+                synth,
+                rx,
+                synth_config.gain,
+                err_fn,
+            ),
             other => {
                 // Non-f32 default formats are uncommon on modern hosts; rather than
                 // pull a sample-conversion path into Phase 2, surface a clean error.
@@ -249,6 +324,122 @@ impl AudioSink for SynthSink {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Offline (no-cpal) render-to-WAV — the deterministic A/B harness core (S31).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One absolutely-timed MIDI event for the offline renderer.
+///
+/// The offline path takes events with an absolute onset in milliseconds (NOT the
+/// per-step-relative offsets the live scheduler uses), so a whole composition can be
+/// rendered deterministically — no wall clock, no RNG, no cpal device. The same event
+/// list rendered through different [`SynthConfig`]/SoundFont choices changes ONLY the
+/// synth config, which is exactly the apples-to-apples property the A/B needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimedMidiEvent {
+    /// Absolute onset time of this event, in milliseconds from t=0.
+    pub at_ms: u64,
+    /// The MIDI command to apply at `at_ms`.
+    pub cmd: MidiCmd,
+}
+
+/// Render a deterministic, fixed-sample-rate stereo buffer from an absolutely-timed
+/// MIDI event list — the offline (no-cpal) core of the A/B WAV harness (S31).
+///
+/// Events are sorted by `at_ms`, then synthesized block-by-block: the synth advances
+/// in `sample_rate`-relative time, MIDI events are applied as their timestamp is
+/// crossed, and `config.gain`'s soft-clip is applied to every output sample (a no-op
+/// at unity). `tail_ms` of extra silence is rendered after the last event so release
+/// envelopes/reverb tails are not truncated. Returns interleaved `[L, R, L, R, …]`.
+///
+/// Determinism: identical inputs → byte-identical output. There is no RNG and no
+/// device negotiation; `sample_rate` is fixed by the caller (44_100 in the harness).
+pub fn render_events_to_stereo(
+    font: SoundFontSource<'_>,
+    config: SynthConfig,
+    sample_rate: u32,
+    mut events: Vec<TimedMidiEvent>,
+    tail_ms: u64,
+) -> Result<Vec<f32>, AudioSinkError> {
+    let sound_font = Arc::new(load_soundfont(font)?);
+    let mut settings = SynthesizerSettings::new(sample_rate as i32);
+    settings.enable_reverb_and_chorus = config.enable_reverb_and_chorus;
+    let mut synth = Synthesizer::new(&sound_font, &settings)
+        .map_err(|e| AudioSinkError::msg(format!("offline synthesizer init failed: {e}")))?;
+
+    events.sort_by_key(|e| e.at_ms);
+
+    // Total duration = last event onset + a release/reverb tail.
+    let last_ms = events.last().map(|e| e.at_ms).unwrap_or(0);
+    let total_ms = last_ms + tail_ms;
+    let total_frames = ((total_ms as u128 * sample_rate as u128) / 1000) as usize;
+
+    // Render in modest blocks; apply each event the first time we cross its sample index.
+    const BLOCK: usize = 441; // ~10 ms @ 44.1 kHz — fine enough vs. a 250 ms musical step.
+    let mut left = vec![0.0f32; BLOCK];
+    let mut right = vec![0.0f32; BLOCK];
+    let mut out: Vec<f32> = Vec::with_capacity(total_frames * 2);
+
+    let mut next_ev = 0usize;
+    let mut frame = 0usize;
+    while frame < total_frames {
+        let this_block = BLOCK.min(total_frames - frame);
+
+        // Apply every event whose onset falls before the END of this block. (Block
+        // granularity ≈ 10 ms is inaudible against the 250 ms step; keeps the loop O(N).)
+        let block_end_ms = (((frame + this_block) as u128 * 1000) / sample_rate as u128) as u64;
+        while next_ev < events.len() && events[next_ev].at_ms < block_end_ms {
+            let (ch, command, d1, d2) = events[next_ev].cmd.to_midi_message();
+            synth.process_midi_message(ch, command, d1, d2);
+            next_ev += 1;
+        }
+
+        if left.len() != this_block {
+            left.resize(this_block, 0.0);
+            right.resize(this_block, 0.0);
+        }
+        synth.render(&mut left, &mut right);
+
+        for i in 0..this_block {
+            out.push(apply_gain_softclip(left[i], config.gain));
+            out.push(apply_gain_softclip(right[i], config.gain));
+        }
+        frame += this_block;
+    }
+
+    Ok(out)
+}
+
+/// Write an interleaved stereo `[L, R, …]` f32 buffer to a 16-bit PCM WAV at `path`
+/// via the existing `hound` dependency — the A/B harness's on-disk output (S31).
+///
+/// Samples are clamped to `[-1.0, 1.0]` and quantized to `i16`. The header records
+/// 2 channels at `sample_rate`. IO/encode failures map to [`engine::AudioSinkError`].
+pub fn write_stereo_wav(
+    path: &std::path::Path,
+    sample_rate: u32,
+    interleaved: &[f32],
+) -> Result<(), AudioSinkError> {
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .map_err(|e| AudioSinkError::msg(format!("creating WAV {}: {e}", path.display())))?;
+    for &s in interleaved {
+        let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+        writer
+            .write_sample(v)
+            .map_err(|e| AudioSinkError::msg(format!("writing WAV sample: {e}")))?;
+    }
+    writer
+        .finalize()
+        .map_err(|e| AudioSinkError::msg(format!("finalizing WAV {}: {e}", path.display())))?;
+    Ok(())
+}
+
 /// Load + parse a SoundFont from a [`SoundFontSource`] into a `rustysynth::SoundFont`.
 ///
 /// `Bundled` parses the `include_bytes!`-embedded GM SF2; `Path` reads the file off
@@ -295,12 +486,17 @@ fn load_soundfont(font: SoundFontSource<'_>) -> Result<SoundFont, AudioSinkError
 ///
 /// The scratch buffers are grown once to the largest frame count seen and re-used, so
 /// the steady-state callback is allocation-free.
+///
+/// `gain` is the S31 master gain applied per output sample via [`apply_gain_softclip`].
+/// At the default `1.0` that helper is a literal no-op, so the interleave/downmix math
+/// is byte-for-byte the pre-S31 code path.
 fn build_f32_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     channels: usize,
     mut synth: Synthesizer,
     mut rx: Consumer<MidiCmd>,
+    gain: f32,
     err_fn: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
     // Reusable per-callback scratch (grows once, then re-used — no steady-state alloc).
@@ -337,26 +533,28 @@ fn build_f32_stream(
             }
             synth.render(&mut left, &mut right);
 
-            // (3) Interleave/downmix into the cpal output buffer.
+            // (3) Interleave/downmix into the cpal output buffer, applying the master
+            //     gain + soft-clip per sample. `apply_gain_softclip` is a no-op at the
+            //     default gain 1.0, so this is the pre-S31 path byte-for-byte by default.
             match channels {
                 1 => {
                     // Mono device: downmix to the average of L/R.
                     for (i, s) in output.iter_mut().enumerate() {
-                        *s = 0.5 * (left[i] + right[i]);
+                        *s = apply_gain_softclip(0.5 * (left[i] + right[i]), gain);
                     }
                 }
                 2 => {
                     for (i, frame) in output.chunks_mut(2).enumerate() {
-                        frame[0] = left[i];
-                        frame[1] = right[i];
+                        frame[0] = apply_gain_softclip(left[i], gain);
+                        frame[1] = apply_gain_softclip(right[i], gain);
                     }
                 }
                 n => {
                     // >2 channels: L on ch0, R on ch1, silence on the rest.
                     for (i, frame) in output.chunks_mut(n).enumerate() {
-                        frame[0] = left[i];
+                        frame[0] = apply_gain_softclip(left[i], gain);
                         if n >= 2 {
-                            frame[1] = right[i];
+                            frame[1] = apply_gain_softclip(right[i], gain);
                         }
                         for s in frame.iter_mut().skip(2) {
                             *s = 0.0;
@@ -556,5 +754,223 @@ mod tests {
     fn synth_sink_satisfies_audiosink_bound() {
         fn assert_is_audiosink<T: AudioSink>() {}
         assert_is_audiosink::<SynthSink>();
+    }
+
+    // ── S31 A/B controls ────────────────────────────────────────────────────────
+
+    /// The default audio config reproduces today's behavior exactly: reverb on,
+    /// unity gain. This pins the must-not-break property at the config layer.
+    #[test]
+    fn synth_config_default_is_current_behavior() {
+        let d = SynthConfig::default();
+        assert!(
+            d.enable_reverb_and_chorus,
+            "reverb defaults ON (rustysynth 1.3.6)"
+        );
+        assert_eq!(d.gain, 1.0, "gain defaults to unity");
+    }
+
+    /// THE no-op proof: at gain 1.0 the gain+soft-clip stage returns every sample
+    /// UNCHANGED — for normal samples AND for out-of-range ones (tanh is NOT identity,
+    /// so a naive `(s).tanh()` would corrupt these; the short-circuit must skip it).
+    #[test]
+    fn gain_unity_is_exact_no_op() {
+        for &s in &[
+            0.0f32,
+            0.5,
+            -0.5,
+            1.0,
+            -1.0,
+            0.999_999,
+            -0.123_456,
+            2.0,
+            -3.5,
+            f32::MIN_POSITIVE,
+        ] {
+            let out = apply_gain_softclip(s, 1.0);
+            assert_eq!(
+                out.to_bits(),
+                s.to_bits(),
+                "gain 1.0 must be a bit-exact no-op for {s}"
+            );
+        }
+    }
+
+    /// At non-unity gain the stage multiplies then soft-clips: it must boost quiet
+    /// signals and must keep the output strictly inside (-1, 1) even for a huge input.
+    #[test]
+    fn gain_nonunity_boosts_and_softclips() {
+        // Quiet sample, modest boost: louder but still well below clip.
+        let boosted = apply_gain_softclip(0.1, 2.0);
+        assert!(boosted > 0.1, "2x gain must increase a quiet sample");
+        assert!(boosted < 1.0, "still within range");
+        // Hot input with boost: tanh saturates, never hard-clips past ±1.
+        let hot = apply_gain_softclip(0.9, 8.0);
+        assert!(
+            hot < 1.0 && hot > 0.99,
+            "soft-clip saturates toward +1, never exceeds it"
+        );
+        let hot_neg = apply_gain_softclip(-0.9, 8.0);
+        assert!(
+            hot_neg > -1.0 && hot_neg < -0.99,
+            "soft-clip saturates toward -1"
+        );
+    }
+
+    /// A bad/missing SoundFont path fails LOUDLY with a clear, path-bearing message
+    /// (the `--soundfont` error contract), not a panic.
+    #[test]
+    fn soundfont_path_missing_fails_with_clear_message() {
+        let p = std::path::Path::new("/nonexistent/does-not-exist.sf2");
+        let err = load_soundfont(SoundFontSource::Path(p)).expect_err("missing font must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does-not-exist.sf2"),
+            "error must name the offending path; got: {msg}"
+        );
+    }
+
+    /// A non-SF2 file fails loudly at PARSE time (clear message, no panic).
+    #[test]
+    fn soundfont_path_non_sf2_fails_to_parse() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("audiohax_not_a_soundfont.sf2");
+        std::fs::write(&tmp, b"this is plainly not a RIFF/SF2 file").expect("write tmp");
+        let err = load_soundfont(SoundFontSource::Path(&tmp)).expect_err("garbage must not parse");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(
+            err.to_string().contains("audiohax_not_a_soundfont.sf2"),
+            "parse error must name the path"
+        );
+    }
+
+    /// The offline renderer is DETERMINISTIC: the same event list + config renders to a
+    /// byte-identical buffer across runs — the apples-to-apples property the A/B needs.
+    /// Also proves it produces non-silent audio from a note_on through the bundled font.
+    #[test]
+    fn offline_render_is_deterministic_and_nonsilent() {
+        let events = vec![
+            TimedMidiEvent {
+                at_ms: 0,
+                cmd: MidiCmd::ProgramChange {
+                    channel: 0,
+                    program: 0,
+                },
+            },
+            TimedMidiEvent {
+                at_ms: 0,
+                cmd: MidiCmd::NoteOn {
+                    channel: 0,
+                    note: 60,
+                    velocity: 110,
+                },
+            },
+            TimedMidiEvent {
+                at_ms: 250,
+                cmd: MidiCmd::NoteOff {
+                    channel: 0,
+                    note: 60,
+                },
+            },
+        ];
+        let a = render_events_to_stereo(
+            SoundFontSource::Bundled,
+            SynthConfig::default(),
+            44_100,
+            events.clone(),
+            500,
+        )
+        .expect("render a");
+        let b = render_events_to_stereo(
+            SoundFontSource::Bundled,
+            SynthConfig::default(),
+            44_100,
+            events,
+            500,
+        )
+        .expect("render b");
+
+        assert_eq!(a.len(), b.len(), "same length");
+        assert_eq!(
+            a.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            b.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            "identical inputs must render byte-identically"
+        );
+        let peak = a.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(
+            peak > 1e-4,
+            "a note_on must produce audible output; peak={peak}"
+        );
+    }
+
+    /// Reverb on vs. off through the offline renderer produces DIFFERENT audio — proves
+    /// the `--reverb` toggle is actually threaded into `SynthesizerSettings`.
+    #[test]
+    fn offline_render_reverb_toggle_changes_output() {
+        let events = vec![
+            TimedMidiEvent {
+                at_ms: 0,
+                cmd: MidiCmd::NoteOn {
+                    channel: 0,
+                    note: 64,
+                    velocity: 110,
+                },
+            },
+            TimedMidiEvent {
+                at_ms: 200,
+                cmd: MidiCmd::NoteOff {
+                    channel: 0,
+                    note: 64,
+                },
+            },
+        ];
+        let wet = render_events_to_stereo(
+            SoundFontSource::Bundled,
+            SynthConfig {
+                enable_reverb_and_chorus: true,
+                gain: 1.0,
+            },
+            44_100,
+            events.clone(),
+            500,
+        )
+        .expect("wet");
+        let dry = render_events_to_stereo(
+            SoundFontSource::Bundled,
+            SynthConfig {
+                enable_reverb_and_chorus: false,
+                gain: 1.0,
+            },
+            44_100,
+            events,
+            500,
+        )
+        .expect("dry");
+        assert_eq!(wet.len(), dry.len());
+        assert!(
+            wet.iter()
+                .zip(&dry)
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "reverb on vs off must change the rendered audio"
+        );
+    }
+
+    /// `write_stereo_wav` produces a readable 2-channel WAV at the requested rate.
+    #[test]
+    fn write_stereo_wav_roundtrips_header() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("audiohax_ab_test_out.wav");
+        let interleaved = vec![0.0f32, 0.0, 0.25, -0.25, 0.5, -0.5];
+        write_stereo_wav(&tmp, 44_100, &interleaved).expect("write wav");
+        let reader = hound::WavReader::open(&tmp).expect("reopen wav");
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 2);
+        assert_eq!(spec.sample_rate, 44_100);
+        assert_eq!(
+            reader.len() as usize,
+            interleaved.len(),
+            "all samples written"
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 }
