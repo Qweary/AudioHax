@@ -169,16 +169,48 @@
           { "label": "A", "offset_rule": "home" },
           { "label": "B", "offset_rule": "region_related:b" },
           { "label": "A", "offset_rule": "home" } ] },
-      { "id": "abac_rondo", "sections": [
+      { "id": "rounded_binary_excursion", "resolution": "resolve", "pivot": false, "sections": [
+          { "label": "A",  "offset_rule": "home" },
+          { "label": "B",  "offset_rule": "region_related:b" },
+          { "label": "A'", "offset_rule": "home" } ] },
+      { "id": "ternary_aba_excursion", "resolution": "resolve", "pivot": false, "sections": [
+          { "label": "A", "offset_rule": "home" },
+          { "label": "B", "offset_rule": "region_related:b" },
+          { "label": "A", "offset_rule": "home" } ] },
+      { "id": "aaba_excursion", "resolution": "resolve", "pivot": false, "sections": [
+          { "label": "A", "offset_rule": "home" },
+          { "label": "A", "offset_rule": "home" },
+          { "label": "B", "offset_rule": "region_related:b" },
+          { "label": "A", "offset_rule": "home" } ] },
+      { "id": "abac_rondo", "resolution": "resolve", "pivot": false, "sections": [
           { "label": "A", "offset_rule": "home" },
           { "label": "B", "offset_rule": "region_related:b" },
           { "label": "A", "offset_rule": "home" },
-          { "label": "C", "offset_rule": "region_related:c" } ] }
+          { "label": "C", "offset_rule": "region_related:c" } ] },
+      { "id": "abbac_excursion", "resolution": "resolve", "pivot": false, "sections": [
+          { "label": "A",  "offset_rule": "home" },
+          { "label": "B",  "offset_rule": "region_related:b" },
+          { "label": "B'", "offset_rule": "region_related:c" },
+          { "label": "A",  "offset_rule": "home" },
+          { "label": "C",  "offset_rule": "region_related:c" } ] },
+      { "id": "theme_and_variations_resolve", "resolution": "resolve", "pivot": false, "sections": [
+          { "label": "T",  "offset_rule": "home" },
+          { "label": "V1", "offset_rule": "region_related:b" },
+          { "label": "V2", "offset_rule": "region_related:c" } ] },
+      { "id": "theme_and_variations_excursion", "resolution": "open", "pivot": false, "sections": [
+          { "label": "T",  "offset_rule": "home" },
+          { "label": "V1", "offset_rule": "region_related:b" },
+          { "label": "V2", "offset_rule": "region_related:c" } ] }
     ],
     "key_scheme": {
       "default": "home_only",
       "rules": [
-        { "when": [ {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ], "pick": "aba_excursion" }
+        { "when": [ {"knob":"complexity","op":"ge","lo":0.66,"hi":0.0}, {"knob":"edge_activity","op":"ge","lo":0.6,"hi":0.0}, {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ], "pick": "theme_and_variations_resolve" },
+        { "when": [ {"knob":"quadrant_contrast","op":"ge","lo":0.6,"hi":0.0}, {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ], "pick": "ternary_aba_excursion" },
+        { "when": [ {"knob":"aspect_ratio","op":"ge","lo":1.6,"hi":0.0}, {"knob":"palette_bimodality","op":"le","lo":0.3,"hi":0.0}, {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ], "pick": "aaba_excursion" },
+        { "when": [ {"knob":"vertical_emphasis","op":"ge","lo":0.6,"hi":0.0}, {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ], "pick": "abac_rondo" },
+        { "when": [ {"knob":"edge_activity","op":"ge","lo":0.7,"hi":0.0}, {"knob":"value_key","op":"ge","lo":0.6,"hi":0.0}, {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ], "pick": "abbac_excursion" },
+        { "when": [ {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ], "pick": "rounded_binary_excursion" }
       ]
     },
     "texture_catalogue": [

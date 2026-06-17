@@ -96,10 +96,11 @@ pub struct ImageUnderstanding {
     pub background_brightness: f32,
     /// NEW S26 — dominant hue (0..360) of the foreground band. Per-region hue, so the
     /// near-vs-relative hue-distance test (`region_excursion_offset`) measures the FOREGROUND's
-    /// hue against the subject, not the whole image. Defaults to `secondary_hue`.
+    /// hue against the subject, not the whole image. A degenerate band falls back to the
+    /// whole-image `dominant_hue` the runtime caller passes (`understand_image_pure`).
     pub foreground_hue: f32,
-    /// NEW S26 — dominant hue (0..360) of the background band. Same discipline; defaults to
-    /// `secondary_hue`.
+    /// NEW S26 — dominant hue (0..360) of the background band. Same discipline; degenerate-band
+    /// fallback is the whole-image `dominant_hue` the runtime caller passes.
     pub background_hue: f32,
     /// NEW S22 — the planner-computed arousal composite (0..1). NOT extracted from pixels and
     /// NOT deserialized; `pure_analysis::understand_image_pure` and `neutral()` leave it at the
@@ -1461,6 +1462,16 @@ fn resolve_key_scheme(
     // already tolerated by the pad/truncate above): a "home" rule must land on a home role
     // (Statement/Return), and a "region_related:*" rule must land on a non-home role
     // (Contrast/Development/Coda — Coda is allowed a non-home rule now, the Option A change).
+    //
+    // K2b NOTE: every shipped routing rule (assets/mappings.json `key_scheme`) now mirrors the
+    // `form` ladder ORDER+PREDICATES 1:1 (plus the shared `fg_bg_contrast >= 0.25` subject gate),
+    // so the scheme selected for an image is the structural twin of the form selected — each
+    // per-form excursion scheme's sections align role-for-role with that form's sections, and this
+    // assert is QUIET for every routed (form, scheme) pair. It is NOT a no-op: it still fires if a
+    // future routing edit picks a scheme whose section roles diverge from the form's (e.g. the old
+    // pre-K2b case where a 3-section [home, region, home] scheme landed on the 4-section `aaba`
+    // form and its `region` rule fell on a Statement role). Keeping it strict is the guard that
+    // makes the order-isomorphic routing safe rather than merely assumed.
     for (i, tpl) in sections.iter().enumerate() {
         if let Some(rule) = scheme.sections.get(i) {
             let role_is_home = matches!(tpl.role, ThematicRole::Statement | ThematicRole::Return);
