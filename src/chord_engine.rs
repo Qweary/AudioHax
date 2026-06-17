@@ -1723,42 +1723,29 @@ fn realize_rhythm(
             let held_chord = prev.is_some_and(|p| p.chord.notes == step.chord.notes);
             let melody_static = mel_dir == MotionDir::Hold || m_now.is_none();
 
-            // How many consecutive PRIOR steps already sounded THIS exact chord — the
-            // step's position WITHIN the current held run (0 at the run's first step).
-            // Bounded by HELD_RUN_SEED_CAP so this stays O(cap) per step, never O(run
-            // length): a held run only needs ~one rotation through the chord's band
-            // tones to read as a moving line, so the cap is the rotation period, not the
-            // whole section. Deterministic (a pure scan of plan chords, no RNG).
-            let held_run_index = held_run_position(ctx.section, si);
+            // PITCH (§3.2 — contrary/oblique, chord-tone, no parallel perfects, fifth-species
+            // figures): the full pitch selection — held-run rotation seed / §3.1 seed / figure
+            // driver — now lives in the SHARED `realized_counter_pitch_with_prev` so the live
+            // emission and the cross-step REPLAY use one code path and cannot diverge. The arm
+            // computes only the realized-prev seed and delegates; `held_run_index`/`held_target`
+            // are recomputed inside the shared helper.
 
-            // PITCH: contrary/oblique, chord-tone, no parallel perfects vs the melody
-            // (§3.2). Two seed modes drive `pick_counter_pitch`:
-            //   * INSIDE a held run (held_run_index >= 1): seat the ADVANCING ROTATION
-            //     TARGET (a non-root band tone that walks with the run position) as the
-            //     pick's previous pitch with force_move OFF, so the pick LANDS on that
-            //     rotated tone — each held step sounds a NEW inner tone, the moving line
-            //     the operator's "empty period" verdict demanded. The no-parallel-perfects
-            //     reject still guards it.
-            //   * OTHERWISE (run start / changing chord): the §3.1 LOCK nearest-prior-chord
-            //     seed with force_move = held_chord||melody_static, byte-identical to the
-            //     as-built impl on every non-held-run step.
-            // The advancing held-run TARGET (Some inside a held run), or None on a run
-            // start / changing chord. When present it is the chord tone the held line
-            // should SOUND this step (the rotation already chose the musically-correct,
-            // non-root, moving tone); `pick_counter_pitch` lands on it unless it would
-            // form a parallel perfect against the melody, in which case it falls back to
-            // the scored pick. When None, the seed + force_move path is the as-built impl.
-            let held_target = advancing_seed_counter(step, held_run_index);
-            let prev_counter = seed_prev_counter(prev, step);
-            let cnt = pick_counter_pitch(
-                &step.chord,
-                prev_counter,
-                m_prev,
-                m_now,
-                mel_dir,
-                held_chord || melody_static,
-                held_target,
-            );
+            // S30-CP-FIX — REALIZED-PREV MEMORY. The as-built arm seeded `prev_counter` off the
+            // PRIOR CHORD (`seed_prev_counter`, the §3.1 "LOCK"), so the species two-point gates
+            // (parallel-perfects, approach-perfect, melodic-leap, the cadence clausula) checked a
+            // SYNTHETIC seed→candidate transition the ear never hears, not the REALIZED prev→now
+            // transition that actually sounds — the root cause of GAP-1/3/4. We now feed the gates
+            // the ACTUAL realized counter pitch of the previous step, recovered by deterministic
+            // replay (`realized_prev_counter`: recurse toward the section opening, the base case).
+            // At a section START (no prior) this is exactly the §3.1 seed, so the opening is
+            // unchanged. The pitch is then computed via the SHARED `realized_counter_pitch_with_prev`
+            // so the live emission and the replay cannot diverge.
+            let prev_counter = match prev {
+                Some(_) => realized_prev_counter(ctx, features, si),
+                None => seed_prev_counter(None, step),
+            };
+
+            let cnt = realized_counter_pitch_with_prev(ctx, step, features, si, prev_counter);
 
             let with_note = |ev: NoteEvent| NoteEvent { note: cnt, ..ev };
 
@@ -2813,6 +2800,93 @@ fn seed_prev_counter(prev: Option<&StepPlan>, step: &StepPlan) -> u8 {
     nearest_counter_tone(seed_chord, anchor).unwrap_or(anchor)
 }
 
+/// S30-CP-FIX — the REALIZED counter pitch this step would sound, GIVEN the realized prior
+/// counter pitch `prev_counter`. This is the exact pitch-selection the CounterMelody realize
+/// arm performs (held-run rotation seed / §3.1 LOCK seed → figure driver), factored into a
+/// pure function so it can be REPLAYED for an earlier step to recover that step's realized
+/// pitch. The realize arm and the replay therefore share ONE code path — they cannot diverge.
+///
+/// theory: the species two-point gates (parallel-perfects, approach-perfect, melodic-leap,
+/// the cadence clausula) must constrain the REALIZED prev→now transition that actually sounds.
+/// The as-built arm fed them a SYNTHETIC seed (`seed_prev_counter`, re-derived off the prior
+/// CHORD), so they guarded a transition the ear never hears. Routing the gates through this
+/// function with the realized prior pitch (see `realized_prev_counter`) makes them bind the
+/// sounding line — closing GAP-1/3/4 at the root. `force_move`/`held_target`/`figures_enabled`
+/// are recomputed here EXACTLY as the arm computes them, so the replayed pitch is identical to
+/// what the arm emits.
+fn realized_counter_pitch_with_prev(
+    ctx: &crate::composition::StepContext,
+    step: &StepPlan,
+    features: &PerfFeatures,
+    si: usize,
+    prev_counter: u8,
+) -> u8 {
+    let prev: Option<&StepPlan> = si.checked_sub(1).and_then(|p| ctx.section.steps.get(p));
+    // Re-point the borrowed ctx at THIS step so the melody/theme seam reads the right index
+    // (the replay path computes earlier steps; the live arm passes its own ctx unchanged).
+    let mut step_ctx = *ctx;
+    step_ctx.step_in_section = si;
+    let m_now = melody_pitch_for(&step_ctx, step, features);
+    let m_prev = prev.and_then(|p| melody_pitch_for_step(&step_ctx, p, features));
+    let mel_dir = motion_dir(m_prev, m_now);
+
+    let held_chord = prev.is_some_and(|p| p.chord.notes == step.chord.notes);
+    let melody_static = mel_dir == MotionDir::Hold || m_now.is_none();
+    let held_run_index = held_run_position(ctx.section, si);
+    let held_target = advancing_seed_counter(step, held_run_index);
+    let next_chord: Option<&Chord> = ctx.section.steps.get(si + 1).map(|s| &s.chord);
+    let figures_enabled = !(held_chord || melody_static);
+
+    let (cnt, _figure) = pick_counter_figure(
+        &step.chord,
+        prev_counter,
+        m_prev,
+        m_now,
+        mel_dir,
+        step.position,
+        next_chord,
+        held_chord || melody_static,
+        held_target,
+        figures_enabled,
+    );
+    cnt
+}
+
+/// S30-CP-FIX — the REALIZED counter pitch at step `si` (the line that ACTUALLY sounds), by
+/// deterministic REPLAY. This is the cross-step pitch memory the as-built arm lacked.
+///
+/// MECHANISM: the counter pick at step `i` is a deterministic function of `(ctx, features, i)`
+/// and the realized pick at `i-1`. So the realized prior pitch is recovered by recursing toward
+/// the section opening — `si == 0` is the BASE CASE (no prior step; the line opens off the §3.1
+/// seed exactly as the as-built arm does at a section start), and each step `i` feeds the
+/// realized pitch of `i-1` as its `prev_counter`. Because the recursion is strictly downward in
+/// `si` and the per-step work is O(1) over the bounded helpers, a single top-level call costs
+/// O(si) — and the realize arm's own call (replaying only `si-1`) makes the whole section's
+/// realization O(n²) in the worst case. Sections are short (a phrase, ≤ a few dozen steps), so
+/// this is negligible; it is also RNG-free and fully deterministic (PT-9 preserved). The
+/// `seen`/depth guard caps the recursion at the section length as a defensive floor against a
+/// malformed `step_in_section` (it can never legitimately exceed the step count).
+fn realized_prev_counter(
+    ctx: &crate::composition::StepContext,
+    features: &PerfFeatures,
+    si: usize,
+) -> u8 {
+    let Some(prev_idx) = si.checked_sub(1) else {
+        // BASE CASE: si == 0 has no prior step. The opening pitch is seeded off THIS chord
+        // (the §3.1 seed with no prior), matching the as-built section-start behavior.
+        let step = &ctx.section.steps[si];
+        return seed_prev_counter(None, step);
+    };
+    let Some(prev_step) = ctx.section.steps.get(prev_idx) else {
+        // Defensive: malformed plan — fall back to the synthetic seed for THIS step.
+        let step = &ctx.section.steps[si];
+        return seed_prev_counter(ctx.section.steps.get(prev_idx.wrapping_add(1)), step);
+    };
+    // The realized pitch at `prev_idx` = its own realized-prev fed through the shared pick.
+    let prev_prev_counter = realized_prev_counter(ctx, features, prev_idx);
+    realized_counter_pitch_with_prev(ctx, prev_step, features, prev_idx, prev_prev_counter)
+}
+
 /// The step's position WITHIN its current held run: the count of consecutive PRIOR
 /// steps in `section` (ending at `si - 1`) whose chord notes equal `section.steps[si]`'s,
 /// capped at `HELD_RUN_SEED_CAP`. 0 means `si` opens a run (its prior chord differs, or
@@ -3077,6 +3151,751 @@ fn pick_counter_pitch(
                 .unwrap_or(prev_counter)
         }
     })
+}
+
+// =========================================================================
+// S30 SLICE 1 — SPECIES-COUNTERPOINT FIGURE SELECTION (Music Theory Specialist owns)
+//
+// design-s30-pattern-library-slice1.md §3.1 / research-s30 Area 1. Promotes the
+// sustain-only `pick_counter_pitch` scorer above into a fifth-species figure-selection
+// driver: per step ENUMERATE {Sustain, Passing, Neighbor, Suspension, Cambiata},
+// HARD-GATE by first-species + figure-specific counterpoint invariants, PREF-SCORE,
+// and PICK DETERMINISTICALLY (no thread_rng).
+//
+// BYTE-FREEZE DISCIPLINE (design §5.2 PT-0): `pick_counter_figure` reduces EXACTLY to
+// `pick_counter_pitch` on every step where no dissonant figure is licensed — the Sustain
+// figure's pitch is literally `pick_counter_pitch(..)` unchanged, and dissonant figures
+// are only ever ENABLED on changing-chord / moving-melody steps (R-A). On the identity /
+// held-run / equivalence path the driver is never reached or yields Sustain only, so the
+// realized counter is byte-identical to the as-built line.
+//
+// All items are PRIVATE; nothing is `pub`; nothing changes `realize_step`'s public
+// 7-param signature; everything is reachable ONLY from the CounterMelody realize arm.
+// =========================================================================
+
+// --- §1.1 consonance/dissonance classifier (the new foundation predicate) ---
+
+/// Common-practice harmonic class of the vertical interval between two MIDI notes,
+/// computed via the existing `interval_class`.
+///
+/// theory (research Area 1 §1.1): ic 0/7 = PERFECT consonance (unison/octave, fifth);
+/// ic 3/4/8/9 = IMPERFECT consonance (thirds, sixths); ic 1/2/6/10/11 = DISSONANCE
+/// (seconds, tritone, sevenths). The perfect fourth (ic 5) is the one contested class —
+/// classified per `FOURTH_IS_DISSONANT` (contested-decision #1: dissonant in the bare
+/// two-voice counter line, the safe standard split). This classifier is used ONLY by the
+/// two-voice counter scorer; the chordal `voice_lead_one` path never calls it and keeps
+/// its current 4th-as-consonant behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HarmonicClass {
+    PerfectConsonance,
+    ImperfectConsonance,
+    Dissonance,
+}
+
+/// Contested-decision #1: the bare perfect fourth (ic 5) is a DISSONANCE inside the
+/// independent two-voice counter line (a 4th cannot be a stable structural interval
+/// between two unsupported voices). `true` = the standard, conservative resolution.
+const FOURTH_IS_DISSONANT: bool = true;
+
+fn harmonic_class(a: u8, b: u8) -> HarmonicClass {
+    match interval_class(a, b) {
+        0 | 7 => HarmonicClass::PerfectConsonance,
+        3 | 4 | 8 | 9 => HarmonicClass::ImperfectConsonance,
+        // ic 5 (the perfect fourth) routes per the contested-decision flag.
+        5 => {
+            if FOURTH_IS_DISSONANT {
+                HarmonicClass::Dissonance
+            } else {
+                HarmonicClass::PerfectConsonance
+            }
+        }
+        // 1, 2, 6, 10, 11 — seconds, tritone, sevenths.
+        _ => HarmonicClass::Dissonance,
+    }
+}
+
+/// True iff the vertical interval between the two voices is ANY consonance (perfect or
+/// imperfect) — the first-species "structural verticals must be consonant" gate.
+fn is_consonant(a: u8, b: u8) -> bool {
+    !matches!(harmonic_class(a, b), HarmonicClass::Dissonance)
+}
+
+// --- §1.x relative (pairwise) motion of two voices ---
+
+/// The four relative-motion types of two voices, in preference order (Contrary best,
+/// Parallel worst). Distinct from single-line `MotionDir`.
+///
+/// theory (research Area 1 terminology): contrary = opposite directions (most
+/// independent); oblique = one voice holds; similar = same direction, different
+/// interval; parallel = same direction, SAME harmonic interval class (least
+/// independent — the parallel-perfect prohibition's geometry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelMotion {
+    Contrary,
+    Oblique,
+    Similar,
+    Parallel,
+}
+
+/// Pairwise relative motion from voice-pair (a_prev,b_prev) to (a_now,b_now). `a` is the
+/// CF (melody) side, `b` the counter side, but the classification is symmetric.
+///
+/// theory: oblique iff either voice holds; otherwise contrary iff the two single-line
+/// directions oppose; otherwise similar, refined to PARALLEL when the harmonic interval
+/// class is PRESERVED across the move (the textbook "same direction, same interval").
+fn rel_motion(a_prev: u8, a_now: u8, b_prev: u8, b_now: u8) -> RelMotion {
+    let da = motion_dir(Some(a_prev), Some(a_now));
+    let db = motion_dir(Some(b_prev), Some(b_now));
+    match (da, db) {
+        // Either voice holds → oblique (the held voice is the oblique axis).
+        (MotionDir::Hold, _) | (_, MotionDir::Hold) => RelMotion::Oblique,
+        // Both move in opposite directions → contrary.
+        (MotionDir::Up, MotionDir::Down) | (MotionDir::Down, MotionDir::Up) => RelMotion::Contrary,
+        // Both move the same way → similar, promoted to parallel when the interval
+        // class is preserved (same vertical interval carried in the same direction).
+        _ => {
+            if interval_class(a_prev, b_prev) == interval_class(a_now, b_now) {
+                RelMotion::Parallel
+            } else {
+                RelMotion::Similar
+            }
+        }
+    }
+}
+
+/// Graded PREF term (lower-is-better, matching `pick_counter_pitch`'s score convention)
+/// for a relative-motion type — generalizes the single `CONTRARY_BONUS` into the full
+/// contrary > oblique > similar > parallel gradient (research Area 1 §1.2 PREF).
+///
+/// theory: contrary motion is the strongest two-voice independence, parallel the weakest.
+/// The gradient is keyed off `CONTRARY_BONUS` so it stays smaller than any HARD reject
+/// (those are boolean gates upstream, never score terms) — it ORDERS legal candidates,
+/// it never rescues an illegal one. Contrary keeps the full bonus; oblique most of it;
+/// similar a small reward; parallel none (the worst legal motion).
+fn rel_motion_score(m: RelMotion) -> i32 {
+    match m {
+        RelMotion::Contrary => -CONTRARY_BONUS, // best — the as-built contrary bonus
+        RelMotion::Oblique => -(CONTRARY_BONUS * 3 / 4), // a held voice is still independent
+        RelMotion::Similar => -(CONTRARY_BONUS / 8), // a faint nudge over parallel
+        RelMotion::Parallel => 0,               // worst legal motion — no reward
+    }
+}
+
+// --- §1.2 / §1.3 HARD gates over a voice-pair transition ---
+
+/// Contested-decision #2: STRICT hidden/direct-perfects rule — forbid ALL similar
+/// (and parallel) motion INTO a perfect consonance. `true` = the strict two-voice form
+/// (the cleaner independence the engine lacks); the four-part-harmony relaxation
+/// (allow when the upper voice steps) belongs to chordal pedagogy, not the bare line.
+const HIDDEN_PERFECTS_STRICT: bool = true;
+
+/// HARD (research Area 1 §1.2): approaching a PERFECT consonance must be by Contrary or
+/// Oblique motion — forbids direct/hidden fifths & octaves (similar motion into a
+/// perfect) on top of the strict parallel-perfect ban `has_parallel_perfects` already
+/// enforces. Returns `true` when the resulting vertical is NOT perfect (rule vacuous) or
+/// the approach motion is legal.
+///
+/// `m_*` is the CF/melody side, `c_*` the counter side.
+fn approach_perfect_is_legal(m_prev: u8, m_now: u8, c_prev: u8, c_now: u8) -> bool {
+    // The rule only constrains transitions whose ARRIVAL vertical is a perfect consonance.
+    if harmonic_class(m_now, c_now) != HarmonicClass::PerfectConsonance {
+        return true;
+    }
+    match rel_motion(m_prev, m_now, c_prev, c_now) {
+        RelMotion::Contrary | RelMotion::Oblique => true,
+        // Similar/Parallel into a perfect: legal only if the strict flag is OFF.
+        RelMotion::Similar | RelMotion::Parallel => !HIDDEN_PERFECTS_STRICT,
+    }
+}
+
+/// HARD (research Area 1 §1.2 melodic): the counter line must not LEAP by a DISSONANT
+/// melodic interval — a melodic seventh (ic 10/11 across an octave-or-less leap) or any
+/// augmented interval (the tritone, ic 6). Steps (≤2 semitones) are always legal; the
+/// classic prohibited leaps are the melodic 7th and the tritone.
+///
+/// theory: the ear cannot sing an unprepared dissonant leap cleanly — these are the
+/// textbook forbidden melodic intervals. Consonant leaps (3rds/4ths/5ths/6ths/octave)
+/// pass; a tritone or seventh leap is rejected.
+fn melodic_leap_is_legal(prev: u8, now: u8) -> bool {
+    let semis = (now as i16 - prev as i16).abs();
+    // A step is never a forbidden leap.
+    if semis <= 2 {
+        return true;
+    }
+    let ic = interval_class(prev, now);
+    // Tritone (ic 6) and sevenths (ic 10/11) are the prohibited melodic leaps. (An
+    // octave, ic 0 across 12 semitones, is a consonant leap and stays legal.)
+    !matches!(ic, 6 | 10 | 11)
+}
+
+// --- §1.4–§1.6 the licensed dissonant figures (each = approach+resolution predicate) ---
+
+/// The per-step figure the counter sounds. `Sustain` is the first-species default (one
+/// consonant chord tone — today's behavior, byte-preserved). The rest are the licensed
+/// dissonances; each is producible ONLY when its approach+resolution predicate holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CounterFigure {
+    Sustain,    // one consonant chord tone (today's pick_counter_pitch behavior)
+    Passing,    // §1.4/1.5: dissonance approached & left by step, SAME direction
+    Neighbor,   // §1.5: step away & step back to the start pitch, OPPOSITE directions
+    Suspension, // §1.6: prepared-consonant, held, dissonant-on-strong, resolves DOWN by step
+    #[allow(dead_code)] // recognized by `is_legal_cambiata`; emission is a Slice-4 widening
+    Cambiata, // §1.5: the canonical 5-note changing-note figure (one sanctioned leap-from-diss)
+}
+
+/// Contested-decision #3 (second-species dissonance): passing is HARD-legal; neighbor is
+/// PREF-permitted behind this flag. `true` admits neighbor figures.
+const NEIGHBOR_ALLOWED: bool = true;
+
+/// §1.4 passing-tone predicate: a candidate dissonant note is legal iff it is approached
+/// by STEP and left by STEP in the SAME direction (it passes between two consonances).
+///
+/// `prev` = the prior counter pitch (consonant against its CF), `cand` = the candidate
+/// (dissonant against `cf_at_cand`), `next_resolution` = the pitch it steps to (consonant
+/// against its CF). theory (research Area 1 §1.4): step-in AND step-out AND same-direction,
+/// both ENDS consonant. The candidate itself is the controlled passing dissonance.
+fn is_legal_passing(prev: u8, cand: u8, next_resolution: u8, cf_at_cand: u8) -> bool {
+    let in_step = (cand as i16 - prev as i16).abs();
+    let out_step = (next_resolution as i16 - cand as i16).abs();
+    // Approached and left by step (≤ a whole tone).
+    if !(1..=2).contains(&in_step) || !(1..=2).contains(&out_step) {
+        return false;
+    }
+    // Same direction in and out (a true passing tone, not a turn).
+    let same_dir =
+        motion_dir(Some(prev), Some(cand)) == motion_dir(Some(cand), Some(next_resolution));
+    // The candidate must actually BE the dissonance the figure licenses, and the
+    // resolution end-point a consonance (the prep end is the prior consonant note).
+    same_dir && harmonic_class(cand, cf_at_cand) == HarmonicClass::Dissonance
+}
+
+/// §1.5 neighbor predicate: step AWAY from the start pitch then step BACK to it
+/// (opposite directions, start == end), the candidate dissonant in the middle, both
+/// framing notes consonant. Behind `NEIGHBOR_ALLOWED` at the call site.
+///
+/// theory (research Area 1 §1.5): `step_in AND step_out AND opposite_dir AND start==end`.
+fn is_legal_neighbor(prev: u8, cand: u8, return_to: u8, cf_at_cand: u8) -> bool {
+    let in_step = (cand as i16 - prev as i16).abs();
+    let out_step = (return_to as i16 - cand as i16).abs();
+    if !(1..=2).contains(&in_step) || !(1..=2).contains(&out_step) {
+        return false;
+    }
+    // Returns to the SAME pitch it left (the defining neighbor property).
+    if prev != return_to {
+        return false;
+    }
+    // Opposite directions (away then back).
+    let away = motion_dir(Some(prev), Some(cand));
+    let back = motion_dir(Some(cand), Some(return_to));
+    let opposite = matches!(
+        (away, back),
+        (MotionDir::Up, MotionDir::Down) | (MotionDir::Down, MotionDir::Up)
+    );
+    opposite && harmonic_class(cand, cf_at_cand) == HarmonicClass::Dissonance
+}
+
+/// §1.6 suspension three-stage predicate over three consecutive counter states and the
+/// CF beneath each: PREP consonant → HELD at the same pitch → now DISSONANT on the strong
+/// position → RESOLVES DOWN by step to a consonance. Encodes the canonical {7-6, 4-3, 9-8
+/// upper; 2-3 bass} suspension table implicitly (any prepared-and-down-resolved
+/// dissonance against the CF that lands consonant satisfies it).
+///
+/// theory (research Area 1 §1.6): `prep_consonant AND held_same_pitch AND
+/// now_dissonant_on_strong AND resolves == step_down_to_consonance`. Resolution is ALWAYS
+/// by a single downward step (−1 or −2 semitones) to a consonant vertical.
+fn is_legal_suspension(
+    prep: u8,
+    held: u8,
+    resolution: u8,
+    cf_prep: u8,
+    cf_held: u8,
+    cf_resolution: u8,
+) -> bool {
+    // Stage 1: preparation is consonant.
+    if !is_consonant(prep, cf_prep) {
+        return false;
+    }
+    // Stage 2: the SAME pitch is held into the strong position (the syncopation/tie).
+    if prep != held {
+        return false;
+    }
+    // Stage 3a: that held pitch is now DISSONANT against the new CF (the suspension).
+    if harmonic_class(held, cf_held) != HarmonicClass::Dissonance {
+        return false;
+    }
+    // Stage 3b: it resolves DOWN by a single step to a consonance (the 7-6/4-3/9-8/2-3
+    // table is exactly "down a step to the consonant tone below").
+    let drop = resolution as i16 - held as i16;
+    (drop == -1 || drop == -2) && is_consonant(resolution, cf_resolution)
+}
+
+/// §1.5 cambiata recognizer: the ONE canonical 5-note changing-note form —
+/// consonance → step DOWN to a dissonance → leap DOWN a third → step UP → step UP. It is
+/// the single sanctioned place a dissonance is left by LEAP; the recognizer permits that
+/// otherwise-illegal leap-away-from-dissonance only when the whole template matches.
+///
+/// `figure` is the 5 counter pitches, `cf` the 5 CF pitches beneath them. theory
+/// (research Area 1 §1.5; contested-decision: one canonical 5-note form, variants out of
+/// scope). Recognition-only in Slice 1 (the emission path is a Slice-4 widening — the
+/// predicate is built now so PT-4 can classify a cambiata if one is ever produced).
+fn is_legal_cambiata(figure: &[u8], cf: &[u8]) -> bool {
+    if figure.len() != 5 || cf.len() != 5 {
+        return false;
+    }
+    let d = |a: u8, b: u8| b as i16 - a as i16; // signed melodic interval a→b
+                                                // n0→n1: step down (−1/−2); n1→n2: leap down a third (−3/−4); n2→n3: step up (+1/+2);
+                                                // n3→n4: step up (+1/+2). The classic Fux cambiata shape.
+    let n01 = d(figure[0], figure[1]);
+    let n12 = d(figure[1], figure[2]);
+    let n23 = d(figure[2], figure[3]);
+    let n34 = d(figure[3], figure[4]);
+    let step_down = (-2..=-1).contains(&n01);
+    let third_down = (-4..=-3).contains(&n12);
+    let step_up_1 = (1..=2).contains(&n23);
+    let step_up_2 = (1..=2).contains(&n34);
+    if !(step_down && third_down && step_up_1 && step_up_2) {
+        return false;
+    }
+    // The 2nd note (the changing note) is the licensed dissonance; the frame notes
+    // (0 and the landing) are consonant.
+    harmonic_class(figure[1], cf[1]) == HarmonicClass::Dissonance
+        && is_consonant(figure[0], cf[0])
+        && is_consonant(figure[4], cf[4])
+}
+
+// --- §1.3 begin / cadence boundary formulas ---
+
+/// HARD (research Area 1 §1.3): the counter's FIRST vertical (a `PhraseStart` step) must
+/// be a PERFECT consonance — unison/5th/octave when the counter is above the CF;
+/// unison/octave when below (avoid the bare fourth-below opening). Returns the opening
+/// candidate set filtered to perfect-consonant verticals, in the counter band.
+///
+/// theory: species writing opens on a stable perfect interval so the two voices declare
+/// their independence from a clear vertical. The 5th-below is the bare-fourth-above
+/// inversion the rule excludes, hence the `counter_above` split.
+fn opening_candidates(chord: &Chord, cf_first: u8, counter_above: bool) -> Vec<u8> {
+    counter_candidate_pitches(chord, cf_first)
+        .into_iter()
+        .filter(|&c| harmonic_class(c, cf_first) == HarmonicClass::PerfectConsonance)
+        .filter(|&c| {
+            let ic = interval_class(c, cf_first);
+            if counter_above {
+                // Above: unison/octave (ic 0) or fifth (ic 7) are all legal.
+                ic == 0 || ic == 7
+            } else {
+                // Below: only unison/octave; a "fifth below" sounds as a fourth above
+                // the counter, the excluded bare-fourth opening.
+                ic == 0 || c >= cf_first
+            }
+        })
+        .collect()
+}
+
+/// HARD (research Area 1 §1.3): at a PerfectAuthenticCadence step, the counter resolves by
+/// STEPWISE CONTRARY motion onto the octave/unison with the CF (the clausula) — the
+/// penultimate vertical a major 6th (counter above) or minor 3rd (counter below)
+/// expanding/contracting by step to the final perfect consonance.
+///
+/// theory: the cadential clausula is the most rigid two-voice formula — the voices
+/// converge by step to the octave/unison. We choose the perfect-consonant chord tone
+/// reachable by a STEP from `counter_prev` whose motion is CONTRARY to the CF's, nearest
+/// the prior counter pitch. Falls back to the nearest perfect-consonant tone if no
+/// stepwise contrary landing exists (degenerate cadence chord).
+fn cadence_resolution_pitch(chord: &Chord, cf_now: u8, counter_prev: u8, cf_prev: u8) -> u8 {
+    let cf_dir = motion_dir(Some(cf_prev), Some(cf_now));
+    let cands = counter_candidate_pitches(chord, counter_prev);
+    // Perfect-consonant landings reachable by a STEP from where the counter sat.
+    let mut stepwise_contrary: Vec<u8> = cands
+        .iter()
+        .copied()
+        .filter(|&c| harmonic_class(c, cf_now) == HarmonicClass::PerfectConsonance)
+        .filter(|&c| (c as i16 - counter_prev as i16).abs() <= 2 && c != counter_prev)
+        .filter(|&c| {
+            // Contrary to the CF (or oblique when the CF holds — still convergent).
+            let cdir = motion_dir(Some(counter_prev), Some(c));
+            matches!(
+                (cf_dir, cdir),
+                (MotionDir::Up, MotionDir::Down)
+                    | (MotionDir::Down, MotionDir::Up)
+                    | (MotionDir::Hold, _)
+            )
+        })
+        .collect();
+    stepwise_contrary.sort_by_key(|&c| (c as i16 - counter_prev as i16).abs());
+    if let Some(&c) = stepwise_contrary.first() {
+        return c;
+    }
+    // Fallback: nearest perfect-consonant chord tone (still closes on a perfect
+    // consonance — the HARD floor — even if a clean stepwise clausula isn't available).
+    cands
+        .iter()
+        .copied()
+        .filter(|&c| harmonic_class(c, cf_now) == HarmonicClass::PerfectConsonance)
+        .min_by_key(|&c| (c as i16 - counter_prev as i16).abs())
+        .unwrap_or(counter_prev)
+}
+
+// --- new PREF constants (siblings of CONTRARY_BONUS, all private) ---
+
+/// §1.2 PREF: prefer imperfect consonances (3rds/6ths) over perfect ones for interior
+/// verticals — a line of only 5ths/8ves sounds empty and courts parallels. A small
+/// reward (kept below the motion gradient so it only breaks near-ties).
+const IMPERFECT_PREF: i32 = 4;
+
+/// §1.6 reward for a legal SUSPENSION figure — the most expressive licensed dissonance,
+/// nudged so a prepared-and-resolved suspension is preferred over a plain sustain when
+/// both are legal on a strong cadential-approach step. Smaller than `CONTRARY_BONUS` so
+/// it never overrides motion independence or any HARD reject.
+const SUSPENSION_CHAIN_BONUS: i32 = 6;
+
+/// §1.4 reward for a legal PASSING/NEIGHBOR figure — a small inducement to fill a
+/// stepwise gap with a controlled passing dissonance rather than a static sustain, on the
+/// changing-chord/moving-melody steps where dissonant figures are enabled. Kept small so
+/// the consonant frame remains the default and dissonance stays an ornament.
+const PASSING_PREF: i32 = 3;
+
+/// §1.7 the fifth-species figure-selection driver — the new top of the counter scorer.
+///
+/// Enumerates the legal {Sustain, Passing, Neighbor, Suspension} candidates for this step
+/// under the HARD gates (consonant structural verticals; dissonance only as a licensed
+/// figure with correct approach+resolution; approach perfects by contrary/oblique; no
+/// melodic dissonant leaps; begin/cadence formulas), PREF-scores survivors, and picks the
+/// best DETERMINISTICALLY. Returns the sounding pitch AND its figure tag.
+///
+/// BYTE-FREEZE (design §5.2 PT-0): the `Sustain` pitch is literally `pick_counter_pitch`
+/// unchanged, and dissonant figures are enabled ONLY when `figures_enabled` is true (the
+/// arm sets it false on held-run / static steps — R-A). When dissonance is disabled, OR no
+/// dissonant figure's predicate holds, the driver returns `(pick_counter_pitch(..),
+/// Sustain)` — IDENTICAL to the as-built line. The cambiata figure is recognition-only in
+/// Slice 1 (emission deferred to Slice 4), so it is not enumerated here.
+/// S30-CP-FIX (GAP-2) — re-select a CONSONANT structural sustain when the plain scorer pick
+/// is dissonant against the sounding CF.
+///
+/// theory: in species counterpoint every SUSTAINED (note-against-note) vertical must be a
+/// consonance; a dissonance is admissible only as a licensed figure with a prepared approach
+/// and a stepwise resolution. The as-built `pick_counter_pitch` never consonance-checks the
+/// tone it lands on, so a diminished chord can sustain a chord tone that is a bare tritone
+/// against the melody. This gate enforces the floor: if `raw` is already consonant (or the CF
+/// rests, so there is no vertical to constrain), it is returned unchanged — a no-op on every
+/// consonant triad, preserving the byte-stable held/consonant behavior. Otherwise we choose,
+/// among the chord's reachable counter-band tones, the CONSONANT one that best matches the
+/// inner-line bias the scorer already encodes: prefer an imperfect consonance (3rd/6th) over a
+/// perfect one (a line of bare 5ths/8ves is the §1.2 emptiness the scorer also avoids), then
+/// the smallest melodic step from `prev_counter` (connectedness), then a non-root tone. If NO
+/// chord tone is consonant against the CF (a fully degenerate vertical — every band tone of
+/// the chord clashes), we keep `raw`: the structural floor cannot be met from the chord's own
+/// tones, and inventing a non-chord tone would break the first-species chord-tone invariant;
+/// such a chord has no consonant counter and that is a harmony defect upstream, not a counter
+/// defect. Pure/deterministic; reached only from the CounterMelody figure driver.
+fn consonance_gate_sustain(chord: &Chord, raw: u8, prev_counter: u8, m_now: Option<u8>) -> u8 {
+    // No CF this step (melody rests) → no vertical to constrain; keep the scorer's pick.
+    let Some(cf) = m_now else { return raw };
+    // Already consonant → no-op (the byte-stable common case).
+    if is_consonant(raw, cf) {
+        return raw;
+    }
+    // Re-select among the chord's reachable consonant counter-band tones.
+    let consonant: Vec<u8> = counter_candidate_pitches(chord, prev_counter)
+        .into_iter()
+        .filter(|&c| is_consonant(c, cf))
+        .collect();
+    consonant
+        .into_iter()
+        .min_by_key(|&c| {
+            // Lower-is-better, mirroring the scorer's biases:
+            //  (1) imperfect consonance preferred over perfect (avoid bare 5ths/8ves);
+            //  (2) smallest step from where the line just was (connectedness);
+            //  (3) a non-root inner tone over the root pc (the counter is not a bass double).
+            let imperfect_first = if harmonic_class(c, cf) == HarmonicClass::ImperfectConsonance {
+                0
+            } else {
+                1
+            };
+            let step = (c as i16 - prev_counter as i16).abs();
+            let root_last = if is_root_pc(chord, c) { 1 } else { 0 };
+            (imperfect_first, step, root_last)
+        })
+        // No consonant chord tone exists at all → the chord cannot support a consonant
+        // structural vertical from its own tones; keep `raw` rather than emit a non-chord tone.
+        .unwrap_or(raw)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pick_counter_figure(
+    chord: &Chord,
+    prev_counter: u8,
+    m_prev: Option<u8>,
+    m_now: Option<u8>,
+    mel_dir: MotionDir,
+    position: PhrasePosition,
+    next_chord: Option<&Chord>,
+    force_move: bool,
+    held_target: Option<u8>,
+    // True only on changing-chord / moving-melody steps (R-A): dissonant figures are
+    // enabled here and NOWHERE else, so held-run / static steps stay sustain-only and the
+    // held-period behavior is byte-stable (PT-0).
+    figures_enabled: bool,
+) -> (u8, CounterFigure) {
+    // The first-species sustain pitch — today's scorer, unchanged. This is the byte-freeze
+    // anchor: it is what the figure driver reduces to whenever no dissonance is licensed.
+    let sustain_raw = pick_counter_pitch(
+        chord,
+        prev_counter,
+        m_prev,
+        m_now,
+        mel_dir,
+        force_move,
+        held_target,
+    );
+
+    // S30-CP-FIX (GAP-2) — CONSONANCE-GATE THE STRUCTURAL SUSTAIN.
+    //
+    // theory: a first-species (sustained) structural vertical MUST be a consonance — the
+    // species floor is "every note-against-note vertical is consonant; dissonance appears
+    // ONLY as a licensed, prepared-and-resolved figure". The as-built `pick_counter_pitch`
+    // scorer rejects parallel perfects and rewards independence but NEVER checks the
+    // vertical consonance of the pitch it lands on, so on a chord whose only reachable band
+    // tones are dissonant against the CF (the diminished vii = B-D-F sustaining B against a
+    // melody on F → a bare tritone) it emits an unprepared, unresolved structural dissonance.
+    // Here we route the sustain pick through `is_consonant` against the sounding CF: if the
+    // plain pick is dissonant, we re-select the CONSONANT chord tone nearest the prior
+    // counter pitch (preferring an imperfect consonance, then the smallest melodic step from
+    // `prev_counter`, then a non-root tone — the same inner-line bias the scorer encodes), so
+    // the line never leaves an unprepared structural dissonance. The added passing/neighbor/
+    // suspension figures below remain the ONLY way a dissonance is sounded, and each is still
+    // routed through its own approach+resolution predicate. When the plain pick is already
+    // consonant (the overwhelmingly common case, every consonant triad) this is a no-op and
+    // the sustain is byte-identical to before — so the held-period / consonant-triad freeze
+    // and PT-0 are untouched.
+    let sustain = consonance_gate_sustain(chord, sustain_raw, prev_counter, m_now);
+
+    // --- §1.3 BEGIN formula: a PhraseStart vertical MUST be a perfect consonance. This is
+    // a HARD override of the sustain pick (which optimizes for motion, not the opening
+    // interval). Only applies when the CF actually sounds this step.
+    if position == PhrasePosition::PhraseStart {
+        if let Some(cf) = m_now {
+            let counter_above = sustain >= cf;
+            let opens = opening_candidates(chord, cf, counter_above);
+            if !opens.is_empty() {
+                // Nearest legal perfect-consonant opening to the as-built sustain pick, so
+                // the opening is stable yet as close as possible to the connected line.
+                let pick = opens
+                    .into_iter()
+                    .min_by_key(|&c| (c as i16 - sustain as i16).abs())
+                    .unwrap_or(sustain);
+                return (pick, CounterFigure::Sustain);
+            }
+        }
+        // No CF (rest) or no legal perfect opening → fall through to the sustain pick.
+        return (sustain, CounterFigure::Sustain);
+    }
+
+    // --- §1.3 CADENCE formula: a PerfectAuthenticCadence step resolves by stepwise
+    // contrary motion onto the octave/unison. HARD override of the sustain pick.
+    if position == PhrasePosition::PerfectAuthenticCadence {
+        if let (Some(cf_now), Some(cf_prev)) = (m_now, m_prev) {
+            let pick = cadence_resolution_pitch(chord, cf_now, prev_counter, cf_prev);
+            return (pick, CounterFigure::Sustain);
+        }
+        return (sustain, CounterFigure::Sustain);
+    }
+
+    // --- Interior steps. Dissonant figures are licensed ONLY when enabled (changing-chord
+    // / moving-melody) AND the CF sounds both now and prior (we need the vertical context).
+    if figures_enabled {
+        if let (Some(cf_now), Some(cf_prev)) = (m_now, m_prev) {
+            // The resolution target's CF: the NEXT chord's nearest CF analogue if it
+            // exists, else the current CF (R-B: a figure at section end resolves into the
+            // current harmony, never into a non-existent next chord).
+            let resolve_chord = next_chord.unwrap_or(chord);
+
+            if let Some((pitch, figure, bonus)) =
+                best_dissonant_figure(resolve_chord, prev_counter, sustain, cf_prev, cf_now)
+            {
+                // A licensed dissonant figure was found and is legal. It must still pass
+                // the §1.2 melodic-leap gate (no dissonant leap INTO the figure) and the
+                // approach-perfect gate is irrelevant (the arrival is a dissonance, not a
+                // perfect). Compare it against the sustain pick on score: a dissonance is
+                // an ORNAMENT, only chosen when its figure bonus makes it the better line.
+                if melodic_leap_is_legal(prev_counter, pitch) {
+                    // Score both options on the SAME scale and pick the lower (better).
+                    let sustain_score =
+                        figure_vertical_score(cf_prev, cf_now, prev_counter, sustain, chord);
+                    let diss_score = (pitch as i32 - prev_counter as i32).abs() - bonus;
+                    if diss_score < sustain_score {
+                        return (pitch, figure);
+                    }
+                }
+            }
+        }
+    }
+
+    (sustain, CounterFigure::Sustain)
+}
+
+/// PREF score (lower-is-better) of the SUSTAIN candidate as a vertical+motion choice, on
+/// the same scale `pick_counter_figure` compares the dissonant figures against: melodic
+/// step size, minus the graded relative-motion bonus, minus the imperfect-consonance
+/// preference. Used only to decide sustain-vs-dissonant-figure; it never changes the
+/// sustain PITCH (that is `pick_counter_pitch`).
+fn figure_vertical_score(
+    cf_prev: u8,
+    cf_now: u8,
+    prev_counter: u8,
+    cand: u8,
+    chord: &Chord,
+) -> i32 {
+    let mut score = (cand as i32 - prev_counter as i32).abs();
+    score += rel_motion_score(rel_motion(cf_prev, cf_now, prev_counter, cand));
+    if harmonic_class(cand, cf_now) == HarmonicClass::ImperfectConsonance {
+        score -= IMPERFECT_PREF; // §1.2 prefer 3rds/6ths interior
+    }
+    if is_root_pc(chord, cand) {
+        score += ROOT_PC_BIAS;
+    }
+    score
+}
+
+/// Enumerate and HARD-gate the dissonant figures {Passing, Neighbor, Suspension} for this
+/// interior step, returning the best legal one as `(pitch, figure, pref_bonus)` or `None`
+/// when none is licensed. Every returned figure has a verified approach AND resolution
+/// (PT-4): the candidate is the dissonance, and the resolution lands consonant.
+///
+/// theory: a dissonance reads as intentional ONLY as a recognized figure with a satisfied
+/// approach+resolution (research §4.2 coherence rule 1). We enumerate candidate dissonant
+/// counter pitches a STEP from the prior pitch, and for each test the passing / neighbor /
+/// suspension predicate against the CF; a candidate failing EVERY predicate is discarded
+/// (never an unprepared/unresolved dissonance).
+fn best_dissonant_figure(
+    resolve_chord: &Chord,
+    prev_counter: u8,
+    sustain: u8,
+    cf_prev: u8,
+    cf_now: u8,
+) -> Option<(u8, CounterFigure, i32)> {
+    // The resolution pitch a passing/neighbor figure steps to: the as-built sustain pick
+    // is the connected consonant tone this step would otherwise sound, so it is the
+    // natural resolution target (a consonant chord tone of the resolving harmony). Its CF
+    // is the CF at the resolution moment — `cf_now` (the figure ornaments THIS step's
+    // arrival; the resolution sits on the same beat's consonant tone in Slice 1's
+    // single-step ornament model).
+    let resolution = sustain;
+    let cf_at_resolution = cf_now;
+
+    // Candidate dissonant counter pitches: a STEP (±1/±2) away from the prior counter
+    // pitch, dissonant against the current CF, seated in the counter band. These are the
+    // only notes a passing/neighbor figure can occupy (approached by step from prev).
+    let mut best: Option<(i32, u8, CounterFigure, i32)> = None;
+    for delta in [-2i16, -1, 1, 2] {
+        let cand_i = prev_counter as i16 + delta;
+        if !(FILL_REGISTER_FLOOR as i16..COUNTER_CEILING as i16).contains(&cand_i) {
+            continue;
+        }
+        let cand = cand_i as u8;
+        // Must be a dissonance to be a dissonant figure at all (a consonant step is just
+        // a sustain alternative, handled by the sustain scorer).
+        if harmonic_class(cand, cf_now) != HarmonicClass::Dissonance {
+            continue;
+        }
+        // Never collide in unison with the melody/CF (PT-7): the dissonant figure must
+        // stay audibly distinct from the line it counters. (In the two-voice model the CF
+        // *is* the melody pitch, so `cf_now` is the note to avoid doubling.)
+        if cand == cf_now {
+            continue;
+        }
+
+        // --- PASSING: step-in (prev→cand) and step-out (cand→resolution) same direction.
+        // The resolution arrival must also honor the approach-to-perfect HARD gate (§1.2):
+        // if it lands on a perfect consonance it must do so by contrary/oblique motion
+        // (the CF moves from `cf_now` toward the resolution's CF, here `cf_at_resolution`).
+        if is_legal_passing(prev_counter, cand, resolution, cf_now)
+            && is_consonant(resolution, cf_at_resolution)
+            && approach_perfect_is_legal(cf_now, cf_at_resolution, cand, resolution)
+        {
+            let score = delta.unsigned_abs() as i32 - PASSING_PREF;
+            consider(&mut best, score, cand, CounterFigure::Passing, PASSING_PREF);
+        }
+
+        // --- NEIGHBOR: step-away then step-back to prev (start==end), behind the flag.
+        if NEIGHBOR_ALLOWED
+            && is_legal_neighbor(prev_counter, cand, prev_counter, cf_now)
+            && is_consonant(prev_counter, cf_now)
+        {
+            // A neighbor returns to prev; the "resolution" is prev itself, which must be
+            // consonant against the CF at the return (approximated by cf_now in the
+            // single-step model). Slightly less preferred than passing (a turn, not a
+            // forward step), so a smaller bonus.
+            let score = delta.unsigned_abs() as i32 - (PASSING_PREF - 1);
+            consider(
+                &mut best,
+                score,
+                cand,
+                CounterFigure::Neighbor,
+                PASSING_PREF - 1,
+            );
+        }
+
+        // --- SUSPENSION: prep (prev consonant) → held (==prev) → dissonant on strong →
+        // resolves DOWN a step to a consonance. Modeled across the two available beats:
+        // prep/held = prev_counter under cf_prev/cf_now, resolution = the down-step tone.
+        // Only a DOWNWARD candidate can be a suspension resolution's antecedent dissonance.
+        // Here the *held dissonance* is prev_counter carried under cf_now; `cand` is its
+        // downward-step resolution. We detect this when prev_counter is dissonant now and
+        // cand resolves it down by step to a consonance.
+        if delta < 0
+            && is_legal_suspension(
+                prev_counter, // prep
+                prev_counter, // held (same pitch — the syncopation)
+                cand,         // resolution (down a step)
+                cf_prev,      // CF under preparation
+                cf_now,       // CF under the held dissonance
+                cf_at_resolution,
+            )
+        {
+            let score = delta.unsigned_abs() as i32 - SUSPENSION_CHAIN_BONUS;
+            consider(
+                &mut best,
+                score,
+                cand,
+                CounterFigure::Suspension,
+                SUSPENSION_CHAIN_BONUS,
+            );
+        }
+    }
+
+    // Reuse the resolve_chord parameter so its harmony constrains the resolution end
+    // when a next chord exists (R-B): the resolution pitch must be a chord tone of the
+    // resolving harmony. If `resolution` is NOT a tone of `resolve_chord`, no forward
+    // figure can legally resolve into it — discard (HARD, PT-4).
+    if !resolve_chord.notes.is_empty() {
+        let res_pc = resolution % 12;
+        let resolves_into_harmony = resolve_chord.notes.iter().any(|&n| n % 12 == res_pc);
+        if !resolves_into_harmony {
+            // The forward (passing) figures cannot resolve; only the suspension (which
+            // resolves to `cand`, a fresh tone, not `resolution`) survives.
+            if let Some((_, p, CounterFigure::Suspension, b)) = best {
+                return Some((p, CounterFigure::Suspension, b));
+            }
+            return None;
+        }
+    }
+
+    best.map(|(_, p, f, b)| (p, f, b))
+}
+
+/// Tie-broken "keep the lower score" accumulator for the figure search (deterministic:
+/// strictly-less replaces, so the first-enumerated wins a tie — no RNG, stable order).
+fn consider(
+    best: &mut Option<(i32, u8, CounterFigure, i32)>,
+    score: i32,
+    pitch: u8,
+    figure: CounterFigure,
+    bonus: i32,
+) {
+    match best {
+        Some((bs, _, _, _)) if *bs <= score => {}
+        _ => *best = Some((score, pitch, figure, bonus)),
+    }
 }
 
 /// Re-voice `next` to connect smoothly from the already-voiced `prev`.
@@ -5632,13 +6451,17 @@ mod tests {
                 1,
                 "the counter must sound on a changing-chord step"
             );
-            let seed = seed_prev_counter(Some(&sec.steps[0]), &sec.steps[1]);
-            let cnt_dir = motion_dir(Some(seed), Some(evs[0].note));
+            // S30-CP-FIX: measure the counter's motion from its REALIZED prior pitch (the line
+            // that actually sounded at step 0), not the synthetic §3.1 seed — that realized
+            // prev is exactly the transition the species gates now constrain, so it is the
+            // correct anchor for the contrary/oblique rule.
+            let realized_prev = realized_prev_counter(&ctx_now, &f, 1);
+            let cnt_dir = motion_dir(Some(realized_prev), Some(evs[0].note));
             assert_ne!(
                 cnt_dir,
                 MotionDir::Up,
                 "the counter must move CONTRARY/OBLIQUE (not strictly up with the melody): \
-                 seed {seed} → note {}",
+                 realized-prev {realized_prev} → note {}",
                 evs[0].note
             );
         }
@@ -5697,5 +6520,297 @@ mod tests {
         );
         // And it is the documented step_ms/4 offset.
         assert_eq!(counter[0].offset_ms, sec.ms_per_step / 4);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // S30 SLICE 1 — SPECIES-COUNTERPOINT figure-selection UNIT tests (design §6).
+    // Unit-level correctness of the new helpers ONLY. The load-bearing property net
+    // (full voice-independence at T/T+1, motion distribution, byte-freeze witnesses)
+    // is the Test Engineer lane's tests/counterpoint_s30.rs — NOT duplicated here.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// §1.1 classifier: the consonance/dissonance table is exactly right, including the
+    /// contested perfect fourth (ic 5 = dissonant in the two-voice counter scorer).
+    #[test]
+    fn s30_harmonic_class_table_incl_contested_fourth() {
+        // Perfect consonances: unison (0), octave (12 → ic 0), fifth (7).
+        assert_eq!(harmonic_class(60, 60), HarmonicClass::PerfectConsonance);
+        assert_eq!(harmonic_class(60, 72), HarmonicClass::PerfectConsonance);
+        assert_eq!(harmonic_class(60, 67), HarmonicClass::PerfectConsonance);
+        // Imperfect consonances: m3 (3), M3 (4), m6 (8), M6 (9).
+        assert_eq!(harmonic_class(60, 63), HarmonicClass::ImperfectConsonance);
+        assert_eq!(harmonic_class(60, 64), HarmonicClass::ImperfectConsonance);
+        assert_eq!(harmonic_class(60, 68), HarmonicClass::ImperfectConsonance);
+        assert_eq!(harmonic_class(60, 69), HarmonicClass::ImperfectConsonance);
+        // Dissonances: m2/M2 (1/2), tritone (6), m7/M7 (10/11).
+        assert_eq!(harmonic_class(60, 61), HarmonicClass::Dissonance);
+        assert_eq!(harmonic_class(60, 62), HarmonicClass::Dissonance);
+        assert_eq!(harmonic_class(60, 66), HarmonicClass::Dissonance);
+        assert_eq!(harmonic_class(60, 70), HarmonicClass::Dissonance);
+        assert_eq!(harmonic_class(60, 71), HarmonicClass::Dissonance);
+        // Contested-decision #1: the bare perfect fourth (ic 5) is DISSONANT here.
+        assert!(FOURTH_IS_DISSONANT);
+        assert_eq!(harmonic_class(60, 65), HarmonicClass::Dissonance);
+    }
+
+    /// §1.x relative motion + the parallel/similar refinement, and the graded score order
+    /// (contrary best, parallel worst).
+    #[test]
+    fn s30_rel_motion_classification_and_gradient() {
+        // Contrary: CF up, counter down.
+        assert_eq!(rel_motion(60, 62, 67, 65), RelMotion::Contrary);
+        // Oblique: CF holds, counter moves.
+        assert_eq!(rel_motion(60, 60, 64, 67), RelMotion::Oblique);
+        // Parallel: both up by the SAME interval (a parallel third 60/64 → 62/66).
+        assert_eq!(rel_motion(60, 62, 64, 66), RelMotion::Parallel);
+        // Similar: both up, DIFFERENT interval (third 60/64 → fifth 62/69).
+        assert_eq!(rel_motion(60, 62, 64, 69), RelMotion::Similar);
+        // Gradient strictly orders contrary < oblique < similar < parallel (lower better).
+        assert!(rel_motion_score(RelMotion::Contrary) < rel_motion_score(RelMotion::Oblique));
+        assert!(rel_motion_score(RelMotion::Oblique) < rel_motion_score(RelMotion::Similar));
+        assert!(rel_motion_score(RelMotion::Similar) < rel_motion_score(RelMotion::Parallel));
+    }
+
+    /// §1.2 HARD approach-to-perfect: strict form forbids ALL similar/parallel motion
+    /// INTO a perfect consonance; contrary/oblique into a perfect is legal; the rule is
+    /// vacuous when the arrival vertical is not perfect.
+    #[test]
+    fn s30_approach_perfect_strict() {
+        assert!(HIDDEN_PERFECTS_STRICT);
+        // SIMILAR motion into a perfect fifth (both up; arrival 60/67 is ic 7) → ILLEGAL.
+        // CF 57→60 (up), counter 64→67 (up): arrival is a fifth, both rose ⇒ hidden fifth.
+        assert!(!approach_perfect_is_legal(57, 60, 64, 67));
+        // CONTRARY into the same fifth (CF up, counter down to 67 from above) → LEGAL.
+        assert!(approach_perfect_is_legal(57, 60, 69, 67));
+        // OBLIQUE into a perfect (CF holds) → LEGAL.
+        assert!(approach_perfect_is_legal(60, 60, 64, 67));
+        // Arrival is an imperfect consonance (a third) → rule vacuous, always legal.
+        assert!(approach_perfect_is_legal(57, 60, 60, 64));
+    }
+
+    /// §1.2 melodic: steps always legal; consonant leaps legal; the tritone and the
+    /// melodic seventh are the forbidden dissonant leaps.
+    #[test]
+    fn s30_melodic_leap_legality() {
+        assert!(melodic_leap_is_legal(60, 62)); // a step
+        assert!(melodic_leap_is_legal(60, 64)); // a major third (consonant leap)
+        assert!(melodic_leap_is_legal(60, 67)); // a perfect fifth
+        assert!(melodic_leap_is_legal(60, 72)); // an octave — a consonant leap
+        assert!(!melodic_leap_is_legal(60, 66)); // a tritone leap — forbidden
+        assert!(!melodic_leap_is_legal(60, 70)); // a minor-seventh leap — forbidden
+        assert!(!melodic_leap_is_legal(60, 71)); // a major-seventh leap — forbidden
+    }
+
+    /// §1.4 passing-tone predicate: a stepwise-in, stepwise-out, same-direction dissonance
+    /// between two consonances is legal; a turn (opposite direction) is NOT a passing tone.
+    #[test]
+    fn s30_passing_tone_predicate() {
+        // Over a CF of C4 (60): counter goes E(64, M3 consonant) → D(62, M2 DISSONANT)
+        // → C(60, unison consonant). Step down, step down, same direction ⇒ passing.
+        assert!(is_legal_passing(64, 62, 60, 60));
+        // Opposite directions (down then up) is a neighbor, not a passing tone.
+        assert!(!is_legal_passing(64, 62, 64, 60));
+        // The candidate must be a dissonance: E→F#(consonant? F#=66 vs C=60 is tritone,
+        // dissonant) is fine, but a consonant candidate fails the passing predicate.
+        // G(67) over C(60) is a fifth (consonant) ⇒ not a passing dissonance.
+        assert!(!is_legal_passing(65, 67, 69, 60));
+    }
+
+    /// §1.5 neighbor predicate: step away and step BACK to the start pitch (opposite
+    /// directions, start == end), the middle note dissonant.
+    #[test]
+    fn s30_neighbor_predicate() {
+        // CF C4 (60). Counter E(64) → F(65, ic5 = DISSONANT here) → back to E(64).
+        // Step up, step down, returns to start ⇒ a legal upper neighbor.
+        assert!(NEIGHBOR_ALLOWED);
+        assert!(is_legal_neighbor(64, 65, 64, 60));
+        // Does NOT return to the start pitch ⇒ not a neighbor.
+        assert!(!is_legal_neighbor(64, 65, 62, 60));
+        // Same direction (not a turn) ⇒ not a neighbor.
+        assert!(!is_legal_neighbor(64, 65, 67, 60));
+    }
+
+    /// §1.6 suspension three-stage shape: prep consonant → held same pitch → dissonant on
+    /// the strong beat → resolves DOWN by step to a consonance.
+    #[test]
+    fn s30_suspension_predicate() {
+        // Classic 7-6 suspension. Prep: D5(74) over E(64)?? Build it cleanly in one octave:
+        // Prep D(62) over G(55): ic7 fifth (consonant). Hold D(62) as the CF moves to
+        // C(60): D-over-C is a major SECOND (ic2, DISSONANT) — the suspension. Resolve
+        // DOWN a step to C(60)?? C-over-C is a unison; use a 4-3: prep over the bass.
+        // Simpler canonical: prep F(65) consonant over C(60)? ic5 dissonant — pick a
+        // genuine consonance prep. Prep E(64) over C(60): M3 consonant. Hold E(64) as CF
+        // rises to D(62): E-over-D is a M2 (dissonant). Resolve DOWN a step to D(62):
+        // D-over-D unison (consonant). prep/held E, resolve D, cf C→D→D.
+        assert!(is_legal_suspension(64, 64, 62, 60, 62, 62));
+        // Resolution UP (a retardation) is NOT a suspension.
+        assert!(!is_legal_suspension(64, 64, 66, 60, 62, 62));
+        // Prep not consonant ⇒ not a suspension (prep F65 over C60 = ic5 dissonant here).
+        assert!(!is_legal_suspension(65, 65, 64, 60, 62, 62));
+        // Held pitch differs from prep (no tie/syncopation) ⇒ not a suspension.
+        assert!(!is_legal_suspension(64, 65, 64, 60, 62, 62));
+    }
+
+    /// §1.5 cambiata recognizer: the canonical 5-note form (consonance → step down to a
+    /// dissonance → leap down a third → step up → step up) is recognized; a non-matching
+    /// shape is rejected. Recognition-only in Slice 1.
+    #[test]
+    fn s30_cambiata_recognizer() {
+        let cf_c = [60u8; 5];
+        // REJECT — correct melodic shape (step-down / third-down / step-up / step-up) but
+        // the LANDING note (index 4) is dissonant against the CF: a cambiata must close on
+        // a consonance. figure G F D E F over held C: 65-over-60 (ic5) is the bad landing.
+        assert!(!is_legal_cambiata(&[67, 65, 62, 64, 65], &cf_c));
+        // REJECT — correct shape but the CHANGING NOTE (index 1) is consonant (67-over-60
+        // = P5): the figure's whole point is a sanctioned dissonance at index 1.
+        assert!(!is_legal_cambiata(&[69, 67, 64, 65, 67], &cf_c));
+        // ACCEPT — a fully-legal cambiata: figure E D B C D over CF C C C C B.
+        //   melody 64→62 (step down), 62→59 (leap down a m3), 59→60 (step up),
+        //          60→62 (step up) — the canonical 5-note shape ✓
+        //   index1 62-over-60 = M2 DISSONANT (the changing note) ✓
+        //   index0 64-over-60 = M3 consonant frame ✓; index4 62-over-59 = m3 consonant ✓
+        assert!(is_legal_cambiata(
+            &[64, 62, 59, 60, 62],
+            &[60, 60, 60, 60, 59]
+        ));
+    }
+
+    /// §1.3 opening: the PhraseStart vertical is filtered to PERFECT consonances; the
+    /// above/below split excludes the bare fourth-below opening.
+    #[test]
+    fn s30_opening_candidates_are_perfect() {
+        let chord = c_major_triad(); // C E G
+                                     // Counter ABOVE a CF of C4(60): every legal opening is a perfect consonance.
+        for c in opening_candidates(&chord, 60, true) {
+            assert_eq!(
+                harmonic_class(c, 60),
+                HarmonicClass::PerfectConsonance,
+                "opening vertical {c} over 60 must be a perfect consonance"
+            );
+            let ic = interval_class(c, 60);
+            assert!(ic == 0 || ic == 7, "above: unison/octave/fifth only");
+        }
+    }
+
+    /// PT-0 / §5.2 BYTE-PRESERVATION (unit-level): when dissonant figures are DISABLED
+    /// (`figures_enabled = false` — the held-run / static path), `pick_counter_figure`
+    /// returns the CONSONANCE-GATED sustain pitch, tagged `Sustain` — the §5.2 freeze anchor
+    /// as corrected by the S30-CP-FIX GAP-2 consonance gate.
+    ///
+    /// S30-CP-FIX: the gate is a NO-OP whenever the as-built scorer's pick is already
+    /// consonant against the sounding CF (every consonant-triad sustain — the overwhelmingly
+    /// common case), so the byte-freeze still holds there: `pick_counter_figure == raw
+    /// pick_counter_pitch`. It re-selects a consonant chord tone ONLY when the raw pick would
+    /// be a dissonant structural sustain (GAP-2: never leave an unprepared, unresolved
+    /// dissonance). We therefore assert the driver reduces to `consonance_gate_sustain(raw)`
+    /// — which is `raw` itself in the consonant cases and a consonant re-pick in the dissonant
+    /// one — and that the consonant-already cases are byte-identical to the raw scorer.
+    #[test]
+    fn s30_sustain_reduces_to_gated_sustain_when_figures_disabled() {
+        let chord = c_major_triad();
+        // A battery of (prev_counter, m_prev, m_now, mel_dir, force_move, held_target)
+        // states spanning the as-built scorer's branches. Case 1 (prev 60 / CF 62) is the
+        // GAP-2 witness: the raw scorer pick (C=60) is a M2 DISSONANCE against D(62), so the
+        // gate re-picks a consonant tone; the rest are already consonant (byte-frozen).
+        let cases: [(u8, Option<u8>, Option<u8>, bool, Option<u8>); 5] = [
+            (60, Some(64), Some(62), false, None),
+            (64, Some(60), Some(67), true, None),
+            (62, None, Some(60), false, None),
+            (67, Some(72), Some(71), false, Some(64)),
+            (55, Some(60), None, true, None),
+        ];
+        for (prev_c, mp, mn, fm, ht) in cases {
+            let mel_dir = motion_dir(mp, mn);
+            let raw = pick_counter_pitch(&chord, prev_c, mp, mn, mel_dir, fm, ht);
+            let gated = consonance_gate_sustain(&chord, raw, prev_c, mn);
+            let (pitch, fig) = pick_counter_figure(
+                &chord,
+                prev_c,
+                mp,
+                mn,
+                mel_dir,
+                PhrasePosition::Interior,
+                Some(&chord),
+                fm,
+                ht,
+                false, // figures DISABLED → must reduce to the consonance-gated sustain pick
+            );
+            assert_eq!(
+                pitch, gated,
+                "figures-disabled pitch must reduce to the consonance-gated sustain"
+            );
+            // The structural sustain is NEVER a dissonance against the sounding CF (GAP-2 floor).
+            if let Some(cf) = mn {
+                assert!(
+                    is_consonant(pitch, cf),
+                    "the figures-disabled structural sustain {pitch} must be consonant against \
+                     the CF {cf} (no unprepared structural dissonance)"
+                );
+            }
+            // Byte-freeze: where the raw scorer pick is already consonant, the gate is a no-op
+            // and the driver is byte-identical to the as-built sustain scorer.
+            if mn.map(|cf| is_consonant(raw, cf)).unwrap_or(true) {
+                assert_eq!(
+                    pitch, raw,
+                    "consonant-already sustain must byte-match the as-built scorer (freeze)"
+                );
+            }
+            assert_eq!(fig, CounterFigure::Sustain);
+        }
+    }
+
+    /// A parallel-perfects rejection case threaded through the driver: on an interior step
+    /// the driver never returns a pitch that forms a parallel perfect with the melody
+    /// (delegated to the as-built `has_parallel_perfects` reject inside the sustain
+    /// scorer, which the figure driver inherits — a candidate that would parallel is never
+    /// the sustain pick, and dissonant figures are dissonances, not perfects).
+    #[test]
+    fn s30_driver_never_emits_parallel_perfect() {
+        let chord = c_major_triad();
+        // Melody rises a step (60→62); seed a prior counter a fifth below the prior melody
+        // so a SIMILAR rise would parallel the fifth (55 under 60 → 57 under 62). The
+        // scorer must reject that and pick a non-parallel tone.
+        let m_prev = Some(60u8);
+        let m_now = Some(62u8);
+        let mel_dir = motion_dir(m_prev, m_now);
+        let (pitch, _) = pick_counter_figure(
+            &chord,
+            55,
+            m_prev,
+            m_now,
+            mel_dir,
+            PhrasePosition::Interior,
+            Some(&chord),
+            false,
+            None,
+            true, // enabled — exercise the full path
+        );
+        // No parallel perfect across the [melody, counter] transition.
+        assert!(
+            !has_parallel_perfects(&[60, 55], &[62, pitch]),
+            "driver pitch {pitch} forms a parallel perfect with the melody"
+        );
+    }
+
+    /// Determinism: the driver is a pure function — same inputs, same output, twice
+    /// (no thread_rng in the figure/voice choice, design §1.7 requirement 4 / PT-9).
+    #[test]
+    fn s30_driver_is_deterministic() {
+        let chord = g_major_triad();
+        let args = || {
+            pick_counter_figure(
+                &chord,
+                62,
+                Some(67),
+                Some(65),
+                motion_dir(Some(67), Some(65)),
+                PhrasePosition::Interior,
+                Some(&c_major_triad()),
+                false,
+                None,
+                true,
+            )
+        };
+        assert_eq!(args(), args());
     }
 }

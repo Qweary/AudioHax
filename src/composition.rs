@@ -2204,4 +2204,223 @@ mod tests {
             boundary_cadence: CadenceStrength::Perfect,
         }
     }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // S30 Slice-1 catalogue-deepening sanity (Area-3 figuration rows + the
+    // texture selection wiring that reaches them). Data-row validity only; the
+    // load-bearing property net (figured_bed emission, NoteEvent shape) is the
+    // Test Engineer lane. No new composition.rs logic was added — these guard
+    // the JSON rows + the four new `Ge`-only texture rules I appended.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// The four NEW S30 fixed-pattern figuration rows are present and each is
+    /// well-formed under the EXISTING `{at, tone, hold_frac}` schema: 2..=4 onsets,
+    /// strictly ascending `at` in [0,1), no new field. (PT-10 data-row validity,
+    /// implementer half.)
+    #[test]
+    fn s30_new_figuration_rows_are_wellformed() {
+        let pm: PlanMappings = mappings()
+            .composition
+            .clone()
+            .expect("composition block present")
+            .into();
+        for id in [
+            "broken_chord_up",
+            "broken_chord_wave",
+            "arp_waltz",
+            "block_comp_24",
+        ] {
+            let fig = pm
+                .figuration_catalogue
+                .iter()
+                .find(|f| f.id == id)
+                .unwrap_or_else(|| panic!("figuration row `{id}` present"));
+            assert!(
+                (2..=4).contains(&fig.onsets.len()),
+                "{id}: 2..=4 onsets, got {}",
+                fig.onsets.len()
+            );
+            let mut prev = -1.0_f32;
+            for o in &fig.onsets {
+                assert!(
+                    (0.0..1.0).contains(&o.at),
+                    "{id}: onset at={} must be in [0,1)",
+                    o.at
+                );
+                assert!(o.at > prev, "{id}: onsets must be strictly ascending in at");
+                assert!(
+                    (0.0..=1.0).contains(&o.hold_frac),
+                    "{id}: hold_frac {} must be in [0,1]",
+                    o.hold_frac
+                );
+                prev = o.at;
+            }
+        }
+    }
+
+    /// The OLD `mappings.json` byte-shape still parses: every existing figuration row
+    /// (block, alberti) survives, and the new rows ride the same serde shape with NO
+    /// new field — i.e. `FigurationOnset` is unchanged (no `register_octaves`). A
+    /// successful `mappings()` load + a `voices == 3` read on alberti is the
+    /// backward-compat witness. (Backward-compat hard requirement.)
+    #[test]
+    fn s30_figuration_backward_compat_old_rows_unchanged() {
+        let pm: PlanMappings = mappings()
+            .composition
+            .clone()
+            .expect("composition block present")
+            .into();
+        let alberti = pm
+            .figuration_catalogue
+            .iter()
+            .find(|f| f.id == "alberti")
+            .expect("alberti row still present");
+        assert_eq!(alberti.voices, 3, "alberti voices unchanged");
+        assert_eq!(alberti.onsets.len(), 4, "alberti onsets unchanged");
+        assert!(
+            pm.figuration_catalogue.iter().any(|f| f.id == "block"),
+            "block row still present"
+        );
+    }
+
+    /// The four NEW `texture` rules I appended select the matching new figured
+    /// profile when (and only when) their affect/colorfulness gate is met on a
+    /// PLANNER-FILLED understanding. Each new profile references its figuration row.
+    /// Sentinel safety: on `neutral()` (affect == -1.0 sentinel, colorfulness 0) NONE
+    /// fire — the default `pad_bed` is preserved (the Ge-only discipline). Direct over
+    /// the loaded `texture` SelectTable; no planner, RNG-free.
+    #[test]
+    fn s30_texture_rules_reach_new_figured_profiles() {
+        let pm: PlanMappings = mappings()
+            .composition
+            .clone()
+            .expect("composition block present")
+            .into();
+        let texture = &pm.texture;
+
+        // Sentinel/neutral → no new rule fires → default pad_bed (byte-stable).
+        assert_eq!(
+            texture.select(&ImageUnderstanding::neutral()),
+            "pad_bed",
+            "neutral sentinel must not trip any new Ge rule"
+        );
+
+        // High arousal + high valence (planner-filled) → block-comping groove.
+        let groove = ImageUnderstanding {
+            affect_arousal: 0.8,
+            affect_valence: 0.7,
+            ..ImageUnderstanding::neutral()
+        };
+        assert_eq!(texture.select(&groove), "pad_block_comp");
+
+        // High arousal, low valence → broken-chord up (the second rule).
+        let energetic = ImageUnderstanding {
+            affect_arousal: 0.65,
+            affect_valence: 0.2,
+            ..ImageUnderstanding::neutral()
+        };
+        assert_eq!(texture.select(&energetic), "pad_broken_up");
+
+        // Calm, bright, colorful → arpeggiated waltz.
+        let waltz = ImageUnderstanding {
+            affect_arousal: 0.1,
+            affect_valence: 0.7,
+            colorfulness: 0.6,
+            ..ImageUnderstanding::neutral()
+        };
+        assert_eq!(texture.select(&waltz), "pad_arp_waltz");
+
+        // Colorful but not bright enough for waltz → broken-chord wave (catch-all).
+        let wave = ImageUnderstanding {
+            affect_arousal: 0.1,
+            affect_valence: 0.2,
+            colorfulness: 0.5,
+            ..ImageUnderstanding::neutral()
+        };
+        assert_eq!(texture.select(&wave), "pad_broken_wave");
+
+        // Each new profile names a real figuration row.
+        for (prof_id, fig_id) in [
+            ("pad_broken_up", "broken_chord_up"),
+            ("pad_broken_wave", "broken_chord_wave"),
+            ("pad_arp_waltz", "arp_waltz"),
+            ("pad_block_comp", "block_comp_24"),
+        ] {
+            let prof = pm
+                .texture_catalogue
+                .iter()
+                .find(|p| p.id == prof_id)
+                .unwrap_or_else(|| panic!("profile `{prof_id}` present"));
+            assert_eq!(
+                prof.figuration.as_deref(),
+                Some(fig_id),
+                "{prof_id} references figuration {fig_id}"
+            );
+            assert!(
+                pm.figuration_catalogue.iter().any(|f| f.id == fig_id),
+                "{fig_id} present in figuration_catalogue"
+            );
+        }
+    }
+
+    /// The NEW S30 Area-2 progression rows realize through the EXISTING roman path
+    /// (`pick_progression` family arrays → `generate_chords`): every symbol resolves to
+    /// a non-empty chord with no panic, and the new rows are present in their families.
+    /// `pick_progression` is `thread_rng` over a family (chord_engine, not this lane), so
+    /// we drive `generate_chords` directly on each new row to assert symbol validity
+    /// deterministically. (PT-10 data-row validity, progression half.)
+    #[test]
+    fn s30_new_progression_rows_realize() {
+        let mt = mappings();
+        let fams = &mt.global.progression_families;
+        // The new rows are present in their families.
+        let warm = fams.get("warm").expect("warm family");
+        for row in [
+            "vi-IV-I-V",
+            "IV-I-V-vi",
+            "I-IV-vii-iii-vi-ii-V-I",
+            "I-vi-IV-ii",
+        ] {
+            assert!(warm.contains(&row.to_string()), "warm row `{row}` present");
+        }
+        let cool = fams.get("cool").expect("cool family");
+        for row in ["i-VII-VI-V", "iv-V"] {
+            assert!(cool.contains(&row.to_string()), "cool row `{row}` present");
+        }
+        let neutral = fams.get("neutral").expect("neutral family");
+        assert!(
+            neutral.contains(&"I-vi-IV-V".to_string()),
+            "neutral doo-wop row present"
+        );
+
+        // Every new row realizes: each symbol → a non-empty chord, no panic.
+        // (`MappingTable` is not `Clone`; load a fresh table for the engine.)
+        let engine = ChordEngine::new(mappings());
+        let new_rows = [
+            "vi-IV-I-V",
+            "IV-I-V-vi",
+            "I-IV-vii-iii-vi-ii-V-I",
+            "I-vi-IV-ii",
+            "i-VII-VI-V",
+            "iv-V",
+            "I-vi-IV-V",
+        ];
+        for row in new_rows {
+            let prog: Vec<String> = row.split('-').map(|s| s.to_string()).collect();
+            let chords = engine.generate_chords(&prog, 60, "Ionian", 0.0, 0.0, 50.0, 0.0);
+            assert!(
+                chords.len() >= prog.len(),
+                "row `{row}` realizes at least one chord per symbol (got {} for {} symbols)",
+                chords.len(),
+                prog.len()
+            );
+            for c in &chords {
+                assert!(
+                    !c.notes.is_empty(),
+                    "row `{row}` chord `{}` has notes",
+                    c.name
+                );
+            }
+        }
+    }
 }

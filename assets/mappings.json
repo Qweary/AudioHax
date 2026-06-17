@@ -40,9 +40,22 @@
       "low_motion_cadence": "Authentic"
     },
     "progression_families": {
-      "warm": ["I-vi-IV-V", "ii-V-I", "I-V-vi-IV"],
-      "cool": ["i-bVII-bVI-V", "i-iv-V", "i-bVI-bIII-bVII"],
-      "neutral": ["I-V-vi-iii-IV-I-IV-V"]
+      "warm": [
+        "I-vi-IV-V", "ii-V-I", "I-V-vi-IV",
+        "vi-IV-I-V",
+        "IV-I-V-vi",
+        "I-IV-vii-iii-vi-ii-V-I",
+        "I-vi-IV-ii"
+      ],
+      "cool": [
+        "i-bVII-bVI-V", "i-iv-V", "i-bVI-bIII-bVII",
+        "i-VII-VI-V",
+        "iv-V"
+      ],
+      "neutral": [
+        "I-V-vi-iii-IV-I-IV-V",
+        "I-vi-IV-V"
+      ]
     }
   },
   "instrument_section": {
@@ -217,7 +230,11 @@
       { "id": "identity", "layers": [], "density": 0.5, "pad_voices": 0 },
       { "id": "pad_bed",  "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.55, "pad_voices": 3 },
       { "id": "pad_bed_counter", "layers": ["Bass","Pad","CounterMelody","Melody"], "density": 0.6, "pad_voices": 3 },
-      { "id": "pad_figured", "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.62, "pad_voices": 3, "figuration": "alberti" }
+      { "id": "pad_figured", "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.62, "pad_voices": 3, "figuration": "alberti" },
+      { "id": "pad_broken_up",   "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.6,  "pad_voices": 3, "figuration": "broken_chord_up" },
+      { "id": "pad_broken_wave", "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.58, "pad_voices": 3, "figuration": "broken_chord_wave" },
+      { "id": "pad_arp_waltz",   "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.6,  "pad_voices": 3, "figuration": "arp_waltz" },
+      { "id": "pad_block_comp",  "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.62, "pad_voices": 3, "figuration": "block_comp_24" }
     ],
     "figuration_catalogue": [
       { "id": "block",   "onsets": [] },
@@ -227,6 +244,31 @@
           { "at": 0.25, "tone": 2 },
           { "at": 0.5,  "tone": 1 },
           { "at": 0.75, "tone": 2 }
+        ] },
+      { "id": "broken_chord_up", "voices": 3,
+        "onsets": [
+          { "at": 0.0,  "tone": 0 },
+          { "at": 0.25, "tone": 1 },
+          { "at": 0.5,  "tone": 2 },
+          { "at": 0.75, "tone": 1 }
+        ] },
+      { "id": "broken_chord_wave", "voices": 3,
+        "onsets": [
+          { "at": 0.0,  "tone": 0 },
+          { "at": 0.25, "tone": 2 },
+          { "at": 0.5,  "tone": 1 },
+          { "at": 0.75, "tone": 2 }
+        ] },
+      { "id": "arp_waltz", "voices": 3,
+        "onsets": [
+          { "at": 0.0,  "tone": 0, "hold_frac": 1.0 },
+          { "at": 0.33, "tone": 1 },
+          { "at": 0.66, "tone": 2 }
+        ] },
+      { "id": "block_comp_24", "voices": 3,
+        "onsets": [
+          { "at": 0.25, "tone": 0, "hold_frac": 0.5 },
+          { "at": 0.75, "tone": 0, "hold_frac": 0.5 }
         ] }
     ],
     "texture": {
@@ -237,7 +279,17 @@
           "pick": "pad_figured" },
         { "when": [ {"knob":"foreground_energy","op":"ge","lo":0.35,"hi":0.0},
                     {"knob":"fg_bg_contrast","op":"ge","lo":0.20,"hi":0.0} ],
-          "pick": "pad_bed_counter" }
+          "pick": "pad_bed_counter" },
+        { "when": [ {"knob":"arousal","op":"ge","lo":0.70,"hi":0.0},
+                    {"knob":"valence","op":"ge","lo":0.55,"hi":0.0} ],
+          "pick": "pad_block_comp" },
+        { "when": [ {"knob":"arousal","op":"ge","lo":0.60,"hi":0.0} ],
+          "pick": "pad_broken_up" },
+        { "when": [ {"knob":"valence","op":"ge","lo":0.65,"hi":0.0},
+                    {"knob":"colorfulness","op":"ge","lo":0.50,"hi":0.0} ],
+          "pick": "pad_arp_waltz" },
+        { "when": [ {"knob":"colorfulness","op":"ge","lo":0.40,"hi":0.0} ],
+          "pick": "pad_broken_wave" }
       ]
     },
     "prominence_catalogue": [
