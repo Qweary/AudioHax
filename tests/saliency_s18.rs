@@ -37,8 +37,8 @@ use audiohax::chord_engine::{
     realize_step, Chord, NoteEvent, PerfFeatures, PhrasePosition, StepPlan,
 };
 use audiohax::composition::{
-    CadenceStrength, ImageUnderstanding, KeyTempoPlan, LayerRole, OrchestrationProfile, Section,
-    StepContext, ThematicRole, ThemeVariation,
+    CadenceStrength, ImageUnderstanding, KeyTempoPlan, LayerRole, OrchestrationProfile,
+    ResolutionPolicy, Section, StepContext, ThematicRole, ThemeVariation,
 };
 use audiohax::pure_analysis::understand_image_pure;
 use image::{Rgb, RgbImage};
@@ -412,6 +412,9 @@ fn realize_counter(s0: StepPlan, s1: StepPlan, features: &PerfFeatures) -> Vec<N
         theme: None,
         variation: ThemeVariation::Identity,
         boundary_cadence: CadenceStrength::Perfect,
+        // K3 identity carry: keep this fixture on the byte-frozen non-modulating path.
+        pivot: false,
+        resolution: ResolutionPolicy::Resolve,
         density: 0.6,
         orchestration: pad_bed_counter(),
         steps: vec![s0, s1],
@@ -421,6 +424,8 @@ fn realize_counter(s0: StepPlan, s1: StepPlan, features: &PerfFeatures) -> Vec<N
         step_in_section: 1,
         theme: None,
         key_tempo: &kt,
+        // K3 identity carry: None prev ⇒ never a modulating boundary ⇒ pivot path dead.
+        prev_key_offset_semitones: None,
     };
     realize_step(&section.steps[1], 2, 4, features, MS_PER_STEP, &ctx)
 }
@@ -590,6 +595,9 @@ fn test_held_period_pitch_advances_across_steps() {
         theme: None,
         variation: ThemeVariation::Identity,
         boundary_cadence: CadenceStrength::Perfect,
+        // K3 identity carry: keep this fixture on the byte-frozen non-modulating path.
+        pivot: false,
+        resolution: ResolutionPolicy::Resolve,
         density: 0.6,
         orchestration: pad_bed_counter(),
         steps: vec![
@@ -605,6 +613,8 @@ fn test_held_period_pitch_advances_across_steps() {
             step_in_section: si,
             theme: None,
             key_tempo: &kt,
+            // K3 identity carry: None prev ⇒ never a modulating boundary ⇒ pivot path dead.
+            prev_key_offset_semitones: None,
         };
         let evs = realize_step(&section.steps[si], 2, 4, &perf(0.03), MS_PER_STEP, &ctx);
         assert_eq!(evs.len(), 1, "each held step sounds one counter note");
@@ -702,6 +712,9 @@ fn test_counter_section_start_is_valid() {
         theme: None,
         variation: ThemeVariation::Identity,
         boundary_cadence: CadenceStrength::Perfect,
+        // K3 identity carry: keep this fixture on the byte-frozen non-modulating path.
+        pivot: false,
+        resolution: ResolutionPolicy::Resolve,
         density: 0.6,
         orchestration: pad_bed_counter(),
         steps: vec![step(cur.clone(), 0)],
@@ -711,6 +724,8 @@ fn test_counter_section_start_is_valid() {
         step_in_section: 0,
         theme: None,
         key_tempo: &kt,
+        // K3 identity carry: None prev ⇒ never a modulating boundary ⇒ pivot path dead.
+        prev_key_offset_semitones: None,
     };
     let evs = realize_step(&section.steps[0], 2, 4, &perf(0.04), MS_PER_STEP, &ctx);
     // At a section start there is no prior step → melody-static, so the counter SOUNDS

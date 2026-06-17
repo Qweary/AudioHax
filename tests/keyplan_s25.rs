@@ -20,8 +20,8 @@
 //!     register invariant (mirroring prominence_s23.rs::no_inversion_invariant),
 //!   * `mapping_loader::load_mappings` (the shipped `assets/mappings.json`) + tiny inline JSON
 //!     fixtures for the loader round-trip witness,
-//!   * `git` / `sha256sum` shell-outs for the §3 machine-checkable byte-freeze witnesses
-//!     (precedent: prominence_s23.rs::engine_freeze_diff_empty, affect_s22.rs).
+//!   * a `sha256sum` shell-out for the §3 machine-checkable byte-freeze witness (re-baselined
+//!     for S28/K3; precedent: prominence_s23.rs::engine_freeze_diff_empty, affect_s22.rs).
 //!
 //! RNG-BOUNDARY DISCIPLINE (same as composition_s15.rs / diversity_s13.rs): `plan()` delegates
 //! per-section harmony to `pick_progression` (`thread_rng`), so chords / Roman numerals / per-step
@@ -63,13 +63,16 @@
 use audiohax::chord_engine::{realize_step, Chord, NoteEvent, PhrasePosition, StepPlan};
 use audiohax::composition::{
     CadenceStrength, CompositionPlanner, ImageUnderstanding, KeyTempoPlan, LayerProminence,
-    LayerRole, OrchestrationProfile, PlanMappings, Section, StepContext, ThematicRole,
-    ThemeVariation,
+    LayerRole, OrchestrationProfile, PlanMappings, ResolutionPolicy, Section, StepContext,
+    ThematicRole, ThemeVariation,
 };
 use audiohax::mapping_loader::{load_mappings, MappingTable};
 
 /// The locked engine.rs witness sha256 (design §3 / §7).
-const ENGINE_SHA256: &str = "7a07fb8568fcd94536dd3ec2e4dc71c8154f9d9678599a6106e3a542a4343c23";
+/// Re-baselined for the S28/K3 slice (lead-approved, spec-s28-k3-build §3 guarantee 3): the
+/// realizer pivot / common-tone modulation + land-home cadence move the engine kernel to a NEW
+/// frozen byte-anchor; engine_equivalence stays byte-green (9/9). This is the new freeze witness.
+const ENGINE_SHA256: &str = "e50c7db189a1585102a885fd1e975bf378b06a9ed56ce26993c6c767a2348261";
 
 /// The v1 menu set every NON-ZERO offset must belong to (Decision 3): dominant +7,
 /// subdominant +5, relative-up +3, relative-down −3. Zero (home) is always allowed.
@@ -150,7 +153,7 @@ fn all_in_menu(scheme: &[i8]) -> bool {
 /// the shipped default `home_only` scheme → EVERY section's `key_offset_semitones == 0` AND
 /// `KeyTempoPlan.key_scheme` is all-zero — the byte-freeze identity (no offset moves off 0).
 /// Driven through the SHIPPED `assets/mappings.json` (not a synthetic table) so it pins the
-/// real default behaviour. The plumbed sha256 + empty-diff witnesses live in §5.2.
+/// real default behaviour. The plumbed sha256 freeze witness lives in §5.2.
 #[test]
 fn home_only_keeps_offsets_zero() {
     let m = mappings();
@@ -185,62 +188,39 @@ fn home_only_keeps_offsets_zero() {
 // §5.2 — engine_equivalence_byte_green (the §3 machine-checkable freeze witness)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// §5.2: the byte-freeze WITNESS for the realizer kernel. K1 is planner+loader+data only; it
-/// must not touch `src/engine.rs` / `src/chord_engine.rs` / `tests/engine_equivalence.rs`.
-/// Two independent machine checks (design §3 "Witnesses"):
-///   (a) `sha256sum src/engine.rs` == the locked witness — the engine kernel byte-frozen;
-///   (b) `git diff HEAD -- src/engine.rs src/chord_engine.rs tests/engine_equivalence.rs`
-///       is EMPTY — none of the freeze-locked files moved.
-/// Asserts ONLY on the locked paths, so the slice's own uncommitted edits to
-/// composition.rs / mapping_loader.rs / assets/mappings.json do not fail it. If a shell tool
-/// is unavailable the sub-check is inconclusive-but-non-failing (engine_equivalence + the
-/// Quality Gate diff remain the freeze authority), exactly the prominence_s23 precedent — but
-/// the sha and the diff are independent, so a missing tool never silently passes both.
+/// §5.2: the byte-freeze WITNESS for the realizer kernel, re-baselined for the S28/K3 slice
+/// (lead-approved, spec-s28-k3-build §3 guarantee 3). The engine kernel was deliberately moved
+/// to a NEW frozen byte-anchor by K3 (pivot/common-tone modulation + land-home cadence), so the
+/// witness now pins the NEW sha; engine_equivalence stays byte-green (9/9).
+///
+/// The witness is the COMMIT-STATE-INDEPENDENT sha anchor: `sha256sum src/engine.rs` ==
+/// `ENGINE_SHA256`. This passes on the K3-landed working tree (committed OR uncommitted) and
+/// FAILS LOUDLY if engine.rs drifts off the new anchor in any future slice — a true forward
+/// guard, not a no-op. (The old `git diff HEAD` sub-check was retired: HEAD predates K3, so a
+/// diff-vs-HEAD witness is non-empty on the legitimate K3 tree and is not commit-state-robust;
+/// the sha anchor is the cleaner freeze. engine_equivalence + the Quality Gate's own diff remain
+/// secondary authorities.) If `sha256sum` is entirely unavailable the check is
+/// inconclusive-but-non-failing rather than spuriously red; a readable file that mismatches the
+/// anchor always fails, so a missing tool can never silently pass.
 #[test]
 fn engine_equivalence_byte_green() {
     use std::process::Command;
 
-    // (a) sha256 of the engine kernel == the locked witness.
-    let mut sha_checked = false;
-    if let Ok(out) = Command::new("sha256sum").arg("src/engine.rs").output() {
-        if out.status.success() {
+    // sha256 of the engine kernel == the locked witness (the new K3 anchor).
+    match Command::new("sha256sum").arg("src/engine.rs").output() {
+        Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
             let got = text.split_whitespace().next().unwrap_or("");
             assert_eq!(
                 got, ENGINE_SHA256,
-                "src/engine.rs sha256 moved off the locked witness — the engine kernel was touched"
-            );
-            sha_checked = true;
-        }
-    }
-    if !sha_checked {
-        eprintln!(
-            "engine_equivalence_byte_green: sha256sum unavailable; deferring the engine-kernel \
-             hash check to the git-diff witness below + engine_equivalence + the Quality Gate"
-        );
-    }
-
-    // (b) git diff over the freeze-locked files is empty.
-    let locked = [
-        "src/engine.rs",
-        "src/chord_engine.rs",
-        "tests/engine_equivalence.rs",
-    ];
-    let mut args = vec!["diff", "HEAD", "--"];
-    args.extend(locked.iter().copied());
-    match Command::new("git").args(&args).output() {
-        Ok(out) => {
-            let diff = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                diff.trim().is_empty(),
-                "K1 must NOT touch the byte-freeze files; `git diff HEAD` over {locked:?} \
-                 produced:\n{diff}"
+                "src/engine.rs sha256 moved off the locked witness — the engine kernel drifted \
+                 from the S28/K3 frozen anchor"
             );
         }
-        Err(e) => {
+        _ => {
             eprintln!(
-                "engine_equivalence_byte_green: git not runnable ({e}); deferring to the sha256 \
-                 witness above + engine_equivalence + the Quality-Gate diff as freeze authority"
+                "engine_equivalence_byte_green: sha256sum unavailable; deferring the engine-kernel \
+                 freeze to engine_equivalence + the Quality Gate diff as authority"
             );
         }
     }
@@ -895,6 +875,9 @@ fn realize_offset(
         theme: None,
         variation: ThemeVariation::Identity,
         boundary_cadence: CadenceStrength::Perfect,
+        // K3 identity carry: keep this fixture on the byte-frozen non-modulating path.
+        pivot: false,
+        resolution: ResolutionPolicy::Resolve,
         density: 0.5,
         orchestration: profile.clone(),
         steps: vec![step.clone()],

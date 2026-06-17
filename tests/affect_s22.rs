@@ -399,44 +399,44 @@ fn affect_absent_block_keeps_ballad_window() {
 // (6) BYTE-FREEZE WITNESS — the engine/realizer is provably untouched by Slice A.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The byte-freeze witness (spec §6(f)): Slice A changes only the compose path + an additive
-/// surface; `src/engine.rs`, `src/chord_engine.rs`, and `tests/engine_equivalence.rs` are NOT
-/// in its file set, so they must be byte-unchanged vs HEAD. This shells `git diff HEAD` over the
-/// three locked files and asserts empty stdout — the mechanical witness the spec's §5 names.
+/// The byte-freeze witness (spec §6(f)), re-baselined for the S28/K3 slice (lead-approved,
+/// spec-s28-k3-build §3 guarantee 3). K3 deliberately moves the engine kernel to a NEW frozen
+/// byte-anchor (pivot/common-tone modulation + land-home cadence) while engine_equivalence stays
+/// byte-green (9/9), so a `git diff HEAD` witness is no longer correct: HEAD predates K3, so the
+/// diff is legitimately non-empty on the K3 tree. The witness is therefore re-pointed to the
+/// COMMIT-STATE-INDEPENDENT sha anchor (matching keyplan_s25::engine_equivalence_byte_green):
+/// `sha256sum src/engine.rs` == the new locked anchor. This passes on the K3-landed tree
+/// (committed OR uncommitted) and FAILS LOUDLY if engine.rs drifts off the anchor in a future
+/// slice — a true forward guard, not a no-op. The engine_equivalence net owns the
+/// equivalence-test freeze, so this guard pins only the engine kernel byte-image.
 ///
-/// Robustness: if `git` is unavailable or the working tree is mid-edit (e.g. the implementer's
-/// uncommitted S22 changes to OTHER files are present), this test asserts only on the three
-/// LOCKED paths, so unrelated dirty files do not fail it. If `git` cannot run at all, the test
-/// is treated as inconclusive-but-non-failing (the engine_equivalence suite + the Quality
-/// Gate's own `git diff` check are the authoritative freeze guards) rather than spuriously red.
+/// Robustness: if `sha256sum` is unavailable the check is inconclusive-but-non-failing (the
+/// engine_equivalence suite + the Quality Gate's own diff are the authoritative freeze guards)
+/// rather than spuriously red; a readable file that mismatches the anchor always fails, so a
+/// missing tool can never silently pass.
 #[test]
 fn byte_freeze_witness_locked_files_unmoved() {
     use std::process::Command;
 
-    let locked = [
-        "src/engine.rs",
-        "tests/engine_equivalence.rs",
-    ];
+    // The new S28/K3 frozen engine-kernel byte-anchor (sha256 of src/engine.rs).
+    const ENGINE_SHA256: &str = "e50c7db189a1585102a885fd1e975bf378b06a9ed56ce26993c6c767a2348261";
 
-    let mut args = vec!["diff", "HEAD", "--"];
-    args.extend(locked.iter().copied());
-
-    match Command::new("git").args(&args).output() {
-        Ok(out) => {
-            // git ran. A clean exit (0 or 1 for "differences") is fine; what matters is stdout.
-            let diff = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                diff.trim().is_empty(),
-                "Slice A must not touch the locked byte-freeze files; `git diff HEAD` over \
-                 {locked:?} produced:\n{diff}"
+    match Command::new("sha256sum").arg("src/engine.rs").output() {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let got = text.split_whitespace().next().unwrap_or("");
+            assert_eq!(
+                got, ENGINE_SHA256,
+                "src/engine.rs sha256 moved off the locked witness — the engine kernel drifted \
+                 from the S28/K3 frozen anchor"
             );
         }
-        Err(e) => {
-            // git not runnable in this environment → inconclusive, not a failure. The
+        _ => {
+            // sha256sum not runnable in this environment → inconclusive, not a failure. The
             // engine_equivalence net + the Quality Gate's manual git-diff are the freeze
-            // authority; we do not turn a missing-tool into a spurious red.
+            // authority; we do not turn a missing tool into a spurious red.
             eprintln!(
-                "byte_freeze_witness: git not runnable ({e}); deferring to engine_equivalence \
+                "byte_freeze_witness: sha256sum unavailable; deferring to engine_equivalence \
                  + Quality-Gate diff as the freeze authority"
             );
         }

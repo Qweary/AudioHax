@@ -11,8 +11,8 @@ use audiohax::chord_engine::{Chord, NoteEvent, PhrasePosition, StepPlan};
 use audiohax::engine::{
     decide_instrument_action, AudioSink, AudioSinkError, CadenceStrength, EngineCommand,
     EngineConfig, FeatureSource, GlobalFeatures, InteractionEvent, KeyTempoPlan,
-    OrchestrationProfile, PipelineEngine, ScanBarFeatures, Section, StepContext, ThematicRole,
-    ThemeVariation,
+    OrchestrationProfile, PipelineEngine, ResolutionPolicy, ScanBarFeatures, Section, StepContext,
+    ThematicRole, ThemeVariation,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -320,6 +320,9 @@ fn seam_section(plan: &[StepPlan]) -> Section {
         theme: None,
         variation: ThemeVariation::Identity,
         boundary_cadence: CadenceStrength::Perfect,
+        // K3 identity carry: keep this fixture on the byte-frozen non-modulating path.
+        pivot: false,
+        resolution: ResolutionPolicy::Resolve,
         density: 0.5,
         // S17: identity orchestration profile — additive struct-field plumb only; the
         // determinism/seam properties are unaffected (realizer delegates to instrument_role).

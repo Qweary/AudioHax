@@ -19,7 +19,8 @@ use audiohax::chord_engine::{
 };
 use audiohax::composition::{
     CadenceStrength, FigurationOnset, FigurationSpec, ImageUnderstanding, KeyTempoPlan, LayerRole,
-    OrchestrationProfile, PlanMappings, Section, StepContext, ThematicRole, ThemeVariation,
+    OrchestrationProfile, PlanMappings, ResolutionPolicy, Section, StepContext, ThematicRole,
+    ThemeVariation,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,6 +188,9 @@ fn realize_pad(profile: OrchestrationProfile, step: StepPlan) -> Vec<NoteEvent> 
         theme: None,
         variation: ThemeVariation::Identity,
         boundary_cadence: CadenceStrength::Perfect,
+        // K3 identity carry: keep this fixture on the byte-frozen non-modulating path.
+        pivot: false,
+        resolution: ResolutionPolicy::Resolve,
         density: 0.6,
         orchestration: profile,
         steps: vec![step],
@@ -196,6 +200,8 @@ fn realize_pad(profile: OrchestrationProfile, step: StepPlan) -> Vec<NoteEvent> 
         step_in_section: 0,
         theme: None,
         key_tempo: &kt,
+        // K3 identity carry: None prev ⇒ never a modulating boundary ⇒ pivot path dead.
+        prev_key_offset_semitones: None,
     };
     // inst 1 of 4 → the Pad layer under both `pad_figured` and `pad_bed`.
     realize_step(&section.steps[0], 1, 4, &perf(), MS_PER_STEP, &ctx)

@@ -34,8 +34,8 @@
 
 use audiohax::chord_engine::{Chord, PhrasePosition, StepPlan};
 use audiohax::engine::{
-    decide_instrument_action, CadenceStrength, KeyTempoPlan, OrchestrationProfile, ScanBarFeatures,
-    Section, StepContext, ThematicRole, ThemeVariation,
+    decide_instrument_action, CadenceStrength, KeyTempoPlan, OrchestrationProfile,
+    ResolutionPolicy, ScanBarFeatures, Section, StepContext, ThematicRole, ThemeVariation,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -90,6 +90,9 @@ fn default_section(plan: &[StepPlan]) -> Section {
         theme: None,
         variation: ThemeVariation::Identity,
         boundary_cadence: CadenceStrength::Perfect,
+        // K3 identity carry: keep this fixture on the byte-frozen non-modulating path.
+        pivot: false,
+        resolution: ResolutionPolicy::Resolve,
         density: 0.5,
         // S17: identity orchestration profile ⇒ the realizer's plan-aware role assignment
         // delegates to `instrument_role` byte-for-byte. Struct-field add ONLY — no assert,

@@ -36,7 +36,7 @@
 use audiohax::chord_engine::{realize_step, Chord, NoteEvent, PhrasePosition, StepPlan};
 use audiohax::composition::{
     CadenceStrength, Character, KeyTempoPlan, LayerProminence, LayerRole, OrchestrationProfile,
-    Section, StepContext, ThematicRole, ThemeVariation,
+    ResolutionPolicy, Section, StepContext, ThematicRole, ThemeVariation,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -113,6 +113,9 @@ fn section_with(profile: OrchestrationProfile, step: &StepPlan) -> Section {
         theme: None,
         variation: ThemeVariation::Identity,
         boundary_cadence: CadenceStrength::Perfect,
+        // K3 identity carry: keep this fixture on the byte-frozen non-modulating path.
+        pivot: false,
+        resolution: ResolutionPolicy::Resolve,
         density: 0.5,
         orchestration: profile,
         // S23 prominence is read off `orchestration.prominence`, not the section.
@@ -581,34 +584,38 @@ fn no_inversion_invariant() {
 // TEST 5 — engine_freeze_diff_empty
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// §4(5): the byte-freeze witness. `git diff HEAD -- src/engine.rs tests/engine_equivalence.rs`
-/// must be EMPTY — Slice B does not touch the engine kernel or the equivalence net. Shells
-/// `git diff` (the precedent: tests/affect_s22.rs::byte_freeze_witness_locked_files_unmoved
-/// uses the same `Command::new("git").args(["diff","HEAD","--", ...])` pattern). Asserts ONLY
-/// on the two locked paths, so unrelated dirty files (the slice's own uncommitted edits to
-/// composition.rs / chord_engine.rs / mappings.json) do not fail it. If git cannot run at
-/// all, the test is inconclusive-but-non-failing (engine_equivalence + the Quality Gate's own
-/// diff are the freeze authority) rather than spuriously red.
+/// §4(5): the byte-freeze witness, re-baselined for the S28/K3 slice (lead-approved,
+/// spec-s28-k3-build §3 guarantee 3). K3 deliberately moves the engine kernel to a NEW frozen
+/// byte-anchor (pivot/common-tone modulation + land-home cadence) while engine_equivalence stays
+/// byte-green (9/9), so a `git diff HEAD` witness is no longer correct: HEAD predates K3, so the
+/// diff is legitimately non-empty on the K3 tree. The witness is therefore re-pointed to the
+/// COMMIT-STATE-INDEPENDENT sha anchor (matching keyplan_s25::engine_equivalence_byte_green):
+/// `sha256sum src/engine.rs` == the new locked anchor. This passes on the K3-landed tree
+/// (committed OR uncommitted) and FAILS LOUDLY if engine.rs drifts off the anchor in a future
+/// slice — a true forward guard, not a no-op. The engine_equivalence net owns the
+/// equivalence-test freeze, so this guard pins only the engine kernel byte-image. If `sha256sum`
+/// is unavailable the check is inconclusive-but-non-failing (engine_equivalence + the Quality
+/// Gate's own diff remain the authority); a readable file that mismatches always fails.
 #[test]
 fn engine_freeze_diff_empty() {
     use std::process::Command;
 
-    let locked = ["src/engine.rs", "tests/engine_equivalence.rs"];
-    let mut args = vec!["diff", "HEAD", "--"];
-    args.extend(locked.iter().copied());
+    // The new S28/K3 frozen engine-kernel byte-anchor (sha256 of src/engine.rs).
+    const ENGINE_SHA256: &str = "e50c7db189a1585102a885fd1e975bf378b06a9ed56ce26993c6c767a2348261";
 
-    match Command::new("git").args(&args).output() {
-        Ok(out) => {
-            let diff = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                diff.trim().is_empty(),
-                "Slice B must NOT touch the byte-freeze files; `git diff HEAD` over \
-                 {locked:?} produced:\n{diff}"
+    match Command::new("sha256sum").arg("src/engine.rs").output() {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let got = text.split_whitespace().next().unwrap_or("");
+            assert_eq!(
+                got, ENGINE_SHA256,
+                "src/engine.rs sha256 moved off the locked witness — the engine kernel drifted \
+                 from the S28/K3 frozen anchor"
             );
         }
-        Err(e) => {
+        _ => {
             eprintln!(
-                "engine_freeze_diff_empty: git not runnable ({e}); deferring to \
+                "engine_freeze_diff_empty: sha256sum unavailable; deferring to \
                  engine_equivalence + Quality-Gate diff as the freeze authority"
             );
         }

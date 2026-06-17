@@ -169,31 +169,31 @@
           { "label": "A", "offset_rule": "home" },
           { "label": "B", "offset_rule": "region_related:b" },
           { "label": "A", "offset_rule": "home" } ] },
-      { "id": "rounded_binary_excursion", "resolution": "resolve", "pivot": false, "sections": [
+      { "id": "rounded_binary_excursion", "resolution": "resolve", "pivot": true, "sections": [
           { "label": "A",  "offset_rule": "home" },
           { "label": "B",  "offset_rule": "region_related:b" },
           { "label": "A'", "offset_rule": "home" } ] },
-      { "id": "ternary_aba_excursion", "resolution": "resolve", "pivot": false, "sections": [
+      { "id": "ternary_aba_excursion", "resolution": "resolve", "pivot": true, "sections": [
           { "label": "A", "offset_rule": "home" },
           { "label": "B", "offset_rule": "region_related:b" },
           { "label": "A", "offset_rule": "home" } ] },
-      { "id": "aaba_excursion", "resolution": "resolve", "pivot": false, "sections": [
+      { "id": "aaba_excursion", "resolution": "resolve", "pivot": true, "sections": [
           { "label": "A", "offset_rule": "home" },
           { "label": "A", "offset_rule": "home" },
           { "label": "B", "offset_rule": "region_related:b" },
           { "label": "A", "offset_rule": "home" } ] },
-      { "id": "abac_rondo", "resolution": "resolve", "pivot": false, "sections": [
+      { "id": "abac_rondo", "resolution": "resolve", "pivot": true, "sections": [
           { "label": "A", "offset_rule": "home" },
           { "label": "B", "offset_rule": "region_related:b" },
           { "label": "A", "offset_rule": "home" },
           { "label": "C", "offset_rule": "region_related:c" } ] },
-      { "id": "abbac_excursion", "resolution": "resolve", "pivot": false, "sections": [
+      { "id": "abbac_excursion", "resolution": "resolve", "pivot": true, "sections": [
           { "label": "A",  "offset_rule": "home" },
           { "label": "B",  "offset_rule": "region_related:b" },
           { "label": "B'", "offset_rule": "region_related:c" },
           { "label": "A",  "offset_rule": "home" },
           { "label": "C",  "offset_rule": "region_related:c" } ] },
-      { "id": "theme_and_variations_resolve", "resolution": "resolve", "pivot": false, "sections": [
+      { "id": "theme_and_variations_resolve", "resolution": "resolve", "pivot": true, "sections": [
           { "label": "T",  "offset_rule": "home" },
           { "label": "V1", "offset_rule": "region_related:b" },
           { "label": "V2", "offset_rule": "region_related:c" } ] },

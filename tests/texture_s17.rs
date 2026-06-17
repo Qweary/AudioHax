@@ -36,8 +36,8 @@ use audiohax::chord_engine::{
     PhrasePosition, StepPlan,
 };
 use audiohax::composition::{
-    CadenceStrength, KeyTempoPlan, LayerRole, OrchestrationProfile, Section, StepContext,
-    ThematicRole, ThemeVariation,
+    CadenceStrength, KeyTempoPlan, LayerRole, OrchestrationProfile, ResolutionPolicy, Section,
+    StepContext, ThematicRole, ThemeVariation,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -102,6 +102,9 @@ fn section_with(profile: OrchestrationProfile, step: &StepPlan) -> Section {
         theme: None,
         variation: ThemeVariation::Identity,
         boundary_cadence: CadenceStrength::Perfect,
+        // K3 identity carry: keep this fixture on the byte-frozen non-modulating path.
+        pivot: false,
+        resolution: ResolutionPolicy::Resolve,
         density: 0.5,
         orchestration: profile,
         steps: vec![step.clone()],

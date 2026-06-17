@@ -31,7 +31,8 @@ use crate::mapping_loader::{lookup_range_map, rebuild_mapping_table, MappingTabl
 // boundary discipline as `GlobalFeatures`).
 pub use crate::composition::{
     CadenceStrength, Character, CompositionPlan as Plan, KeyTempoPlan, LayerRole, Meter,
-    OrchestrationProfile, Section, StepContext, ThematicRole, ThemeSeed, ThemeVariation,
+    OrchestrationProfile, ResolutionPolicy, Section, StepContext, ThematicRole, ThemeSeed,
+    ThemeVariation,
 };
 
 /// Image-free mirror of `image_analysis::GlobalFeatures` (all plain `f32`).
@@ -544,12 +545,16 @@ impl PipelineEngine {
                 let theme = section
                     .theme
                     .and_then(|ti| comp.themes.iter().find(|t| t.id == ti));
-                let ctx = StepContext {
+                // S28/K3: build via the `with_prev` constructor carrying the PREVIOUS section's
+                // key offset (`None` for section 0) — the additive field rides the ctx without
+                // open-coding the struct literal here.
+                let ctx = StepContext::with_prev(
                     section,
                     step_in_section,
                     theme,
-                    key_tempo: &comp.key_tempo,
-                };
+                    &comp.key_tempo,
+                    comp.prev_section_offset(step_idx),
+                );
                 for (inst_idx, f) in row.iter().enumerate() {
                     out.push(decide_instrument_action(
                         f,
@@ -754,6 +759,10 @@ fn legacy_default_section(plan: &[StepPlan], ms_per_step: u64, mode: &str) -> Se
         theme: None,
         variation: ThemeVariation::Identity,
         boundary_cadence: CadenceStrength::Perfect,
+        // S28/K3: identity carry — the legacy flat path is never a modulating scheme, so the
+        // realizer's pivot gate stays dead (pivot:false) and the land-home detector is inert.
+        pivot: false,
+        resolution: crate::composition::ResolutionPolicy::Resolve,
         density: 0.5,
         // S17: the byte-freeze anchor — the legacy flat path carries the identity profile, so
         // the realizer's plan-aware role assignment delegates to `instrument_role` unchanged.

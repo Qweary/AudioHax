@@ -876,6 +876,14 @@ pub struct Section {
     pub variation: ThemeVariation,
     /// The cadence closing this section.
     pub boundary_cadence: CadenceStrength,
+    /// NEW S28/K3 — the active scheme's pivot opt-in, copied onto each section so the realizer
+    /// can read it zero-copy off `ctx.section`. `false` on every legacy/identity/`pivot:false`
+    /// section → the pivot guard is dead. Set by the planner from `scheme.pivot`.
+    pub pivot: bool,
+    /// NEW S28/K3 — the active scheme's resolution policy, copied onto each section so the
+    /// land-home cadence detector can tell a Resolve final-return (arm land-home) from an Open
+    /// ending (do not arm). Defaults to `ResolutionPolicy::Resolve` on legacy/identity sections.
+    pub resolution: ResolutionPolicy,
     /// Local density bias, 0..1; slice 1 default 0.5 (no-op).
     pub density: f32,
     /// NEW S17 — the selected orchestration profile for this section. The default paths
@@ -928,6 +936,28 @@ impl CompositionPlan {
         }
         None
     }
+
+    /// S28/K3: the `key_offset_semitones` of the section IMMEDIATELY BEFORE the one containing
+    /// `step_idx`, or `None` when `step_idx` lands in the FIRST non-empty section (no predecessor)
+    /// or is out of range. This is the sole signal the realizer's pivot detector needs to spot a
+    /// modulating boundary; `None` is never treated as a key change, so the first section and the
+    /// out-of-range guard both stay inert. Walks the same non-modulo boundary list as
+    /// [`CompositionPlan::locate`].
+    pub fn prev_section_offset(&self, step_idx: usize) -> Option<i8> {
+        let mut acc = 0usize;
+        let mut prev: Option<i8> = None;
+        for section in &self.sections {
+            if section.step_len == 0 {
+                continue;
+            }
+            if step_idx < acc + section.step_len {
+                return prev;
+            }
+            acc += section.step_len;
+            prev = Some(section.key_offset_semitones);
+        }
+        None
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -947,6 +977,11 @@ pub struct StepContext<'a> {
     pub theme: Option<&'a ThemeSeed>,
     /// The piece's key + tempo spine.
     pub key_tempo: &'a KeyTempoPlan,
+    /// NEW S28/K3 — the PREVIOUS section's `key_offset_semitones`, or `None` on the first
+    /// section / the legacy identity path. The ONLY signal the realizer's pivot detector needs
+    /// to recognize a modulating boundary. `None` is never a key change (so the identity/legacy
+    /// ctx is inert and the byte-freeze gate holds).
+    pub prev_key_offset_semitones: Option<i8>,
 }
 
 impl<'a> StepContext<'a> {
@@ -962,6 +997,31 @@ impl<'a> StepContext<'a> {
             step_in_section: 0,
             theme: None,
             key_tempo,
+            // NEW S28/K3 — identity path never modulates; the equivalence net + the legacy
+            // flat path both build through here, so they stay on the inert pivot gate.
+            prev_key_offset_semitones: None,
+        }
+    }
+
+    /// The COMPOSE-path constructor (S28/K3): a full step context carrying the resolved
+    /// `theme`, `step_in_section`, and the PREVIOUS section's key offset (`None` for the first
+    /// section). Built ONCE per step by the engine compose path. Routing the engine through this
+    /// constructor (rather than open-coding the struct literal) keeps the additive
+    /// `prev_key_offset_semitones` field off the engine's textual surface (§3 byte-freeze
+    /// contingency) — the field's value flows in via this single call site.
+    pub fn with_prev(
+        section: &'a Section,
+        step_in_section: usize,
+        theme: Option<&'a ThemeSeed>,
+        key_tempo: &'a KeyTempoPlan,
+        prev_key_offset_semitones: Option<i8>,
+    ) -> StepContext<'a> {
+        StepContext {
+            section,
+            step_in_section,
+            theme,
+            key_tempo,
+            prev_key_offset_semitones,
         }
     }
 }
@@ -1040,12 +1100,14 @@ impl CompositionPlanner {
                                  // home_mode are chosen (mirrors the S23 prominence resolve). `home_only`/absent scheme →
                                  // all-zero (byte-stable). The section loop reads `offsets[i]`; the KeyTempoPlan spine
                                  // clones this Vec.
-        let offsets = resolve_key_scheme(
-            lookup_key_scheme(&self.plan_mappings.key_scheme_catalogue, &key_scheme_id),
-            &form_spec.sections,
-            u,
-            &home_mode,
-        );
+                                 // S28/K3: capture the resolved scheme handle ONCE so its `pivot`/`resolution` flags can
+                                 // be copied onto each Section below. `home_only`/absent scheme → `None` → identity carry
+                                 // (`pivot:false`, `resolution:Resolve`), which keeps the realizer's pivot gate dead.
+        let key_scheme_handle =
+            lookup_key_scheme(&self.plan_mappings.key_scheme_catalogue, &key_scheme_id);
+        let scheme_pivot = key_scheme_handle.map(|s| s.pivot).unwrap_or(false);
+        let scheme_resolution = key_scheme_handle.map(|s| s.resolution).unwrap_or_default();
+        let offsets = resolve_key_scheme(key_scheme_handle, &form_spec.sections, u, &home_mode);
         let raw_bpm = interp_tempo_bpm(&mappings.global.brightness_to_tempo_bpm, u.avg_brightness);
         // Per-character tempo window (de-caps the legacy Ballad 56..96 clamp): the chosen
         // character selects the window; brightness positions BPM within it. Absent window → no clamp.
@@ -1165,6 +1227,8 @@ impl CompositionPlanner {
                 // to Identity so a later-stage variation can never leak into a slice-1 plan.
                 variation: clamp_variation_slice1(tpl.variation),
                 boundary_cadence: tpl.boundary_cadence,
+                pivot: scheme_pivot, // S28/K3 — from the resolved scheme
+                resolution: scheme_resolution, // S28/K3 — from the resolved scheme
                 density: 0.5,
                 orchestration: orchestration.clone(),
                 steps,
@@ -1795,6 +1859,8 @@ mod tests {
             theme: None,
             variation: ThemeVariation::Identity,
             boundary_cadence: CadenceStrength::Perfect,
+            pivot: false,                          // S28/K3 — identity carry
+            resolution: ResolutionPolicy::Resolve, // S28/K3 — identity carry
             density: 0.5,
             orchestration: OrchestrationProfile::identity(),
             steps: vec![],

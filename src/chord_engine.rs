@@ -1027,6 +1027,16 @@ pub fn realize_step(
     ctx: &crate::composition::StepContext,
 ) -> Vec<NoteEvent> {
     let role = assign_role(inst_idx, num_instruments, ctx);
+    // S28/K3 — pivot/common-tone modulation. Reachable ONLY on a non-`home_only`,
+    // `pivot:true` scheme at a real key-change boundary. Returns Some(events) → those ARE
+    // this step's events for THIS instrument (the boundary step IS realized as the pivot,
+    // voiced per the instrument's role). Returns None on the identity / home_only /
+    // pivot:false path → fall straight through to the FROZEN free-select/theme path below.
+    // This is the byte-freeze gate: on every identity step `pivot_chord_events` is None, so
+    // the guard is dead and control reaches the frozen path byte-identically.
+    if let Some(pivot) = pivot_chord_events(ctx, role, features, ms_per_step) {
+        return pivot;
+    }
     // S23 prominence: the per-role weight for THIS step, computed once and threaded
     // down to role_pitch (register) and realize_velocity (dynamics) as an additive
     // PRIVATE param — the already-blessed pad_voices/ctx additive-private-param route,
@@ -1077,6 +1087,18 @@ pub fn realize_step(
             features,
             prominence_w,
         ),
+    };
+
+    // S28/K3 — LAND-HOME re-voicing. When the form is a returning (Resolve) `pivot:true`
+    // form at its final, already-stamped Perfect Authentic Cadence step, STRENGTHEN the
+    // cadence's VOICING into an explicit root-position V→I in the HOME key with the home
+    // tonic on top (the PAC marker: soprano on the tonic). This only RE-POINTS the role's
+    // pitch within the existing single-note path — it adds NO event, moves no boundary, and
+    // is `false` (untouched) on every identity / home_only / pivot:false / Open step.
+    let base_note = if land_home_is_armed(ctx, step.position) {
+        land_home_pitch(role, ctx, &step.chord)
+    } else {
+        base_note
     };
 
     // ------------------------------------------------------------------
@@ -1164,7 +1186,8 @@ fn role_pitch(
             // lift), never each independently — the single .clamp(24,96) below IS that
             // sum-clamp. REG_SPAN is kept small so floor(67)+lift(≤12)+prom_lift(≤2)=81 ≪
             // 96, so the melody never clamps flat at the top (no_inversion_invariant holds).
-            let prom_lift = ((prominence_w - PROMINENCE_NEUTRAL) * PROMINENCE_REG_SPAN).round() as i16;
+            let prom_lift =
+                ((prominence_w - PROMINENCE_NEUTRAL) * PROMINENCE_REG_SPAN).round() as i16;
             let floor = (MELODY_REGISTER_FLOOR as i16 + lift + prom_lift).clamp(24, 96) as u8;
             seat_pc_in_register(pc, floor)
         }
@@ -2118,6 +2141,180 @@ fn theme_pitch(
         pitch = seat_pc_in_register(pc, floor);
     }
     pitch.clamp(24, 108)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S28/K3 — the pivot / common-tone modulation + land-home cadence realizer fns.
+// The harmonic RULES are specified in docs/input-s28-k3-pivot-harmony.md. These
+// fns are reachable ONLY on a non-home_only, pivot:true scheme; on the identity /
+// home_only / pivot:false / Open path they are inert (None / false), which is the
+// chord_engine.rs BEHAVIORAL byte-freeze.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The boundary-step velocity for a pivot: a prepared modulation lands ON a downbeat,
+/// so it sounds at the phrase-start weight — not a cadence (96), not an interior step.
+/// theory: the pivot is the fresh start of the new section; the phrase-initial accent is
+/// the correct dynamic for it. Matches `plan_phrases`'s `V_START`.
+const V_PIVOT: u8 = 88;
+
+/// A witnessed pivot / common-tone chord inserted at a MODULATING section boundary (S28/K3).
+/// The chord prepares the move from the previous section's key to this section's
+/// `key_offset_semitones` so a direct modulation no longer sounds like a splice. Returns the
+/// pivot's note event(s) for THIS instrument's `role` on this step, or `None` when no pivot
+/// applies (the byte-freeze gate).
+///
+/// THE HARMONIC RULE (docs/input-s28-k3-pivot-harmony.md §2): the pivot is the DOMINANT of the
+/// DESTINATION key (a major-quality V triad rooted on `dest_root_pc + 7`). The destination's
+/// leading tone — the V chord's major third — is the pitch that most strongly asserts the new
+/// key, and the dominant→tonic pull into the next downbeat (the destination's own first chord)
+/// realizes the prepared modulation across the abutting step windows (§4, no scheduler change).
+/// A pitch class shared between the PREVIOUS tonic triad and this destination V is voiced in an
+/// inner (fill) voice as the audible hinge.
+///
+/// Returns `Some` ONLY when ALL hold (else `None`):
+///   (a) the active scheme is `pivot == true` (`ctx.section.pivot`);
+///   (b) this is the FIRST step of the section (`ctx.step_in_section == 0`);
+///   (c) this section's key differs from the previous section's:
+///       `Some(prev) = ctx.prev_key_offset_semitones` AND `prev != ctx.section.key_offset_semitones`
+///       (a `None` prev — first section / identity — is NEVER a key change → `None`).
+/// Under `home_only` every offset is 0 and equals its predecessor → `None` → NOTHING inserted.
+///
+/// VOICING (§3): bass = dominant root; fill/inner = the common-tone hinge (+ the destination
+/// leading tone); melody = the dominant's fifth. Every pitch is seated via the SAME register
+/// floors the free-select path uses (`seat_pc_in_register` at the role's floor), so the bass <
+/// fill < melody ordering holds by construction and `no_inversion_invariant` cannot break.
+/// DURATION (§4): one note for this role, `offset_ms = 0`, `hold_ms = ms_per_step` (a sustained,
+/// legato preparation; capped at the step so it never bleeds past). Pure.
+fn pivot_chord_events(
+    ctx: &crate::composition::StepContext,
+    role: OrchestralRole,
+    features: &PerfFeatures,
+    ms_per_step: u64,
+) -> Option<Vec<NoteEvent>> {
+    // (a) scheme opt-in. (b) boundary step only. Both are the byte-freeze gate.
+    if !ctx.section.pivot || ctx.step_in_section != 0 {
+        return None;
+    }
+    // (c) a REAL key change: a Some(prev) that differs from this section's offset. A `None`
+    // prev (first section / identity / legacy flat path) is never a modulation.
+    let prev_off = ctx.prev_key_offset_semitones?;
+    let dest_off = ctx.section.key_offset_semitones;
+    if prev_off == dest_off {
+        return None;
+    }
+
+    // The home/prev/dest tonic pitch classes (semitone offsets from the home root).
+    let home_root_pc = (ctx.key_tempo.home_root_midi % 12) as i16;
+    let dest_root_pc = (home_root_pc + dest_off as i16).rem_euclid(12) as u8;
+    let prev_root_pc = (home_root_pc + prev_off as i16).rem_euclid(12) as u8;
+
+    // The DESTINATION DOMINANT (V of the destination key) — the unifying pivot (§2.1). The
+    // dominant is MAJOR-quality (the leading tone of the new key is its major third); that is
+    // what asserts the destination regardless of the piece's mode.
+    let dom_root_pc = (dest_root_pc + 7) % 12; // 5th degree of the destination
+    let dom_third_pc = (dom_root_pc + 4) % 12; // major 3rd = the destination's leading tone
+    let dom_fifth_pc = (dom_root_pc + 7) % 12; // perfect 5th of the dominant
+
+    // The HINGE (§2.2): a pitch class shared by the PREVIOUS tonic triad and this destination V,
+    // held in an inner voice. Prefer the previous tonic itself if it is a member of V/dest, else
+    // the previous dominant pc, else fall back to the dominant 5th. The picker only ever selects
+    // a pc that IS in the dominant triad, so the hinge is always a real chord tone of the pivot.
+    let v_triad = [dom_root_pc, dom_third_pc, dom_fifth_pc];
+    let prev_dom_pc = ((prev_root_pc as i16 + 7).rem_euclid(12)) as u8;
+    let common_tone_pc = if v_triad.contains(&prev_root_pc) {
+        prev_root_pc
+    } else if v_triad.contains(&prev_dom_pc) {
+        prev_dom_pc
+    } else {
+        dom_fifth_pc
+    };
+
+    // Per-role voicing, each pitch seated at the role's existing register floor via the SAME
+    // helper the free-select path uses → bass < fill < melody by construction (no inversion).
+    // brightness lifts the melody octave exactly as role_pitch does, so the pivot's top line
+    // sits in the same register the surrounding melody does.
+    let bright_octaves = ((features.brightness - 50.0) / 50.0).clamp(-1.0, 1.0);
+    let note = match role {
+        OrchestralRole::Bass => {
+            // Root of the dominant in the bass = root-position V — the strongest preparation.
+            let dark_drop = if bright_octaves < 0.0 { 12 } else { 0 };
+            let floor = BASS_REGISTER_FLOOR.saturating_sub(dark_drop);
+            seat_pc_in_register(dom_root_pc, floor)
+        }
+        OrchestralRole::Melody => {
+            // The dominant's 5th on top — a stable, singable melody tone over the V.
+            let lift = (bright_octaves * 12.0).round() as i16;
+            let floor = (MELODY_REGISTER_FLOOR as i16 + lift).clamp(24, 96) as u8;
+            seat_pc_in_register(dom_fifth_pc, floor)
+        }
+        OrchestralRole::HarmonicFill | OrchestralRole::Pad | OrchestralRole::CounterMelody => {
+            // The HINGE common tone in the inner register — the held pitch the ear tracks
+            // across the boundary. Inner voices hold; the bass and melody move.
+            let lift = ((bright_octaves * 6.0).round() as i16).clamp(-12, 12);
+            let floor = (FILL_REGISTER_FLOOR as i16 + lift).clamp(24, 96) as u8;
+            seat_pc_in_register(common_tone_pc, floor)
+        }
+    };
+
+    // One sustained note for this role, on the boundary downbeat, never longer than the step.
+    Some(vec![NoteEvent {
+        note,
+        velocity: V_PIVOT,
+        hold_ms: ms_per_step,
+        offset_ms: 0,
+    }])
+}
+
+/// Is the land-home authentic cadence armed at THIS step (S28/K3)? `true` only when the scheme's
+/// `ResolutionPolicy::Resolve` forced the final section to offset 0 AND `pivot == true` AND this
+/// is the final section's closing Perfect-cadence step. When armed, the realizer STRENGTHENS the
+/// VOICING of the already-stamped Perfect cadence into an explicit root-position V→I in the HOME
+/// key with the home tonic on top (a true PAC) — it does NOT re-author cadence DATA (`plan_phrases`
+/// already stamps `PerfectAuthenticCadence` and adds no step / moves no boundary). Pure. Returns
+/// `false` on the identity / `home_only` / `pivot:false` / `Open` path → the voicing is untouched
+/// and byte-identical to pre-K3.
+fn land_home_is_armed(ctx: &crate::composition::StepContext, position: PhrasePosition) -> bool {
+    use crate::composition::ResolutionPolicy;
+    ctx.section.pivot
+        && ctx.section.resolution == ResolutionPolicy::Resolve
+        // Resolve forces the FINAL section to offset 0; this guards against arming off-home.
+        && ctx.section.key_offset_semitones == 0
+        // Only the already-stamped final Perfect Authentic Cadence step.
+        && matches!(position, PhrasePosition::PerfectAuthenticCadence)
+}
+
+/// The land-home PAC pitch for `role` (S28/K3): bass = home tonic ROOT (root-position I),
+/// soprano/melody = the home TONIC (the defining PAC marker — soprano on the tonic), fill = the
+/// inner tonic-triad tones. Seated at the role's existing register floor so the voicing adds NO
+/// event and cannot invert the frame. Called ONLY when `land_home_is_armed` is true.
+fn land_home_pitch(
+    role: OrchestralRole,
+    ctx: &crate::composition::StepContext,
+    chord: &Chord,
+) -> u8 {
+    let home_root_pc = (ctx.key_tempo.home_root_midi % 12) as u8;
+    match role {
+        OrchestralRole::Bass => {
+            // Home tonic root in the bass → root-position I (the PAC requires it).
+            seat_pc_in_register(home_root_pc, BASS_REGISTER_FLOOR)
+        }
+        OrchestralRole::Melody => {
+            // Soprano on the home TONIC — the single feature that makes this a PERFECT
+            // authentic cadence rather than an imperfect one.
+            seat_pc_in_register(home_root_pc, MELODY_REGISTER_FLOOR)
+        }
+        OrchestralRole::HarmonicFill | OrchestralRole::Pad | OrchestralRole::CounterMelody => {
+            // An inner tonic-triad tone (the 3rd or 5th) if the cadence chord carries one,
+            // else the home tonic — keeps the inner voice on the I chord.
+            let third_or_fifth = chord
+                .notes
+                .iter()
+                .map(|&n| n % 12)
+                .find(|&pc| pc == (home_root_pc + 3) % 12 || pc == (home_root_pc + 4) % 12)
+                .unwrap_or((home_root_pc + 7) % 12);
+            seat_pc_in_register(third_or_fifth, FILL_REGISTER_FLOOR)
+        }
+    }
 }
 
 /// Minimum spacing (in semitones) required between any two ADJACENT upper
@@ -4490,8 +4687,8 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════
 
     use crate::composition::{
-        CadenceStrength, KeyTempoPlan, Section, StepContext, ThematicRole, ThemeSeed,
-        ThemeVariation,
+        CadenceStrength, KeyTempoPlan, ResolutionPolicy, Section, StepContext, ThematicRole,
+        ThemeSeed, ThemeVariation,
     };
 
     /// Build a behaviour-neutral home-key section for theme tests.
@@ -4511,6 +4708,9 @@ mod tests {
             theme,
             variation,
             boundary_cadence: CadenceStrength::Perfect,
+            // S28/K3 — identity carry: a test fixture stays on the inert pivot/land-home path.
+            pivot: false,
+            resolution: ResolutionPolicy::Resolve,
             density: 0.5,
             // S17: identity orchestration profile — mandatory-field plumb so this
             // behaviour-neutral test fixture compiles; byte-neutral (no realizer logic, no
@@ -4650,6 +4850,8 @@ mod tests {
             step_in_section: 0,
             theme: Some(&seed),
             key_tempo: &kt,
+            // S28/K3 — identity carry: this test ctx never modulates.
+            prev_key_offset_semitones: None,
         };
         let chord = c_major_triad();
         for role in [OrchestralRole::Bass, OrchestralRole::HarmonicFill] {
@@ -4676,6 +4878,8 @@ mod tests {
             step_in_section: 0,
             theme: Some(&seed),
             key_tempo: &kt,
+            // S28/K3 — identity carry: this test ctx never modulates.
+            prev_key_offset_semitones: None,
         };
         assert!(
             theme_melody_pitch(&ctx, OrchestralRole::Melody, &chord, &perf_mid()).is_none(),
@@ -4689,6 +4893,8 @@ mod tests {
             step_in_section: 0,
             theme: None,
             key_tempo: &kt,
+            // S28/K3 — identity carry: this test ctx never modulates.
+            prev_key_offset_semitones: None,
         };
         assert!(
             theme_melody_pitch(&ctx2, OrchestralRole::Melody, &chord, &perf_mid()).is_none(),
@@ -4714,6 +4920,8 @@ mod tests {
             step_in_section: 0,
             theme: Some(&seed),
             key_tempo: &kt,
+            // S28/K3 — identity carry: this test ctx never modulates.
+            prev_key_offset_semitones: None,
         };
         let chord = c_major_triad();
         let got = theme_melody_pitch(&ctx, OrchestralRole::Melody, &chord, &perf_mid());
@@ -4747,6 +4955,8 @@ mod tests {
                 step_in_section: step,
                 theme: Some(&seed),
                 key_tempo: &kt,
+                // S28/K3 — identity carry: this test ctx never modulates.
+                prev_key_offset_semitones: None,
             };
             theme_melody_pitch(&ctx, OrchestralRole::Melody, &chord, &perf_mid())
         };
@@ -4786,6 +4996,8 @@ mod tests {
                 step_in_section: step,
                 theme: Some(&seed),
                 key_tempo: &kt,
+                // S28/K3 — identity carry: this test ctx never modulates.
+                prev_key_offset_semitones: None,
             };
             theme_melody_pitch(&ctx, OrchestralRole::Melody, &chord, &perf_mid())
         };
@@ -4964,6 +5176,9 @@ mod tests {
             theme: None,
             variation: ThemeVariation::Identity,
             boundary_cadence: CadenceStrength::Perfect,
+            // S28/K3 — identity carry.
+            pivot: false,
+            resolution: ResolutionPolicy::Resolve,
             density: 0.6,
             orchestration: counter_profile(),
             steps: vec![s0, s1],
@@ -4982,6 +5197,8 @@ mod tests {
             step_in_section: 1,
             theme: None,
             key_tempo: kt,
+            // S28/K3 — identity carry: this test ctx never modulates.
+            prev_key_offset_semitones: None,
         };
         // inst 2 of 4 under counter_profile() == CounterMelody. The step is steps[1].
         realize_step(&section.steps[1], 2, 4, features, section.ms_per_step, &ctx)
@@ -5094,6 +5311,8 @@ mod tests {
             step_in_section: 0,
             theme: None,
             key_tempo: &kt,
+            // S28/K3 — identity carry: this test ctx never modulates.
+            prev_key_offset_semitones: None,
         };
         let prev_evs = realize_step(&sec.steps[0], 2, 4, &f, sec.ms_per_step, &prev_ctx);
         assert_eq!(
@@ -5131,6 +5350,9 @@ mod tests {
             theme: None,
             variation: ThemeVariation::Identity,
             boundary_cadence: CadenceStrength::Perfect,
+            // S28/K3 — identity carry.
+            pivot: false,
+            resolution: ResolutionPolicy::Resolve,
             density: 0.6,
             orchestration: counter_profile(),
             steps: vec![
@@ -5148,6 +5370,8 @@ mod tests {
                 step_in_section: si,
                 theme: None,
                 key_tempo: &kt,
+                // S28/K3 — identity carry: this test ctx never modulates.
+                prev_key_offset_semitones: None,
             };
             let evs = realize_step(&section.steps[si], 2, 4, &f, section.ms_per_step, &ctx);
             assert_eq!(
@@ -5207,6 +5431,8 @@ mod tests {
             step_in_section: 1,
             theme: None,
             key_tempo: &kt,
+            // S28/K3 — identity carry: this test ctx never modulates.
+            prev_key_offset_semitones: None,
         };
         let m_now = melody_pitch_for(&ctx_now, &sec.steps[1], &f);
         let m_prev = melody_pitch_for_step(&ctx_now, &sec.steps[0], &f);
@@ -5247,6 +5473,8 @@ mod tests {
             step_in_section: 0,
             theme: None,
             key_tempo: &kt,
+            // S28/K3 — identity carry: this test ctx never modulates.
+            prev_key_offset_semitones: None,
         };
         let evs = realize_step(&sec.steps[0], 2, 4, &perf_mid(), sec.ms_per_step, &ctx);
         // A start with no prior: melody_static is true (m_prev None → mel_dir Hold), so
