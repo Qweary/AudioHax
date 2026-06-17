@@ -425,6 +425,40 @@ impl ChordEngine {
             notes,
         }
     }
+
+    /// Build the ROOT-POSITION tonic triad ("I") at `root_midi` in `mode` — the
+    /// DETERMINISTIC destination tonic the S29 opening tonicizing cadence (Lever 1)
+    /// forces as a modulating section's first chord, so the step-0 pivot V resolves
+    /// V→I into the new key.
+    ///
+    /// theory reasoning: this is a plain diatonic "I" — root, diatonic third, perfect
+    /// fifth — with NO RNG, NO secondary-dominant prepend, and NO mode-mixture borrow.
+    /// It reuses the EXACT same scale selection `generate_chords` uses (the `match mode`
+    /// head) and the existing private `roman_to_chord_complex("I", …, Triad)` builder, so
+    /// the chord TONES are byte-for-byte identical to a free-selected diatonic "I" at this
+    /// root — only the SELECTION is forced (we drop the RNG/secondary-dominant/borrow
+    /// machinery that `generate_chords` wraps around the same builder). Triad complexity:
+    /// the opening confirmation wants the bare tonic skeleton (a 7th on a tonic blurs the
+    /// arrival), and a bare triad keeps the V→I voice-leading frame (§ input-s29) clean.
+    /// `Chord.name == "I"` so the Test Engineer can pin `chords[0].name == "I"`.
+    pub fn tonic_triad(&self, root_midi: u8, mode: &str) -> Chord {
+        // Same mode→scale selection `generate_chords` performs at its head (chord_engine
+        // :183); an unknown mode falls back to Ionian, exactly as the free-select path does,
+        // so the forced tonic is built in the SAME scale the rest of the section uses.
+        let scale = match mode {
+            "Ionian" => IONIAN,
+            "Dorian" => DORIAN,
+            "Phrygian" => PHRYGIAN,
+            "Lydian" => LYDIAN,
+            "Mixolydian" => MIXOLYDIAN,
+            "Aeolian" => AEOLIAN,
+            // theory: unknown mode -> default to Ionian (major) so output stays diatonic.
+            _ => IONIAN,
+        };
+        // Deterministic root-position "I" at Triad complexity — identical tones to a
+        // free-selected diatonic tonic; the SELECTION is forced, the harmony is not new.
+        self.roman_to_chord_complex("I", root_midi, &scale, HarmonicComplexity::Triad)
+    }
 }
 
 // =========================================================================
@@ -1101,6 +1135,21 @@ pub fn realize_step(
         base_note
     };
 
+    // S29/K3 Lever 1(b) — OPENING V→I re-voicing. On the step that RESOLVES a modulating
+    // section's step-0 pivot V (step_in_section == 1 of a real key change), voice this step's
+    // chord as the DESTINATION TONIC resolving the pivot — leading-tone up to the new tonic,
+    // pivot 7th down to the new third — so the boundary reads as a true authentic cadence in
+    // the new key rather than two root-position triads stacked (the parallel octaves a
+    // trombonist hears). Like land-home, this only RE-POINTS the role's pitch within the
+    // existing single-note path: NO event added, NO step, NO stamp (Option A, not the held
+    // Option B). `false` (untouched, byte-identical) on every identity / home_only /
+    // pivot:false / non-modulating-boundary step.
+    let base_note = if pivot_resolution_is_armed(ctx) {
+        pivot_resolution_pitch(role, ctx)
+    } else {
+        base_note
+    };
+
     // ------------------------------------------------------------------
     // DYNAMICS — phrase contour ON the structural floor.
     // velocity = floor + saturation LEVEL gain + messa-di-voce swell
@@ -1342,6 +1391,16 @@ const LEGATO_FRAC: f32 = 0.95;
 /// ONLY because `realize_rhythm` is a free fn with no MappingTable handle (the seam
 /// does not carry one into the per-step realization); keep the two values in sync.
 const EDGE_ACTIVITY_RANGE_MAX: f32 = 0.05;
+/// S29 Lever 2(ii) — gain mapping `(Section.density − 0.5)` into an `edge_activity` nudge.
+/// theory reasoning (spec-s29 §2.2(ii)): `Section.density` is the per-section busyness knob the
+/// planner sets from region energy (a denser/higher-energy excursion should sound busier — the
+/// MX-4 "second dimension of contrast"). The realizer's busyness knob is `edge_activity`, so we
+/// bias it by the section density. The gain 0.5 keeps the bias MODEST: the planner's ±0.15
+/// density swing (0.35..0.65 around the 0.5 neutral) shifts activity by ≤ ±0.075 — a felt scene
+/// change, not a different piece. CRITICAL byte-freeze hinge: `Section.density == 0.5`
+/// (DENSITY_NEUTRAL) on EVERY identity/home/home_only section ⇒ `(0.5 − 0.5) * GAIN == 0.0` ⇒
+/// `edge_activity` is byte-identical to pre-S29 on the identity path.
+const DENSITY_ACTIVITY_GAIN: f32 = 0.5;
 /// S15 §4.4: the NON-CADENCE articulation window — the perceptually pleasant
 /// hold-fraction range the continuous S13 curve is re-scaled into. theory: a hold
 /// below ~0.55 of the slot reads as a click rather than a sounded tone; a hold above
@@ -1414,7 +1473,18 @@ fn realize_rhythm(
     // code compared raw edge (≈0.005 on real photos) against 0.25/0.70 cutoffs, so
     // every real image fell in the "low edge → legato/sustained" band — uniform output.
     // Normalizing first lets the curve and the pattern bands span their full range.
-    let edge_activity = (features.edge_density / EDGE_ACTIVITY_RANGE_MAX).clamp(0.0, 1.0);
+    let edge_activity = {
+        let base = (features.edge_density / EDGE_ACTIVITY_RANGE_MAX).clamp(0.0, 1.0);
+        // S29 Lever 2(ii)/MX-4: a denser section nudges activity UP, a sparser one DOWN, so the
+        // per-section density the planner set from region energy becomes AUDIBLE as busyness —
+        // the second dimension of contrast (key + density) the modulation needs to read as a
+        // scene change. theory: `ctx.section.density` is 0.5 (DENSITY_NEUTRAL) on EVERY
+        // identity/home/home_only section, so this term is EXACTLY 0.0 there → `edge_activity`
+        // is byte-identical to pre-S29 on the identity path (the byte-freeze hinge). Read
+        // zero-copy off the already-borrowed `ctx` — no new field, no seam change.
+        let density_nudge = (ctx.section.density - 0.5) * DENSITY_ACTIVITY_GAIN;
+        (base + density_nudge).clamp(0.0, 1.0)
+    };
     // (The former raw-clamped `edge` local is GONE: the HarmonicFill rest-as-gesture
     // check now reads the NORMALIZED `edge_activity` against FILL_REST_ACTIVITY, so the
     // raw value — which never reached the old 0.15 cutoff on real photos and silenced
@@ -2214,14 +2284,33 @@ fn pivot_chord_events(
     let dom_root_pc = (dest_root_pc + 7) % 12; // 5th degree of the destination
     let dom_third_pc = (dom_root_pc + 4) % 12; // major 3rd = the destination's leading tone
     let dom_fifth_pc = (dom_root_pc + 7) % 12; // perfect 5th of the dominant
+                                               // S29 Lever 3: the dominant SEVENTH — a minor 7th above the dominant root — turning the
+                                               // bare V triad into a V7. theory reasoning: the V7 carries the tritone (its 3rd ↔ 7th,
+                                               // i.e. the destination's leading tone ↔ this 7th) that is the unambiguous signal of a
+                                               // functional dominant; a bare triad lacks that pull, so the announcement of the new key
+                                               // is softer than it could be. The 7th resolves DOWN by step into the destination tonic's
+                                               // THIRD across the pivot→I boundary (the dovetail with the §2.1(b) opening-cadence rule;
+                                               // see docs/input-s29-k3-retune-harmony.md). It is an inner-voice color tone by nature and
+                                               // is seated in the FILL register below, strictly between the bass (dom root) and the
+                                               // melody (dom fifth), so the no-inversion frame (bass < fill < melody) holds by
+                                               // construction. A 1-/2-instrument ensemble assigns no fill role, so the 7th is simply
+                                               // never voiced there (the bare-triad pivot remains) — exactly spec §2.3.
+    let dom_seventh_pc = (dom_root_pc + 10) % 12; // minor 7th above the dominant = the V7 color
 
-    // The HINGE (§2.2): a pitch class shared by the PREVIOUS tonic triad and this destination V,
-    // held in an inner voice. Prefer the previous tonic itself if it is a member of V/dest, else
-    // the previous dominant pc, else fall back to the dominant 5th. The picker only ever selects
-    // a pc that IS in the dominant triad, so the hinge is always a real chord tone of the pivot.
+    // The HINGE (§2.2, retained as documented reasoning): a pitch class shared by the PREVIOUS
+    // tonic triad and this destination V. Prefer the previous tonic itself if it is a member of
+    // V/dest, else the previous dominant pc, else the dominant 5th. The picker only ever selects
+    // a pc that IS in the dominant triad, so a shared tone PROVABLY exists across the boundary —
+    // which is WHY the V7 reads as a prepared move and not a splice. As of S29 (Lever 3) the
+    // inner voice carries the dominant SEVENTH instead of statically holding this hinge; the hinge
+    // is preserved here as the proof a common tone exists and as the conceptual line the resolving
+    // 7th rides (see docs/input-s29-k3-retune-harmony.md §3). Bound with a leading underscore
+    // because the inner voice now sounds the 7th, not this pc, but kept for the invariant it
+    // witnesses. `dom_third_pc` (the destination leading tone) is likewise the V's defining new
+    // pitch — implied by the major-quality dominant and the resolution target documented below.
     let v_triad = [dom_root_pc, dom_third_pc, dom_fifth_pc];
     let prev_dom_pc = ((prev_root_pc as i16 + 7).rem_euclid(12)) as u8;
-    let common_tone_pc = if v_triad.contains(&prev_root_pc) {
+    let _common_tone_pc = if v_triad.contains(&prev_root_pc) {
         prev_root_pc
     } else if v_triad.contains(&prev_dom_pc) {
         prev_dom_pc
@@ -2248,11 +2337,19 @@ fn pivot_chord_events(
             seat_pc_in_register(dom_fifth_pc, floor)
         }
         OrchestralRole::HarmonicFill | OrchestralRole::Pad | OrchestralRole::CounterMelody => {
-            // The HINGE common tone in the inner register — the held pitch the ear tracks
-            // across the boundary. Inner voices hold; the bass and melody move.
+            // S29 Lever 3: the inner voice now sounds the dominant SEVENTH (the V7 color),
+            // not the bare common-tone hinge. theory reasoning: the 7th is the chord's
+            // leading dissonance — the inner voice is exactly where it belongs, and giving it
+            // to the fill makes the pivot an unambiguous V7. The common-tone HINGE is not
+            // abandoned: it is preserved as the 7th's RESOLUTION TARGET — the 7th resolves
+            // DOWN by step into the destination tonic's third on the next downbeat (the
+            // step-1 I), so the inner voice still tracks a prepared, resolving line across the
+            // boundary rather than a static hinge. (The hinge picker above proves a common tone
+            // exists; the 7th seated here is strictly between bass (dom root) and melody (dom
+            // fifth) → no inversion.)
             let lift = ((bright_octaves * 6.0).round() as i16).clamp(-12, 12);
             let floor = (FILL_REGISTER_FLOOR as i16 + lift).clamp(24, 96) as u8;
-            seat_pc_in_register(common_tone_pc, floor)
+            seat_pc_in_register(dom_seventh_pc, floor)
         }
     };
 
@@ -2313,6 +2410,96 @@ fn land_home_pitch(
                 .find(|&pc| pc == (home_root_pc + 3) % 12 || pc == (home_root_pc + 4) % 12)
                 .unwrap_or((home_root_pc + 7) % 12);
             seat_pc_in_register(third_or_fifth, FILL_REGISTER_FLOOR)
+        }
+    }
+}
+
+/// Is the S29 opening V→I authentic cadence armed at THIS step (Lever 1(b), Option A)?
+/// `true` only on the step that RESOLVES the step-0 pivot V of a modulating section: the
+/// scheme is `pivot == true`, this is `step_in_section == 1` (the downbeat right after the
+/// boundary pivot), and the section is a REAL key change (`Some(prev) != dest`). When armed,
+/// the realizer voice-leads this step's chord as the DESTINATION TONIC resolving the prior
+/// pivot V (`pivot_resolution_pitch`), turning V→I into a true authentic cadence in the new
+/// key instead of two root-position triads stacked.
+///
+/// theory reasoning: this is the SAME gate shape as `pivot_chord_events` but one step later
+/// (step 1, the resolution downbeat, vs. step 0, the pivot itself). It is `false` on every
+/// identity / `home_only` / `pivot:false` / non-modulating-boundary step → the voicing is
+/// untouched and byte-identical to pre-S29. Option B (`plan_phrases` stamping an explicit
+/// opening PAC) is HELD; this voicing-only rule is the default per spec-s29 §2.1(b).
+fn pivot_resolution_is_armed(ctx: &crate::composition::StepContext) -> bool {
+    if !ctx.section.pivot || ctx.step_in_section != 1 {
+        return false;
+    }
+    // A real key change: a Some(prev) differing from this section's offset (a None prev — the
+    // first section / identity — is never a modulation, exactly as the pivot gate reads it).
+    match ctx.prev_key_offset_semitones {
+        Some(prev) => prev != ctx.section.key_offset_semitones,
+        None => false,
+    }
+}
+
+/// The S29 opening-cadence resolution pitch for `role` (Lever 1(b), Option A): voice the
+/// destination TONIC so the step-0 pivot V resolves V→I as a true authentic cadence in the new
+/// key. Called ONLY when `pivot_resolution_is_armed` is true.
+///
+/// theory reasoning (docs/input-s29-k3-retune-harmony.md §3): the prior pivot sounded V7 of the
+/// destination — bass = dominant root, melody = dominant 5th (= destination 2nd degree),
+/// inner = dominant 7th. The two voice-leading resolutions that make this an authentic cadence
+/// and PREVENT the parallel octaves a trombonist hears when two root-position triads are merely
+/// stacked are:
+///   * the new key's LEADING TONE (the V's major 3rd) resolves UP by semitone to the new TONIC
+///     ROOT — realized structurally by arriving root-position with the tonic DOUBLED in the
+///     outer voices, the upper voices descending by step INTO it (contrary/oblique to the bass
+///     leap), which is exactly the frame the leading-tone-up resolution produces;
+///   * any chordal 7th resolves DOWN by step to the I's THIRD — realized literally: the inner
+///     voice's pivot 7th (destination 5th degree + a minor 7th = dest_root + 5) steps DOWN to
+///     the destination tonic's diatonic third in the active mode.
+/// Per role, in the destination key (`dest_root_pc = home_root + this section's offset`):
+///   * Bass    → destination tonic ROOT (root-position I; dom-root → tonic-root is the
+///               idiomatic authentic-cadence bass leap).
+///   * Melody  → destination tonic ROOT on top (the pivot's melody dom-5th = dest 2nd degree
+///               descends a STEP to the tonic — soprano-on-tonic, a strong arrival, and the
+///               step-down/leap-up split is the contrary motion that voids parallel octaves).
+///   * Fill    → destination tonic diatonic THIRD (the pivot 7th's down-by-step target).
+/// Every pitch is seated via `seat_pc_in_register` at the role's existing floor, so
+/// bass < fill < melody holds by construction and `no_inversion_invariant` cannot break.
+fn pivot_resolution_pitch(role: OrchestralRole, ctx: &crate::composition::StepContext) -> u8 {
+    let home_root_pc = (ctx.key_tempo.home_root_midi % 12) as i16;
+    let dest_off = ctx.section.key_offset_semitones as i16;
+    let dest_root_pc = (home_root_pc + dest_off).rem_euclid(12) as u8;
+    // The destination tonic's DIATONIC third in the piece's mode — major (3rd interval = 4) for
+    // Ionian/Lydian/Mixolydian, minor (= 3) for Aeolian/Dorian/Phrygian. Reuses the same scale
+    // selection `generate_chords`/`tonic_triad` use, so the resolved third matches the tonic the
+    // forced I (`tonic_triad`) builds. scale[2] is the third scale degree's semitone offset.
+    let scale = match ctx.key_tempo.home_mode.as_str() {
+        "Ionian" => IONIAN,
+        "Dorian" => DORIAN,
+        "Phrygian" => PHRYGIAN,
+        "Lydian" => LYDIAN,
+        "Mixolydian" => MIXOLYDIAN,
+        "Aeolian" => AEOLIAN,
+        _ => IONIAN,
+    };
+    let dest_third_pc = ((dest_root_pc as i16 + scale[2] as i16).rem_euclid(12)) as u8;
+    // theory: the resolution arrival is register-stable — we seat each role at its plain floor
+    // (no brightness octave lift) so the V→I lands as a steady, grounded cadence rather than a
+    // register-jumping gesture.
+    match role {
+        OrchestralRole::Bass => {
+            // Destination tonic root in the bass → root-position I; dom-root → tonic-root.
+            seat_pc_in_register(dest_root_pc, BASS_REGISTER_FLOOR)
+        }
+        OrchestralRole::Melody => {
+            // Soprano on the destination tonic — the strong-arrival top; the pivot's dom-5th
+            // (dest 2nd degree) descends a step into it (contrary to the bass leap → no
+            // parallel octaves between outer voices).
+            seat_pc_in_register(dest_root_pc, MELODY_REGISTER_FLOOR)
+        }
+        OrchestralRole::HarmonicFill | OrchestralRole::Pad | OrchestralRole::CounterMelody => {
+            // The destination tonic's diatonic third — the pivot 7th's down-by-step target,
+            // completing the V7→I resolution in the inner voice where the dissonance lived.
+            seat_pc_in_register(dest_third_pc, FILL_REGISTER_FLOOR)
         }
     }
 }

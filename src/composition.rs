@@ -1034,6 +1034,17 @@ impl<'a> StepContext<'a> {
 /// near the legacy single-image scan length, deterministic and modest.
 const BASE_STEPS_PER_SECTION: usize = 8;
 
+/// S29/MX-4 (Lever 2) — the modest energy→density map and its byte-stable neutral. A
+/// home/fallback section carries `HOME_ENERGY_NEUTRAL`, and `f(HOME_ENERGY_NEUTRAL)` is
+/// the algebraic identity (== `DENSITY_NEUTRAL` == 0.5) so every home / home_only / identity
+/// section keeps `Section.density == 0.5` byte-for-byte → the realizer density nudge is 0 →
+/// the engine_equivalence goldens cannot move. This is the byte-stability proof.
+const HOME_ENERGY_NEUTRAL: f32 = 0.5; // f(this) == DENSITY_NEUTRAL exactly (byte-stability proof)
+const DENSITY_NEUTRAL: f32 = 0.5;
+const DENSITY_ENERGY_SPAN: f32 = 0.30;
+const DENSITY_FLOOR: f32 = 0.35;
+const DENSITY_CEIL: f32 = 0.65;
+
 /// Builds a [`CompositionPlan`] from an [`ImageUnderstanding`] by running the `SelectTable`
 /// ladders, expanding the chosen [`FormSpec`], and delegating per-section harmony +
 /// theme-motif resolution to `chord_engine`. It does NOT duplicate `chord_engine` craft.
@@ -1199,11 +1210,17 @@ impl CompositionPlanner {
             // arg; its body is untouched. BYTE-IDENTICAL at offset 0 (home_root + 0 = same root →
             // identical chords → the `home_only`/identity path is unchanged). Saturating i16 cast
             // keeps the root a valid MIDI byte for the menu offsets {+7,+5,+3,−3}.
-            let section_offset = offsets.get(i).copied().unwrap_or(0);
+            // S29/MX-4: each resolved entry is (offset, source_region_energy).
+            let (section_offset, energy_i) =
+                offsets.get(i).copied().unwrap_or((0, HOME_ENERGY_NEUTRAL));
             let section_root_midi =
                 (home_root_midi as i16 + section_offset as i16).clamp(0, 127) as u8;
+            // S29 Lever 1(a): a MODULATING pivot section (offset differs from its predecessor)
+            // forces its opening chord to the destination root-position tonic, so the step-0
+            // pivot V resolves V→I into the new key. First section (i == 0) is never a key change.
+            let is_mod_boundary = scheme_pivot && i > 0 && section_offset != offsets[i - 1].0;
             let progression = chord_engine.pick_progression(&home_mode);
-            let chords = chord_engine.generate_chords(
+            let mut chords = chord_engine.generate_chords(
                 &progression,
                 section_root_midi,
                 &home_mode,
@@ -1212,7 +1229,24 @@ impl CompositionPlanner {
                 u.avg_saturation, // raw 0..100
                 u.colorfulness,   // raw hue_spread ~0..1
             );
+            if is_mod_boundary {
+                // Force the destination TONIC as the section's opening chord so the step-0 pivot V
+                // resolves V→I in the new key. Root-position I built at the section root; the
+                // Music Theory rule governs its voicing/voice-leading inside chord_engine. This
+                // makes the plan record agree the opening is "I" (the `chords[0].name == "I"`
+                // assertion); the AUDIBLE resolution is self-contained in chord_engine.
+                if let Some(first) = chords.first_mut() {
+                    *first = chord_engine.tonic_triad(section_root_midi, &home_mode);
+                }
+            }
             let steps = chord_engine.plan_phrases(&chords);
+
+            // S29/MX-4 Lever 2(i): SET Section.density from the source-region energy ONCE, HERE.
+            // f(e) = clamp(DENSITY_NEUTRAL + DENSITY_ENERGY_SPAN * (e - 0.5), FLOOR, CEIL).
+            // Home/home_only/identity sections carry HOME_ENERGY_NEUTRAL == 0.5, and f(0.5) ==
+            // DENSITY_NEUTRAL == 0.5 exactly, so those sections keep density == 0.5 byte-for-byte.
+            let section_density = (DENSITY_NEUTRAL + DENSITY_ENERGY_SPAN * (energy_i - 0.5))
+                .clamp(DENSITY_FLOOR, DENSITY_CEIL);
 
             sections.push(Section {
                 label: tpl.label.clone(),
@@ -1229,13 +1263,15 @@ impl CompositionPlanner {
                 boundary_cadence: tpl.boundary_cadence,
                 pivot: scheme_pivot, // S28/K3 — from the resolved scheme
                 resolution: scheme_resolution, // S28/K3 — from the resolved scheme
-                density: 0.5,
+                density: section_density, // S29/MX-4: f(source-region energy), 0.5 on identity
                 orchestration: orchestration.clone(),
                 steps,
             });
         }
 
-        let key_scheme = offsets.clone(); // S24: section_index → offset; home_only ⇒ all zeros
+        // S24: section_index → offset; home_only ⇒ all zeros. S29: drop the per-section energy
+        // (the density carrier) — KeyTempoPlan.key_scheme is the offset spine only.
+        let key_scheme: Vec<i8> = offsets.iter().map(|t| t.0).collect();
         let tempo_scheme = vec![base_ms_per_step; sections.len()];
 
         CompositionPlan {
@@ -1461,11 +1497,12 @@ fn resolve_key_scheme(
     sections: &[SectionTemplate],
     u: &ImageUnderstanding,
     home_mode: &str,
-) -> Vec<i8> {
+) -> Vec<(i8, f32)> {
     let n = sections.len();
     let scheme = match scheme {
+        // None / empty (home_only) → all-zero identity, neutral energy (density stays 0.5).
         Some(s) if !s.sections.is_empty() => s,
-        _ => return vec![0i8; n], // None / empty (home_only) → all-zero identity.
+        _ => return vec![(0i8, HOME_ENERGY_NEUTRAL); n],
     };
 
     // Energy-DESCENDING ranking of the two non-subject regions (Decision 2 generalized). Each
@@ -1497,21 +1534,26 @@ fn resolve_key_scheme(
         energy: 0.0,
     };
 
-    let mut offsets: Vec<i8> = Vec::with_capacity(n);
+    // S29/MX-4: each entry is (offset, source_region_energy). A Home/fallback section carries
+    // HOME_ENERGY_NEUTRAL so its density maps to the byte-stable 0.5; an Excursion section carries
+    // the energy of the ranked region its offset was drawn from, which drives the density contrast.
+    let mut offsets: Vec<(i8, f32)> = Vec::with_capacity(n);
     for i in 0..n {
         let rule = scheme
             .sections
             .get(i)
             .map(|s| parse_offset_rule(s.offset_rule.as_str()))
             .unwrap_or(OffsetRule::Home); // scheme shorter than the form → home (byte-stable degrade).
-        let off = match rule {
-            OffsetRule::Home => 0,
+        let entry = match rule {
+            OffsetRule::Home => (0, HOME_ENERGY_NEUTRAL),
             OffsetRule::Excursion(rank) => {
                 let region = ranked.get(rank as usize).unwrap_or(&whole_image);
-                region_excursion_offset(region, u.subject_hue, home_mode)
+                let off = region_excursion_offset(region, u.subject_hue, home_mode);
+                let energy = ranked.get(rank as usize).map(|r| r.energy).unwrap_or(0.0);
+                (off, energy)
             }
         };
-        offsets.push(off);
+        offsets.push(entry);
     }
 
     // S26 resolution policy, applied LAST. `Resolve` forces the FINAL section's offset to 0
@@ -1519,7 +1561,9 @@ fn resolve_key_scheme(
     // `Open` leaves the final offset as resolved (the deliberate off-home ending). On an empty
     // form (n == 0) there is no final section to touch.
     if n > 0 && scheme.resolution == ResolutionPolicy::Resolve {
-        offsets[n - 1] = 0;
+        // Force the offset home; leave the source-region energy untouched (a Coda that was an
+        // excursion keeps its source energy so it can still carry a density bias if wanted).
+        offsets[n - 1].0 = 0;
     }
 
     // Risk 6 role-alignment witness (debug only, never panics in release; the length mismatch is
@@ -2007,7 +2051,10 @@ mod tests {
         u.background_brightness = 0.1; // low valence → subdominant +5
         u.background_hue = 0.0;
         u.subject_hue = 0.0;
-        let offs = resolve_key_scheme(Some(&scheme), &sections, &u, "Ionian");
+        let offs: Vec<i8> = resolve_key_scheme(Some(&scheme), &sections, &u, "Ionian")
+            .iter()
+            .map(|t| t.0)
+            .collect();
         assert_eq!(offs.len(), 4);
         assert_eq!(offs[0], 0, "A is home");
         assert_eq!(offs[1], 7, "B (rank-0, bright) → dominant +7");
@@ -2055,18 +2102,25 @@ mod tests {
         u.foreground_brightness = 0.9;
         u.background_energy = 0.3;
         u.background_brightness = 0.9; // both bright so the rule, not affect, drives the final-0 test
-        let resolved = resolve_key_scheme(
+        let resolved: Vec<i8> = resolve_key_scheme(
             Some(&mk(ResolutionPolicy::Resolve)),
             &sections,
             &u,
             "Ionian",
-        );
+        )
+        .iter()
+        .map(|t| t.0)
+        .collect();
         assert_eq!(
             resolved[2], 0,
             "Resolve forces the FINAL offset to 0 (Invariant A)"
         );
         assert_ne!(resolved[1], 0, "the non-final excursion still travels");
-        let open = resolve_key_scheme(Some(&mk(ResolutionPolicy::Open)), &sections, &u, "Ionian");
+        let open: Vec<i8> =
+            resolve_key_scheme(Some(&mk(ResolutionPolicy::Open)), &sections, &u, "Ionian")
+                .iter()
+                .map(|t| t.0)
+                .collect();
         assert_ne!(open[2], 0, "Open keeps the final off-home offset");
     }
 
@@ -2081,7 +2135,10 @@ mod tests {
         let u = ImageUnderstanding::neutral();
         // None scheme.
         assert_eq!(
-            resolve_key_scheme(None, &sections, &u, "Ionian"),
+            resolve_key_scheme(None, &sections, &u, "Ionian")
+                .iter()
+                .map(|t| t.0)
+                .collect::<Vec<i8>>(),
             vec![0, 0]
         );
         // Empty (home_only) scheme.
@@ -2092,7 +2149,10 @@ mod tests {
             pivot: false,
         };
         assert_eq!(
-            resolve_key_scheme(Some(&empty), &sections, &u, "Ionian"),
+            resolve_key_scheme(Some(&empty), &sections, &u, "Ionian")
+                .iter()
+                .map(|t| t.0)
+                .collect::<Vec<i8>>(),
             vec![0, 0]
         );
         // Unknown rule → home (0). Both sections carry a HOME role so the unknown→Home degrade is
@@ -2118,7 +2178,10 @@ mod tests {
             pivot: false,
         };
         assert_eq!(
-            resolve_key_scheme(Some(&unknown), &home_sections, &u, "Ionian"),
+            resolve_key_scheme(Some(&unknown), &home_sections, &u, "Ionian")
+                .iter()
+                .map(|t| t.0)
+                .collect::<Vec<i8>>(),
             vec![0, 0],
             "unknown rule degrades to home (0)"
         );

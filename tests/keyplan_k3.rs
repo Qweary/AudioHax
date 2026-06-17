@@ -335,14 +335,39 @@ fn pivot_fires_on_modulating_boundary() {
         melody[0].velocity
     );
 
-    // (2) A NON-boundary step (step_in_section != 0) inserts NO pivot — it must equal the frozen
-    //     identity realization of the same step (compared against single_section_default).
-    let interior_baseline = realize_baseline(&sec, &kt, &step, 0, 3, &f);
-    let interior = realize_with_prev(&sec, &kt, &step, 1, Some(prev_off), 0, 3, &f);
-    assert_eq!(
-        interior, interior_baseline,
-        "a non-boundary step (step_in_section != 0) must NOT fire the pivot — it falls through to \
-         the frozen free-select path; got {interior:?} vs baseline {interior_baseline:?}"
+    // (2) The pivot itself fires at step 0 ONLY (never step 1) — but step 1 is NOT frozen: it is
+    //     deliberately RE-VOICED to the destination ROOT-POSITION I (S29 Lever 1(b), the V→I
+    //     authentic-cadence resolution). The pivot V at step 0 → the destination I at step 1.
+    //     So step 1 is NO LONGER byte-identical to the free-select baseline (that was the K3
+    //     misconception this S29 slice corrects); instead its BASS sounds the destination tonic
+    //     ROOT (root-position I), i.e. the dom_root_pc → dest_root_pc cadence bass leap. We assert
+    //     the INTENDED step-1 re-voicing, and separately re-confirm the pivot's V (pc
+    //     `expected_dom_root_pc`) lands at step 0, NOT at step 1.
+    let resolution_bass = realize_with_prev(&sec, &kt, &step, 1, Some(prev_off), 0, 3, &f);
+    assert!(
+        !resolution_bass.is_empty(),
+        "the V->I resolution must sound at step 1 of the modulating section, got {resolution_bass:?}"
+    );
+    assert!(
+        resolution_bass.iter().all(|e| e.note % 12 == dest_root_pc),
+        "step 1 (the V->I resolution downbeat) must voice the DESTINATION TONIC ROOT \
+         (pc {dest_root_pc} = root-position I) so the step-0 pivot V resolves V->I into the new \
+         key — step 1 is re-voiced BY DESIGN, not frozen to the free-select baseline; got \
+         {resolution_bass:?}"
+    );
+    // And the V (the pivot's root, pc `expected_dom_root_pc`) is the STEP-0 chord, distinct from
+    // the step-1 destination tonic — the pivot fires at step 0, the resolution at step 1.
+    assert_ne!(
+        expected_dom_root_pc, dest_root_pc,
+        "sanity: the pivot V root pc and the destination tonic root pc must differ for V->I to be \
+         a real cadence"
+    );
+    assert!(
+        resolution_bass
+            .iter()
+            .all(|e| e.note % 12 != expected_dom_root_pc),
+        "step 1 must NOT still be sounding the pivot V (pc {expected_dom_root_pc}) — the pivot \
+         fires at step 0; step 1 is the I it resolves into; got {resolution_bass:?}"
     );
 
     // (3) A same-key boundary (prev == dest) inserts NO pivot even at step 0.
@@ -437,6 +462,12 @@ fn land_home_voicing_on_resolve_final() {
 /// pitch via the SAME register floors the free-select path uses, so the frame must never invert.
 /// Swept over the full menu of modulating boundaries {prev 0 → dest +7/+5/+3/−3} for the pivot, and
 /// the at-home Resolve final for land-home, across a range of brightness (the octave-lift driver).
+///
+/// S29 EXTENSION (spec §6 task 6): the pivot's FILL voice now carries the dominant SEVENTH (Lever
+/// 3) — the no-inversion frame must hold WITH that dom7 present. This sweep therefore ALSO pins, at
+/// every (dest × bright) pivot combo, that the fill voice sounds `dom_seventh_pc = (dom_root_pc +
+/// 10) % 12 = (dest_root_pc + 5) % 12` (a 3+ ensemble has a dedicated inner voice), so the
+/// bass<fill<melody assertions below are guarding the actual V7 voicing, not a stale bare triad.
 #[test]
 fn no_inversion_under_pivot_path() {
     let kt = key_tempo();
@@ -456,9 +487,14 @@ fn no_inversion_under_pivot_path() {
                 edge_density: 0.20,
             };
             let sec = section(dest, true, ResolutionPolicy::Resolve, &step);
+            // ALL THREE roles realized at the SAME boundary downbeat (step_in_section == 0) so the
+            // pivot fires for each — the frame and the S29 dom7 are asserted on the actual pivot
+            // voicing. (The original K3 sweep passed step_in_section == inst_idx, which only fired
+            // the pivot for the bass; the frame held trivially because the fill/melody fell through
+            // to free-select. S29 task 6 needs the dom7-bearing pivot voicing in all three voices.)
             let bass = realize_with_prev(&sec, &kt, &step, 0, Some(prev_off), 0, 3, &f);
-            let fill = realize_with_prev(&sec, &kt, &step, 1, Some(prev_off), 1, 3, &f);
-            let melody = realize_with_prev(&sec, &kt, &step, 2, Some(prev_off), 2, 3, &f);
+            let fill = realize_with_prev(&sec, &kt, &step, 0, Some(prev_off), 1, 3, &f);
+            let melody = realize_with_prev(&sec, &kt, &step, 0, Some(prev_off), 2, 3, &f);
 
             for (who, evs) in [("bass", &bass), ("fill", &fill), ("melody", &melody)] {
                 assert!(
@@ -473,6 +509,17 @@ fn no_inversion_under_pivot_path() {
                     );
                 }
             }
+            // S29 Lever 3: the pivot inner/fill voice sounds the dominant 7th (the V7 color) —
+            // assert the frame is held WITH the dom7 present (spec §6 task 6).
+            let home_root_pc = (HOME_ROOT_MIDI % 12) as i16;
+            let dest_root_pc = ((home_root_pc + dest as i16).rem_euclid(12)) as u8;
+            let dom_root_pc = (dest_root_pc + 7) % 12;
+            let dom_seventh_pc = (dom_root_pc + 10) % 12; // == (dest_root_pc + 5) % 12
+            assert!(
+                fill.iter().all(|e| e.note % 12 == dom_seventh_pc),
+                "the pivot FILL must carry the dominant 7th (pc {dom_seventh_pc}) for a 3+ \
+                 ensemble (dest {dest}, bright {bright}); got {fill:?}"
+            );
             let b = mean_pitch(&bass);
             let m = mean_pitch(&fill);
             let t = mean_pitch(&melody);
