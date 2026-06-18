@@ -7,7 +7,7 @@ Contract: `docs/design-s34-pattern-library-slice2.md`. Every verdict below was r
 
 ## TOP-LINE VERDICT: **PASS WITH ISSUES**
 
-One non-blocker finding: a TMP-internal codename ("Neo") leaks in the *design doc* (not in shipped source/asset/test), and the repo is PUBLIC. The code, data, tests, and byte-freeze are clean and correct. The lead must scrub the one doc line before push; no source/test change is required.
+One non-blocker finding: an internal role codename leaked in the *design doc* (not in shipped source/asset/test), and the repo is PUBLIC. The code, data, tests, and byte-freeze are clean and correct. The lead must scrub the one doc line before push; no source/test change is required.
 
 Headline results:
 - engine.rs sha256 == anchor: **YES** (`e50c7db…2348261`).
@@ -70,8 +70,8 @@ The s34 net (16 tests) checks real musical properties, not execution: arrives-on
 
 ## 8. CODENAME-CLEAN — **FAIL (non-blocker)**
 
-- Source/asset/test files (composition.rs, chord_engine.rs, mapping_loader.rs, mappings.json, tests/pattern_library_s34.rs): **clean** — word-boundary scan for TMP codenames found zero hits.
-- **FINDING (non-blocker):** `docs/design-s34-pattern-library-slice2.md:535` — `### Open decision points needing the lead's (Neo's) / operator's input`. "Neo" is the TMP swarm's internal interaction-layer codename; the repo is PUBLIC. It appears only in a design doc, not in shipped code, so it does not affect runtime — but it should be scrubbed before push.
+- Source/asset/test files (composition.rs, chord_engine.rs, mapping_loader.rs, mappings.json, tests/pattern_library_s34.rs): **clean** — word-boundary scan for internal codenames found zero hits.
+- **FINDING (non-blocker):** `docs/design-s34-pattern-library-slice2.md:535` carried an internal interaction-layer role codename as a parenthetical beside "the lead's" in a section header; the repo is PUBLIC. It appeared only in a design doc, not in shipped code, so it did not affect runtime — it was scrubbed before push.
 
 ---
 
@@ -79,7 +79,7 @@ The s34 net (16 tests) checks real musical properties, not execution: arrives-on
 
 | # | Severity | File:line | Issue | Recommended fix |
 |---|---|---|---|---|
-| F-1 | **non-blocker** | docs/design-s34-pattern-library-slice2.md:535 | TMP codename "Neo" in a PUBLIC-repo doc | Reword to `### Open decision points needing the lead's / operator's input` (drop "(Neo's)"). |
+| F-1 | **non-blocker** | docs/design-s34-pattern-library-slice2.md:535 | internal role codename in a PUBLIC-repo doc | Reword to `### Open decision points needing the lead's / operator's input` (drop the parenthetical codename). |
 
 No BLOCKER findings.
 
@@ -87,6 +87,6 @@ No BLOCKER findings.
 
 ## WHAT THE LEAD MUST DO BEFORE COMMIT
 
-1. Scrub the "Neo" codename at `docs/design-s34-pattern-library-slice2.md:535` (F-1) — reword to drop "(Neo's)". The repo is public.
+1. Scrub the internal role codename at `docs/design-s34-pattern-library-slice2.md:535` (F-1) — reword to drop the parenthetical. The repo is public. (DONE pre-commit.)
 
 Everything else is clean: byte-freeze held, generators correct (walking-bass hand-trace matched), no new clippy warnings, full suite green.
