@@ -1573,6 +1573,33 @@ fn realize_rhythm(
     // cadence rings as a single sustained, ritardando-lengthened note — the
     // arrival is a point of repose, not an active figure.
     if is_cadence {
+        // S30-CP-FIX (GAP-3) — COUNTER CADENCE PITCH AT THE RING. The generic cadence ring
+        // emits `note` (the role's `role_pitch` seat) and returns BEFORE the per-role match
+        // below — including the CounterMelody arm. For the structural roles that is correct
+        // and byte-frozen. But the CounterMelody role's species CADENCE clausula
+        // (`cadence_resolution_pitch`, the §1.2 no-leap step-to-perfect close) lives in
+        // `pick_counter_figure`, reached only from the counter arm — so without this branch the
+        // counter would ring on its STUB inner-tone seat and the cadence clausula would be dead
+        // code. Here we recompute the CounterMelody pitch through the SAME shared realize path
+        // (`realized_counter_pitch_with_prev`, which dispatches the PAC arm of
+        // `pick_counter_figure`) so the counter rings on its CONTRAPUNTAL cadence pitch, then
+        // still rings it as the single sustained legato cadence note. This touches ONLY the
+        // CounterMelody role; Bass/Pad/Melody keep their frozen `note`, so the cadence ring and
+        // the engine_equivalence goldens are unperturbed (the counter is never on the identity/
+        // frozen path). Deterministic (the realize path is RNG-free).
+        if role == OrchestralRole::CounterMelody {
+            let si = ctx.step_in_section;
+            let prev_counter = match si.checked_sub(1) {
+                Some(_) => realized_prev_counter(ctx, features, si),
+                None => seed_prev_counter(None, step),
+            };
+            let cnt = realized_counter_pitch_with_prev(ctx, step, features, si, prev_counter);
+            let ring = NoteEvent {
+                note: cnt,
+                ..sustained(0, step_ms, LEGATO_FRAC)
+            };
+            return vec![ring];
+        }
         return vec![sustained(0, step_ms, LEGATO_FRAC)];
     }
 
@@ -2711,6 +2738,34 @@ fn is_root_pc(chord: &Chord, n: u8) -> bool {
     chord.notes.first().is_some_and(|&r| r % 12 == n % 12)
 }
 
+/// True iff the chord's pitch-class set is a DIMINISHED triad: a root, a minor third
+/// (root+3), and a diminished fifth (root+6) — the structure that carries an internal
+/// tritone (the `vii°` of a major key, the `ii°` of a minor key). Used to recognize the
+/// GAP-2 "keep the bite" terminal sonority: a diminished triad is the only diatonic triad
+/// whose verticals are inherently dissonant, so a SECTION-TERMINAL diminished is the chord
+/// where an intentional unresolved dissonance ("the bite") is the musical choice rather than
+/// a smoothed-away consonance.
+///
+/// theory: we test the pitch-class INTERVALS above the chord root (notes[0] is the root, per
+/// `roman_to_chord`), not absolute pitches, so it is octave- and voicing-agnostic. A 7th/9th
+/// extension on top of a diminished triad still reads as diminished (the m3 + dim5 above the
+/// root are present); a half-diminished 7th likewise reads diminished on its triad core,
+/// which is the correct reading for the terminal-bite decision. Pure/deterministic.
+fn is_diminished_triad(chord: &Chord) -> bool {
+    let Some(&root) = chord.notes.first() else {
+        return false;
+    };
+    let root_pc = root % 12;
+    let has = |semis: u8| {
+        chord
+            .notes
+            .iter()
+            .any(|&n| (n % 12) == ((root_pc + semis) % 12))
+    };
+    // minor third (3) AND diminished fifth (6) above the root — the diminished signature.
+    has(3) && has(6)
+}
+
 /// Melodic motion direction between two (optional) pitches. A rest is folded into
 /// `Hold` by the callers (a rest neither rises nor falls — it is a static gap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3525,10 +3580,51 @@ fn cadence_resolution_pitch(chord: &Chord, cf_now: u8, counter_prev: u8, cf_prev
         .collect();
     stepwise_contrary.sort_by_key(|&c| (c as i16 - counter_prev as i16).abs());
     if let Some(&c) = stepwise_contrary.first() {
+        // TIER A (unchanged): the ideal clausula — a stepwise CONTRARY perfect close.
         return c;
     }
-    // Fallback: nearest perfect-consonant chord tone (still closes on a perfect
-    // consonance — the HARD floor — even if a clean stepwise clausula isn't available).
+
+    // S30-CP-FIX (GAP-3) — TIER B: a no-leap STEPWISE perfect close in EITHER direction.
+    //
+    // theory: the strict clausula demands stepwise CONTRARY convergence, but the
+    // load-bearing musical guarantee at a PAC is "close on a perfect consonance WITHOUT a
+    // leap" — a leap into the final sonority is the mechanical artifact we are removing.
+    // From a realized penult like 62 (on V/vi → IV → V → I) the perfect P5 landing 60 is a
+    // -2 STEP, but it moves SIMILAR to the descending CF (74→67), so the strict contrary
+    // filter above drops it and the old nearest-perfect fallback LEAPED to 55 (move 7).
+    // Before falling back to that leap, accept any perfect-consonant chord tone reachable by
+    // a STEP (|motion| ≤ 2) regardless of motion direction (similar/oblique allowed). This
+    // preserves the perfect CLOSE (PT-8 strengthened) and eliminates the by-leap resolution
+    // while never octave-displacing the line out of band.
+    let mut stepwise_perfect: Vec<u8> = cands
+        .iter()
+        .copied()
+        .filter(|&c| harmonic_class(c, cf_now) == HarmonicClass::PerfectConsonance)
+        .filter(|&c| (c as i16 - counter_prev as i16).abs() <= 2 && c != counter_prev)
+        .collect();
+    stepwise_perfect.sort_by_key(|&c| (c as i16 - counter_prev as i16).abs());
+    if let Some(&c) = stepwise_perfect.first() {
+        return c;
+    }
+
+    // S30-CP-FIX (GAP-3) — TIER C: a no-leap STEPWISE CONSONANT (perfect-or-imperfect)
+    // close. Not needed for the pinned battery; specified for completeness so a future
+    // degenerate cadence chord with no stepwise PERFECT landing still avoids a leap, mildly
+    // relaxing only the "perfect close" while keeping the no-leap guarantee.
+    let mut stepwise_consonant: Vec<u8> = cands
+        .iter()
+        .copied()
+        .filter(|&c| is_consonant(c, cf_now))
+        .filter(|&c| (c as i16 - counter_prev as i16).abs() <= 2 && c != counter_prev)
+        .collect();
+    stepwise_consonant.sort_by_key(|&c| (c as i16 - counter_prev as i16).abs());
+    if let Some(&c) = stepwise_consonant.first() {
+        return c;
+    }
+
+    // TIER D (fallback, unchanged): nearest perfect-consonant chord tone by ANY motion —
+    // the existing leaping floor, now reached only by a genuinely degenerate chord with no
+    // stepwise landing of any kind.
     cands
         .iter()
         .copied()
@@ -3589,37 +3685,122 @@ const PASSING_PREF: i32 = 3;
 /// tones, and inventing a non-chord tone would break the first-species chord-tone invariant;
 /// such a chord has no consonant counter and that is a harmony defect upstream, not a counter
 /// defect. Pure/deterministic; reached only from the CounterMelody figure driver.
-fn consonance_gate_sustain(chord: &Chord, raw: u8, prev_counter: u8, m_now: Option<u8>) -> u8 {
+/// Rank a band-seated counter candidate against the CF for the "no ideal landing" recovery
+/// search (design §1, the Option-B preference order). Lower-is-better, total order, RNG-free:
+///
+///   tier 0  CONSONANT + reached by STEP        (|motion| ≤ 2)               — the ideal
+///   tier 1  CONSONANT + reached by a CONSONANT LEAP (legal leap, |motion| ≥ 3) — register kept
+///   tier 2  a PREPARED ornamental DISSONANCE reached by STEP (|motion| ≤ 2)  — rare, expressive
+///
+/// A dissonant LEAP and an out-of-band pitch are NOT candidates here — they are exactly what
+/// Option B forbids; callers filter them out BEFORE ranking. Within a tier the existing
+/// inner-line biases break ties, identical to `consonance_gate_sustain`'s historic ordering:
+/// imperfect consonance over perfect (avoid bare 5ths/8ves), then smallest melodic motion
+/// (connectedness), then a non-root pc (the counter is not a bass double). The helper does NOT
+/// itself enforce legality (band membership, `melodic_leap_is_legal`, parallel-perfect) — the
+/// caller restricts to legal candidates first, then `min_by_key(rank_inregister_landing)`.
+fn rank_inregister_landing(
+    cand: u8,
+    prev_counter: u8,
+    cf_now: u8,
+    chord: &Chord,
+) -> (u8, u8, i16, u8) {
+    let motion = (cand as i16 - prev_counter as i16).abs();
+    let is_step = motion <= 2;
+    let consonant = is_consonant(cand, cf_now);
+    // tier: 0 consonant-step, 1 consonant-leap, 2 prepared-dissonance-step (3 = should be
+    // pre-filtered out, ranked last as a defensive floor).
+    let tier = match (consonant, is_step) {
+        (true, true) => 0,
+        (true, false) => 1,
+        (false, true) => 2,
+        (false, false) => 3,
+    };
+    let imperfect_first = if harmonic_class(cand, cf_now) == HarmonicClass::ImperfectConsonance {
+        0
+    } else {
+        1
+    };
+    let root_last = if is_root_pc(chord, cand) { 1 } else { 0 };
+    (tier, imperfect_first, motion, root_last)
+}
+
+fn consonance_gate_sustain(
+    chord: &Chord,
+    raw: u8,
+    prev_counter: u8,
+    m_prev: Option<u8>,
+    m_now: Option<u8>,
+) -> u8 {
     // No CF this step (melody rests) → no vertical to constrain; keep the scorer's pick.
     let Some(cf) = m_now else { return raw };
     // Already consonant → no-op (the byte-stable common case).
     if is_consonant(raw, cf) {
         return raw;
     }
-    // Re-select among the chord's reachable consonant counter-band tones.
+
+    // S30-CP-FIX (GAP-2) — TIER 0/1: widen the consonant search to a CONSONANT LEAP.
+    //
+    // theory: a first-species (sustained) vertical must be a consonance. From the realized
+    // penult on {IV,V} → vii a consonant landing DOES exist in the chord's band tones (the
+    // m3, 62, vs melody 77), reachable by a legal CONSONANT leap (P4/m3) — but the old gate
+    // ranked only by (imperfect, step, root) and never distinguished a step from a consonant
+    // leap nor admitted the leap explicitly. We rank the consonant chord-tone set by
+    // `rank_inregister_landing` so a consonant STEP wins (tier 0) and, failing that, a
+    // consonant LEAP (tier 1) — register preserved, vertical consonant — is taken before any
+    // dissonant fallback. Only LEGAL melodic moves are eligible: a step is always legal; a
+    // leap must pass `melodic_leap_is_legal` (so a tritone/7th leap is never a consonant-leap
+    // landing — there is none in the pinned set).
     let consonant: Vec<u8> = counter_candidate_pitches(chord, prev_counter)
         .into_iter()
         .filter(|&c| is_consonant(c, cf))
+        .filter(|&c| melodic_leap_is_legal(prev_counter, c))
         .collect();
-    consonant
+    if let Some(c) = consonant
         .into_iter()
-        .min_by_key(|&c| {
-            // Lower-is-better, mirroring the scorer's biases:
-            //  (1) imperfect consonance preferred over perfect (avoid bare 5ths/8ves);
-            //  (2) smallest step from where the line just was (connectedness);
-            //  (3) a non-root inner tone over the root pc (the counter is not a bass double).
-            let imperfect_first = if harmonic_class(c, cf) == HarmonicClass::ImperfectConsonance {
-                0
-            } else {
-                1
-            };
-            let step = (c as i16 - prev_counter as i16).abs();
-            let root_last = if is_root_pc(chord, c) { 1 } else { 0 };
-            (imperfect_first, step, root_last)
-        })
-        // No consonant chord tone exists at all → the chord cannot support a consonant
-        // structural vertical from its own tones; keep `raw` rather than emit a non-chord tone.
-        .unwrap_or(raw)
+        .min_by_key(|&c| rank_inregister_landing(c, prev_counter, cf, chord))
+    {
+        return c;
+    }
+
+    // S30-CP-FIX (GAP-2) — TIER 2: a PREPARED ornamental dissonance reached by STEP.
+    //
+    // theory: when NO chord tone of the harmony is consonant vs the CF from this band
+    // position (a truly degenerate terminal vertical), Option B keeps the line IN REGISTER
+    // with a deliberate, step-prepared dissonance rather than the blunt non-chord-tone floor.
+    // A terminal `vii` has no resolution slot, so the dissonance is made intentional by
+    // PREPARATION ALONE: it is a band chord tone reached by a STEP (|motion| ≤ 2) from a prior
+    // counter pitch that was ITSELF consonant against the prior CF — the appoggiatura/
+    // suspension "lean-in" gesture minus the resolution the final position cannot provide
+    // (design §2). This tier is reached ONLY when the consonant set above is empty; it does
+    // NOT arise for the pinned {IV,V}→vii set (62 is consonant), but is the principled floor
+    // for a future fully-degenerate terminal.
+    let preparation_consonant = match m_prev {
+        // The preparation must itself be a consonance against the prior CF.
+        Some(cf_prev) => is_consonant(prev_counter, cf_prev),
+        // No prior CF → cannot verify the preparation; do not license the ornament.
+        None => false,
+    };
+    if preparation_consonant {
+        let ornament: Vec<u8> = counter_candidate_pitches(chord, prev_counter)
+            .into_iter()
+            // A STEP (≤2) from the realized prior counter pitch — the prepared approach.
+            .filter(|&c| {
+                let motion = (c as i16 - prev_counter as i16).abs();
+                (1..=2).contains(&motion)
+            })
+            .collect();
+        if let Some(c) = ornament
+            .into_iter()
+            .min_by_key(|&c| rank_inregister_landing(c, prev_counter, cf, chord))
+        {
+            return c;
+        }
+    }
+
+    // No consonant chord tone AND no step-prepared ornament exists → keep `raw` as the
+    // absolute defensive floor (a harmony defect upstream, not a counter defect).
+    raw
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3669,7 +3850,7 @@ fn pick_counter_figure(
     // consonant (the overwhelmingly common case, every consonant triad) this is a no-op and
     // the sustain is byte-identical to before — so the held-period / consonant-triad freeze
     // and PT-0 are untouched.
-    let sustain = consonance_gate_sustain(chord, sustain_raw, prev_counter, m_now);
+    let sustain = consonance_gate_sustain(chord, sustain_raw, prev_counter, m_prev, m_now);
 
     // --- §1.3 BEGIN formula: a PhraseStart vertical MUST be a perfect consonance. This is
     // a HARD override of the sustain pick (which optimizes for motion, not the opening
@@ -3702,15 +3883,76 @@ fn pick_counter_figure(
         return (sustain, CounterFigure::Sustain);
     }
 
-    // --- Interior steps. Dissonant figures are licensed ONLY when enabled (changing-chord
-    // / moving-melody) AND the CF sounds both now and prior (we need the vertical context).
-    if figures_enabled {
-        if let (Some(cf_now), Some(cf_prev)) = (m_now, m_prev) {
-            // The resolution target's CF: the NEXT chord's nearest CF analogue if it
-            // exists, else the current CF (R-B: a figure at section end resolves into the
-            // current harmony, never into a non-existent next chord).
-            let resolve_chord = next_chord.unwrap_or(chord);
+    // --- S32-CP "KEEP THE BITE" (GAP-2) — SECTION-TERMINAL DIMINISHED FINAL SONORITY.
+    //
+    // theory & operator decision: at a SECTION-TERMINAL diminished triad (`vii°` last, no
+    // `next_chord`) the species "every structural vertical is consonant" floor would smooth the
+    // line to a consonant chord tone (the prior GAP-2 outcome — counter 62, a m3 vs the melody).
+    // But a terminal step has NO resolution beat: it is not a figure-that-must-resolve, it is the
+    // FINAL sonority of the piece. The operator's confirmed call is to KEEP THE BITE — let the
+    // counter sound a DELIBERATE, PREPARED dissonance against the melody and leave it unresolved,
+    // because that is the expressive intent of ending on a diminished harmony. The dissonance is
+    // made musical (intentional, not a blundered leap-in) by PREPARATION ALONE:
+    //   * IN-REGISTER  — drawn from `counter_candidate_pitches`, which enforces the band [55,67);
+    //   * PREPARED     — approached by STEP (|motion| ≤ 2) from the REALIZED penult `prev_counter`
+    //                    (the lean-in gesture; a blunt leap into a dissonance is forbidden);
+    //   * GENUINELY DISSONANT vs the sounding melody (the bite itself);
+    //   * UNRESOLVED   — it is the end of the piece, so no resolution slot is expected.
+    // PREFERENCE: the prepared dissonance is PREFERRED OVER the consonant sustain here. GUARD: if
+    // NO dissonant band tone is step-reachable from the realized penult, we DO NOT manufacture a
+    // blunt leap-in dissonance — we fall through to the consonance-gated sustain (the prepared-
+    // ness requirement is a hard floor, never relaxed into a leap). Determinism: `min_by_key`
+    // (smallest step first, then prefer a tone NOT equal to the melody's pc for PT-7 hygiene),
+    // RNG-free. Scope: ONLY the terminal-diminished case — every interior step, every consonant
+    // terminal, and the PhraseStart/PAC overrides above are untouched, so the goldens and PT
+    // invariants outside this exact sonority are byte-stable.
+    if next_chord.is_none() && is_diminished_triad(chord) {
+        if let Some(cf_now) = m_now {
+            let bite: Vec<u8> = counter_candidate_pitches(chord, prev_counter)
+                .into_iter()
+                // PREPARED: |motion| ≤ 2 from the realized penult (the operator's definition).
+                // This INCLUDES motion 0 — a HELD dissonant tone (oblique motion against the
+                // moving melody, the textbook suspension-style preparation: the counter sustains
+                // its penult while the melody steps onto the dissonant interval). A leap (≥3) is
+                // the blunt leap-in the guard forbids. So |motion| ≤ 2 exactly.
+                .filter(|&c| (c as i16 - prev_counter as i16).abs() <= 2)
+                // The BITE: a genuine vertical dissonance against the sounding melody.
+                .filter(|&c| !is_consonant(c, cf_now))
+                // PT-7 hygiene: never collapse onto the melody's exact pitch (a unison is not a
+                // dissonance anyway, but keep the floor explicit).
+                .filter(|&c| c != cf_now)
+                .collect();
+            if let Some(c) = bite.into_iter().min_by_key(|&c| {
+                // Lower-is-better: smallest prepared step first (the tightest lean-in), then a
+                // deterministic tie-break by pitch.
+                ((c as i16 - prev_counter as i16).abs(), c)
+            }) {
+                return (c, CounterFigure::Sustain);
+            }
+            // No step-reachable dissonance from the realized penult → preparation impossible.
+            // Honor the guard: fall through to the consonance-gated sustain rather than leap into
+            // a dissonance. (The sustain below is already consonant where a consonant in-band
+            // landing exists.)
+        }
+    }
 
+    // --- Interior steps. Dissonant figures are licensed ONLY when enabled (changing-chord
+    // / moving-melody) AND the CF sounds both now and prior (we need the vertical context)
+    // AND a real NEXT chord exists to resolve into.
+    //
+    // S30-CP-FIX (GAP-2) — TERMINAL FIGURE LICENSE. A passing/neighbor/suspension figure is a
+    // PREPARED-AND-RESOLVED dissonance: it requires a resolution BEAT on the following step
+    // (design §2). At a section-terminal step there is no next step emitted, so a dissonant
+    // figure there would sound a permanently-UNRESOLVED structural dissonance — exactly the
+    // GAP-2 fault (e.g. {IV,V} → vii terminal, where the figure scorer otherwise picks a
+    // Neighbor/Passing that beats the now-consonant sustain and lands a bare m7/P4 with no
+    // resolution slot). We therefore license dissonant figures ONLY when `next_chord` is
+    // present; at a terminal step the line falls to the consonance-gated sustain (§1.1), which
+    // is consonant wherever a consonant in-band landing exists (the strong Option-B outcome).
+    // The old `next_chord.unwrap_or(chord)` "resolve into the current harmony at section end"
+    // reasoning was the bug — a figure cannot resolve when no further step sounds.
+    if figures_enabled {
+        if let (Some(cf_now), Some(cf_prev), Some(resolve_chord)) = (m_now, m_prev, next_chord) {
             if let Some((pitch, figure, bonus)) =
                 best_dissonant_figure(resolve_chord, prev_counter, sustain, cf_prev, cf_now)
             {
@@ -3728,6 +3970,74 @@ fn pick_counter_figure(
                         return (pitch, figure);
                     }
                 }
+            }
+        }
+    }
+
+    // S30-CP-FIX (GAP-4) — OPTION-B IN-REGISTER LEAP RECOVERY.
+    //
+    // theory: `melodic_leap_is_legal` correctly forbids a DISSONANT melodic leap (a tritone
+    // or 7th), but the as-built scorer can still SELECT such a leap as its surviving sustain
+    // pick when every consonant chord-tone candidate is vetoed by an upstream gate (the
+    // no-parallel / approach-perfect guard). On `ii/vi → IV → iii` the line lands 59 by a
+    // -6 TRITONE leap from the realized penult 65, because the clean stepwise consonant
+    // chord tone 64 (P5 vs melody 71) is dropped by `approach_perfect_is_legal` (similar
+    // motion into a perfect). Rather than loosen the leap gate (it is the correct gate) or
+    // octave-displace, we run an in-register recovery search when — and ONLY when — the
+    // chosen sustain pitch is itself reachable from the realized prior counter pitch only by
+    // a DISSONANT leap. We prefer, per the Option-B order: (tier 0) a consonant chord tone
+    // by STEP, (tier 1) a consonant chord tone by a CONSONANT (legal) LEAP, (tier 2) a
+    // PREPARED ornamental dissonance by STEP. A consonant stepwise landing (64) strictly
+    // beats the dissonant tritone leap (59) and is taken. On every clean transition
+    // `melodic_leap_is_legal(prev_counter, sustain)` is already true, so this branch is a
+    // no-op and the line is byte-identical (the recovery never widens the band — all
+    // candidates come from `counter_candidate_pitches`, which enforces [55,67)).
+    if !melodic_leap_is_legal(prev_counter, sustain) {
+        if let Some(cf_now) = m_now {
+            // Eligible recovery landings: in-band chord tones reachable by a LEGAL melodic
+            // move (step, or a consonant/legal leap — never a tritone/7th leap), and never
+            // the unison with the CF (PT-7). Tier 2 (prepared ornament) requires the
+            // preparation `prev_counter` to be consonant vs the prior CF.
+            let preparation_consonant = match m_prev {
+                Some(cf_prev) => is_consonant(prev_counter, cf_prev),
+                None => false,
+            };
+            let recovery: Vec<u8> = counter_candidate_pitches(chord, prev_counter)
+                .into_iter()
+                .filter(|&c| c != cf_now) // no unison collapse (PT-7)
+                .filter(|&c| melodic_leap_is_legal(prev_counter, c)) // never a dissonant leap
+                // HARD INVARIANT — the recovery must NOT manufacture a parallel/hidden perfect
+                // against the melody (PT-1). The naive "stepwise consonant landing 64" the spec
+                // suggested for ii/vi → IV → iii is a P5 vs the melody reached by SIMILAR motion
+                // (counter 65→64 with melody 72→71) — a hidden P5 that `approach_perfect_is_legal`
+                // rejects and that `test_no_audible_parallel_perfect` (a non-GAP, must-stay-green
+                // invariant) forbids. We re-apply the SAME two-point guards the main scorer uses
+                // so the leap-recovery can never trade the tritone for a parallel perfect.
+                .filter(|&c| match m_prev {
+                    Some(cf_prev) => {
+                        approach_perfect_is_legal(cf_prev, cf_now, prev_counter, c)
+                            && !has_parallel_perfects(&[cf_prev, prev_counter], &[cf_now, c])
+                    }
+                    // No prior CF → cannot evaluate two-point motion; keep the candidate.
+                    None => true,
+                })
+                .filter(|&c| {
+                    let motion = (c as i16 - prev_counter as i16).abs();
+                    let is_step = motion <= 2;
+                    if is_consonant(c, cf_now) {
+                        // tiers 0/1: a consonant landing by step OR a consonant legal leap.
+                        true
+                    } else {
+                        // tier 2: a PREPARED ornamental dissonance, by STEP only.
+                        is_step && preparation_consonant
+                    }
+                })
+                .collect();
+            if let Some(c) = recovery
+                .into_iter()
+                .min_by_key(|&c| rank_inregister_landing(c, prev_counter, cf_now, chord))
+            {
+                return (c, CounterFigure::Sustain);
             }
         }
     }
@@ -6724,7 +7034,7 @@ mod tests {
         for (prev_c, mp, mn, fm, ht) in cases {
             let mel_dir = motion_dir(mp, mn);
             let raw = pick_counter_pitch(&chord, prev_c, mp, mn, mel_dir, fm, ht);
-            let gated = consonance_gate_sustain(&chord, raw, prev_c, mn);
+            let gated = consonance_gate_sustain(&chord, raw, prev_c, mp, mn);
             let (pitch, fig) = pick_counter_figure(
                 &chord,
                 prev_c,

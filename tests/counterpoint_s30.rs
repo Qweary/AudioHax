@@ -38,29 +38,37 @@
 //!   GAP-1 (no audible parallel perfect): `IV→iii→I` now realizes melody 71→67 and counter
 //!   59→60 at the si1→si2 boundary — CONTRARY motion; the parallel perfect fifth is GONE.
 //!
-//!   GAP-2 (consonant structural sustain): on a diminished triad (vii = B-D-F) the SUSTAIN
-//!   now lands counter 62 (D, a CONSONANT m3 against melody F=77) instead of the old bare
-//!   tritone 59 (B). PARTIAL: 4 of 6 terminal `X→vii` openers are consonant; IV→vii and V→vii
-//!   still land a dissonant terminal sustain (pinned RESIDUAL).
+//!   GAP-2 (terminal diminished `vii` — "KEEP THE BITE", S32 disposition): on a diminished
+//!   triad (vii = B-D-F) the four openers I, ii, iii, vi sidestep to a CONSONANT terminal
+//!   counter (I/iii/vi → 62 = D, a CONSONANT m3 vs melody F=77; ii → 65 = F, ic 0 octave-class
+//!   consonance). The two openers IV, V are an INTENTIONAL design choice — the terminal `vii`
+//!   deliberately KEEPS a PREPARED dissonant final sonority (the diminished "bite"): IV→vii
+//!   lands 59 (B, tritone ic 6) approached from realized penult 57 by a +2 STEP; V→vii lands
+//!   59 from penult 59 by a held motion 0 (oblique suspension). This is NOT a lingering defect
+//!   — it is a positive property: a step-PREPARED, deliberately-unresolved terminal dissonance.
 //!
-//!   GAP-3 (cadence resolves without leap): an `X→IV→V→I` PAC now closes counter 55→55
-//!   (move 0, an OBLIQUE hold onto a perfect consonance) instead of the old 59→55 leap. The
-//!   guaranteed level is "lands a perfect consonance by motion ≤2 semitones, NO leap"; strict
-//!   stepwise-contrary clausula convergence is a documented future-slice refinement. PARTIAL:
-//!   the perfect CLOSE holds for all 6 openers, the NO-LEAP approach for 4 of 6; V/vi still
-//!   resolve 62→55 by leap (pinned RESIDUAL).
+//!   GAP-3 (cadence resolves without leap — CLOSED CLEAN, S32): an `X→IV→V→I` PAC now closes
+//!   the counter by motion ≤2 (NO leap) onto a perfect consonance for ALL SIX openers.
+//!   I/ii/iii/IV → 55→55 (move 0, an OBLIQUE hold onto a perfect consonance); V/vi → 62→60
+//!   (move 2, a STEP onto a P5). The residual is now EMPTY: the no-leap perfect close is
+//!   UNIVERSAL over the diatonic opener battery. Strict stepwise-contrary clausula convergence
+//!   remains a documented future-slice refinement (the guaranteed level here is no-leap, not
+//!   strict-contrary).
 //!
-//!   GAP-4 (no dissonant melodic leap): `I→V→IV` now realizes the counter line [64,62,65];
-//!   the 62→65 move is a CONSONANT m3 leap, not the old 59→65 tritone. PARTIAL: 55 of 57
+//!   GAP-4 (no dissonant melodic leap): `I→V→IV` realizes the counter line [64,62,65]; the
+//!   62→65 move is a CONSONANT m3 leap, not the old 59→65 tritone. PARTIAL / DEFERRED: 55 of 57
 //!   realized leaps are consonant; ii→IV→iii and vi→IV→iii still leap a 65→59 tritone (pinned
-//!   RESIDUAL).
+//!   RESIDUAL — a DELIBERATE DEFERRAL: closing it at the iii-landing would force a parallel
+//!   perfect fifth and needs a separate penult-rework slice; see the test's doc-comment).
 //!
 //! Consequently the strict forms of design PT-1 (no parallel perfects) now hold UNIVERSALLY
-//! over the diatonic-triple battery (GAP-1 fully closed). GAP-2/3/4 are SUBSTANTIALLY closed
-//! but NOT universal: each inverted test asserts the verified witness + the clean region
-//! STRICTLY, and PINS the exact residual set so the clean region stays clean AND the residual
-//! FAILS LOUDLY (with a stderr advisory) the moment the lane closes — or accidentally widens —
-//! it. The earlier held-period/consonant-triad-scoped PT-1/PT-4 assertions are RETAINED.
+//! over the diatonic-triple battery (GAP-1 fully closed), and GAP-3's no-leap cadence is now
+//! UNIVERSAL (residual empty). GAP-2 is a settled POSITIVE property (consonant sidestep for 4
+//! openers, a kept prepared "bite" for IV/V). GAP-4 remains a pinned, explained DEFERRAL. Each
+//! inverted test asserts the verified witnesses + the clean region STRICTLY, and (for GAP-4)
+//! PINS the exact residual set so the clean region stays clean AND the residual FAILS LOUDLY
+//! (with a stderr advisory) the moment the lane closes — or accidentally widens — it. The
+//! earlier held-period/consonant-triad-scoped PT-1/PT-4 assertions are RETAINED.
 
 use audiohax::chord_engine::{
     realize_step, Chord, NoteEvent, PerfFeatures, PhrasePosition, StepPlan,
@@ -804,26 +812,33 @@ fn test_no_audible_parallel_perfect_counter_vs_melody() {
     );
 }
 
-/// PROPERTY (inverted GAP-2) — the STRUCTURAL SUSTAIN pitch is CONSONANT against the melody
-/// even on a DIMINISHED triad; if it is ever dissonant it must be a prepared+resolved figure.
+/// PROPERTY (GAP-2 — "KEEP THE BITE", the S32 operator disposition) — on a terminal DIMINISHED
+/// `vii` the counter is split BY DESIGN into two intentional behaviors:
 ///
-/// The lane fixed the root cause: the base SUSTAIN pick is now routed through `is_consonant`,
-/// so it can no longer land an unprepared structural dissonance — including on a chord that
-/// contains an internal tritone (the diminished vii = B-D-F).
+///   * the 4 openers I, ii, iii, vi SIDESTEP to a CONSONANT terminal counter (the safe default,
+///     no dissonance at all): I/iii/vi land 62 (D, a CONSONANT m3 vs melody F=77, ic 3); ii
+///     lands 65 (F, ic 0 — an octave-class consonance vs the F=77 melody);
+///   * the 2 openers IV, V deliberately KEEP a PREPARED DISSONANT terminal sonority — the
+///     diminished "bite". IV→vii lands 59 (B, a TRITONE ic 6 vs melody 77) approached from the
+///     realized penult 57 by a +2 STEP; V→vii lands 59 (tritone ic 6) from penult 59 by a HELD
+///     motion 0 (an oblique suspension). The dissonance is INTENTIONAL: it is reached by a STEP
+///     (|motion| ≤ 2 — a leaned-into preparation, not a blunt leap-in), stays in the counter
+///     band [55,67), and is deliberately left unresolved because `vii` is the terminal step.
 ///
-/// ADVERSARIAL WITNESS: a 2-step `iii → vii` where vii is the LAST step — the single most
-/// tempting case for the defect, because there is no next step to resolve into, so a dissonant
-/// sustain would be permanently unresolved. The sustain now lands counter 62 (D), a CONSONANT
-/// m3 against melody 77 (F), instead of the old bare tritone 59 (B).
+/// This is NOT a lingering defect. The earlier net pinned `{IV, V}` as an unresolved residual to
+/// be closed; the operator's S32 decision is that the terminal diminished bite is a FEATURE —
+/// the appoggiatura-colour the project wants — provided it is PREPARED (approached by step). So
+/// this test is a POSITIVE property: the consonant sidesteps stay consonant AND the kept bite is
+/// a genuine prepared, in-band, terminal dissonance. The explicit |approach motion| ≤ 2 check on
+/// the bite cases means a future BLUNT leap-in dissonance (an un-prepared bite) would FAIL here.
 ///
-/// We assert the structural vertical is consonant at the witness, AND — over the full battery
-/// of `X → vii` finals (vii last, every consonant X) — that the diminished structural sustain
-/// is never an unprepared/unresolved dissonance. Because vii is the terminal step there is no
-/// resolution slot, so the property is the strict one: the structural vertical must be
-/// CONSONANT (a dissonance there could never be a resolved figure).
+/// WITNESSES (re-derived against the realized engine; melody 77/F, band tones B=59,D=62,F=65):
+///   * `iii → vii` (kept consonant witness): terminal counter 62 vs melody 77 = m3 (ic 3).
+///   * `IV → vii` (prepared bite): penult 57 → terminal 59 (tritone ic 6), approach +2 STEP.
+///   * `V → vii`  (prepared bite): penult 59 → terminal 59 (tritone ic 6), approach motion 0.
 #[test]
-fn test_diminished_structural_sustain_is_consonant() {
-    // 1) The adversarial witness: vii as the unresolvable LAST step is now consonant.
+fn test_terminal_diminished_keeps_prepared_bite() {
+    // 1) The kept CONSONANT witness: iii -> vii sidesteps to a consonant m3.
     let steps = vec![
         step(c_iii(), 0, PhrasePosition::Interior),
         step(c_vii(), 1, PhrasePosition::Interior),
@@ -834,100 +849,140 @@ fn test_diminished_structural_sustain_is_consonant() {
     assert_eq!(
         (m, c),
         (77, 62),
-        "witness drifted: expected melody 77 / counter 62 (the fixed consonant m3) on the vii \
-         step; got melody {m} / counter {c}. Re-derive."
-    );
-    assert!(
-        !is_dissonant(c, m),
-        "PT-4 REGRESSED: the diminished-triad terminal SUSTAIN lands a vertical DISSONANCE \
-         (counter {c} vs melody {m}, ic {}). Since vii is the LAST step there is no resolution \
-         slot — this is an unprepared, unresolvable structural dissonance. The sustain pick is \
-         no longer routed through is_consonant.",
-        ic(c, m)
+        "witness drifted: expected melody 77 / counter 62 (the consonant m3 sidestep) on the \
+         iii->vii terminal; got melody {m} / counter {c}. Re-derive."
     );
     assert_eq!(
         ic(c, m),
         3,
-        "the fixed witness vertical should be a consonant m3 (ic 3)"
+        "the iii->vii consonant witness vertical should be a m3 (ic 3)"
+    );
+    assert!(
+        !is_dissonant(c, m),
+        "the iii->vii terminal must stay CONSONANT (the consonant-sidestep region must not \
+         regress to a bite)"
     );
 
-    // 2) RESIDUAL SCOPE. The fix is INCOMPLETE on the broad terminal-diminished battery: over
-    //    the 6 consonant openers of `X -> vii` (vii LAST), 4 land consonant but 2 still land an
-    //    unresolvable structural DISSONANCE (IV->vii = ic 10 m7, V->vii = ic 5/P4). When the
-    //    realized penult's nearest band-reachable diminished chord-tone is itself dissonant
-    //    against the melody, the is_consonant routing has no consonant landing and falls back to
-    //    a dissonant tone. We pin the EXACT residual set so it (a) is visible and (b) FAILS
-    //    LOUDLY the moment the lane closes it (e.g. via a consonant non-chord-tone escape or a
-    //    voice-exchange on the diminished terminal). See the residual report.
-    const GAP2_RESIDUAL_DISSONANT_OPENERS: &[&str] = &["IV", "V"];
-    let mut residual_dissonant: Vec<String> = Vec::new();
-    for x in consonant_corpus() {
+    // 2) The 4 CONSONANT openers (I, ii, iii, vi) — terminal vii is a consonance against the
+    //    melody. Drift-guarded to the exact realized counter pitch per opener (62, except ii=65).
+    let consonant_witnesses: &[(&str, u8)] = &[("I", 62), ("ii", 65), ("iii", 62), ("vi", 62)];
+    for &(name, want) in consonant_witnesses {
+        let opener = consonant_corpus()
+            .into_iter()
+            .find(|c| c.name == name)
+            .unwrap();
         let steps = vec![
-            step(x.clone(), 0, PhrasePosition::Interior),
+            step(opener.clone(), 0, PhrasePosition::Interior),
             step(c_vii(), 1, PhrasePosition::Interior),
         ];
         let sec = section_of(steps);
         let c = counter_at(&sec, 1, &perf(0.04));
-        let Some(m) = melody_at(&sec, 1, &perf(0.04)) else {
-            continue;
-        };
-        if is_dissonant(c, m) {
-            residual_dissonant.push(x.name.clone());
-        } else {
-            // The CONSONANT region is the strict positive property and must stay clean.
-            // (If a previously-consonant opener regresses to dissonant it is caught here.)
-        }
-    }
-    residual_dissonant.sort();
-    let mut expected: Vec<String> = GAP2_RESIDUAL_DISSONANT_OPENERS
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    expected.sort();
-    if residual_dissonant != expected {
-        eprintln!(
-            "GAP-2 RESIDUAL SET CHANGED: terminal-diminished dissonant openers now {residual_dissonant:?} \
-             (was {expected:?}). If the set SHRANK the lane made progress — tighten this pin \
-             toward the full consonant property. If it GREW a NEW opener regressed."
+        let m = melody_at(&sec, 1, &perf(0.04)).expect("melody sounds on the vii step");
+        assert_eq!(
+            (m, c),
+            (77, want),
+            "witness drifted: {name}->vii terminal expected melody 77 / counter {want} (the \
+             consonant sidestep); got melody {m} / counter {c}. Re-derive."
+        );
+        assert!(
+            !is_dissonant(c, m),
+            "GAP-2 REGRESSED: {name}->vii consonant-sidestep opener now lands a DISSONANCE \
+             (counter {c} vs melody {m}, ic {}). The consonant region must stay consonant.",
+            ic(c, m)
+        );
+        assert!(
+            (COUNTER_FLOOR..COUNTER_CEIL).contains(&c),
+            "{name}->vii terminal counter {c} must stay in the band [{COUNTER_FLOOR},{COUNTER_CEIL})"
         );
     }
-    assert_eq!(
-        residual_dissonant, expected,
-        "GAP-2 residual set drifted (see stderr). Strict-consonant openers must stay consonant; \
-         the known-residual pair {{IV,V}} must not grow."
-    );
+
+    // 3) The 2 KEPT-BITE openers (IV, V) — the terminal vii deliberately KEEPS a PREPARED,
+    //    in-band, terminal DISSONANCE. The bite must be: (a) a genuine vertical dissonance vs the
+    //    melody, (b) PREPARED — reached from the realized penult by a STEP (|motion| <= 2; motion
+    //    0 = a held/oblique suspension counts), (c) in the counter band, (d) terminal/unresolved.
+    //    Witnesses: IV penult 57 -> terminal 59 (tritone, +2 step); V penult 59 -> terminal 59
+    //    (tritone, held motion 0). The |approach motion| <= 2 assertion makes a future BLUNT
+    //    leap-in dissonance (an un-prepared bite) FAIL — preparation is the binding requirement.
+    let bite_witnesses: &[(&str, u8, u8)] = &[("IV", 57, 59), ("V", 59, 59)];
+    for &(name, want_penult, want_term) in bite_witnesses {
+        let opener = consonant_corpus()
+            .into_iter()
+            .find(|c| c.name == name)
+            .unwrap();
+        let steps = vec![
+            step(opener.clone(), 0, PhrasePosition::Interior),
+            step(c_vii(), 1, PhrasePosition::Interior),
+        ];
+        let sec = section_of(steps);
+        let penult = counter_at(&sec, 0, &perf(0.04));
+        let term = counter_at(&sec, 1, &perf(0.04));
+        let m = melody_at(&sec, 1, &perf(0.04)).expect("melody sounds on the vii step");
+        assert_eq!(
+            (penult, term, m),
+            (want_penult, want_term, 77),
+            "witness drifted: {name}->vii expected realized penult {want_penult} -> terminal \
+             {want_term} vs melody 77 (the prepared bite); got penult {penult} -> terminal {term} \
+             vs melody {m}. Re-derive."
+        );
+        // (a) genuine vertical dissonance — the "bite".
+        assert!(
+            is_dissonant(term, m),
+            "GAP-2 'keep the bite' REGRESSED: {name}->vii terminal {term} vs melody {m} is no \
+             longer a vertical dissonance (ic {}). The kept diminished bite is gone.",
+            ic(term, m)
+        );
+        // (b) PREPARED — approached from the realized penult by a STEP (|motion| <= 2).
+        let approach = (term as i16 - penult as i16).abs();
+        assert!(
+            approach <= 2,
+            "GAP-2 'keep the bite' REGRESSED: {name}->vii terminal dissonance {term} is reached \
+             from realized penult {penult} by a {approach}-semitone move — that is a BLUNT LEAP-IN, \
+             not a prepared (step, |motion| <= 2) ornament. A kept bite must be PREPARED."
+        );
+        // (c) in band, (d) terminal (the section is 2 steps, vii is the last → unresolved).
+        assert!(
+            (COUNTER_FLOOR..COUNTER_CEIL).contains(&term),
+            "{name}->vii prepared-bite terminal {term} must stay in the band \
+             [{COUNTER_FLOOR},{COUNTER_CEIL}) (Option-B: never octave-displace out of register)"
+        );
+    }
 }
 
-/// PROPERTY (inverted GAP-3) — the cadence CLAUSULA lands a PERFECT consonance by motion ≤ 2
-/// semitones, with NO leap (the guaranteed level the fix achieves).
+/// PROPERTY (inverted GAP-3 — CLOSED CLEAN at S32) — the cadence CLAUSULA lands a PERFECT
+/// consonance by motion ≤ 2 semitones, with NO leap, for EVERY consonant opener. The residual
+/// is now EMPTY: the no-leap perfect close is UNIVERSAL.
 ///
-/// The lane fixed the root cause: `cadence_resolution_pitch` now derives from the REALIZED
-/// prior counter pitch, so the close is reached without leaping. The OLD behavior resolved
-/// counter 59 → 55 (a 4-semitone leap); the FIXED behavior resolves 55 → 55 (move 0, an
-/// OBLIQUE hold onto the perfect consonance).
+/// The lane fixed the root cause: `cadence_resolution_pitch` derives from the REALIZED prior
+/// counter pitch, so the close is reached without leaping. The OLD behavior resolved counter
+/// 59 → 55 (a 4-semitone leap) for some openers and 62 → 55 (a 7-semitone leap) for V/vi; the
+/// S32 band-reachability change (design-s32 §1.2 tier-B step-to-perfect) eliminated the last
+/// leaping fallback, so V/vi now resolve 62 → 60 by a −2 STEP onto a P5.
 ///
 /// GUARANTEED LEVEL (what this asserts): the PAC close is a perfect consonance AND the counter
-/// reaches it by |motion| ≤ 2 semitones — i.e. no by-leap resolution. The fix does NOT always
-/// achieve strict stepwise-CONTRARY convergence: on some progressions the strict clausula form
-/// is not band-reachable from the realized penult. That strict stepwise-contrary clausula is a
-/// documented FUTURE-SLICE refinement; we assert the guaranteed level here.
+/// reaches it by |motion| ≤ 2 semitones — i.e. no by-leap resolution — for ALL six openers.
+/// The fix does NOT always achieve strict stepwise-CONTRARY convergence (on some progressions
+/// the close is similar/oblique rather than strictly contrary); that strict stepwise-contrary
+/// clausula is a documented FUTURE-SLICE refinement, and we assert the no-leap guaranteed level
+/// here, universally.
 ///
-/// ADVERSARIAL WITNESS: `ii → IV → V → I` — the exact phrase that historically resolved by a
-/// 4-semitone leap. We also sweep every consonant opener so the cadence pick is exercised from
-/// a range of realized penults.
+/// WITNESSES (re-derived against the realized engine):
+///   * `ii → IV → V → I` (kept adversarial witness — once a 4-semitone leap): penult 55 →
+///     final 55 (move 0, an OBLIQUE hold onto P8/ic 0). I/iii/IV close identically (55→55).
+///   * `V → IV → V → I` and `vi → IV → V → I` (the S32-closed openers — once a 7-semitone leap):
+///     penult 62 → final 60 (a −2 STEP onto a P5, ic 7, NO leap).
 #[test]
 fn test_cadence_resolves_perfect_no_leap() {
-    // 1) The adversarial witness: the once-leaping ii->IV->V->I close is now a no-leap hold.
+    // 1) The kept adversarial witness: the once-leaping ii->IV->V->I close is a no-leap hold.
     let line = realize_line(&[c_ii(), c_iv(), c_v(), c_i()], &perf(0.04));
     let last = line.len() - 1;
     let (cp, _) = line[last - 1];
     let (cl, ml) = line[last];
     let ml = ml.expect("melody sounds on the PAC close");
     assert_eq!(
-        (cp, cl),
-        (55, 55),
-        "witness drifted: expected penult 55 -> final 55 (the fixed no-leap OBLIQUE hold); got \
-         {cp} -> {cl}. Re-derive."
+        (cp, cl, ml),
+        (55, 55, 67),
+        "witness drifted: expected penult 55 -> final 55 vs melody 67 (the no-leap OBLIQUE hold, \
+         a P8 ic 0); got {cp} -> {cl} vs melody {ml}. Re-derive."
     );
     assert!(
         is_perfect(cl, ml),
@@ -943,13 +998,41 @@ fn test_cadence_resolves_perfect_no_leap() {
          prior counter pitch."
     );
 
-    // 2) STRICT (holds everywhere): the PAC CLOSE is a perfect consonance for EVERY opener.
-    //    RESIDUAL: the NO-LEAP approach holds for 4 of 6 openers but NOT for V/vi — those
-    //    realize a penult of 62 from which no perfect-consonant tone is band-reachable by
-    //    |motion| <= 2, so the cadence still resolves 62 -> 55 (move 7, a LEAP). We pin the
-    //    exact residual openers so the no-leap region stays clean AND the residual fails loudly
-    //    when the lane closes it (e.g. by widening the band-reachable cadence landing set).
-    const GAP3_RESIDUAL_LEAP_OPENERS: &[&str] = &["V", "vi"];
+    // 1b) The S32-closed witnesses: V/vi -> IV -> V -> I now resolve 62 -> 60 by a -2 STEP onto
+    //     a P5 (was the 62 -> 55, move-7 LEAP). Drift-guarded to the exact realized pitches.
+    for opener in [c_v(), c_vi()] {
+        let line = realize_line(&[opener.clone(), c_iv(), c_v(), c_i()], &perf(0.04));
+        let last = line.len() - 1;
+        let (cp, _) = line[last - 1];
+        let (cl, ml) = line[last];
+        let ml = ml.expect("melody sounds on the PAC close");
+        assert_eq!(
+            (cp, cl, ml),
+            (62, 60, 67),
+            "witness drifted: expected {}->IV->V->I penult 62 -> final 60 vs melody 67 (the S32 \
+             no-leap STEP onto a P5, ic 7); got {cp} -> {cl} vs melody {ml}. Re-derive.",
+            opener.name
+        );
+        assert_eq!(
+            ic(cl, ml),
+            7,
+            "the S32-closed {} cadence should land a P5 (ic 7)",
+            opener.name
+        );
+        assert_eq!(
+            (cl as i16 - cp as i16).abs(),
+            2,
+            "the S32-closed {} cadence should reach the close by a 2-semitone STEP (no leap)",
+            opener.name
+        );
+    }
+
+    // 2) STRICT + UNIVERSAL (GAP-3 closed clean): for EVERY consonant opener, the PAC close is a
+    //    perfect consonance reached by |motion| <= 2 (NO leap). The S32 band-reachability change
+    //    drained the V/vi residual; the residual set is now EMPTY and this is the strict
+    //    universal "perfect close + no-leap approach" property over the whole opener battery.
+    //    The empty pin still FAILS LOUDLY if any opener ever regresses to a by-leap cadence.
+    const GAP3_RESIDUAL_LEAP_OPENERS: &[&str] = &[];
     let mut residual_leap: Vec<String> = Vec::new();
     for opener in consonant_corpus() {
         let line = realize_line(&[opener.clone(), c_iv(), c_v(), c_i()], &perf(0.04));
@@ -957,7 +1040,7 @@ fn test_cadence_resolves_perfect_no_leap() {
         let (cp, _) = line[last - 1];
         let (cl, ml) = line[last];
         let Some(ml) = ml else { continue };
-        // The perfect CLOSE is the strict, universal part of PT-8 — it must hold for all openers.
+        // The perfect CLOSE is universal — it must hold for all openers.
         assert!(
             is_perfect(cl, ml),
             "PT-8 REGRESSED: {}->IV->V->I PAC close is not perfect (counter {cl} vs melody {ml}, \
@@ -979,33 +1062,47 @@ fn test_cadence_resolves_perfect_no_leap() {
     if residual_leap != expected {
         eprintln!(
             "GAP-3 RESIDUAL SET CHANGED: cadence-by-leap openers now {residual_leap:?} (was \
-             {expected:?}). Shrinking = lane progress (tighten this pin toward the full no-leap \
-             property); growing = a NEW opener regressed to a by-leap cadence."
+             {expected:?} — i.e. EMPTY, GAP-3 closed clean). A NON-empty set means an opener \
+             REGRESSED to a by-leap cadence."
         );
     }
     assert_eq!(
         residual_leap, expected,
-        "GAP-3 residual set drifted (see stderr). The no-leap openers must stay no-leap; the \
-         known-residual pair {{V,vi}} must not grow."
+        "GAP-3 regressed (see stderr). The no-leap perfect close must hold UNIVERSALLY for all \
+         six consonant openers; the residual leap set must stay EMPTY."
     );
 }
 
-/// PROPERTY (inverted GAP-4) — the realized counter LINE contains NO dissonant (tritone/7th)
-/// melodic leap; any leap is to a consonant melodic interval and is recovered per the
-/// leap-recovery rule (no two consecutive ≥4th leaps in the same direction).
+/// PROPERTY (inverted GAP-4 — clean region strict; the residual is a DELIBERATE DEFERRAL) —
+/// the realized counter LINE contains no dissonant (tritone/7th) melodic leap EXCEPT a pinned,
+/// explained residual; any non-residual leap is to a consonant melodic interval and is recovered
+/// per the leap-recovery rule (no two consecutive ≥4th leaps in the same direction).
 ///
-/// The lane fixed the root cause: `melodic_leap_is_legal` now gates the REALIZED prior→now
-/// counter transition (not just the seed→candidate one), so the actual SOUNDING line can no
-/// longer leap a dissonant melodic interval.
+/// The lane fixed the root cause for almost all of the battery: `melodic_leap_is_legal` gates the
+/// REALIZED prior→now counter transition (not just the seed→candidate one), so the actual
+/// SOUNDING line generally cannot leap a dissonant melodic interval. 55 of 57 realized leaps are
+/// consonant.
+///
+/// THE DEFERRAL (S32 disposition — keep this pin; it is an intentional, explained boundary, NOT
+/// an unaddressed gap): `ii → IV → iii` and `vi → IV → iii` still realize the 65→59 TRITONE leap.
+/// This residual genuinely CANNOT close at the iii-landing without introducing a PARALLEL PERFECT
+/// FIFTH: from the realized penult 65, the only in-band stepwise landing (64) is a hidden P5
+/// against the melody (the `approach_perfect_is_legal` guard vetoes it), and the other in-band
+/// iii chord tones (59, 55) are reachable only by a dissonant LEAP. So every available landing is
+/// either a parallel fifth, a dissonant leap, or out of band. Closing it requires a separate
+/// PENULT-REWORK slice (changing the realized penult so a clean stepwise consonant landing
+/// becomes reachable), which is out of scope for the S32 band-reachability change. The pin is
+/// therefore LEFT IN PLACE deliberately, and FAILS LOUDLY if the residual either grows (a new
+/// progression regressed) or shrinks (the penult-rework slice landed and the pin should tighten).
 ///
 /// ADVERSARIAL WITNESS: `I → V → IV` — the exact progression that historically realized the
 /// counter line [64, 59, 65] with a 59→65 TRITONE leap. It now realizes [64, 62, 65]; the
 /// 62→65 move is a CONSONANT m3 leap (ic 3).
 ///
 /// BROADER BATTERY: every ordered diatonic triple over the 6 consonant triads is realized and
-/// EVERY melodic step in the counter line is checked: a leap (≥3 semitones) must land on a
-/// consonant MELODIC interval (never ic 6/10/11), and the leap-recovery invariant (no two
-/// consecutive ≥4th leaps in the same direction) holds.
+/// EVERY melodic step in the counter line is checked: a non-residual leap (≥3 semitones) must
+/// land on a consonant MELODIC interval (never ic 6/10/11), and the leap-recovery invariant (no
+/// two consecutive ≥4th leaps in the same direction) holds universally.
 #[test]
 fn test_no_dissonant_melodic_leap_in_counter_line() {
     // 1) The adversarial witness: the once-tritone I->V->IV line now leaps by a consonant m3.
@@ -1023,13 +1120,16 @@ fn test_no_dissonant_melodic_leap_in_counter_line() {
     );
 
     // 2) STRICT (leap recovery, holds everywhere): no two consecutive ≥4th leaps in the same
-    //    direction over the WHOLE battery. RESIDUAL (dissonant melodic leap): the gate is closed
-    //    for almost all of the 57 realized leaps, but 2 still land a dissonant TRITONE
-    //    (ii->IV->iii and vi->IV->iii both realize the 65->59 tritone). When the realized penult
-    //    forces a band-constrained landing whose only available consonant chord-tone collides
-    //    with the unison/parallel guard, the line falls back across the tritone. We pin the
+    //    direction over the WHOLE battery. RESIDUAL (dissonant melodic leap) — a DELIBERATE,
+    //    EXPLAINED DEFERRAL, not an unaddressed gap: the gate is closed for almost all of the 57
+    //    realized leaps, but 2 still land a dissonant TRITONE (ii->IV->iii and vi->IV->iii both
+    //    realize the 65->59 tritone). This residual CANNOT close at the iii-landing without a
+    //    PARALLEL PERFECT FIFTH: from the realized penult 65, the only in-band stepwise landing
+    //    64 is a hidden P5 (vetoed by approach_perfect_is_legal); the other in-band iii tones
+    //    (59, 55) are dissonant LEAPS. Closing it requires a separate penult-rework slice (out of
+    //    scope for S32 band-reachability), so the pin is LEFT IN PLACE on purpose. We pin the
     //    exact residual transition set so the clean region stays clean AND the residual fails
-    //    loudly when the lane fully gates the realized prior->now leap.
+    //    loudly when it grows (a NEW regression) OR shrinks (the penult-rework slice landed).
     let pool = consonant_corpus();
     let mut leaps_seen = 0usize;
     let mut residual_diss_leaps: Vec<String> = Vec::new();
