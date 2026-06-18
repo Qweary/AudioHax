@@ -234,7 +234,12 @@
       { "id": "pad_broken_up",   "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.6,  "pad_voices": 3, "figuration": "broken_chord_up" },
       { "id": "pad_broken_wave", "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.58, "pad_voices": 3, "figuration": "broken_chord_wave" },
       { "id": "pad_arp_waltz",   "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.6,  "pad_voices": 3, "figuration": "arp_waltz" },
-      { "id": "pad_block_comp",  "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.62, "pad_voices": 3, "figuration": "block_comp_24" }
+      { "id": "pad_block_comp",  "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.62, "pad_voices": 3, "figuration": "block_comp_24" },
+      { "id": "pad_oom_pah",     "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.6,  "pad_voices": 3, "figuration": "oom_pah" },
+      { "id": "pad_oom_pah_pah", "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.6,  "pad_voices": 3, "figuration": "oom_pah_pah" },
+      { "id": "pad_stride",      "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.64, "pad_voices": 3, "figuration": "stride" },
+      { "id": "pad_walking",     "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.6,  "pad_voices": 3, "bass_pattern": "walking" },
+      { "id": "pad_pedal",       "layers": ["Bass","Pad","HarmonicFill","Melody"], "density": 0.6,  "pad_voices": 3, "bass_pattern": "pedal" }
     ],
     "figuration_catalogue": [
       { "id": "block",   "onsets": [] },
@@ -269,7 +274,32 @@
         "onsets": [
           { "at": 0.25, "tone": 0, "hold_frac": 0.5 },
           { "at": 0.75, "tone": 0, "hold_frac": 0.5 }
+        ] },
+      { "id": "oom_pah", "voices": 3,
+        "onsets": [
+          { "at": 0.0, "tone": 0, "register_octaves": -1, "hold_frac": 0.4 },
+          { "at": 0.5, "tone": 1, "register_octaves": 0,  "hold_frac": 0.4 }
+        ] },
+      { "id": "oom_pah_pah", "voices": 3,
+        "onsets": [
+          { "at": 0.0,  "tone": 0, "register_octaves": -1, "hold_frac": 0.3 },
+          { "at": 0.33, "tone": 1, "register_octaves": 0,  "hold_frac": 0.3 },
+          { "at": 0.66, "tone": 2, "register_octaves": 0,  "hold_frac": 0.3 }
+        ] },
+      { "id": "stride", "voices": 3,
+        "onsets": [
+          { "at": 0.0,  "tone": 0, "register_octaves": -1, "hold_frac": 0.4 },
+          { "at": 0.25, "tone": 1, "register_octaves": 0,  "hold_frac": 0.4 },
+          { "at": 0.5,  "tone": 2, "register_octaves": -1, "hold_frac": 0.4 },
+          { "at": 0.75, "tone": 1, "register_octaves": 0,  "hold_frac": 0.4 }
         ] }
+    ],
+    "bass_pattern_catalogue": [
+      { "id": "sustained", "kind": "sustained" },
+      { "id": "walking",   "kind": "walking", "density": 2 },
+      { "id": "walking_q", "kind": "walking", "density": 4 },
+      { "id": "pedal",     "kind": "pedal",   "pedal_degree": 1 },
+      { "id": "pedal_dom", "kind": "pedal",   "pedal_degree": 5 }
     ],
     "texture": {
       "default": "pad_bed",
@@ -289,7 +319,13 @@
                     {"knob":"colorfulness","op":"ge","lo":0.50,"hi":0.0} ],
           "pick": "pad_arp_waltz" },
         { "when": [ {"knob":"colorfulness","op":"ge","lo":0.40,"hi":0.0} ],
-          "pick": "pad_broken_wave" }
+          "pick": "pad_broken_wave" },
+        { "when": [ {"knob":"valence","op":"ge","lo":0.60,"hi":0.0},
+                    {"knob":"arousal","op":"in_range","lo":0.40,"hi":0.65} ],
+          "pick": "pad_oom_pah" },
+        { "when": [ {"knob":"arousal","op":"ge","lo":0.75,"hi":0.0},
+                    {"knob":"colorfulness","op":"ge","lo":0.55,"hi":0.0} ],
+          "pick": "pad_stride" }
       ]
     },
     "prominence_catalogue": [

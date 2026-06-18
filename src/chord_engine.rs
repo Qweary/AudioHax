@@ -1605,23 +1605,83 @@ fn realize_rhythm(
 
     match role {
         OrchestralRole::Bass => {
-            // BASS: the harmonic floor — steady, sparse, mostly sustained. Even
-            // when busy it adds at most a single re-articulation (a walking
-            // pickup into a pre-cadence), never an arpeggio. Low onset count.
-            if pre_cadence {
-                // Harmonic-rhythm acceleration: a long root + a short pickup
-                // onset at 3/4 driving into the cadence (2 onsets > the 1 of an
-                // early-interior bass step).
-                let two_thirds = step_ms * 3 / 4;
-                vec![
-                    sustained(0, two_thirds, PORTATO_FRAC),
-                    sustained(two_thirds, step_ms - two_thirds, PORTATO_FRAC),
-                ]
-            } else {
-                // One grounded, sustained root for the whole step, its length set by
-                // the CONTINUOUS articulation curve (S13): a calm image's bass sings
-                // across the bar (frac>1.0), a busy image's bass is shorter/detached.
-                vec![sustained(0, step_ms, base_frac)]
+            // S34 PART (B) — GENERATOR-BACKED BASS DISPATCH. Before the legacy bass body, branch
+            // on this section's RESOLVED bass pattern (read zero-copy off the borrowed `ctx`, the
+            // S20 figuration-seam discipline). A Walking/Pedal pattern OVERRIDES the bass with a
+            // generated line; None / Sustained / ANY cadence step falls through to the EXISTING
+            // sustained/pre-cadence body BYTE-UNCHANGED — that `_` arm is the freeze default.
+            // FREEZE: the identity / `single_section_default` profile carries
+            // `bass_pattern_resolved == None`, so the match is structurally `None` on every
+            // equivalence-net step → control reaches the legacy body byte-identically and the
+            // engine_equivalence goldens (G_BASS_NOTE=36, …) do not move. (`is_cadence` already
+            // returned its sustained ring above, so a cadence never reaches this match.)
+            match ctx
+                .section
+                .orchestration
+                .bass_pattern_resolved
+                .as_ref()
+                .map(|b| (b.kind, b.density, b.pedal_degree))
+            {
+                Some((crate::composition::BassPatternKind::Walking, density, _)) => {
+                    // The tonic pitch class for diatonic derivation — IDENTICAL to the convention
+                    // `theme_pitch`/the pivot helpers use (home root + section key offset).
+                    let tonic_pc = ((ctx.key_tempo.home_root_midi as i16
+                        + ctx.section.key_offset_semitones as i16)
+                        .rem_euclid(12)) as u8;
+                    let current_root_pc =
+                        step.chord.notes.first().map(|n| n % 12).unwrap_or(tonic_pc);
+                    // Next chord root via the proven S33 in-realizer lookahead (no seam change).
+                    let si = ctx.step_in_section;
+                    let next_root_pc = ctx
+                        .section
+                        .steps
+                        .get(si + 1)
+                        .and_then(|s| s.chord.notes.first())
+                        .map(|n| n % 12);
+                    walking_bass(
+                        current_root_pc,
+                        next_root_pc,
+                        tonic_pc,
+                        ctx.section.mode.as_str(),
+                        velocity,
+                        step_ms,
+                        density,
+                    )
+                }
+                Some((crate::composition::BassPatternKind::Pedal, _, pedal_degree)) => {
+                    let tonic_pc = ((ctx.key_tempo.home_root_midi as i16
+                        + ctx.section.key_offset_semitones as i16)
+                        .rem_euclid(12)) as u8;
+                    pedal_bass(
+                        tonic_pc,
+                        ctx.section.mode.as_str(),
+                        pedal_degree,
+                        velocity,
+                        step_ms,
+                        base_frac,
+                    )
+                }
+                // Sustained, None → the EXISTING byte-unchanged bass body (the freeze default).
+                _ => {
+                    // BASS: the harmonic floor — steady, sparse, mostly sustained. Even
+                    // when busy it adds at most a single re-articulation (a walking
+                    // pickup into a pre-cadence), never an arpeggio. Low onset count.
+                    if pre_cadence {
+                        // Harmonic-rhythm acceleration: a long root + a short pickup
+                        // onset at 3/4 driving into the cadence (2 onsets > the 1 of an
+                        // early-interior bass step).
+                        let two_thirds = step_ms * 3 / 4;
+                        vec![
+                            sustained(0, two_thirds, PORTATO_FRAC),
+                            sustained(two_thirds, step_ms - two_thirds, PORTATO_FRAC),
+                        ]
+                    } else {
+                        // One grounded, sustained root for the whole step, its length set by
+                        // the CONTINUOUS articulation curve (S13): a calm image's bass sings
+                        // across the bar (frac>1.0), a busy image's bass is shorter/detached.
+                        vec![sustained(0, step_ms, base_frac)]
+                    }
+                }
             }
         }
 
@@ -1863,6 +1923,258 @@ fn realize_rhythm(
     }
 }
 
+/// Apply a whole-octave register shift to a seated pitch, clamped to the engine's MIDI
+/// range `[24, 108]` (identical to `seat_pc_in_register`'s clamp, so a shifted tone can
+/// never escape the synthesizable range). `octaves == 0` returns `pitch` UNCHANGED — the
+/// byte-freeze default for every non-register-split figure. NEW S34. Private free fn.
+///
+/// theory: the oom-pah / stride idiom places the "oom"/stride-bass an octave BELOW the
+/// inner bed (`octaves == -1`) so the accompaniment reads as bass-vs-chord (the alternating
+/// left hand), while the "pah"/stab stays in the fill band (`octaves == 0`). The shift is
+/// whole-octave ONLY — it preserves PITCH CLASS, so the figure remains chord-tones-only (a
+/// `-1` shift on a tone seated at the fill floor 55 lands at 43 / G2, between the bass floor
+/// 36 and the fill floor 55: the correct "oom" register, below the inner stabs and above the
+/// true Bass root). The clamp uses saturating i16 arithmetic so an adversarially large
+/// `octaves` can never wrap a `u8` — it pins to the playable band instead of panicking.
+fn apply_register_octaves(pitch: u8, octaves: i8) -> u8 {
+    // octaves == 0 is the common case (every existing figuration row) and is the byte-freeze
+    // no-op: 0 * 12 == 0, so `shifted == pitch` and the clamp is the identity on a valid seat.
+    let shifted = pitch as i16 + (octaves as i16) * 12;
+    shifted.clamp(24, 108) as u8
+}
+
+/// The 7-tone interval set of a mode (semitones from the tonic). Mirrors `degree_to_pitch`'s
+/// `match`; an unknown mode falls back to Ionian, matching `generate_chords`. NEW S34 helper
+/// the Bass generators share for their DIATONIC pitch derivation.
+fn mode_scale(mode: &str) -> [i8; 7] {
+    match mode {
+        "Ionian" => IONIAN,
+        "Dorian" => DORIAN,
+        "Phrygian" => PHRYGIAN,
+        "Lydian" => LYDIAN,
+        "Mixolydian" => MIXOLYDIAN,
+        "Aeolian" => AEOLIAN,
+        _ => IONIAN,
+    }
+}
+
+/// Map a pitch CLASS to the index (0..=6) of the nearest-at-or-below diatonic scale degree
+/// in `mode` over `tonic_pc`. theory: a walking bass moves THROUGH the scale, so we must place
+/// an arbitrary chord root (which is always diatonic in this engine — chords are built off scale
+/// degrees) onto its scale-degree index. If a pc is not exactly in the scale (it always is here,
+/// but be defensive), snap DOWN to the nearest scale tone so the walk never lands on a pitch the
+/// mode does not contain. NEW S34.
+fn pc_to_scale_index(pc: u8, tonic_pc: u8, scale: &[i8; 7]) -> usize {
+    // Degree above the tonic, 0..=11.
+    let rel = (pc as i16 - tonic_pc as i16).rem_euclid(12) as i8;
+    // Exact match preferred; else the highest scale degree whose interval is <= rel (snap down).
+    let mut best = 0usize;
+    for (i, &iv) in scale.iter().enumerate() {
+        if iv == rel {
+            return i;
+        }
+        if iv < rel {
+            best = i;
+        }
+    }
+    best
+}
+
+/// Seat a pitch CLASS into the bass register at the octave NEAREST `prev` (so the walking line
+/// moves by the smallest interval — a walking bass is a connected, stepwise-or-small-leap line,
+/// never an octave jump between adjacent notes). Falls back to the plain bass-floor seat when
+/// there is no previous note (the first onset). NEW S34. Stays within `[24, 108]`.
+fn seat_bass_near(pc: u8, prev: Option<u8>) -> u8 {
+    let base = seat_pc_in_register(pc, BASS_REGISTER_FLOOR);
+    match prev {
+        None => base,
+        Some(p) => {
+            // Consider base and the octave above/below; pick whichever is closest to `prev`,
+            // preferring to stay at/above the bass floor so the line does not sink into mud.
+            let candidates = [
+                base.saturating_sub(12),
+                base,
+                base.saturating_add(12).min(108),
+            ];
+            candidates
+                .into_iter()
+                .filter(|&c| (24..=108).contains(&c))
+                .min_by_key(|&c| (c as i16 - p as i16).unsigned_abs())
+                .unwrap_or(base)
+        }
+    }
+}
+
+/// Generate a target-seeking stepwise WALKING bass for one step: `density` onsets that connect
+/// THIS chord's root to the NEXT chord's root by DIATONIC step, arriving so the next downbeat
+/// lands on the next root. The strong-beat (first) onset is a chord tone (the current root); the
+/// weak-beat onsets are diatonic passing/neighbor tones walking toward the target, with the FINAL
+/// onset a diatonic scale tone one step from the next root (the approach). The next chord is read
+/// off `ctx.section.steps.get(si+1)` by the caller (the S33 in-realizer lookahead — NO seam
+/// change). At a section's last step (`next_root_pc` is None) it walks WITHIN the current chord
+/// (root → 5th → root) rather than inventing a target — the §R-B end-of-section fallback. All
+/// notes are seated in the bass register, connected by `seat_bass_near` so no adjacent pair leaps
+/// by an octave. Deterministic: a pure function of the chord stream + spec (NO RNG — the S30
+/// realized-line gating lesson). Returns `density.max(1)` `NoteEvent`s within the step. NEW S34.
+fn walking_bass(
+    current_root_pc: u8,
+    next_root_pc: Option<u8>,
+    tonic_pc: u8,
+    mode: &str,
+    velocity: u8,
+    step_ms: u64,
+    density: u8,
+) -> Vec<NoteEvent> {
+    let scale = mode_scale(mode);
+    let n = density.max(1) as usize;
+    let step_ms = step_ms.max(1);
+
+    // The DIATONIC pitch-class walk: a sequence of `n` scale tones starting on the current root
+    // and stepping toward the target. theory: a walking bass arrives ON the next root at the
+    // next downbeat — so THIS step's onsets begin on the current root and step diatonically so
+    // the line is poised to land on the next root at the start of the next step. The final onset
+    // is the diatonic scale tone one step short of the target (the approach tone), so the next
+    // step's downbeat root completes the stepwise motion.
+    let start_idx = pc_to_scale_index(current_root_pc, tonic_pc, &scale) as i32;
+
+    let pc_seq: Vec<u8> = match next_root_pc {
+        Some(target_pc) => {
+            // Walk diatonically from the current root toward the diatonic position one step
+            // BEFORE the target (so step N+1's root completes the stepwise arrival). Choose the
+            // direction (up or down) that gives the SHORTER diatonic distance — a walking bass
+            // takes the nearer route, not a forced ascent.
+            let target_idx = pc_to_scale_index(target_pc, tonic_pc, &scale) as i32;
+            // Diatonic signed distance, measured in scale steps within one octave (-3..=3-ish).
+            let mut diff = (target_idx - start_idx).rem_euclid(7);
+            // Prefer the shorter direction: distances 4..6 are shorter going DOWN.
+            let dir: i32 = if diff == 0 || diff > 3 {
+                if diff > 3 {
+                    diff -= 7;
+                }
+                if diff < 0 {
+                    -1
+                } else {
+                    1
+                }
+            } else {
+                1
+            };
+            // We need to traverse `diff.abs()` diatonic steps to REACH the target at the NEXT
+            // downbeat; this step emits `n` onsets that approach it. Distribute the onsets along
+            // the path so the first is the current root and the last is one step short of target.
+            let total_steps = diff.unsigned_abs() as i32; // diatonic steps to the target
+            (0..n)
+                .map(|k| {
+                    // Fractional progress 0..1 across this step's onsets; the last onset stops
+                    // one diatonic step short of the target (progress maps to total_steps - 1
+                    // at most, so the target itself is the NEXT step's downbeat, not this one).
+                    let reach = if total_steps == 0 {
+                        // Same scale position (e.g. C→C or a chord whose root repeats): neighbor
+                        // figure — root, upper-neighbor, root, ... so the line still MOVES.
+                        match k % 2 {
+                            0 => start_idx,
+                            _ => start_idx + 1,
+                        }
+                    } else if n == 1 {
+                        start_idx
+                    } else {
+                        // Spread k across [0, total_steps-1]: first onset = root, last onset = the
+                        // approach tone one step before the target.
+                        let span = (total_steps - 1).max(0);
+                        let frac = k as f32 / (n - 1) as f32;
+                        start_idx + dir * (frac * span as f32).round() as i32
+                    };
+                    diatonic_index_to_pc(reach, tonic_pc, &scale)
+                })
+                .collect()
+        }
+        None => {
+            // §R-B end-of-section fallback: no next chord → walk WITHIN the current chord
+            // (root → 5th → root …), an arpeggiated hold rather than an invented target. The 5th
+            // is scale degree start_idx + 4 (a diatonic fifth above the root in the mode).
+            (0..n)
+                .map(|k| {
+                    let reach = match k % 2 {
+                        0 => start_idx,
+                        _ => start_idx + 4, // a diatonic fifth above the root
+                    };
+                    diatonic_index_to_pc(reach, tonic_pc, &scale)
+                })
+                .collect()
+        }
+    };
+
+    // Seat each pc in the bass register, connected to the prior note so adjacent onsets move by
+    // the smallest interval (a true walking line — stepwise, no octave jumps). Even slots within
+    // the step; each note holds to the next onset (portato walk, not legato smear).
+    let slot = step_ms / n as u64;
+    let mut events = Vec::with_capacity(n);
+    let mut prev: Option<u8> = None;
+    for (k, &pc) in pc_seq.iter().enumerate() {
+        let note = seat_bass_near(pc, prev);
+        prev = Some(note);
+        let offset_ms = (k as u64) * slot;
+        // Hold to just shy of the next onset (a detached, articulated walk — the canonical
+        // walking-bass touch — so each note speaks individually rather than tying over).
+        let next_off = if k + 1 < n {
+            (k as u64 + 1) * slot
+        } else {
+            step_ms
+        };
+        let hold_ms = next_off.saturating_sub(offset_ms).max(1);
+        events.push(NoteEvent {
+            note,
+            velocity,
+            hold_ms,
+            offset_ms,
+        });
+    }
+    events
+}
+
+/// Map a (possibly out-of-range) diatonic scale INDEX to a pitch class, wrapping by octave so
+/// `index` can ascend/descend past the 7-tone scale (the walk crosses the octave seam cleanly).
+/// NEW S34 — the inverse of `pc_to_scale_index`.
+fn diatonic_index_to_pc(index: i32, tonic_pc: u8, scale: &[i8; 7]) -> u8 {
+    let i = index.rem_euclid(7) as usize;
+    ((tonic_pc as i32 + scale[i] as i32).rem_euclid(12)) as u8
+}
+
+/// Generate a PEDAL-POINT bass for one step: hold the section-key `pedal_degree` (1 == tonic,
+/// 5 == dominant) as ONE sustained low pitch, IGNORING the step's chord (the harmony changes
+/// above; the pedal does not). Seated in the bass register. Returns one sustained `NoteEvent`.
+/// theory: the pedal is a NON-chord bass that the upper voices' harmony is heard AGAINST — the
+/// one sanctioned standing dissonance in common practice. `pedal_degree` is a SCALE DEGREE
+/// (1-based: 1 == tonic, 5 == dominant); any other value falls back to the tonic. Deterministic.
+/// NEW S34.
+fn pedal_bass(
+    tonic_pc: u8,
+    mode: &str,
+    pedal_degree: u8,
+    velocity: u8,
+    step_ms: u64,
+    base_frac: f32,
+) -> Vec<NoteEvent> {
+    let scale = mode_scale(mode);
+    // 1-based scale degree → 0-based index; default to the tonic on an out-of-range degree.
+    let idx = match pedal_degree {
+        d @ 1..=7 => (d - 1) as usize,
+        _ => 0,
+    };
+    let pc = ((tonic_pc as i32 + scale[idx] as i32).rem_euclid(12)) as u8;
+    let note = seat_pc_in_register(pc, BASS_REGISTER_FLOOR);
+    let step_ms = step_ms.max(1);
+    // Sustain across the whole step, the same legato-curve hold the sustained-root bass uses (so
+    // consecutive pedal steps tie into one another — the pedal SOUNDS as a single held drone).
+    let hold_ms = ((step_ms as f32) * base_frac.max(0.0)).round().max(1.0) as u64;
+    vec![NoteEvent {
+        note,
+        velocity,
+        hold_ms,
+        offset_ms: 0,
+    }]
+}
+
 /// Expand ONE held chord into the figure's bounded multi-onset burst within a SINGLE
 /// step — the S20 Slice-3a accompaniment-figuration mapper (Music Theory Specialist
 /// owns). Animates the held Pad bed with an in-beat broken-chord / Alberti cell so the
@@ -1920,7 +2232,16 @@ fn figured_bed(
             let offset_ms = (onset.at.clamp(0.0, 1.0) * step_ms as f32).round() as u64;
             // Tone selection — the non-triad modulo rule (see the fn doc).
             let idx = (onset.tone as usize) % n;
-            let note = seated[idx];
+            // S34 PART (A) — oom-pah / stride register split. Apply this onset's whole-octave
+            // register shift to the seated pitch. theory: the oom-pah/stride idiom alternates a
+            // LOW bass note (the "oom"/stride bass, register_octaves == -1, an octave below the
+            // inner bed) with a MID-register chord stab (the "pah", register_octaves == 0). The
+            // shift is whole-octave ONLY, so the pitch CLASS is preserved — a shifted onset is
+            // still a chord tone (it never introduces a non-harmonic pitch). FREEZE: every
+            // existing figuration row carries register_octaves == 0 (the serde default), for
+            // which apply_register_octaves is the identity `seated[idx]` — so every alberti /
+            // broken-chord / arp-waltz / block-comp bed realizes BYTE-IDENTICALLY to pre-S34.
+            let note = apply_register_octaves(seated[idx], onset.register_octaves);
             // Hold: a fraction of the GAP to the next onset (the in-step articulation).
             // The last onset fills to the step end. theory: with the default hold_frac
             // 1.0 each note holds to the next onset, giving a continuous figure; only the
@@ -6637,6 +6958,10 @@ mod tests {
             // no figuration, so the Pad arm takes the byte-unchanged block bed).
             figuration: None,
             figuration_resolved: None,
+            // S34 — mechanical additive fixture fields (this counter net carries NO bass
+            // pattern, so the Bass arm takes the byte-unchanged sustained/pre-cadence path).
+            bass_pattern: None,
+            bass_pattern_resolved: None,
             // S23 — empty prominence: this existing counter net is a UNIFORM fixture, so
             // every role's weight is PROMINENCE_NEUTRAL (0.5) and the three prominence
             // nudges are all 0.0 — this test stays byte-identical (additive freeze).
@@ -7303,5 +7628,596 @@ mod tests {
             )
         };
         assert_eq!(args(), args());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // S34 PATTERN-LIBRARY SLICE 2 — register_octaves (oom-pah/stride) + the
+    // walking-bass / pedal-point generators. Hand-built, RNG-free; drives the
+    // PUBLIC realize_step for the integration witnesses and the generators
+    // directly for the unit-property witnesses. Validates MUSICAL properties.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    use crate::composition::{BassPatternKind, BassPatternSpec, FigurationOnset, FigurationSpec};
+
+    /// A 4-role profile (Bass, Pad, HarmonicFill, Melody) carrying an optional resolved
+    /// figuration and/or bass pattern — the S34 driving fixture. inst 0 == Bass.
+    fn s34_profile(
+        figuration_resolved: Option<FigurationSpec>,
+        bass_pattern_resolved: Option<BassPatternSpec>,
+    ) -> crate::composition::OrchestrationProfile {
+        crate::composition::OrchestrationProfile {
+            id: "s34_test".to_string(),
+            layers: vec![
+                crate::composition::LayerRole::Bass,
+                crate::composition::LayerRole::Pad,
+                crate::composition::LayerRole::HarmonicFill,
+                crate::composition::LayerRole::Melody,
+            ],
+            density: 0.6,
+            pad_voices: 3,
+            figuration: None,
+            figuration_resolved,
+            bass_pattern: None,
+            bass_pattern_resolved,
+            prominence: Vec::new(),
+        }
+    }
+
+    /// An INTERIOR step (never cadence/start) carrying `chord` at `position_in_phrase` — so the
+    /// Bass/Pad arms (not the cadence ring) are the realized path.
+    fn s34_step(chord: Chord, position_in_phrase: usize) -> StepPlan {
+        StepPlan {
+            chord,
+            phrase_index: 0,
+            position_in_phrase,
+            phrase_len: 8,
+            position: PhrasePosition::Interior,
+            velocity: 76,
+        }
+    }
+
+    /// Realize the BASS instrument (inst 0 of 4) for the section's step index `si`.
+    fn s34_realize_bass(
+        section: &Section,
+        kt: &KeyTempoPlan,
+        si: usize,
+        features: &PerfFeatures,
+    ) -> Vec<NoteEvent> {
+        let ctx = StepContext {
+            section,
+            key_tempo: kt,
+            step_in_section: si,
+            theme: None,
+            prev_key_offset_semitones: None,
+        };
+        realize_step(
+            &section.steps[si],
+            0,
+            4,
+            features,
+            section.ms_per_step,
+            &ctx,
+        )
+    }
+
+    /// Realize the PAD instrument (inst 1 of 4) for the section's step index `si`.
+    fn s34_realize_pad(
+        section: &Section,
+        kt: &KeyTempoPlan,
+        si: usize,
+        features: &PerfFeatures,
+    ) -> Vec<NoteEvent> {
+        let ctx = StepContext {
+            section,
+            key_tempo: kt,
+            step_in_section: si,
+            theme: None,
+            prev_key_offset_semitones: None,
+        };
+        realize_step(
+            &section.steps[si],
+            1,
+            4,
+            features,
+            section.ms_per_step,
+            &ctx,
+        )
+    }
+
+    /// Build an owned home-key section carrying `steps` + the given orchestration profile.
+    fn s34_section(
+        steps: Vec<StepPlan>,
+        orchestration: crate::composition::OrchestrationProfile,
+    ) -> (Section, KeyTempoPlan) {
+        let section = Section {
+            label: "A".to_string(),
+            step_len: steps.len(),
+            thematic_role: ThematicRole::Statement,
+            key_offset_semitones: 0,
+            ms_per_step: 1000,
+            mode: "Ionian".to_string(),
+            progression: vec![],
+            theme: None,
+            variation: ThemeVariation::Identity,
+            boundary_cadence: CadenceStrength::Perfect,
+            pivot: false,
+            resolution: ResolutionPolicy::Resolve,
+            density: 0.5,
+            orchestration,
+            steps,
+        };
+        (section, home_key_tempo())
+    }
+
+    fn d_minor_triad() -> Chord {
+        // ii in C major: D F A.
+        Chord {
+            name: "ii".to_string(),
+            notes: vec![62, 65, 69],
+        }
+    }
+
+    // ── Part (A) — register_octaves / oom-pah / stride ─────────────────────
+
+    /// apply_register_octaves: 0 is a no-op (the byte-freeze default); -1 lands EXACTLY 12
+    /// semitones below the 0 counterpart; +1 exactly 12 above; out-of-range clamps to [24,108].
+    #[test]
+    fn s34_apply_register_octaves_arithmetic_and_clamp() {
+        let p = 60u8;
+        assert_eq!(
+            apply_register_octaves(p, 0),
+            60,
+            "0 is the byte-freeze no-op"
+        );
+        assert_eq!(
+            apply_register_octaves(p, -1),
+            48,
+            "-1 == 12 semitones below"
+        );
+        assert_eq!(apply_register_octaves(p, 1), 72, "+1 == 12 semitones above");
+        // The -1 result is EXACTLY 12 below the 0 result (the test-plan witness).
+        assert_eq!(
+            apply_register_octaves(p, 0) as i16 - apply_register_octaves(p, -1) as i16,
+            12,
+            "register_octaves=-1 lands exactly an octave below register_octaves=0"
+        );
+        // Adversarial shifts clamp into the synthesizable band — never wrap, never panic.
+        assert_eq!(
+            apply_register_octaves(60, -9),
+            24,
+            "−9 clamps to the low bound"
+        );
+        assert_eq!(
+            apply_register_octaves(60, 9),
+            108,
+            "+9 clamps to the high bound"
+        );
+    }
+
+    /// FREEZE: a figured profile whose onsets all carry register_octaves==0 realizes the
+    /// IDENTICAL Pad event sequence as the same row WITHOUT the field — the default-zero freeze
+    /// guard (§2.2). Two specs differing ONLY in an explicit 0 vs the serde default must match.
+    #[test]
+    fn s34_register_octaves_zero_is_byte_identical() {
+        let with_zero = FigurationSpec {
+            id: "alberti".to_string(),
+            voices: 3,
+            onsets: vec![
+                FigurationOnset {
+                    at: 0.0,
+                    tone: 0,
+                    hold_frac: 1.0,
+                    register_octaves: 0,
+                },
+                FigurationOnset {
+                    at: 0.25,
+                    tone: 2,
+                    hold_frac: 1.0,
+                    register_octaves: 0,
+                },
+                FigurationOnset {
+                    at: 0.5,
+                    tone: 1,
+                    hold_frac: 1.0,
+                    register_octaves: 0,
+                },
+                FigurationOnset {
+                    at: 0.75,
+                    tone: 2,
+                    hold_frac: 1.0,
+                    register_octaves: 0,
+                },
+            ],
+        };
+        let without = FigurationSpec {
+            onsets: vec![
+                FigurationOnset {
+                    at: 0.0,
+                    tone: 0,
+                    hold_frac: 1.0,
+                    register_octaves: 0,
+                },
+                FigurationOnset {
+                    at: 0.25,
+                    tone: 2,
+                    hold_frac: 1.0,
+                    register_octaves: 0,
+                },
+                FigurationOnset {
+                    at: 0.5,
+                    tone: 1,
+                    hold_frac: 1.0,
+                    register_octaves: 0,
+                },
+                FigurationOnset {
+                    at: 0.75,
+                    tone: 2,
+                    hold_frac: 1.0,
+                    register_octaves: 0,
+                },
+            ],
+            ..with_zero.clone()
+        };
+        let seated = [55u8, 59, 62];
+        assert_eq!(
+            figured_bed(&with_zero, &seated, 80, 1000),
+            figured_bed(&without, &seated, 80, 1000),
+            "register_octaves==0 on every onset realizes byte-identically (the freeze default)"
+        );
+        // And every event's note is exactly the seated tone (no shift at all).
+        let evs = figured_bed(&with_zero, &seated, 80, 1000);
+        assert_eq!(evs[0].note, seated[0]);
+        assert_eq!(evs[1].note, seated[2 % 3]);
+    }
+
+    /// oom-pah: the at:0.0 "oom" (register_octaves=-1) lands an octave below its in-band
+    /// counterpart; the at:0.5 "pah" (register_octaves=0) stays in the seated fill band — the
+    /// oom is STRICTLY LOWER than the pah (the bass-vs-chord split that makes oom-pah read).
+    #[test]
+    fn s34_oom_pah_register_split() {
+        let oom_pah = FigurationSpec {
+            id: "oom_pah".to_string(),
+            voices: 3,
+            onsets: vec![
+                FigurationOnset {
+                    at: 0.0,
+                    tone: 0,
+                    hold_frac: 0.4,
+                    register_octaves: -1,
+                },
+                FigurationOnset {
+                    at: 0.5,
+                    tone: 1,
+                    hold_frac: 0.4,
+                    register_octaves: 0,
+                },
+            ],
+        };
+        let seated = [55u8, 59, 62]; // fill-band inner tones
+        let evs = figured_bed(&oom_pah, &seated, 80, 1000);
+        assert_eq!(evs.len(), 2);
+        // The oom == apply_register_octaves(seated[0], -1) == an octave below seated[0].
+        assert_eq!(evs[0].note, apply_register_octaves(seated[0], -1));
+        assert_eq!(evs[0].note, seated[0] - 12);
+        // The pah is in-band (== seated[1], no shift).
+        assert_eq!(evs[1].note, seated[1]);
+        assert!(
+            evs[0].note < evs[1].note,
+            "the oom must sit strictly below the pah"
+        );
+    }
+
+    /// A whole-octave shift PRESERVES pitch class — so a register-shifted onset is STILL a chord
+    /// tone (the §6 chord-tone witness). Every shifted note's pc ∈ the seated bed's pitch classes.
+    #[test]
+    fn s34_register_shift_stays_chord_tone() {
+        let stride = FigurationSpec {
+            id: "stride".to_string(),
+            voices: 3,
+            onsets: vec![
+                FigurationOnset {
+                    at: 0.0,
+                    tone: 0,
+                    hold_frac: 0.4,
+                    register_octaves: -1,
+                },
+                FigurationOnset {
+                    at: 0.25,
+                    tone: 1,
+                    hold_frac: 0.4,
+                    register_octaves: 0,
+                },
+                FigurationOnset {
+                    at: 0.5,
+                    tone: 2,
+                    hold_frac: 0.4,
+                    register_octaves: -1,
+                },
+                FigurationOnset {
+                    at: 0.75,
+                    tone: 1,
+                    hold_frac: 0.4,
+                    register_octaves: 0,
+                },
+            ],
+        };
+        let seated = [55u8, 59, 62];
+        let bed_pcs: Vec<u8> = seated.iter().map(|n| n % 12).collect();
+        for e in figured_bed(&stride, &seated, 80, 1000) {
+            assert!(
+                bed_pcs.contains(&(e.note % 12)),
+                "shifted note {} (pc {}) must keep a seated pitch class",
+                e.note,
+                e.note % 12
+            );
+        }
+    }
+
+    /// stride alternates bass (at∈{0.0,0.5}, shifted down) and stab (at∈{0.25,0.75}, in-band):
+    /// the strong-beat bass notes sit strictly below the weak-beat stabs.
+    #[test]
+    fn s34_stride_alternates_bass_and_stab() {
+        let stride = FigurationSpec {
+            id: "stride".to_string(),
+            voices: 3,
+            onsets: vec![
+                FigurationOnset {
+                    at: 0.0,
+                    tone: 0,
+                    hold_frac: 0.4,
+                    register_octaves: -1,
+                },
+                FigurationOnset {
+                    at: 0.25,
+                    tone: 1,
+                    hold_frac: 0.4,
+                    register_octaves: 0,
+                },
+                FigurationOnset {
+                    at: 0.5,
+                    tone: 2,
+                    hold_frac: 0.4,
+                    register_octaves: -1,
+                },
+                FigurationOnset {
+                    at: 0.75,
+                    tone: 1,
+                    hold_frac: 0.4,
+                    register_octaves: 0,
+                },
+            ],
+        };
+        let seated = [55u8, 59, 62];
+        let evs = figured_bed(&stride, &seated, 80, 1000);
+        // The two stride-bass onsets (indices 0, 2) are below both stab onsets (1, 3).
+        let bass_max = evs[0].note.max(evs[2].note);
+        let stab_min = evs[1].note.min(evs[3].note);
+        assert!(
+            bass_max < stab_min,
+            "every stride bass ({bass_max}) must sit below every stab ({stab_min})"
+        );
+    }
+
+    // ── Part (B) — walking bass ─────────────────────────────────────────────
+
+    /// walking_bass: the first (strong-beat) onset is the CURRENT chord root (a chord tone), and
+    /// the line, completed by the NEXT step's downbeat root, arrives ON that next root. Over C→G,
+    /// onset 0 is C (pc 0) and the final onset is one diatonic step short of G (pc 7).
+    #[test]
+    fn s34_walking_bass_strong_beat_is_root_and_targets_next() {
+        // C (pc 0) → G (pc 7), 4 onsets, C major (Ionian), tonic pc 0. The generator takes the
+        // SHORTER diatonic route: G is 4 scale steps UP but only 3 DOWN, so the walk descends
+        // C→B→A→(G), arriving on G at the NEXT step's downbeat.
+        let line = walking_bass(0, Some(7), 0, "Ionian", 80, 1000, 4);
+        assert_eq!(line.len(), 4, "density 4 → 4 onsets");
+        assert_eq!(
+            line[0].note % 12,
+            0,
+            "strong-beat onset is the current root (C)"
+        );
+        // The last onset is the diatonic tone ONE STEP from the target G (here A, pc 9, the upper
+        // neighbour) — NOT G itself; the next downbeat completes the stepwise arrival on G.
+        let scale = [0u8, 2, 4, 5, 7, 9, 11];
+        let g_idx = scale.iter().position(|&p| p == 7).unwrap();
+        let last_idx = scale.iter().position(|&p| p == line[3].note % 12).unwrap();
+        let dist = (last_idx as i32 - g_idx as i32).rem_euclid(7);
+        assert!(
+            dist == 1 || dist == 6,
+            "the final onset (pc {}) must be ONE diatonic step from the target G",
+            line[3].note % 12
+        );
+        assert_ne!(
+            line[3].note % 12,
+            7,
+            "the final onset is NOT yet G (that is the next downbeat)"
+        );
+    }
+
+    /// Every walking onset is DIATONIC to the section scale — NO chromatic approach this slice
+    /// (OD-2: diatonic-only). C major scale pcs = {0,2,4,5,7,9,11}.
+    #[test]
+    fn s34_walking_bass_is_diatonic() {
+        let scale_pcs = [0u8, 2, 4, 5, 7, 9, 11]; // C Ionian
+        for (cur, next) in [(0u8, 7u8), (7, 0), (2, 9), (5, 0)] {
+            for e in walking_bass(cur, Some(next), 0, "Ionian", 80, 1000, 4) {
+                assert!(
+                    scale_pcs.contains(&(e.note % 12)),
+                    "walking note {} (pc {}) must be diatonic to C Ionian",
+                    e.note,
+                    e.note % 12
+                );
+            }
+        }
+    }
+
+    /// The walking line stays in the bass register and moves connectedly — no adjacent pair
+    /// leaps by an octave or more (a true walking line is stepwise / small-leap, not jumpy).
+    #[test]
+    fn s34_walking_bass_is_a_connected_bass_line() {
+        let line = walking_bass(0, Some(7), 0, "Ionian", 80, 1000, 4);
+        for e in &line {
+            assert!(
+                (24..=108).contains(&e.note) && e.note >= BASS_REGISTER_FLOOR - 12,
+                "walking note {} must sit in the bass register",
+                e.note
+            );
+        }
+        for w in line.windows(2) {
+            let leap = (w[1].note as i16 - w[0].note as i16).unsigned_abs();
+            assert!(
+                leap < 12,
+                "adjacent walking notes must not leap an octave (got {leap})"
+            );
+        }
+    }
+
+    /// End-of-section fallback: with no next chord, walking_bass walks WITHIN the current chord
+    /// (root → 5th → root …) rather than inventing a target — no panic, first onset is the root.
+    #[test]
+    fn s34_walking_bass_end_of_section_falls_back() {
+        let line = walking_bass(0, None, 0, "Ionian", 80, 1000, 4);
+        assert_eq!(line.len(), 4);
+        assert_eq!(line[0].note % 12, 0, "fallback opens on the current root");
+        // The odd onsets are the diatonic fifth above the root (G, pc 7).
+        assert_eq!(
+            line[1].note % 12,
+            7,
+            "the fallback alternates root and its diatonic fifth"
+        );
+    }
+
+    /// Integration: a Walking profile driven through realize_step over a C→G step pair produces
+    /// the walking line on the Bass instrument; a single-step section (no next) falls back.
+    #[test]
+    fn s34_walking_bass_via_realize_step() {
+        let walking = BassPatternSpec {
+            id: "walking".to_string(),
+            kind: BassPatternKind::Walking,
+            density: 4,
+            pedal_degree: 1,
+        };
+        let steps = vec![s34_step(c_major_triad(), 2), s34_step(g_major_triad(), 4)];
+        let (section, kt) = s34_section(steps, s34_profile(None, Some(walking)));
+        let f = perf_mid();
+        let bass0 = s34_realize_bass(&section, &kt, 0, &f);
+        assert_eq!(bass0.len(), 4, "the walking bass emits density (4) onsets");
+        assert_eq!(bass0[0].note % 12, 0, "step 0 opens on the C root");
+    }
+
+    // ── Part (B) — pedal point ──────────────────────────────────────────────
+
+    /// pedal_bass holds ONE constant pitch (the pedal_degree of the key) regardless of the
+    /// chord — the same low pitch across a multi-chord span (the standing drone).
+    #[test]
+    fn s34_pedal_point_holds_one_pitch() {
+        // tonic pedal (degree 1) in C major → pc 0.
+        let a = pedal_bass(0, "Ionian", 1, 80, 1000, 1.0);
+        let b = pedal_bass(0, "Ionian", 1, 80, 1000, 1.0);
+        assert_eq!(a.len(), 1, "the pedal is a single sustained note");
+        assert_eq!(
+            a[0].note, b[0].note,
+            "the pedal pitch is constant across steps"
+        );
+        assert_eq!(a[0].note % 12, 0, "the tonic pedal sounds the tonic (C)");
+    }
+
+    /// pedal_degree selects tonic (1) vs dominant (5): degree 1 → pc 0 (C), degree 5 → pc 7 (G).
+    #[test]
+    fn s34_pedal_degree_selects_tonic_or_dominant() {
+        assert_eq!(
+            pedal_bass(0, "Ionian", 1, 80, 1000, 1.0)[0].note % 12,
+            0,
+            "degree 1 == tonic"
+        );
+        assert_eq!(
+            pedal_bass(0, "Ionian", 5, 80, 1000, 1.0)[0].note % 12,
+            7,
+            "degree 5 == dominant"
+        );
+    }
+
+    /// Integration: a Pedal profile holds the SAME bass pitch under a CHANGING harmony across a
+    /// 3-chord stream (C, ii, G) — the harmony moves above; the pedal does not.
+    #[test]
+    fn s34_pedal_point_holds_under_changing_harmony_via_realize_step() {
+        let pedal = BassPatternSpec {
+            id: "pedal".to_string(),
+            kind: BassPatternKind::Pedal,
+            density: 2,
+            pedal_degree: 1,
+        };
+        let steps = vec![
+            s34_step(c_major_triad(), 2),
+            s34_step(d_minor_triad(), 4),
+            s34_step(g_major_triad(), 6),
+        ];
+        let (section, kt) = s34_section(steps, s34_profile(None, Some(pedal)));
+        let f = perf_mid();
+        let n0 = s34_realize_bass(&section, &kt, 0, &f);
+        let n1 = s34_realize_bass(&section, &kt, 1, &f);
+        let n2 = s34_realize_bass(&section, &kt, 2, &f);
+        assert_eq!(n0.len(), 1);
+        assert_eq!(
+            (n0[0].note, n1[0].note, n2[0].note),
+            (n0[0].note, n0[0].note, n0[0].note),
+            "the pedal bass is the SAME pitch on every step despite the chord change"
+        );
+        assert_eq!(
+            n0[0].note % 12,
+            0,
+            "the tonic pedal sounds C under all three chords"
+        );
+    }
+
+    // ── Part (B) — the Sustained/None dispatch freeze witness ───────────────
+
+    /// FREEZE: a profile with bass_pattern_resolved == None realizes the IDENTICAL Bass events
+    /// as a profile with NO bass-pattern seam at all — the sustained-root freeze default did not
+    /// move. Drives realize_step on the Bass instrument and compares against a Sustained-kind row
+    /// (which the dispatch routes to the legacy `_` arm byte-for-byte).
+    #[test]
+    fn s34_sustained_and_none_dispatch_are_byte_identical() {
+        let f = perf_mid();
+        let steps_a = vec![s34_step(c_major_triad(), 2), s34_step(g_major_triad(), 4)];
+        let steps_b = vec![s34_step(c_major_triad(), 2), s34_step(g_major_triad(), 4)];
+        // (1) bass_pattern_resolved == None → the legacy path.
+        let (sec_none, kt) = s34_section(steps_a, s34_profile(None, None));
+        // (2) an explicit Sustained kind → the SAME legacy `_` arm.
+        let sustained = BassPatternSpec {
+            id: "sustained".to_string(),
+            kind: BassPatternKind::Sustained,
+            density: 2,
+            pedal_degree: 1,
+        };
+        let (sec_sus, _) = s34_section(steps_b, s34_profile(None, Some(sustained)));
+        for si in 0..2 {
+            assert_eq!(
+                s34_realize_bass(&sec_none, &kt, si, &f),
+                s34_realize_bass(&sec_sus, &kt, si, &f),
+                "Sustained kind must realize byte-identically to the None (legacy) path at step {si}"
+            );
+        }
+    }
+
+    /// The Pad bed is UNCHANGED when a bass pattern is present but no figuration: the bass-arm
+    /// dispatch must not perturb the Pad voice (the parts are independent).
+    #[test]
+    fn s34_pad_bed_unperturbed_by_bass_pattern() {
+        let f = perf_mid();
+        let steps_a = vec![s34_step(c_major_triad(), 2), s34_step(g_major_triad(), 4)];
+        let steps_b = vec![s34_step(c_major_triad(), 2), s34_step(g_major_triad(), 4)];
+        let (sec_plain, kt) = s34_section(steps_a, s34_profile(None, None));
+        let walking = BassPatternSpec {
+            id: "walking".to_string(),
+            kind: BassPatternKind::Walking,
+            density: 4,
+            pedal_degree: 1,
+        };
+        let (sec_walk, _) = s34_section(steps_b, s34_profile(None, Some(walking)));
+        assert_eq!(
+            s34_realize_pad(&sec_plain, &kt, 0, &f),
+            s34_realize_pad(&sec_walk, &kt, 0, &f),
+            "the Pad bed is independent of the bass pattern"
+        );
     }
 }

@@ -153,6 +153,8 @@ fn trio(bed: LayerRole, prominence: Vec<LayerProminence>) -> OrchestrationProfil
         pad_voices: 0,
         figuration: None,
         figuration_resolved: None,
+        bass_pattern: None,
+        bass_pattern_resolved: None,
         prominence,
     }
 }
@@ -248,6 +250,8 @@ fn prominence_neutral_is_byte_identical() {
         pad_voices: 0,
         figuration: None,
         figuration_resolved: None,
+        bass_pattern: None,
+        bass_pattern_resolved: None,
         prominence: all_neutral(),
     };
 

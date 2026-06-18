@@ -823,6 +823,8 @@ fn trio(bed: LayerRole, prominence: Vec<LayerProminence>) -> OrchestrationProfil
         pad_voices: 0,
         figuration: None,
         figuration_resolved: None,
+        bass_pattern: None,
+        bass_pattern_resolved: None,
         prominence,
     }
 }

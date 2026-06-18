@@ -404,6 +404,18 @@ pub struct OrchestrationProfile {
     /// keeps `PartialEq`/`Clone` total.
     #[serde(skip)]
     pub figuration_resolved: Option<FigurationSpec>,
+    /// NEW S34 — id of a `bass_pattern_catalogue` row this profile's Bass uses, or None for the
+    /// sustained default. `#[serde(default)]` (== None) → every existing profile is byte-stable
+    /// (the realizer takes its byte-identical legacy Bass path). The planner resolves this handle
+    /// (into `bass_pattern_resolved`); the realizer reads the RESOLVED spec, never this raw handle.
+    #[serde(default)]
+    pub bass_pattern: Option<String>,
+    /// NEW S34 — the RESOLVED bass pattern for this section, filled by the planner from
+    /// `bass_pattern` against `bass_pattern_catalogue`. NOT loaded from JSON (`#[serde(skip)]` →
+    /// always `None` at deserialize). `None` == the sustained default == the byte-stable Bass arm.
+    /// The realizer reads THIS, never the raw `bass_pattern` handle.
+    #[serde(skip)]
+    pub bass_pattern_resolved: Option<BassPatternSpec>,
     /// NEW S23 — the RESOLVED per-layer prominence for this section, filled by the planner
     /// from the `prominence` `SelectTable`. NOT loaded from JSON (`#[serde(skip)]` → always
     /// empty at deserialize). EMPTY == the uniform/identity sentinel: the realizer takes its
@@ -429,6 +441,8 @@ impl OrchestrationProfile {
             pad_voices: 0,
             figuration: None,
             figuration_resolved: None,
+            bass_pattern: None,
+            bass_pattern_resolved: None,
             prominence: Vec::new(),
         }
     }
@@ -543,7 +557,8 @@ pub struct FigurationSpec {
 }
 
 /// One onset of a figure: WHEN it sounds (fraction of step_ms), WHICH seated inner-voice index
-/// it sounds (cycled modulo the seated voice count), and how long it holds. NEW S20.
+/// it sounds (cycled modulo the seated voice count), how long it holds, AND an optional
+/// whole-octave register shift applied to the seated pitch. NEW S20; `register_octaves` NEW S34.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
 pub struct FigurationOnset {
     /// Onset time as a fraction of step_ms, 0.0..1.0 (0.0 == downbeat, 0.25 == the off-beat).
@@ -554,6 +569,16 @@ pub struct FigurationOnset {
     /// Default 1.0 (legato: fill the whole gap up to the per-onset cap).
     #[serde(default = "one_f32")]
     pub hold_frac: f32,
+    /// NEW S34 — whole-octave register shift applied to the seated pitch for THIS onset:
+    /// `-1` drops the tone an octave (the oom-pah "oom" / stride bass), `+1` raises it (a
+    /// high stride stab), `0` == in-band (every existing row). The mapper applies
+    /// `seated[idx] + 12·register_octaves`, CLAMPED to the engine's `[24, 108]` MIDI range
+    /// (the same clamp `seat_pc_in_register` already uses). `#[serde(default)]` (== 0) so
+    /// EVERY existing row (alberti, broken_chord_up/wave, arp_waltz, block_comp_24, block)
+    /// deserializes byte-identically and realizes with NO pitch change — the byte-freeze
+    /// default. Read ONLY in `chord_engine.rs::figured_bed`; never reaches engine.rs.
+    #[serde(default)]
+    pub register_octaves: i8,
 }
 
 /// serde default for [`FigurationSpec::voices`].
@@ -564,6 +589,53 @@ fn one_u8() -> u8 {
 /// serde default for [`FigurationOnset::hold_frac`].
 fn one_f32() -> f32 {
     1.0
+}
+
+/// A named BASS-LINE generator pattern — pure STRUCTURE/POLICY, no pitch content. Unlike a
+/// [`FigurationSpec`] (a static onset table over the Pad bed), a bass pattern is a small POLICY
+/// the realizer's Bass arm interprets against the live chord stream (walking needs the NEXT
+/// chord root; pedal holds one pitch under changing harmony). Lives in `bass_pattern_catalogue`;
+/// an [`OrchestrationProfile`] references it BY ID. Adding a pattern is a JSON row, NOT a Rust
+/// edit (the `FigurationSpec`/`FormSpec` discipline). NEW S34.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct BassPatternSpec {
+    /// Stable id, e.g. "sustained" (the no-op default == today's one-root bass) / "walking" / "pedal".
+    pub id: String,
+    /// Which generator the Bass arm runs. serde rejects an unknown kind. Default `Sustained`
+    /// (== the byte-stable current bass).
+    #[serde(default)]
+    pub kind: BassPatternKind,
+    /// For `Walking`: onsets-per-step (the walking-bass note density; 2 == half-step walk,
+    /// 4 == quarter-note walk). Ignored by other kinds. Default 2.
+    #[serde(default = "two_u8")]
+    pub density: u8,
+    /// For `Pedal`: which scale degree to PIN under the changing harmony — `1` (tonic pedal,
+    /// the default) or `5` (dominant pedal). Ignored by other kinds. Default 1.
+    #[serde(default = "one_u8")]
+    pub pedal_degree: u8,
+}
+
+/// The bass-line generator kinds. `Sustained` is the byte-stable default (today's behavior:
+/// one grounded root per step). NEW S34.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BassPatternKind {
+    /// One sustained chord root for the whole step (today's `OrchestralRole::Bass` arm). The
+    /// realizer takes its byte-identical legacy path under this kind — the freeze default.
+    #[default]
+    Sustained,
+    /// A target-seeking stepwise bass: fill `density` onsets between THIS chord root and the
+    /// NEXT chord root with diatonic passing/neighbor tones, arriving ON the next root at the
+    /// next downbeat (strong-beat = chord tone, weak-beat = passing tone).
+    Walking,
+    /// Hold ONE pitch (the `pedal_degree` of the section's key) under the changing harmony —
+    /// the pedal point. The harmony changes above; the bass does not move.
+    Pedal,
+}
+
+/// serde default for [`BassPatternSpec::density`] (the walking-bass note count).
+fn two_u8() -> u8 {
+    2
 }
 
 /// One section's role in a FORM TEMPLATE — pure structure, no music content. The planner
@@ -772,6 +844,12 @@ pub struct PlanMappings {
     /// key parses; an unresolved profile handle then falls back to the block bed.
     #[serde(default)]
     pub figuration_catalogue: Vec<FigurationSpec>,
+    /// NEW S34 — the bass-pattern vocabulary, parallel to `figuration_catalogue`.
+    /// `#[serde(default)]` empty Vec (back-compat floor): an OLD mappings.json with no
+    /// `bass_pattern_catalogue` key parses, and an unresolved `bass_pattern` handle then falls
+    /// back to the sustained (byte-stable) Bass arm.
+    #[serde(default)]
+    pub bass_pattern_catalogue: Vec<BassPatternSpec>,
     /// NEW S22 — the affect weights + per-character tempo windows (§3.1). `#[serde(default)]`
     /// so an OLD mappings.json (no `affect` key) parses → `AffectMappings::default()`, which
     /// ships the legacy `ballad:{56,96}` window → the compose-path tempo is bit-identical.
@@ -808,6 +886,7 @@ impl From<CompositionMappings> for PlanMappings {
             form_catalogue: c.form_catalogue,
             texture_catalogue: c.texture_catalogue,
             figuration_catalogue: c.figuration_catalogue,
+            bass_pattern_catalogue: c.bass_pattern_catalogue,
             affect: c.affect,
             prominence: c.prominence,
             prominence_catalogue: c.prominence_catalogue,
@@ -1177,6 +1256,15 @@ impl CompositionPlanner {
             .as_deref()
             .and_then(|id| lookup_figuration(&self.plan_mappings.figuration_catalogue, id))
             .cloned();
+        // S34: resolve the bass-pattern handle ONCE per plan against the catalogue, mirroring the
+        // figuration resolve. An unresolved / None handle leaves `bass_pattern_resolved == None` →
+        // the realizer takes the byte-stable sustained Bass arm. The `orchestration.clone()` per
+        // section (below) deep-clones the resolved spec onto each Section — no section-loop edit.
+        orchestration.bass_pattern_resolved = orchestration
+            .bass_pattern
+            .as_deref()
+            .and_then(|id| lookup_bass_pattern(&self.plan_mappings.bass_pattern_catalogue, id))
+            .cloned();
         // S23: resolve saliency → prominence ONCE per plan, immediately after the figuration
         // resolve. The `prominence` SelectTable picks a catalogue id from the saliency knobs
         // (subject_size, fg_bg_contrast); an absent/unmatched/`uniform` id leaves `prominence`
@@ -1338,6 +1426,17 @@ fn lookup_orchestration<'a>(
 /// `figuration_resolved == None` and the realizer falls back to the block bed.
 fn lookup_figuration<'a>(catalogue: &'a [FigurationSpec], id: &str) -> Option<&'a FigurationSpec> {
     catalogue.iter().find(|f| f.id == id)
+}
+
+/// Look up a [`BassPatternSpec`] by id in the bass-pattern catalogue (S34). Mirrors
+/// [`lookup_figuration`]; an absent/unmatched id returns `None` so the planner leaves
+/// `bass_pattern_resolved == None` and the realizer falls back to the byte-stable sustained
+/// Bass arm.
+fn lookup_bass_pattern<'a>(
+    catalogue: &'a [BassPatternSpec],
+    id: &str,
+) -> Option<&'a BassPatternSpec> {
+    catalogue.iter().find(|b| b.id == id)
 }
 
 /// Look up a [`ProminenceProfile`] by id in the prominence catalogue (S23). Mirrors
@@ -2264,9 +2363,9 @@ mod tests {
     }
 
     /// The OLD `mappings.json` byte-shape still parses: every existing figuration row
-    /// (block, alberti) survives, and the new rows ride the same serde shape with NO
-    /// new field — i.e. `FigurationOnset` is unchanged (no `register_octaves`). A
-    /// successful `mappings()` load + a `voices == 3` read on alberti is the
+    /// (block, alberti) survives. `FigurationOnset` NOW carries `register_octaves` (NEW S34,
+    /// `#[serde(default)]` == 0), so every existing row deserializes byte-identically with the
+    /// no-op shift. A successful `mappings()` load + a `voices == 3` read on alberti is the
     /// backward-compat witness. (Backward-compat hard requirement.)
     #[test]
     fn s30_figuration_backward_compat_old_rows_unchanged() {
@@ -2427,5 +2526,295 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ───────────────────────── S34 — Pattern-Library Slice 2 (data + plumbing) ─────────────────
+
+    /// FREEZE GUARD: every EXISTING figuration onset deserializes with `register_octaves == 0`
+    /// (the `#[serde(default)]` no-op). Asserted over EVERY onset of EVERY pre-S34 row in the
+    /// loaded catalogue — none of them carry the field in JSON, so all must default to 0. This is
+    /// the §2.2 default-zero byte-freeze guarantee at the DATA boundary (the realizer's no-op is
+    /// the chord_engine lane's witness; this is ours).
+    #[test]
+    fn s34_existing_onsets_default_register_octaves_zero() {
+        let pm: PlanMappings = mappings()
+            .composition
+            .clone()
+            .expect("composition block present")
+            .into();
+        for legacy in [
+            "block",
+            "alberti",
+            "broken_chord_up",
+            "broken_chord_wave",
+            "arp_waltz",
+            "block_comp_24",
+        ] {
+            let row = pm
+                .figuration_catalogue
+                .iter()
+                .find(|f| f.id == legacy)
+                .unwrap_or_else(|| panic!("legacy figuration row `{legacy}` present"));
+            for o in &row.onsets {
+                assert_eq!(
+                    o.register_octaves, 0,
+                    "{legacy}: existing onset must default register_octaves to 0 (the byte-freeze no-op)"
+                );
+            }
+        }
+    }
+
+    /// The NEW oom-pah/stride rows carry the register-shift the spec dictates: the "oom"/stride
+    /// bass onsets are shifted DOWN an octave (`register_octaves == -1`), the "pah"/stab onsets
+    /// stay in-band (`register_octaves == 0`). Asserts the §3.1 catalogue rows verbatim.
+    #[test]
+    fn s34_oom_pah_stride_register_shifts() {
+        let pm: PlanMappings = mappings()
+            .composition
+            .clone()
+            .expect("composition block present")
+            .into();
+        let by_at = |id: &str| -> Vec<(f32, i8)> {
+            pm.figuration_catalogue
+                .iter()
+                .find(|f| f.id == id)
+                .unwrap_or_else(|| panic!("figuration row `{id}` present"))
+                .onsets
+                .iter()
+                .map(|o| (o.at, o.register_octaves))
+                .collect()
+        };
+        assert_eq!(by_at("oom_pah"), vec![(0.0, -1), (0.5, 0)]);
+        assert_eq!(by_at("oom_pah_pah"), vec![(0.0, -1), (0.33, 0), (0.66, 0)]);
+        assert_eq!(
+            by_at("stride"),
+            vec![(0.0, -1), (0.25, 0), (0.5, -1), (0.75, 0)]
+        );
+    }
+
+    /// serde round-trip of `FigurationOnset` with the new field — a row with an explicit
+    /// `register_octaves` parses it, and a row WITHOUT the key defaults to 0.
+    #[test]
+    fn s34_figuration_onset_register_octaves_roundtrip() {
+        let with: FigurationOnset =
+            serde_json::from_str(r#"{ "at": 0.0, "tone": 0, "register_octaves": -1 }"#)
+                .expect("onset with register_octaves parses");
+        assert_eq!(with.register_octaves, -1);
+        assert_eq!(with.hold_frac, 1.0, "hold_frac still defaults to 1.0");
+        let without: FigurationOnset =
+            serde_json::from_str(r#"{ "at": 0.5, "tone": 1 }"#).expect("onset without parses");
+        assert_eq!(
+            without.register_octaves, 0,
+            "absent → 0 (byte-freeze no-op)"
+        );
+    }
+
+    /// serde round-trip of the NEW `BassPatternSpec`/`BassPatternKind` types: each `kind` parses
+    /// from its snake_case string; the `density`/`pedal_degree` defaults (2 / 1) apply when absent;
+    /// an unknown kind is REJECTED (the closed-enum safety the spec requires).
+    #[test]
+    fn s34_bass_pattern_spec_roundtrip_and_defaults() {
+        let walking: BassPatternSpec =
+            serde_json::from_str(r#"{ "id": "walking", "kind": "walking" }"#)
+                .expect("walking parses");
+        assert_eq!(walking.kind, BassPatternKind::Walking);
+        assert_eq!(walking.density, 2, "density defaults to 2");
+        assert_eq!(walking.pedal_degree, 1, "pedal_degree defaults to 1");
+
+        let pedal: BassPatternSpec =
+            serde_json::from_str(r#"{ "id": "pedal_dom", "kind": "pedal", "pedal_degree": 5 }"#)
+                .expect("pedal parses");
+        assert_eq!(pedal.kind, BassPatternKind::Pedal);
+        assert_eq!(pedal.pedal_degree, 5);
+
+        // Absent `kind` → Sustained (the byte-stable default).
+        let bare: BassPatternSpec =
+            serde_json::from_str(r#"{ "id": "sustained" }"#).expect("bare parses");
+        assert_eq!(bare.kind, BassPatternKind::Sustained);
+
+        // Unknown kind → REJECTED (closed enum).
+        assert!(
+            serde_json::from_str::<BassPatternSpec>(r#"{ "id": "x", "kind": "boogie" }"#).is_err(),
+            "an unknown bass-pattern kind must be rejected by serde"
+        );
+    }
+
+    /// FREEZE GUARD: every EXISTING `texture_catalogue` profile keeps `bass_pattern == None`
+    /// (the `#[serde(default)]`), so the realizer takes its byte-identical legacy Bass path. The
+    /// identity profile is byte-stable (`bass_pattern`/`bass_pattern_resolved` both None). Only the
+    /// two NEW part-B profiles (`pad_walking`/`pad_pedal`) carry a `bass_pattern`.
+    #[test]
+    fn s34_existing_profiles_bass_pattern_none() {
+        let pm: PlanMappings = mappings()
+            .composition
+            .clone()
+            .expect("composition block present")
+            .into();
+        for prof in &pm.texture_catalogue {
+            let expect_some = matches!(prof.id.as_str(), "pad_walking" | "pad_pedal");
+            assert_eq!(
+                prof.bass_pattern.is_some(),
+                expect_some,
+                "profile `{}` bass_pattern presence",
+                prof.id
+            );
+            // bass_pattern_resolved is #[serde(skip)] → always None at deserialize.
+            assert!(
+                prof.bass_pattern_resolved.is_none(),
+                "profile `{}` bass_pattern_resolved is serde-skip (None until the planner resolves)",
+                prof.id
+            );
+        }
+        // The identity sentinel is byte-stable.
+        let id = OrchestrationProfile::identity();
+        assert!(id.bass_pattern.is_none() && id.bass_pattern_resolved.is_none());
+    }
+
+    /// Every `bass_pattern_catalogue` row deserializes; the walking/pedal kinds resolve; the
+    /// density/pedal_degree defaults + overrides land. (Implementer-lane data-validity surface.)
+    #[test]
+    fn s34_bass_pattern_catalogue_parses() {
+        let pm: PlanMappings = mappings()
+            .composition
+            .clone()
+            .expect("composition block present")
+            .into();
+        let find = |id: &str| -> &BassPatternSpec {
+            pm.bass_pattern_catalogue
+                .iter()
+                .find(|b| b.id == id)
+                .unwrap_or_else(|| panic!("bass_pattern row `{id}` present"))
+        };
+        assert_eq!(find("sustained").kind, BassPatternKind::Sustained);
+        assert_eq!(find("walking").kind, BassPatternKind::Walking);
+        assert_eq!(find("walking").density, 2);
+        assert_eq!(find("walking_q").density, 4);
+        assert_eq!(find("pedal").kind, BassPatternKind::Pedal);
+        assert_eq!(find("pedal").pedal_degree, 1);
+        assert_eq!(find("pedal_dom").pedal_degree, 5);
+    }
+
+    /// RESOLUTION WIRING: the planner stamps the resolved figuration AND bass-pattern specs onto
+    /// every section's orchestration (mirroring `figuration_resolved`). A profile carrying a
+    /// `bass_pattern` handle resolves it; a profile with `bass_pattern: None` leaves
+    /// `bass_pattern_resolved == None` (the byte-stable Bass path). Driven through the real
+    /// `CompositionPlanner::plan` against a hand-built profile catalogue, RNG-free on the wiring.
+    #[test]
+    fn s34_planner_resolves_bass_pattern_onto_sections() {
+        let mt = mappings();
+        let mut cm = mt.composition.clone().expect("composition block present");
+        // Force the `texture` axis to always pick our walking profile so every section carries it.
+        cm.texture = SelectTable {
+            default: "pad_walking".to_string(),
+            rules: Vec::new(),
+        };
+        let pm: PlanMappings = cm.into();
+        let planner = CompositionPlanner::new(pm);
+        let plan = planner.plan(&ImageUnderstanding::neutral(), &mt);
+        assert!(!plan.sections.is_empty(), "plan has sections");
+        for s in &plan.sections {
+            let resolved = s
+                .orchestration
+                .bass_pattern_resolved
+                .as_ref()
+                .expect("walking profile resolves a bass pattern onto the section");
+            assert_eq!(resolved.kind, BassPatternKind::Walking);
+            assert_eq!(resolved.id, "walking");
+        }
+
+        // Control: a profile with no bass_pattern leaves bass_pattern_resolved == None.
+        let mt2 = mappings();
+        let mut cm2 = mt2.composition.clone().expect("composition block present");
+        cm2.texture = SelectTable {
+            default: "pad_bed".to_string(),
+            rules: Vec::new(),
+        };
+        let pm2: PlanMappings = cm2.into();
+        let plan2 = CompositionPlanner::new(pm2).plan(&ImageUnderstanding::neutral(), &mt2);
+        for s in &plan2.sections {
+            assert!(
+                s.orchestration.bass_pattern_resolved.is_none(),
+                "pad_bed (no bass_pattern) → bass_pattern_resolved None (byte-stable Bass path)"
+            );
+        }
+    }
+
+    /// The two NEW `texture` rules (OD-1 verbatim) reach `pad_oom_pah` / `pad_stride` on their
+    /// gate features and NONE on the `neutral()` sentinel (the Ge/in_range discipline). Each new
+    /// part-A profile references its figuration row; `pad_oom_pah_pah` is authored but UN-SELECTED
+    /// (no `texture` rule), per the S30 R-C "inert until a ladder selects it" decision.
+    #[test]
+    fn s34_texture_rules_reach_oom_pah_and_stride() {
+        let pm: PlanMappings = mappings()
+            .composition
+            .clone()
+            .expect("composition block present")
+            .into();
+        let texture = &pm.texture;
+
+        // Sentinel/neutral → no new rule fires → default pad_bed (byte-stable).
+        assert_eq!(
+            texture.select(&ImageUnderstanding::neutral()),
+            "pad_bed",
+            "neutral sentinel must not trip any new rule"
+        );
+
+        // oom-pah gate: valence >= 0.60 AND arousal in [0.40, 0.65]. Keep colorfulness 0 so the
+        // earlier waltz rule (valence>=0.65 & colorfulness>=0.50) cannot pre-empt, and arousal
+        // below 0.70/0.60 so the block_comp / broken_up rules do not fire first.
+        let oom = ImageUnderstanding {
+            affect_valence: 0.62,
+            affect_arousal: 0.5,
+            ..ImageUnderstanding::neutral()
+        };
+        assert_eq!(texture.select(&oom), "pad_oom_pah");
+
+        // stride gate: arousal >= 0.75 AND colorfulness >= 0.55. (block_comp needs valence>=0.55;
+        // we keep valence at sentinel -1 so it cannot fire, leaving broken_up then stride — but
+        // broken_up is arousal>=0.60 with no other gate, so it would pre-empt. Confirm ORDER:
+        // stride must come AFTER broken_up, so a high-arousal+colorful image lands on broken_up,
+        // NOT stride. This asserts the appended-after, first-match-wins ordering is preserved.)
+        let high = ImageUnderstanding {
+            affect_arousal: 0.8,
+            colorfulness: 0.6,
+            ..ImageUnderstanding::neutral()
+        };
+        assert_eq!(
+            texture.select(&high),
+            "pad_broken_up",
+            "first-match-wins: broken_up (appended earlier) pre-empts the later stride rule"
+        );
+
+        // Reach stride directly over the SelectTable in isolation (the rule is correct even though
+        // broken_up shadows it on the full ladder — its gate is intentionally a strict superset).
+        let stride_rule = texture
+            .rules
+            .iter()
+            .find(|r| r.pick == "pad_stride")
+            .expect("a pad_stride rule is appended");
+        assert!(
+            stride_rule.when.iter().all(|p| p.holds(&high)),
+            "the pad_stride rule's gate (arousal>=0.75 & colorfulness>=0.55) holds on the high image"
+        );
+
+        // Each new part-A profile names a real figuration row; pad_oom_pah_pah is authored.
+        for (prof_id, fig_id) in [
+            ("pad_oom_pah", "oom_pah"),
+            ("pad_oom_pah_pah", "oom_pah_pah"),
+            ("pad_stride", "stride"),
+        ] {
+            let prof = pm
+                .texture_catalogue
+                .iter()
+                .find(|p| p.id == prof_id)
+                .unwrap_or_else(|| panic!("profile `{prof_id}` present"));
+            assert_eq!(prof.figuration.as_deref(), Some(fig_id));
+            assert!(pm.figuration_catalogue.iter().any(|f| f.id == fig_id));
+        }
+        // pad_oom_pah_pah is authored but UN-SELECTED (no texture rule picks it).
+        assert!(
+            !texture.rules.iter().any(|r| r.pick == "pad_oom_pah_pah"),
+            "pad_oom_pah_pah must be inert (un-selected) until a triple-meter knob exists"
+        );
     }
 }

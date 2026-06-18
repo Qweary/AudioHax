@@ -63,21 +63,25 @@ fn alberti() -> FigurationSpec {
                 at: 0.0,
                 tone: 0,
                 hold_frac: 1.0,
+                register_octaves: 0,
             },
             FigurationOnset {
                 at: 0.25,
                 tone: 2,
                 hold_frac: 1.0,
+                register_octaves: 0,
             },
             FigurationOnset {
                 at: 0.5,
                 tone: 1,
                 hold_frac: 1.0,
+                register_octaves: 0,
             },
             FigurationOnset {
                 at: 0.75,
                 tone: 2,
                 hold_frac: 1.0,
+                register_octaves: 0,
             },
         ],
         voices: 3,
@@ -100,6 +104,8 @@ fn pad_figured() -> OrchestrationProfile {
         pad_voices: 3,
         figuration: Some("alberti".to_string()),
         figuration_resolved: Some(alberti()),
+        bass_pattern: None,
+        bass_pattern_resolved: None,
         prominence: Vec::new(),
     }
 }
@@ -119,6 +125,8 @@ fn pad_bed() -> OrchestrationProfile {
         pad_voices: 3,
         figuration: None,
         figuration_resolved: None,
+        bass_pattern: None,
+        bass_pattern_resolved: None,
         prominence: Vec::new(),
     }
 }
@@ -138,6 +146,8 @@ fn pad_figured_unresolved() -> OrchestrationProfile {
         pad_voices: 3,
         figuration: Some("nope".to_string()),
         figuration_resolved: None,
+        bass_pattern: None,
+        bass_pattern_resolved: None,
         prominence: Vec::new(),
     }
 }

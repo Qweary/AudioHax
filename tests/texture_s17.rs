@@ -127,6 +127,8 @@ fn pad_bed() -> OrchestrationProfile {
         pad_voices: 3,
         figuration: None,
         figuration_resolved: None,
+        bass_pattern: None,
+        bass_pattern_resolved: None,
         prominence: Vec::new(),
     }
 }
@@ -415,6 +417,8 @@ fn test_countermelody_is_no_longer_harmonicfill_delegate() {
         pad_voices: 0,
         figuration: None,
         figuration_resolved: None,
+        bass_pattern: None,
+        bass_pattern_resolved: None,
         prominence: Vec::new(),
     };
     // A strong (even) interior beat with real edge so the HarmonicFill SOUNDS (a single

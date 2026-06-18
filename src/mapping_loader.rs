@@ -135,6 +135,12 @@ pub struct CompositionMappings {
     /// carries it onto `PlanMappings`.
     #[serde(default)]
     pub figuration_catalogue: Vec<crate::composition::FigurationSpec>,
+    /// S34 — the bass-pattern vocabulary. `#[serde(default)]` back-compat floor: absent → empty
+    /// catalogue → an unresolved `bass_pattern` handle falls back to the byte-stable sustained
+    /// Bass arm. This is the struct that actually deserializes `assets/mappings.json`; the
+    /// `From<CompositionMappings>` impl carries it onto `PlanMappings`.
+    #[serde(default)]
+    pub bass_pattern_catalogue: Vec<crate::composition::BassPatternSpec>,
     /// S22 — the affect weights + per-character tempo windows. `#[serde(default)]` back-compat
     /// floor: absent → `AffectMappings::default()` (legacy Ballad window). Carried onto
     /// `PlanMappings` by the `From<CompositionMappings>` impl in composition.rs.
@@ -255,4 +261,65 @@ fn parse_range(s: &str) -> Option<(i32, i32)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::composition::BassPatternKind;
+
+    /// S34 — the loader parses `assets/mappings.json`'s NEW `bass_pattern_catalogue` through the
+    /// `CompositionMappings` mirror: every row deserializes, the walking/pedal kinds resolve, and
+    /// the `density`/`pedal_degree` defaults + overrides land. (mapping_loader-lane parse witness.)
+    #[test]
+    fn s34_bass_pattern_catalogue_parses_via_loader() {
+        let mt = load_mappings("assets/mappings.json").expect("mappings load");
+        let cm = mt.composition.expect("composition block present");
+        let find = |id: &str| -> &crate::composition::BassPatternSpec {
+            cm.bass_pattern_catalogue
+                .iter()
+                .find(|b| b.id == id)
+                .unwrap_or_else(|| panic!("bass_pattern row `{id}` present"))
+        };
+        assert_eq!(find("sustained").kind, BassPatternKind::Sustained);
+        assert_eq!(find("walking").kind, BassPatternKind::Walking);
+        assert_eq!(find("walking").density, 2);
+        assert_eq!(find("walking_q").density, 4);
+        assert_eq!(find("pedal").kind, BassPatternKind::Pedal);
+        assert_eq!(find("pedal").pedal_degree, 1);
+        assert_eq!(find("pedal_dom").pedal_degree, 5);
+    }
+
+    /// S34 — an UNKNOWN bass-pattern kind is REJECTED by serde (the closed-enum safety): a
+    /// `composition` block whose catalogue carries a `"kind": "boogie"` row fails to deserialize.
+    #[test]
+    fn s34_unknown_bass_pattern_kind_rejected() {
+        let json = r#"{
+            "global": { "hue_to_mode": {}, "saturation_to_harmonic_complexity": {},
+              "brightness_to_tempo_bpm": {},
+              "feature_normalization": { "edge_density_max": 0.05, "texture_laplacian_var_max": 2000.0,
+                "shape_complexity_max": 2.0, "hue_spread_max": 1.0, "avg_brightness_max": 100.0,
+                "avg_saturation_max": 100.0 },
+              "dominant_substitution_trigger": { "edge_complexity_threshold": 0.5, "substitutions": [] },
+              "modal_interchange_trigger": { "brightness_drop_threshold": 0.5, "borrowed_chords": [] },
+              "cadence_trigger": { "stillness_threshold": 0.5, "high_motion_cadence": "x", "low_motion_cadence": "y" },
+              "progression_families": {} },
+            "instrument_section": { "edge_density_to_rhythm": {}, "line_orientation_to_interval": {},
+              "contrast_to_articulation": {}, "color_shift_to_chord_extension": {}, "texture_to_modal_color": {} },
+            "fine_detail": { "pixel_y_position_to_pitch": "p", "pixel_brightness_to_velocity": "v",
+              "local_jaggedness_to_chromaticism": {}, "shape_to_ostinato": {} },
+            "composition": {
+              "form": { "default": "f", "rules": [] }, "character": { "default": "ballad", "rules": [] },
+              "meter": { "default": "four4", "rules": [] }, "key_scheme": { "default": "home_only", "rules": [] },
+              "theme_behaviour": { "default": "absent", "rules": [] },
+              "form_catalogue": [],
+              "bass_pattern_catalogue": [ { "id": "bad", "kind": "boogie" } ]
+            }
+        }"#;
+        let res: Result<MappingTable, _> = serde_json::from_str(json);
+        assert!(
+            res.is_err(),
+            "an unknown bass-pattern kind must be rejected by serde at load time"
+        );
+    }
 }

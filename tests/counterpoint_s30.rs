@@ -159,6 +159,8 @@ fn pad_bed_counter() -> OrchestrationProfile {
         pad_voices: 3,
         figuration: None,
         figuration_resolved: None,
+        bass_pattern: None,
+        bass_pattern_resolved: None,
         prominence: Vec::new(),
     }
 }
@@ -329,6 +331,8 @@ fn test_counter_off_is_byte_identical_baseline() {
         pad_voices: 0,
         figuration: None,
         figuration_resolved: None,
+        bass_pattern: None,
+        bass_pattern_resolved: None,
         prominence: Vec::new(),
     };
     let mk = |orch: OrchestrationProfile| Section {
