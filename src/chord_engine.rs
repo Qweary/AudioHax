@@ -2904,6 +2904,69 @@ fn realized_counter_pitch_with_prev(
         held_target,
         figures_enabled,
     );
+
+    // S33-CP-FIX (GAP-4) — PENULT LOOKAHEAD REWORK (design §1.2 Option 1).
+    //
+    // theory: on `{ii,vi} → IV → iii` the as-built IV penult `65` (root of IV, bare P5 vs the
+    // melody) dead-ends: from `65` every `iii` landing is a hidden P5 (64), a dissonant tritone
+    // leap (59), or a wide consonant leap (55) — there is NO clean stepwise consonant landing,
+    // so the realized line is forced into the `65 → 59` tritone (the GAP-4 residual). We already
+    // hold `next_chord` (= the iii chord) and can cheaply compute its melody at `si+1`, so we
+    // re-pick the penult ONE STEP EARLY to a tone (the third of IV, `57`) from which the
+    // ordinary machinery lands the `iii` step cleanly by a `−2` step onto `55`. This rides the
+    // existing private realize-replay seam (which already owns `ctx`/`si`/`next_chord`): NO new
+    // threaded field, NO `pick_counter_figure` signature change, the public `realize_step`
+    // surface untouched. The helper is a strict NO-OP unless this exact dead-end shape holds
+    // (it re-checks both boundaries and only fires when the as-built penult forces the tritone
+    // AND a clean reworked penult exists), so every clean transition and the `I→V→IV` witness
+    // (terminal IV, not pre-`iii`) are byte-identical. The fix is upstream candidate selection;
+    // no gate is loosened.
+    if let (Some(nc), Some(next_step)) = (next_chord, ctx.section.steps.get(si + 1)) {
+        // The iii-step (next-step) melody (`m_iii`), computed exactly as the replay computes
+        // melodies: re-point the borrowed ctx at `si+1` and read the Melody/theme seam there.
+        let mut next_ctx = *ctx;
+        next_ctx.step_in_section = si + 1;
+        let m_next = melody_pitch_for(&next_ctx, next_step, features);
+        if let Some(m_next) = m_next {
+            // The next step's ORDINARY realized counter landing, GIVEN the as-built penult `cnt`
+            // as its prior counter pitch. We call `pick_counter_figure` DIRECTLY (the same path
+            // the next step's own replay would take) rather than `realized_counter_pitch_with_prev`
+            // — this both avoids recursing back into this rework AND reads the unreworked landing,
+            // which is exactly the dead-end the trigger must detect (e.g. the `65 → 59` tritone).
+            let nn_chord: Option<&Chord> = ctx.section.steps.get(si + 2).map(|s| &s.chord);
+            let nn_held = next_step.chord.notes == step.chord.notes;
+            let nn_mel_dir = motion_dir(m_now, Some(m_next));
+            let nn_static = nn_mel_dir == MotionDir::Hold;
+            let nn_held_run = held_run_position(ctx.section, si + 1);
+            let nn_held_target = advancing_seed_counter(next_step, nn_held_run);
+            let nn_figures_enabled = !(nn_held || nn_static);
+            let (as_built_next_landing, _f) = pick_counter_figure(
+                &next_step.chord,
+                cnt, // the as-built penult is the next step's prior counter pitch
+                m_now,
+                Some(m_next),
+                nn_mel_dir,
+                next_step.position,
+                nn_chord,
+                nn_held || nn_static,
+                nn_held_target,
+                nn_figures_enabled,
+            );
+            if let Some(reworked) = penult_for_clean_next(
+                &step.chord,
+                prev_counter,
+                m_prev,
+                m_now,
+                nc,
+                m_next,
+                cnt,
+                as_built_next_landing,
+            ) {
+                return reworked;
+            }
+        }
+    }
+
     cnt
 }
 
@@ -3801,6 +3864,122 @@ fn consonance_gate_sustain(
     // No consonant chord tone AND no step-prepared ornament exists → keep `raw` as the
     // absolute defensive floor (a harmony defect upstream, not a counter defect).
     raw
+}
+
+/// S33-CP-FIX (GAP-4) — does a clean STEPWISE consonant non-parallel landing on `next_chord`
+/// exist from a given penult pitch `penult`, against the next melody `m_next`? "Clean" = an
+/// in-band `next_chord` chord tone reached by a STEP (`|motion| ≤ 2`), CONSONANT vs `m_next`,
+/// NOT a unison with `m_next` (PT-7), and introducing NO parallel/hidden perfect against the
+/// melody across the penult→landing transition (`approach_perfect_is_legal` +
+/// `has_parallel_perfects`, the SAME two-point guards the main scorer applies — never loosened).
+///
+/// theory: this is the Boundary-B test of the penult-rework (design §1.1). It asks, at the IV
+/// penult, whether the penult under test admits the stepwise consonant `iii` landing the residual
+/// lacks. `m_iv` (the penult's own melody) drives the approach-motion classification.
+///
+/// Pure/deterministic; reached only from `penult_for_clean_next` on the counter path.
+fn clean_next_landing_exists(next_chord: &Chord, penult: u8, m_iv: Option<u8>, m_next: u8) -> bool {
+    counter_candidate_pitches(next_chord, penult)
+        .into_iter()
+        // STEP only — the clean landing the residual lacks is a stepwise one (|motion| ≤ 2).
+        .filter(|&c| (c as i16 - penult as i16).abs() <= 2 && c != penult)
+        // CONSONANT vs the next melody — a structural landing must be a consonance.
+        .filter(|&c| is_consonant(c, m_next))
+        // PT-7: never collapse onto the melody's exact pitch.
+        .filter(|&c| c != m_next)
+        // PT-1: introduce NO parallel/hidden perfect against the melody across penult→landing.
+        // The penult's own melody `m_iv` is the prior CF for this two-point transition.
+        .any(|c| match m_iv {
+            Some(mp) => {
+                approach_perfect_is_legal(mp, m_next, penult, c)
+                    && !has_parallel_perfects(&[mp, penult], &[m_next, c])
+            }
+            // No penult melody → cannot evaluate the two-point motion; treat as clean.
+            None => true,
+        })
+}
+
+/// S33-CP-FIX (GAP-4) — PENULT LOOKAHEAD REWORK (design §1.2 Option 1, the preferred
+/// realize-seam helper). Given the as-built realized penult `as_built` on an interior step whose
+/// NEXT step's REALIZED counter landing (`as_built_next_landing`, computed by the caller through
+/// the ordinary machinery from `as_built`) is reached by a DISSONANT melodic leap, return a
+/// REWORKED penult `P` that escapes that dead-end. Returns `None` (a byte-identical no-op)
+/// unless ALL of these hold:
+///   * the as-built penult forces the next realized step into a DISSONANT melodic leap
+///     (`!melodic_leap_is_legal(as_built, as_built_next_landing)`) — the GAP-4 tritone shape;
+///   * the as-built penult itself admits NO clean stepwise consonant non-parallel landing on
+///     `next_chord` (Boundary B fails from `as_built`, confirming the dead-end is real); AND
+///   * some OTHER legal in-band chord tone `P` of the CURRENT chord both (Boundary A) is a
+///     legal, consonant, non-parallel vertical reached from `prev_counter`, AND (Boundary B)
+///     DOES admit a clean stepwise consonant non-parallel landing on `next_chord`.
+///
+/// theory (design §1.0–§1.1): on `{ii,vi} → IV → iii` the as-built IV penult is `65` (root of IV
+/// = F, a bare P5 vs the IV melody `72`); the next step is forced to the `iii` chord tone `59` by
+/// a `65 → 59` `−6` TRITONE — a dissonant melodic leap. From `65` there is NO clean STEPWISE
+/// consonant landing on iii (`64` is a hidden P5, `55`/`59` are leaps). The rework re-picks the
+/// penult to `57` (A, the THIRD of IV = an IMPERFECT M3 vs `72`), from which `57 → 55` is a `−2`
+/// STEP onto `55` (G, an iii chord tone, M3 vs the next melody `71`). The cost is one CONSONANT
+/// leap of approach into the penult (m6 from `ii`'s `65`, P5 from `vi`'s `64`); by the engine's
+/// Option-B order a consonant penult-leap that buys a clean stepwise consonant landing strictly
+/// beats a smooth penult that forces a dissonant tritone leap out. The dissonant-leap trigger is
+/// what keeps this from firing on `I→V→IV` (the `62→65` next move is a CONSONANT m3 leap, not a
+/// dissonant one → no-op) and on the GAP-2 `{IV,V}→vii` terminals (the bite lands by a STEP, not
+/// a dissonant leap → no-op). `melodic_leap_is_legal`, `approach_perfect_is_legal`, and
+/// `has_parallel_perfects` are NOT loosened — the fix is purely upstream candidate selection.
+///
+/// Determinism (PT-9): `min_by_key` over the deterministically-ordered
+/// `counter_candidate_pitches` list, ranked by `rank_inregister_landing` against the penult's
+/// own melody (consonant-step penult first, then consonant-leap penult, then non-root
+/// tie-break). No RNG. Band `[55,67)` preserved (all candidates come from
+/// `counter_candidate_pitches`).
+#[allow(clippy::too_many_arguments)]
+fn penult_for_clean_next(
+    chord: &Chord,
+    prev_counter: u8,
+    m_prev: Option<u8>,
+    m_now: Option<u8>,
+    next_chord: &Chord,
+    m_next: u8,
+    as_built: u8,
+    as_built_next_landing: u8,
+) -> Option<u8> {
+    // TRIGGER 1 — the as-built penult must FORCE the next realized step into a DISSONANT melodic
+    // leap (the GAP-4 tritone). If the next realized move is a step or a CONSONANT leap, the line
+    // is already clean and this branch is a strict no-op (so I→V→IV, GAP-2 terminals, and every
+    // clean transition are byte-identical).
+    if melodic_leap_is_legal(as_built, as_built_next_landing) {
+        return None;
+    }
+    // TRIGGER 2 — confirm the dead-end is real: the as-built penult admits NO clean stepwise
+    // consonant non-parallel landing on next_chord (so re-picking the penult is the only fix).
+    if clean_next_landing_exists(next_chord, as_built, m_now, m_next) {
+        return None;
+    }
+    // The penult's own CF (`m_now`) is needed for Boundary A's consonance/approach checks.
+    let cf_iv = m_now?;
+
+    counter_candidate_pitches(chord, prev_counter)
+        .into_iter()
+        // Don't re-pick the as-built penult (it is the dead-end we are escaping).
+        .filter(|&p| p != as_built)
+        // --- Boundary A: prev_counter → P must be a legal, consonant, non-parallel IV vertical.
+        // (1) P is itself CONSONANT vs the IV melody — the first-species structural floor.
+        .filter(|&p| is_consonant(p, cf_iv))
+        // (2) prev_counter → P is a LEGAL melodic move (step, or a non-tritone/non-7th leap).
+        .filter(|&p| melodic_leap_is_legal(prev_counter, p))
+        // (3) prev_counter → P introduces NO parallel/hidden perfect against the melody.
+        .filter(|&p| match m_prev {
+            Some(mp) => {
+                approach_perfect_is_legal(mp, cf_iv, prev_counter, p)
+                    && !has_parallel_perfects(&[mp, prev_counter], &[cf_iv, p])
+            }
+            None => true,
+        })
+        // --- Boundary B: from P, a clean stepwise consonant non-parallel iii landing EXISTS.
+        .filter(|&p| clean_next_landing_exists(next_chord, p, m_now, m_next))
+        // Option-B ranking against the IV melody: consonant-step penult first, then
+        // consonant-leap penult; imperfect-over-perfect, smallest motion, non-root tie-break.
+        .min_by_key(|&p| rank_inregister_landing(p, prev_counter, cf_iv, chord))
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -55,20 +55,24 @@
 //!   remains a documented future-slice refinement (the guaranteed level here is no-leap, not
 //!   strict-contrary).
 //!
-//!   GAP-4 (no dissonant melodic leap): `I→V→IV` realizes the counter line [64,62,65]; the
-//!   62→65 move is a CONSONANT m3 leap, not the old 59→65 tritone. PARTIAL / DEFERRED: 55 of 57
-//!   realized leaps are consonant; ii→IV→iii and vi→IV→iii still leap a 65→59 tritone (pinned
-//!   RESIDUAL — a DELIBERATE DEFERRAL: closing it at the iii-landing would force a parallel
-//!   perfect fifth and needs a separate penult-rework slice; see the test's doc-comment).
+//!   GAP-4 (no dissonant melodic leap — CLOSED CLEAN, S33 penult-rework): `I→V→IV` realizes the
+//!   counter line [64,62,65]; the 62→65 move is a CONSONANT m3 leap, not the old 59→65 tritone.
+//!   The residual is now EMPTY: ii→IV→iii and vi→IV→iii — which S32 deferred as a pinned 65→59
+//!   tritone — now realize [65,57,59] and [64,57,59]. The S33 penult-rework changed the IV-step
+//!   PENULT from 65 (F, the root) to 57 (A, the third of IV), and from 57 the iii step is reached
+//!   by a +2 STEP in CONTRARY motion onto 59 (a P8) — a clean contrary-into-perfect step, NOT a
+//!   tritone leap. The no-dissonant-melodic-leap property is now UNIVERSAL over the diatonic-triple
+//!   battery (residual empty).
 //!
 //! Consequently the strict forms of design PT-1 (no parallel perfects) now hold UNIVERSALLY
-//! over the diatonic-triple battery (GAP-1 fully closed), and GAP-3's no-leap cadence is now
-//! UNIVERSAL (residual empty). GAP-2 is a settled POSITIVE property (consonant sidestep for 4
-//! openers, a kept prepared "bite" for IV/V). GAP-4 remains a pinned, explained DEFERRAL. Each
-//! inverted test asserts the verified witnesses + the clean region STRICTLY, and (for GAP-4)
-//! PINS the exact residual set so the clean region stays clean AND the residual FAILS LOUDLY
-//! (with a stderr advisory) the moment the lane closes — or accidentally widens — it. The
-//! earlier held-period/consonant-triad-scoped PT-1/PT-4 assertions are RETAINED.
+//! over the diatonic-triple battery (GAP-1 fully closed), GAP-3's no-leap cadence is now
+//! UNIVERSAL (residual empty), and GAP-4's no-dissonant-melodic-leap is now UNIVERSAL (residual
+//! empty, closed by the S33 penult-rework). GAP-2 is a settled POSITIVE property (consonant
+//! sidestep for 4 openers, a kept prepared "bite" for IV/V). Each inverted test asserts the
+//! verified witnesses + the clean region STRICTLY; GAP-4 additionally pins the two positive close
+//! witnesses ([65,57,59], [64,57,59]) and PINS the residual set EMPTY so the universal property
+//! FAILS LOUDLY (with a stderr advisory) the moment any progression regresses a dissonant leap.
+//! The earlier held-period/consonant-triad-scoped PT-1/PT-4 assertions are RETAINED.
 
 use audiohax::chord_engine::{
     realize_step, Chord, NoteEvent, PerfFeatures, PhrasePosition, StepPlan,
@@ -1073,45 +1077,51 @@ fn test_cadence_resolves_perfect_no_leap() {
     );
 }
 
-/// PROPERTY (inverted GAP-4 — clean region strict; the residual is a DELIBERATE DEFERRAL) —
-/// the realized counter LINE contains no dissonant (tritone/7th) melodic leap EXCEPT a pinned,
-/// explained residual; any non-residual leap is to a consonant melodic interval and is recovered
-/// per the leap-recovery rule (no two consecutive ≥4th leaps in the same direction).
+/// PROPERTY (GAP-4 CLOSED, S33 — strict universal no-dissonant-melodic-leap) — the realized
+/// counter LINE contains NO dissonant (tritone/7th) melodic leap on ANY ordered diatonic triple
+/// over the 6 consonant triads. Every melodic leap (≥3 semitones) lands on a consonant melodic
+/// interval (never ic 6/10/11), and the leap-recovery invariant (no two consecutive ≥4th leaps in
+/// the same direction) holds universally.
 ///
-/// The lane fixed the root cause for almost all of the battery: `melodic_leap_is_legal` gates the
+/// The lane fixed the root cause across the WHOLE battery: `melodic_leap_is_legal` gates the
 /// REALIZED prior→now counter transition (not just the seed→candidate one), so the actual
-/// SOUNDING line generally cannot leap a dissonant melodic interval. 55 of 57 realized leaps are
-/// consonant.
+/// SOUNDING line cannot leap a dissonant melodic interval anywhere in the diatonic-triple battery.
+/// The residual is now EMPTY: `residual_diss_leaps == []`.
 ///
-/// THE DEFERRAL (S32 disposition — keep this pin; it is an intentional, explained boundary, NOT
-/// an unaddressed gap): `ii → IV → iii` and `vi → IV → iii` still realize the 65→59 TRITONE leap.
-/// This residual genuinely CANNOT close at the iii-landing without introducing a PARALLEL PERFECT
-/// FIFTH: from the realized penult 65, the only in-band stepwise landing (64) is a hidden P5
-/// against the melody (the `approach_perfect_is_legal` guard vetoes it), and the other in-band
-/// iii chord tones (59, 55) are reachable only by a dissonant LEAP. So every available landing is
-/// either a parallel fifth, a dissonant leap, or out of band. Closing it requires a separate
-/// PENULT-REWORK slice (changing the realized penult so a clean stepwise consonant landing
-/// becomes reachable), which is out of scope for the S32 band-reachability change. The pin is
-/// therefore LEFT IN PLACE deliberately, and FAILS LOUDLY if the residual either grows (a new
-/// progression regressed) or shrinks (the penult-rework slice landed and the pin should tighten).
+/// THE CLOSURE (S33 disposition — the PENULT-REWORK slice that S32 deferred): `ii → IV → iii` and
+/// `vi → IV → iii` historically realized a 65→59 TRITONE leap. S32 left this as a DELIBERATE
+/// deferral because, from the realized penult 65, the only in-band stepwise iii landing (64) was a
+/// hidden P5 (vetoed by `approach_perfect_is_legal`) and the other in-band iii tones were
+/// reachable only by a dissonant leap — so closing it at the landing alone was impossible without
+/// a parallel perfect fifth. The S33 penult-rework changed the IV-step PENULT from 65 (F, the root,
+/// a bare P5 vs the melody) to 57 (A, the THIRD of IV, an imperfect M3 vs the melody). From the
+/// reworked penult 57 the iii step now reaches 59 (B) by a `+2` STEP in CONTRARY motion (counter
+/// rises 57→59 while the melody falls 72→71) onto a P8 — a legal contrary-into-perfect step, NOT a
+/// tritone leap. The tritone is gone; the residual is empty; the no-dissonant-leap property is
+/// UNIVERSAL. The closure cost a CONSONANT leap INTO the penult (Boundary A: 65→57 m6 from ii,
+/// 64→57 P5 from vi) traded for the eliminated dissonant leap OUT (Boundary B) — register preserved
+/// in [55,67), no new dissonance.
 ///
 /// ADVERSARIAL WITNESS: `I → V → IV` — the exact progression that historically realized the
-/// counter line [64, 59, 65] with a 59→65 TRITONE leap. It now realizes [64, 62, 65]; the
-/// 62→65 move is a CONSONANT m3 leap (ic 3).
+/// counter line [64, 59, 65] with a 59→65 TRITONE leap. It still realizes [64, 62, 65]; the
+/// 62→65 move is a CONSONANT m3 leap (ic 3). The S33 penult branch must NOT over-fire here: its
+/// terminal chord is IV (not iii), so the branch's guard is false and the witness is UNCHANGED.
 ///
 /// BROADER BATTERY: every ordered diatonic triple over the 6 consonant triads is realized and
-/// EVERY melodic step in the counter line is checked: a non-residual leap (≥3 semitones) must
-/// land on a consonant MELODIC interval (never ic 6/10/11), and the leap-recovery invariant (no
-/// two consecutive ≥4th leaps in the same direction) holds universally.
+/// EVERY melodic step in the counter line is checked: a leap (≥3 semitones) must land on a
+/// consonant MELODIC interval (never ic 6/10/11), and the leap-recovery invariant (no two
+/// consecutive ≥4th leaps in the same direction) holds universally.
 #[test]
 fn test_no_dissonant_melodic_leap_in_counter_line() {
-    // 1) The adversarial witness: the once-tritone I->V->IV line now leaps by a consonant m3.
+    // 1) The adversarial witness: the once-tritone I->V->IV line still leaps by a consonant m3,
+    //    UNCHANGED by the S33 penult-rework (its terminal chord is IV, not iii — branch no-op).
     let line = realize_line_interior(&[c_i(), c_v(), c_iv()], &perf(0.04));
     let cs: Vec<u8> = line.iter().map(|&(c, _)| c).collect();
     assert_eq!(
         cs,
         vec![64, 62, 65],
-        "witness drifted: expected the fixed counter line [64,62,65]; got {cs:?}. Re-derive."
+        "witness drifted: expected the fixed counter line [64,62,65]; got {cs:?}. The S33 penult \
+         branch must NOT over-fire on I->V->IV (terminal IV, not iii). Re-derive."
     );
     assert_eq!(
         ic(cs[1], cs[2]),
@@ -1119,17 +1129,74 @@ fn test_no_dissonant_melodic_leap_in_counter_line() {
         "the fixed 62->65 leap must be a consonant m3 (ic 3), not the old tritone"
     );
 
+    // 1b) POSITIVE CLOSE WITNESSES (S33 penult-rework). The two progressions that S32 pinned as a
+    //     residual tritone now close CLEAN. Pin the exact realized lines (witness-drift guard) and
+    //     assert the penult->iii move is a STEP (|move| <= 2) onto a consonant, non-parallel-
+    //     perfect interval. Pitches are the LIVE replayed values (NOT the design doc's predicted
+    //     55 — the engine lands 59, a legal contrary-into-perfect step).
+    for (name, prog, expected_counter) in [
+        ("ii->IV->iii", [c_ii(), c_iv(), c_iii()], [65u8, 57, 59]),
+        ("vi->IV->iii", [c_vi(), c_iv(), c_iii()], [64u8, 57, 59]),
+    ] {
+        let line = realize_line_interior(&prog, &perf(0.04));
+        let cs: Vec<u8> = line.iter().map(|&(c, _)| c).collect();
+        let ms: Vec<Option<u8>> = line.iter().map(|&(_, m)| m).collect();
+        // Witness-drift guard: the exact realized counter line is pinned (fail-loud on any drift).
+        assert_eq!(
+            cs,
+            expected_counter.to_vec(),
+            "{name} GAP-4 close drifted: expected the S33 penult-rework counter line {:?}; got \
+             {cs:?}. The IV penult must be 57 (third of IV) and the iii landing 59 (a +2 contrary \
+             step). Re-derive from the live engine; do NOT re-pin a tritone.",
+            expected_counter
+        );
+        // The IV penult is 57 (A, third of IV) — the reworked penult, NOT the old root 65.
+        assert_eq!(
+            cs[1], 57,
+            "{name}: the IV penult must be the reworked 57 (third of IV), not the old root 65"
+        );
+        // The penult->iii close is a STEP (|move| <= 2), NOT a tritone (or any) leap.
+        let close_move = (cs[2] as i16 - cs[1] as i16).abs();
+        assert!(
+            close_move <= 2,
+            "{name}: the penult->iii close {}->{} must be a STEP (|move| <= 2), got |move| = \
+             {close_move}; the tritone leap must be gone",
+            cs[1],
+            cs[2]
+        );
+        // The close is to a CONSONANT melodic interval (never the dissonant ic 6/10/11 leap class).
+        assert!(
+            !matches!(ic(cs[1], cs[2]), 6 | 10 | 11),
+            "{name}: the penult->iii melodic interval {}->{} must be consonant (not ic 6/10/11)",
+            cs[1],
+            cs[2]
+        );
+        // The iii landing is CONSONANT against the iii-step melody (here 59 vs 71 = P8, ic 0).
+        let m_iii = ms[2].expect("{name}: iii-step melody must be present");
+        assert!(
+            !is_dissonant(cs[2], m_iii),
+            "{name}: the iii landing {} vs melody {m_iii} must be a consonant vertical (ic {})",
+            cs[2],
+            ic(cs[2], m_iii)
+        );
+        // The close introduces NO parallel/hidden perfect: penult 57 vs melody (imperfect) ->
+        // landing 59 vs melody (perfect P8) are different interval classes, so not parallel.
+        let m_iv = ms[1].expect("{name}: IV-step melody must be present");
+        assert!(
+            !forms_parallel_perfect(m_iv, m_iii, cs[1], cs[2]),
+            "{name}: the penult->iii close must not form a parallel/hidden perfect (penult {} vs \
+             melody {m_iv}, landing {} vs melody {m_iii})",
+            cs[1],
+            cs[2]
+        );
+    }
+
     // 2) STRICT (leap recovery, holds everywhere): no two consecutive ≥4th leaps in the same
-    //    direction over the WHOLE battery. RESIDUAL (dissonant melodic leap) — a DELIBERATE,
-    //    EXPLAINED DEFERRAL, not an unaddressed gap: the gate is closed for almost all of the 57
-    //    realized leaps, but 2 still land a dissonant TRITONE (ii->IV->iii and vi->IV->iii both
-    //    realize the 65->59 tritone). This residual CANNOT close at the iii-landing without a
-    //    PARALLEL PERFECT FIFTH: from the realized penult 65, the only in-band stepwise landing
-    //    64 is a hidden P5 (vetoed by approach_perfect_is_legal); the other in-band iii tones
-    //    (59, 55) are dissonant LEAPS. Closing it requires a separate penult-rework slice (out of
-    //    scope for S32 band-reachability), so the pin is LEFT IN PLACE on purpose. We pin the
-    //    exact residual transition set so the clean region stays clean AND the residual fails
-    //    loudly when it grows (a NEW regression) OR shrinks (the penult-rework slice landed).
+    //    direction over the WHOLE battery. RESIDUAL (dissonant melodic leap) — now CLOSED to
+    //    EMPTY by the S33 penult-rework: every one of the realized leaps over the diatonic-triple
+    //    battery lands a CONSONANT melodic interval. We pin the residual set EMPTY so the universal
+    //    no-dissonant-leap property holds AND fails loudly the moment any progression regresses a
+    //    dissonant leap back into the line.
     let pool = consonant_corpus();
     let mut leaps_seen = 0usize;
     let mut residual_diss_leaps: Vec<String> = Vec::new();
@@ -1178,21 +1245,20 @@ fn test_no_dissonant_melodic_leap_in_counter_line() {
          ({leaps_seen})"
     );
     residual_diss_leaps.sort();
-    let mut expected_diss: Vec<String> = ["ii->IV->iii", "vi->IV->iii"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    expected_diss.sort();
+    // GAP-4 CLOSED (S33): the residual is EMPTY — NO progression in the battery realizes a
+    // dissonant melodic leap in the counter line.
+    let expected_diss: Vec<String> = Vec::new();
     if residual_diss_leaps != expected_diss {
         eprintln!(
             "GAP-4 RESIDUAL SET CHANGED: dissonant-melodic-leap progressions now \
-             {residual_diss_leaps:?} (was {expected_diss:?}). Shrinking = lane progress (tighten \
-             toward the full no-dissonant-leap property); growing = a NEW progression regressed."
+             {residual_diss_leaps:?} (was [] — GAP-4 closed clean by the S33 penult-rework). A \
+             NON-empty set means a progression REGRESSED a dissonant melodic leap back into the \
+             counter line."
         );
     }
     assert_eq!(
         residual_diss_leaps, expected_diss,
-        "GAP-4 residual set drifted (see stderr). The clean leaps must stay consonant; the \
-         known-residual pair {{ii->IV->iii, vi->IV->iii}} must not grow."
+        "GAP-4 regressed (see stderr). The no-dissonant-melodic-leap property must hold \
+         UNIVERSALLY over the diatonic-triple battery; the residual set must stay EMPTY."
     );
 }
