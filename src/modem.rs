@@ -423,7 +423,7 @@ pub fn bits_per_symbol(m_tones: usize) -> usize {
 pub fn bytes_to_symbols(payload: &[u8], m_tones: usize) -> Vec<u8> {
     let bps = bits_per_symbol(m_tones);
     if bps == 0 {
-        return payload.iter().map(|b| (*b % (m_tones as u8))).collect();
+        return payload.iter().map(|b| *b % (m_tones as u8)).collect();
     }
     let mut out: Vec<u8> = Vec::new();
     let mut bitbuf: u64 = 0;
@@ -980,7 +980,6 @@ pub fn depacketize_stream_rs(buf: &[u8]) -> Result<Vec<u8>, ModemError> {
 
         let data_shards = state.data_shards;
         let parity_shards = state.parity_shards;
-        let total_shards = data_shards + parity_shards;
         let shard_size = state.shard_size;
 
         // count present shards

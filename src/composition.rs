@@ -1465,6 +1465,11 @@ fn region_excursion_offset(region: &RegionAffect, subject_hue: f32, home_mode: &
 /// delegates to [`region_excursion_offset`], which by the GENERALIZATION INVARIANT reproduces the
 /// K1 menu math byte-for-byte. Kept as the documented equivalence anchor and the fallback path
 /// when no per-region affect is available. PURE.
+// retained as the K1 byte-freeze equivalence anchor: the S26 GENERALIZATION INVARIANT test
+// (`mod tests`) asserts `region_excursion_offset` reproduces this whole-image K1 math
+// byte-for-byte. Production now calls `region_excursion_offset` directly, so this is reachable
+// only from #[cfg(test)] — keep it as the reference, do not delete.
+#[allow(dead_code)]
 fn excursion_offset(u: &ImageUnderstanding, home_mode: &str) -> i8 {
     let whole_image = RegionAffect {
         valence: u.affect_valence,

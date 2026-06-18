@@ -3438,6 +3438,8 @@ fn is_legal_suspension(
 /// (research Area 1 §1.5; contested-decision: one canonical 5-note form, variants out of
 /// scope). Recognition-only in Slice 1 (the emission path is a Slice-4 widening — the
 /// predicate is built now so PT-4 can classify a cambiata if one is ever produced).
+// retained for the deferred Slice-4 cambiata emission (recognition-only for now)
+#[allow(dead_code)]
 fn is_legal_cambiata(figure: &[u8], cf: &[u8]) -> bool {
     if figure.len() != 5 || cf.len() != 5 {
         return false;
