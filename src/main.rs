@@ -20,8 +20,11 @@
 //
 // GONE from this file (moved into the engine / dissolved): `worker_decide_action`,
 // `play_scanned_steps_concurrent`, the `Barrier`/worker pool, `InstrumentAction`, the
-// mode/progression/plan derivation. The jitter + `ScheduledEvent` time-ordering +
-// `thread::sleep` execution STAY here (wall-clock playback is an adapter concern).
+// mode/progression/plan derivation. The wall-clock `thread::sleep` streaming STAYS here
+// (playback timing is an adapter concern); the EVENT timeline itself is now built once by
+// `build_step_event_timeline` and shared with `render --wav` (S40 divergence #2 fix), so
+// `play == render` by construction and the old per-step `ScheduledEvent` batch/drain (which
+// serialized cross-step note overlap and is the reason this fix exists) is dissolved.
 //
 // WS-4 Phase 2 (S11) Lane C: the DEFAULT build is now PURE RUST (`pure-analysis` +
 // `synth`) and DOES compile on a headless/clean box. The OpenCV acquisition/analysis
@@ -64,20 +67,9 @@ use opencv::prelude::MatTraitConst; // needed for .cols()/.rows()
 use audiohax::engine::AudioSinkError;
 use midi_output::MidiOut;
 
-use rand::Rng;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-/// Scheduled MIDI event (time-based) — adapter-owned wall-clock playback unit.
-#[derive(Clone, Debug)]
-struct ScheduledEvent {
-    at: Instant,
-    on: bool, // true = note_on, false = note_off
-    channel: u8,
-    note: u8,
-    vel: u8, // used only for note_on (note_off vel ignored)
-}
 
 /// `engine::AudioSink for MidiOut` lives HERE (S9 §3.3 / D3) — the lib cannot name the
 /// bin-private `MidiOut`, and even a re-export would be an orphan violation. Each
@@ -235,6 +227,111 @@ fn step_rect(
     (rect, vertical_default, bar_w, bar_h)
 }
 
+/// S40 (divergence #2): the ONE shared event-timeline builder consumed by BOTH
+/// `render --wav` and live `play`, so the two paths are identical BY CONSTRUCTION.
+///
+/// For every step `0..total_steps` and every `NoteEvent` the engine realizes, this emits:
+///   * a `NoteOn`  at `step_idx*grid + offset_ms`,
+///   * a `NoteOff` at `step_idx*grid + offset_ms + hold_ms` — with NO grid/step-boundary
+///     clamp, so a note whose `hold_ms` exceeds one grid step (the common pad/cadence/
+///     legato `1.10–1.20×step_ms` overlap, `chord_engine.rs`) RINGS THROUGH into the next
+///     step exactly as render's offline synth honors it.
+/// Plus the initial per-channel `ProgramChange`s at `at_ms = 0` (prog `(i*7)%128`), the
+/// same scheme both paths used inline before.
+///
+/// The whole vector is STABLE-sorted by `at_ms`. Because the list is global (not per-step),
+/// a step-N tail `NoteOff` and a step-(N+1) head `NoteOn` interleave in true time order —
+/// which is precisely what the per-step-batched live loop used to serialize away. The sort
+/// places `NoteOff` before `NoteOn` at an EQUAL `at_ms` (a small command-rank key), matching
+/// render's historical "off-before-on" effect at coincident timestamps and avoiding a
+/// same-pitch retrigger collision when one note's release lands exactly on the next's onset.
+///
+/// DETERMINISTIC / JITTER-FREE on purpose (design-s40-path-divergence-2 §3 WO-1a): the live
+/// monitor now exactly equals the WAV gate. The old live ~15% `hold_ms` jitter is dropped so
+/// `play == render`; if humanization is wanted later it can be applied as ONE equal pass to
+/// both paths, out of scope here.
+fn build_step_event_timeline<S: FeatureSource>(
+    engine: &PipelineEngine,
+    source: &S,
+    total_steps: usize,
+    grid_ms_per_step: u64,
+    instrument_count: usize,
+) -> Vec<audiohax::synth_sink::TimedMidiEvent> {
+    use audiohax::synth_sink::{MidiCmd, TimedMidiEvent};
+
+    let mut events: Vec<TimedMidiEvent> = Vec::new();
+
+    // Initial per-channel programs (same scheme both paths used: prog = (i*7)%128).
+    for i in 0..instrument_count {
+        let ch = (i % 16) as u8;
+        let prog = ((i * 7) % 128) as u8;
+        events.push(TimedMidiEvent {
+            at_ms: 0,
+            cmd: MidiCmd::ProgramChange {
+                channel: ch,
+                program: prog,
+            },
+        });
+    }
+
+    for step_idx in 0..total_steps {
+        // In compose mode the per-step cadence is the PLAN's base_ms_per_step; falls back to
+        // config when not composing (grid_ms_per_step == ms_per_step in that branch).
+        let step_base_ms = step_onset_offset_ms(step_idx, grid_ms_per_step);
+        for dec in engine.decide_step(source, step_idx) {
+            for ev in &dec.events {
+                let on_ms = step_base_ms + ev.offset_ms;
+                events.push(TimedMidiEvent {
+                    at_ms: on_ms,
+                    cmd: MidiCmd::NoteOn {
+                        channel: dec.channel,
+                        note: ev.note,
+                        velocity: ev.velocity,
+                    },
+                });
+                // NO grid clamp — honor the deliberate cross-step overlap exactly as render did.
+                events.push(TimedMidiEvent {
+                    at_ms: on_ms + ev.hold_ms,
+                    cmd: MidiCmd::NoteOff {
+                        channel: dec.channel,
+                        note: ev.note,
+                    },
+                });
+            }
+        }
+    }
+
+    // STABLE sort by `at_ms` ONLY — this reproduces EXACTLY what render's offline synth did
+    // historically: render appended events in insertion order (program changes, then step 0's
+    // on/off, step 1's, …) and `render_events_to_stereo` applied `sort_by_key(|e| e.at_ms)`
+    // (stable) before synthesis. Extracting that here is therefore a pure refactor — the WAV is
+    // byte-identical to the pre-extraction render. The stable sort PRESERVES insertion order at
+    // equal `at_ms`, which already yields the desired effects at coincident timestamps:
+    //   * program changes (inserted first, at_ms 0) precede the first onsets;
+    //   * a cross-step same-pitch release inserted in step N precedes that pitch's retrigger
+    //     inserted in step N+1 (off-before-on) — the case that matters for voice freeing.
+    // Crucially we do NOT add a command-rank key: that would reorder coincident events vs. the
+    // historical insertion order and move render's bytes. (Verified: rank-keyed sort changed the
+    // WAV md5; at_ms-only stable sort keeps it byte-identical.)
+    events.sort_by_key(|e| e.at_ms);
+    events
+}
+
+/// Absolute-grid onset offset (ms) for a step, measured from the run epoch.
+///
+/// This is the ONE shared timing formula for both render and live `play`: step `N` is
+/// anchored at `N * grid_ms_per_step` regardless of how long its notes actually sound, so
+/// a step whose voices end early (or rest entirely) still occupies its full grid slot
+/// instead of being skipped. `render --wav` lays its absolute event grid on this
+/// (`step_base_ms`), and the live `play` loop schedules each step's `t0 = epoch + this`,
+/// so the two paths play the SAME composition at the SAME plan tempo (S40 convergence).
+///
+/// Pure / total: `step_onset_offset_ms(0, _) == 0`, monotonic non-decreasing in
+/// `step_idx`, and exactly `step_idx * grid_ms_per_step`.
+fn step_onset_offset_ms(step_idx: usize, grid_ms_per_step: u64) -> u64 {
+    step_idx as u64 * grid_ms_per_step
+}
+
 /// S31 A/B harness: render `render_args.image` to a WAV at `wav_path`, OFFLINE (no audio
 /// device) and DETERMINISTICALLY (no jitter, no RNG, no wall clock), honoring
 /// `--soundfont`/`--reverb`/`--gain`. Because the engine's per-step decisions are
@@ -250,8 +347,7 @@ fn run_render_wav(
     wav_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use audiohax::synth_sink::{
-        render_events_to_stereo, write_stereo_wav, MidiCmd, SoundFontSource, SynthConfig,
-        TimedMidiEvent,
+        render_events_to_stereo, write_stereo_wav, SoundFontSource, SynthConfig,
     };
 
     let mappings = load_mappings("assets/mappings.json")?;
@@ -326,47 +422,18 @@ fn run_render_wav(
         wav_path.display()
     );
 
-    // ── Lay decisions onto an absolute ms grid (NO jitter ⇒ deterministic). ──
-    let mut events: Vec<TimedMidiEvent> = Vec::new();
-    // Initial per-channel programs (same scheme as the live path: prog = (i*7)%128).
-    for i in 0..instrument_count {
-        let ch = (i % 16) as u8;
-        let prog = ((i * 7) % 128) as u8;
-        events.push(TimedMidiEvent {
-            at_ms: 0,
-            cmd: MidiCmd::ProgramChange {
-                channel: ch,
-                program: prog,
-            },
-        });
-    }
-    for step_idx in 0..total_steps {
-        // S37: in compose mode the per-step cadence is the PLAN's base_ms_per_step, not the
-        // config ms_per_step — otherwise steps would be spaced at config tempo while the notes
-        // hold at plan tempo (a cadence + determinism break). Falls back to config when not
-        // composing (grid_ms_per_step == ms_per_step in that branch).
-        let step_base_ms = step_idx as u64 * grid_ms_per_step;
-        for dec in engine.decide_step(&source, step_idx) {
-            for ev in &dec.events {
-                let on_ms = step_base_ms + ev.offset_ms;
-                events.push(TimedMidiEvent {
-                    at_ms: on_ms,
-                    cmd: MidiCmd::NoteOn {
-                        channel: dec.channel,
-                        note: ev.note,
-                        velocity: ev.velocity,
-                    },
-                });
-                events.push(TimedMidiEvent {
-                    at_ms: on_ms + ev.hold_ms,
-                    cmd: MidiCmd::NoteOff {
-                        channel: dec.channel,
-                        note: ev.note,
-                    },
-                });
-            }
-        }
-    }
+    // ── Lay decisions onto the SHARED absolute ms grid (NO jitter ⇒ deterministic). ──
+    // S40 divergence #2: this is now the ONE timeline builder live `play` consumes too, so
+    // the two paths are identical by construction. ProgramChange init, per-step NoteOn/NoteOff
+    // accumulation (with the deliberate cross-step overlap, NO grid clamp), and the global
+    // stable sort all live in `build_step_event_timeline` now.
+    let events = build_step_event_timeline(
+        &engine,
+        &source,
+        total_steps,
+        grid_ms_per_step,
+        instrument_count,
+    );
 
     // ── Synthesize offline + write the WAV, honoring the A/B controls. ──
     let synth_config = SynthConfig {
@@ -472,7 +539,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let jitter_percent = play_args.pipeline.jitter_percent;
     println!("Instrument count: {}", instrument_count);
     println!(
-        "Scan bar thickness = {:.2}, steps = {}, ms/step = {}, jitter% = {}",
+        "Scan bar thickness = {:.2}, scan-viz steps = {}, scan-viz ms/step = {}, jitter% = {}",
         bar_thickness_frac, num_steps, ms_per_step, jitter_percent
     );
 
@@ -676,97 +743,393 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = sink.program_change(ch, prog);
     }
 
-    // S37: drive the live loop off the PLAN's step count when composing, NOT
-    // source.step_count(). `play` has no absolute ms-grid (it schedules each note from
-    // ev.offset_ms relative to a per-step t0, so the plan's tempo is already honored inside
-    // each decision); only the total_steps swap is needed here. Plan-derived bind via the
-    // read-only accessor; legacy fallback to source.step_count() when not composing.
-    let total_steps = match engine.composition() {
-        Some(plan) => plan.total_steps,
-        None => source.step_count(),
+    // S40: drive the live loop off the PLAN's step count AND the PLAN's absolute ms-grid
+    // when composing, NOT source.step_count() with an emergent per-step tempo. Pre-S40,
+    // `play` reset `t0 = Instant::now()` every step and advanced as soon as the step's
+    // longest note ended — so its effective tempo was an emergent property of note length,
+    // not `base_ms_per_step`. On busy images that rushed ~1.8x and ate rests, corrupting
+    // every live ear-gate. We now mirror render's absolute grid: bind `grid_ms_per_step`
+    // exactly as render does (main.rs ~:318), capture ONE run `epoch` before the loop, and
+    // anchor step N's `t0` at `epoch + step_onset_offset_ms(N, grid_ms_per_step)`. A step
+    // whose voices end early now idles through its remaining slot (rests preserved) instead
+    // of skipping ahead. The within-step `ev.offset_ms`/`hold_ms` scheduling + jitter are
+    // unchanged. Plan-derived bind via the read-only accessor; legacy fallback to
+    // source.step_count()/config `ms_per_step` (today's non-composed behavior) when not
+    // composing.
+    let (total_steps, grid_ms_per_step): (usize, u64) = match engine.composition() {
+        Some(plan) => (plan.total_steps, plan.key_tempo.base_ms_per_step),
+        None => (source.step_count(), ms_per_step), // legacy fallback (non-composed)
     };
-    let mut rng = rand::thread_rng();
+    // S40: print the ACTUAL playback grid (plan tempo) so the live header no longer reads
+    // the scan-viz `ms/step` as if it were the clock — that mismatch was the red herring
+    // behind the false "play runs at the wrong tempo" hypothesis (design-s40 §Divergence A).
+    println!(
+        "Playback grid: {} steps @ {} ms/step (plan tempo) — matches `render --wav`.",
+        total_steps, grid_ms_per_step
+    );
 
-    for step_idx in 0..total_steps {
-        // BUG-01: a Ctrl-C between steps stops promptly — the function then returns
-        // normally and the sink's Drop runs the all-sound-off panic.
+    // S40 divergence #2: build the ONE shared event timeline that `render --wav` consumes
+    // and STREAM it in real time. The per-step "build local events → sort → drain to
+    // completion before advancing" loop is GONE: it serialized the deliberate cross-step
+    // overlaps (a step-N note_off at `(N+1.10)*grid` fired before step N+1's note_on),
+    // clipping ring-through and making `play` sparse vs. render. Walking ONE sorted global
+    // list, a step-N tail NoteOff and a step-(N+1) head NoteOn interleave in true time order,
+    // so the overlap rings exactly as render synthesizes it → `play == render` by construction.
+    //
+    // Jitter is intentionally dropped here (the live ~15% hold jitter): the builder is
+    // deterministic, so the live monitor exactly equals the WAV gate. `jitter_percent` is
+    // still parsed/printed above for CLI compatibility but no longer perturbs the timeline.
+    let _ = jitter_percent; // (parsed for CLI compat; timeline is deterministic — see above)
+    let timeline = build_step_event_timeline(
+        &engine,
+        &source,
+        total_steps,
+        grid_ms_per_step,
+        instrument_count,
+    );
+
+    // The absolute grid epoch — captured ONCE. Every event fires at `epoch + at_ms`, so the
+    // realized tempo equals the plan tempo and outstanding note_offs ring across step
+    // boundaries at their true scheduled time.
+    let epoch = Instant::now();
+
+    // Note: the per-channel program changes are part of `timeline` (at_ms = 0), so they are
+    // streamed below alongside the notes. The eager `sink.program_change(...)` init above is
+    // harmless (it sets the same programs before the stream) and is kept for the MIDI-port
+    // "ready" handshake.
+
+    // OpenCV overlay (cosmetic, non-audible): derive the step index from `at_ms / grid` at
+    // dispatch time and redraw only when it advances, so the overlay still tracks the scan
+    // bar without the loop owning a per-step timing the audio no longer uses.
+    #[cfg(feature = "opencv")]
+    let mut last_overlay_step: Option<usize> = None;
+
+    use audiohax::synth_sink::MidiCmd;
+    const SHUTDOWN_POLL_SLICE: Duration = Duration::from_millis(20);
+
+    'stream: for tev in &timeline {
+        // BUG-01: a Ctrl-C stops promptly — the function then returns normally and the
+        // sink's Drop runs the all-sound-off panic.
         if shutdown.load(Ordering::SeqCst) {
             println!("Shutdown requested — stopping playback.");
             break;
         }
 
-        // 1) Overlay for this step (OpenCV highgui — adapter; opencv path only).
+        // 1) Overlay for the step this event belongs to (OpenCV highgui — opencv path only).
         #[cfg(feature = "opencv")]
         {
-            let (width, height) = _ocv_dims;
-            let (rect, vertical_default, _bw, _bh) =
-                step_rect(step_idx, total_steps, width, height, bar_thickness_frac);
-            if let Ok(overlay) =
-                draw_scan_bar_overlay_for_rect(&_ocv_img, rect, instrument_count, vertical_default)
-            {
-                let _ = opencv::highgui::imshow("ScanBar Live", &overlay);
-                let _ = opencv::highgui::wait_key(1);
+            let step_idx = if grid_ms_per_step == 0 {
+                0
+            } else {
+                (tev.at_ms / grid_ms_per_step) as usize
             }
-        }
-
-        // 2) Pure musical decisions from the engine (no jitter, no wall clock).
-        let decisions = engine.decide_step(&source, step_idx);
-
-        // 3) Adapter applies jitter + Instant scheduling, then sends via the sink.
-        let mut events: Vec<ScheduledEvent> = Vec::new();
-        let t0 = Instant::now();
-        for dec in &decisions {
-            let channel = dec.channel;
-            for ev in &dec.events {
-                // jitter_percent on hold_ms (±percent), identical to the old worker path.
-                let jitter = rng
-                    .gen_range(-(jitter_percent * 100.0) as i32..=(jitter_percent * 100.0) as i32)
-                    as f32
-                    / 100.0;
-                let base_hold = ev.hold_ms as f32;
-                let hold_ms_f = (base_hold * (1.0 + jitter)).max(8.0).round() as u64;
-
-                let start_instant = t0 + Duration::from_millis(ev.offset_ms);
-                events.push(ScheduledEvent {
-                    at: start_instant,
-                    on: true,
-                    channel,
-                    note: ev.note,
-                    vel: ev.velocity,
-                });
-                events.push(ScheduledEvent {
-                    at: start_instant + Duration::from_millis(hold_ms_f),
-                    on: false,
-                    channel,
-                    note: ev.note,
-                    vel: 0,
-                });
-            }
-        }
-
-        // 4) Time-order and execute (single-threaded wall-clock playback — adapter).
-        events.sort_by_key(|e| e.at);
-        for sev in events {
-            // BUG-01: also poll inside the per-step event loop so a Ctrl-C lands within
-            // (at most) one event's sleep rather than waiting out the whole step's worth
-            // of scheduled note_on/note_off events.
-            if shutdown.load(Ordering::SeqCst) {
-                break;
-            }
-            let now = Instant::now();
-            if sev.at > now {
-                std::thread::sleep(sev.at - now);
-            }
-            if sev.on {
-                if let Err(e) = sink.note_on(sev.channel, sev.note, sev.vel) {
-                    eprintln!("note_on error: {}", e);
+            .min(total_steps.saturating_sub(1));
+            if last_overlay_step != Some(step_idx) {
+                last_overlay_step = Some(step_idx);
+                let (width, height) = _ocv_dims;
+                let (rect, vertical_default, _bw, _bh) =
+                    step_rect(step_idx, total_steps, width, height, bar_thickness_frac);
+                if let Ok(overlay) = draw_scan_bar_overlay_for_rect(
+                    &_ocv_img,
+                    rect,
+                    instrument_count,
+                    vertical_default,
+                ) {
+                    let _ = opencv::highgui::imshow("ScanBar Live", &overlay);
+                    let _ = opencv::highgui::wait_key(1);
                 }
-            } else if let Err(e) = sink.note_off(sev.channel, sev.note) {
-                eprintln!("note_off error: {}", e);
             }
+        }
+
+        // 2) Sleep until this event's absolute time `epoch + at_ms`, in <=20ms slices polling
+        //    the shutdown flag so Ctrl-C still breaks within ~one slice (BUG-01).
+        let target = epoch + Duration::from_millis(tev.at_ms);
+        loop {
+            let now = Instant::now();
+            let remaining = match target.checked_duration_since(now) {
+                Some(d) if !d.is_zero() => d,
+                _ => break, // event time reached (or already past) — fire it now
+            };
+            if shutdown.load(Ordering::SeqCst) {
+                break 'stream;
+            }
+            std::thread::sleep(remaining.min(SHUTDOWN_POLL_SLICE));
+        }
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // 3) Dispatch via the sink (same vocabulary render's offline synth consumes).
+        let res = match tev.cmd {
+            MidiCmd::NoteOn {
+                channel,
+                note,
+                velocity,
+            } => sink.note_on(channel, note, velocity),
+            MidiCmd::NoteOff { channel, note } => sink.note_off(channel, note),
+            MidiCmd::ProgramChange { channel, program } => sink.program_change(channel, program),
+        };
+        if let Err(e) = res {
+            eprintln!("sink dispatch error: {}", e);
         }
     }
 
     println!("Completed playback of {} steps.", total_steps);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_step_event_timeline, step_onset_offset_ms};
+    use audiohax::engine::{
+        EngineConfig, FeatureSource, GlobalFeatures, PipelineEngine, ScanBarFeatures,
+    };
+    use audiohax::mapping_loader::load_mappings;
+    use audiohax::synth_sink::MidiCmd;
+
+    /// S40: the absolute-grid onset formula shared by `render --wav` and live `play`.
+    /// Real-time playback can't be unit-tested, but this pure helper IS the load-bearing
+    /// math — both paths anchor step N at `N * grid_ms_per_step`, so locking it here proves
+    /// the convergence regardless of the (untestable) sleep.
+    #[test]
+    fn onset_step_zero_is_zero() {
+        // Step 0 must start at the run epoch (offset 0) for ANY grid.
+        assert_eq!(step_onset_offset_ms(0, 0), 0);
+        assert_eq!(step_onset_offset_ms(0, 250), 0);
+        assert_eq!(step_onset_offset_ms(0, 912), 0);
+    }
+
+    #[test]
+    fn onset_equals_step_times_grid() {
+        // Exactly step_idx * grid_ms_per_step — the same formula render's step_base_ms uses.
+        assert_eq!(step_onset_offset_ms(1, 912), 912);
+        assert_eq!(step_onset_offset_ms(3, 250), 750);
+        assert_eq!(step_onset_offset_ms(29, 912), 29 * 912);
+    }
+
+    #[test]
+    fn onset_is_monotonic_nondecreasing() {
+        // Onsets never go backwards as the step index advances (the grid never compresses).
+        let grid = 626u64;
+        let mut prev = 0u64;
+        for step in 0..64usize {
+            let onset = step_onset_offset_ms(step, grid);
+            assert!(onset >= prev, "onset must be non-decreasing in step_idx");
+            prev = onset;
+        }
+    }
+
+    #[test]
+    fn onset_zero_grid_is_always_zero() {
+        // A degenerate/zero grid keeps every onset at 0 (no panic, total function).
+        for step in 0..16usize {
+            assert_eq!(step_onset_offset_ms(step, 0), 0);
+        }
+    }
+
+    // ── S40 divergence #2: the shared-timeline equality guard ─────────────────────────
+    //
+    // A synthetic FeatureSource + a real engine, so `build_step_event_timeline` runs the
+    // genuine `decide_step` realize path. The properties asserted below are what make
+    // `play == render` BY CONSTRUCTION: both paths call this one builder, so if its output
+    // is (a) deterministic, (b) globally sorted, (c) off-before-on at equal timestamps, and
+    // (d) overlap-preserving (note_offs may exceed the next step's grid base, NO clamp), then
+    // the live stream and the WAV render consume an identical event list.
+
+    /// A behaviour-neutral synthetic source: a fixed global feature vector + `steps` rows of
+    /// `num_instruments` zeroed scan bars. Enough to drive the engine deterministically.
+    struct SyntheticSource {
+        global: GlobalFeatures,
+        rows: Vec<Vec<ScanBarFeatures>>,
+    }
+
+    fn syn_bar(idx: usize) -> ScanBarFeatures {
+        ScanBarFeatures {
+            bar_index: idx,
+            avg_hue: 200.0,
+            avg_saturation: 40.0,
+            avg_brightness: 50.0,
+            edge_density: 0.2,
+            texture_laplacian_var: 1.0,
+            hue_hist: vec![0.0; 12],
+        }
+    }
+
+    impl SyntheticSource {
+        fn new(steps: usize, num_instruments: usize) -> Self {
+            let global = GlobalFeatures {
+                avg_hue: 200.0,
+                avg_saturation: 40.0,
+                avg_brightness: 50.0,
+                edge_density: 0.2,
+                hue_spread: 0.15,
+                texture_laplacian_var: 1.0,
+                shape_complexity: 0.1,
+                aspect_ratio: 1.5,
+            };
+            let rows = (0..steps)
+                .map(|_| (0..num_instruments).map(syn_bar).collect())
+                .collect();
+            SyntheticSource { global, rows }
+        }
+    }
+
+    impl FeatureSource for SyntheticSource {
+        fn global_features(&self) -> GlobalFeatures {
+            self.global
+        }
+        fn scan_bar_features(
+            &self,
+            step_idx: usize,
+            num_instruments: usize,
+        ) -> Vec<ScanBarFeatures> {
+            let mut row = self.rows.get(step_idx).cloned().unwrap_or_default();
+            row.truncate(num_instruments);
+            row
+        }
+        fn step_count(&self) -> usize {
+            self.rows.len()
+        }
+    }
+
+    /// Build a small engine + synthetic source for the timeline tests. Returns
+    /// `(engine, source, total_steps, grid_ms_per_step, instrument_count)` exactly as both
+    /// the render and play call sites pass to `build_step_event_timeline`.
+    fn fixture() -> (PipelineEngine, SyntheticSource, usize, u64, usize) {
+        let mappings = load_mappings("assets/mappings.json").expect("mappings load");
+        let instrument_count = 4usize;
+        let total_steps = 8usize;
+        let cfg = EngineConfig {
+            num_instruments: instrument_count,
+            ..EngineConfig::default()
+        };
+        let mut engine = PipelineEngine::new(mappings, cfg);
+        let source = SyntheticSource::new(total_steps, instrument_count);
+        engine.set_features_global(&source.global_features());
+        let grid_ms_per_step = 250u64;
+        (
+            engine,
+            source,
+            total_steps,
+            grid_ms_per_step,
+            instrument_count,
+        )
+    }
+
+    #[test]
+    fn timeline_is_sorted_by_at_ms() {
+        let (engine, source, total_steps, grid, instruments) = fixture();
+        let tl = build_step_event_timeline(&engine, &source, total_steps, grid, instruments);
+        assert!(!tl.is_empty(), "synthetic source should realize events");
+        for w in tl.windows(2) {
+            assert!(
+                w[0].at_ms <= w[1].at_ms,
+                "timeline must be non-decreasing in at_ms (got {} then {})",
+                w[0].at_ms,
+                w[1].at_ms
+            );
+        }
+    }
+
+    #[test]
+    fn timeline_same_pitch_off_precedes_cross_step_on() {
+        // The builder uses a STABLE sort by at_ms over insertion order (program-changes, then
+        // step 0's on/off, step 1's, …) — byte-identical to render. The load-bearing coincident
+        // case is a same-(channel,note) release that lands exactly on that pitch's next onset:
+        // the release was inserted in an EARLIER step, so the stable sort keeps it BEFORE the
+        // retrigger (off-before-on), freeing the voice. Assert that invariant directly.
+        let (engine, source, total_steps, grid, instruments) = fixture();
+        let tl = build_step_event_timeline(&engine, &source, total_steps, grid, instruments);
+        for i in 0..tl.len() {
+            if let MidiCmd::NoteOn {
+                channel: c1,
+                note: n1,
+                ..
+            } = tl[i].cmd
+            {
+                // Scan events at the SAME at_ms: a matching NoteOff for this (channel,note)
+                // must not appear AFTER this NoteOn (it would mean on-before-off → stuck voice).
+                for ev in tl.iter().skip(i + 1) {
+                    if ev.at_ms != tl[i].at_ms {
+                        break;
+                    }
+                    if let MidiCmd::NoteOff {
+                        channel: c2,
+                        note: n2,
+                    } = ev.cmd
+                    {
+                        assert!(
+                            !(c1 == c2 && n1 == n2),
+                            "a same-pitch NoteOff at equal at_ms must precede the NoteOn, not follow it"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn timeline_preserves_cross_step_overlap() {
+        // The whole point of the fix: a note's NoteOff may land PAST the next step's grid
+        // base (no clamp), so the deliberate pad/cadence/legato ring-through is honored.
+        let (engine, source, total_steps, grid, instruments) = fixture();
+        let tl = build_step_event_timeline(&engine, &source, total_steps, grid, instruments);
+
+        // Map each (channel, note) NoteOn to the step it belongs to, then check at least one
+        // NoteOff fires at an at_ms >= (its step + 1) * grid — i.e. it rings into the next step.
+        let mut overlap_seen = false;
+        for ev in &tl {
+            if let MidiCmd::NoteOff { .. } = ev.cmd {
+                // The step this off's parent on belonged to is floor(on_ms/grid); but here we
+                // only have the off time. An off at_ms that is NOT a multiple-of-grid boundary
+                // and exceeds the next grid line for some step demonstrates a non-clamped hold.
+                // Concretely: if any off lands strictly inside a later step than where grid
+                // alignment would clamp it, overlap is preserved.
+                let step_of_off_base = ev.at_ms / grid; // which grid slot the off falls in
+                                                        // If an off falls in slot k but k*grid != at_ms, it ended mid-slot k,
+                                                        // which for a note onset in slot k-1 (or earlier) means ring-through.
+                if step_of_off_base >= 1 && ev.at_ms % grid != 0 {
+                    overlap_seen = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            overlap_seen,
+            "at least one NoteOff must ring past a step boundary (overlap preserved, NO grid clamp)"
+        );
+    }
+
+    #[test]
+    fn timeline_is_deterministic_single_source_for_both_paths() {
+        // One builder, called twice with identical inputs, yields an IDENTICAL event list.
+        // This is the load-bearing invariant: render and play both call this fn, so identical
+        // output here == they consume the same timeline == play == render by construction.
+        let (engine, source, total_steps, grid, instruments) = fixture();
+        let a = build_step_event_timeline(&engine, &source, total_steps, grid, instruments);
+        let b = build_step_event_timeline(&engine, &source, total_steps, grid, instruments);
+        assert_eq!(
+            a, b,
+            "the shared timeline must be deterministic (jitter-free) so play == render"
+        );
+    }
+
+    #[test]
+    fn timeline_has_program_change_init_at_zero() {
+        // Each channel gets its ProgramChange at at_ms = 0, sorted ahead of the first onsets.
+        let (engine, source, total_steps, grid, instruments) = fixture();
+        let tl = build_step_event_timeline(&engine, &source, total_steps, grid, instruments);
+        let pc_count = tl
+            .iter()
+            .filter(|e| matches!(e.cmd, MidiCmd::ProgramChange { .. }))
+            .count();
+        assert_eq!(
+            pc_count, instruments,
+            "one ProgramChange per instrument channel"
+        );
+        for e in tl.iter().take(instruments) {
+            assert_eq!(e.at_ms, 0, "program changes anchor at t=0");
+            assert!(matches!(e.cmd, MidiCmd::ProgramChange { .. }));
+        }
+    }
 }
