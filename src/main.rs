@@ -392,6 +392,12 @@ fn run_render_wav(
         (src, understanding)
     };
 
+    // ── S41: set the composition-seed register BEFORE composing (freeze-safe entry). ──
+    // `--seed N` ⇒ Some(N) makes pick_progression deterministic (reproducible WAV); absent
+    // ⇒ None = today's exact `thread_rng()` path. Set once, before the composer/planner runs.
+    // engine.rs is never touched — the register is read inside chord_engine::pick_progression.
+    audiohax::seed::set_composition_seed(render_args.seed);
+
     let mut engine = PipelineEngine::new(mappings, engine_config);
 
     // ── S37: install the COMPOSER plan (pure-Rust / default path). The plan-first composer
@@ -627,6 +633,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Global features: {:?}", src.global_features());
         (src, understanding)
     };
+
+    // ── S41: set the composition-seed register BEFORE composing (freeze-safe entry). ──
+    // `--seed N` ⇒ Some(N) makes pick_progression deterministic (same image+seed ⇒ same
+    // composition); absent ⇒ None = today's exact `thread_rng()` path. Set once, before the
+    // composer/planner runs. engine.rs is never touched — the register is read inside
+    // chord_engine::pick_progression.
+    audiohax::seed::set_composition_seed(play_args.seed);
 
     // ── Build the engine + install the COMPOSER plan (S37) ──
     // The plan-first composer is the audible path; the S13 flat path is the fallback when

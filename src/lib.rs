@@ -7,6 +7,12 @@ pub mod modem;
 pub mod chord_engine;
 pub mod mapping_loader;
 
+// S41 — freeze-safe thread-local composition-seed register for the deterministic
+// `--seed <u64>` feature. Threads a seed to the ONE RNG draw on the composition path
+// (`chord_engine::pick_progression`) WITHOUT touching frozen `engine.rs` or any caller
+// signature. Pure-Rust; builds & unit-tests under `--no-default-features`.
+pub mod seed;
+
 // S15 Slice 1 — the pure-Rust COMPOSER layer (form catalogue, plan, planner, StepContext).
 // `--no-default-features`-clean: NO image type, NO OpenCV. Builds & unit-tests headlessly.
 pub mod composition;

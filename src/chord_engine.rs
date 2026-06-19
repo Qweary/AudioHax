@@ -1,6 +1,9 @@
 use crate::mapping_loader::{lookup_range_map, MappingTable};
+use crate::seed::{composition_seed, mix_seed, next_seed_call};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 
 // The six canonical diatonic modes, as semitone offsets from the tonic.
 // Each is the same seven pitch classes rotated; the rotation is what gives each
@@ -129,8 +132,26 @@ impl ChordEngine {
         };
 
         if let Some(choices) = self.mappings.global.progression_families.get(family_key) {
-            let mut rng = thread_rng();
-            if let Some(p) = choices.choose(&mut rng) {
+            // S41 — deterministic-seed seam. The seed register (thread-local) is the ONLY
+            // change to how this draw obtains randomness; no caller signature changes and
+            // frozen `engine.rs` is untouched (it merely CALLS this method).
+            //   - register Some(seed) → derive a per-call deterministic `ChaCha8Rng` keyed
+            //     by `seed` mixed with a per-call counter, so a multi-section composition is
+            //     reproducible AND its sections still diverge (each call advances the counter).
+            //   - register None (the default, absent `--seed`) → today's exact `thread_rng()`
+            //     path, byte-unchanged.
+            let picked = match composition_seed() {
+                Some(seed) => {
+                    let call = next_seed_call();
+                    let mut rng = ChaCha8Rng::seed_from_u64(mix_seed(seed, call));
+                    choices.choose(&mut rng).cloned()
+                }
+                None => {
+                    let mut rng = thread_rng();
+                    choices.choose(&mut rng).cloned()
+                }
+            };
+            if let Some(p) = picked {
                 // split chord progression string into parts "I-vi-IV-V"
                 return p.split('-').map(|s| s.to_string()).collect();
             }

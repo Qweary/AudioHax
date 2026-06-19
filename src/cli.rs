@@ -188,6 +188,11 @@ pub struct PlayArgs {
     /// errors at construction with guidance to use loopMIDI. Forces `--output midi`.
     #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "AudioHaxOut")]
     pub midi_virtual: Option<String>,
+    /// S41: deterministic composition seed. With `--seed <u64>` the same image+seed yields
+    /// the EXACT same composition every run (reproducible A/B). ABSENT (the default) ⇒
+    /// today's `thread_rng()` behavior, so the composition may vary run-to-run. Opt-in only.
+    #[arg(long, value_name = "U64")]
+    pub seed: Option<u64>,
     #[command(flatten)]
     pub pipeline: PipelineArgs,
     #[command(flatten)]
@@ -208,6 +213,12 @@ pub struct RenderArgs {
     /// the same image+config always yields a byte-identical WAV — for blind A/B.
     #[arg(long, value_name = "PATH")]
     pub wav: Option<PathBuf>,
+    /// S41: deterministic composition seed. With `--seed <u64>` the same image+seed yields
+    /// the EXACT same composition (and, paired with the deterministic WAV render, a
+    /// byte-identical `--wav` output) every run. ABSENT (the default) ⇒ today's
+    /// `thread_rng()` behavior. Opt-in only.
+    #[arg(long, value_name = "U64")]
+    pub seed: Option<u64>,
     #[command(flatten)]
     pub pipeline: PipelineArgs,
     #[command(flatten)]
