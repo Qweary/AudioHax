@@ -176,6 +176,24 @@ pub struct CharacterTempo {
     pub bpm_max: f32,
 }
 
+/// Valence cut-points that decide the major/minor FAMILY of the home mode, loaded from
+/// `composition.affect.mode_valence_cuts`. C6.6: valence owns the major/minor third; hue is
+/// demoted to a within-family colorist garnish (which church mode). `valence >= major_min` →
+/// major family; `valence <= minor_max` → minor family; the band in between is a NEUTRAL dead
+/// band that leaves the hue-selected mode untouched (today's exact behaviour). The two seed
+/// thresholds are operator-tunable in mappings.json.
+///
+/// Back-compat: an OLD mappings.json with NO `mode_valence_cuts` block → `None` (the field is
+/// `#[serde(default)]` → `Option::None`), and `valence_family_mode` is then a NO-OP returning the
+/// hue mode unchanged, so the legacy hue-only derivation reproduces byte-for-byte.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+pub struct ModeValenceCuts {
+    /// `valence >= major_min` forces the MAJOR family (Ionian/Lydian/Mixolydian). Seed `0.55`.
+    pub major_min: f32,
+    /// `valence <= minor_max` forces the MINOR family (Dorian/Aeolian/Phrygian). Seed `0.45`.
+    pub minor_max: f32,
+}
+
 /// The `affect` mapping block: composite weights + per-character tempo windows. All fields
 /// `#[serde(default)]` so a partial/absent block still parses. NEW S22.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -191,6 +209,10 @@ pub struct AffectMappings {
     /// Per-character tempo windows, keyed by lowercase character name ("ballad","scherzo",…).
     #[serde(default)]
     pub character_tempo: std::collections::HashMap<String, CharacterTempo>,
+    /// C6.6 valence→family cut-points. ABSENT in legacy mappings.json → `None` → the
+    /// `valence_family_mode` projection is a NO-OP (hue-only derivation, byte-for-byte legacy).
+    #[serde(default)]
+    pub mode_valence_cuts: Option<ModeValenceCuts>,
 }
 
 impl Default for AffectMappings {
@@ -211,6 +233,88 @@ impl Default for AffectMappings {
             arousal_weights: std::collections::HashMap::new(),
             valence_weights: std::collections::HashMap::new(),
             character_tempo,
+            // C6.6: no cuts in the floor → `valence_family_mode` is a NO-OP, so the default
+            // (no-affect-block) plan keeps the pure hue→mode derivation byte-for-byte.
+            mode_valence_cuts: None,
+        }
+    }
+}
+
+/// Pure. C6.6 — project the hue-selected `home_mode` into the family that VALENCE demands,
+/// preserving hue's colorist contribution via a brightness-slot remap. Valence owns the
+/// major/minor third (the FAMILY); hue is demoted to choosing WHICH church mode within that
+/// family (the garnish).
+///
+/// - Major family = {Ionian, Lydian, Mixolydian} (major 3rd). Minor family = {Dorian, Aeolian,
+///   Phrygian} (minor 3rd). Isomorphic to the warm/cool split `pick_progression` already uses.
+/// - `cuts == None` (legacy mappings, no block) → NO-OP, return `hue_mode` unchanged.
+/// - `valence >= major_min` → force MAJOR; `valence <= minor_max` → force MINOR;
+///   `minor_max < valence < major_min` → NEUTRAL dead band → return `hue_mode` unchanged
+///   (today's exact behaviour).
+/// - Within-family projection (brightness-rank slots — preserves the S2 six-mode diversity rather
+///   than collapsing to plain Ionian/Aeolian): when valence forces a family but the hue mode is in
+///   the OTHER family, remap to the SAME-brightness-slot mode in the forced family:
+///     Lydian(brightest major) ↔ Dorian(brightest minor)
+///     Ionian(mid major)       ↔ Aeolian(mid minor)
+///     Mixolydian(darkest major, b7) ↔ Phrygian(darkest minor)
+///   If the hue mode is already in the forced family, keep it. An UNRECOGNISED mode string (not
+///   one of the six) is left untouched — the projection only ever moves a known mode.
+///
+/// Determinism: pure threshold/table lookup on the already-computed `valence` and the hue-derived
+/// `hue_mode` string. No RNG. Same image → same mode every run.
+pub fn valence_family_mode(hue_mode: &str, valence: f32, cuts: &Option<ModeValenceCuts>) -> String {
+    // Legacy / absent-block path: no cuts → identity (byte-for-byte legacy behaviour).
+    let cuts = match cuts {
+        Some(c) => c,
+        None => return hue_mode.to_string(),
+    };
+
+    // Which family does VALENCE demand? `None` == NEUTRAL dead band → keep the hue mode.
+    enum Family {
+        Major,
+        Minor,
+    }
+    let forced = if valence >= cuts.major_min {
+        Some(Family::Major)
+    } else if valence <= cuts.minor_max {
+        Some(Family::Minor)
+    } else {
+        None // dead band — hue keeps full control (today's exact behaviour)
+    };
+    let forced = match forced {
+        Some(f) => f,
+        None => return hue_mode.to_string(),
+    };
+
+    // Brightness-slot triples, darkest→brightest, paired by index across the two families.
+    // [darkest, mid, brightest]. Mixolydian(b7) is the darkest *major*; Phrygian(b2) the darkest
+    // *minor* — they share the darkest slot. Lydian(#4)/Dorian(#6 vs natural minor) the brightest.
+    const MAJOR_BY_SLOT: [&str; 3] = ["Mixolydian", "Ionian", "Lydian"];
+    const MINOR_BY_SLOT: [&str; 3] = ["Phrygian", "Aeolian", "Dorian"];
+
+    let major_slot = |m: &str| MAJOR_BY_SLOT.iter().position(|&x| x == m);
+    let minor_slot = |m: &str| MINOR_BY_SLOT.iter().position(|&x| x == m);
+
+    match forced {
+        Family::Major => {
+            // Already major → keep hue's colorist choice. From minor → same-brightness major.
+            // Unknown mode → leave untouched.
+            if major_slot(hue_mode).is_some() {
+                hue_mode.to_string()
+            } else if let Some(slot) = minor_slot(hue_mode) {
+                MAJOR_BY_SLOT[slot].to_string()
+            } else {
+                hue_mode.to_string()
+            }
+        }
+        Family::Minor => {
+            if minor_slot(hue_mode).is_some() {
+                hue_mode.to_string()
+            } else if let Some(slot) = major_slot(hue_mode) {
+                MINOR_BY_SLOT[slot].to_string()
+            } else {
+                hue_mode.to_string()
+            }
         }
     }
 }
@@ -1182,9 +1286,19 @@ impl CompositionPlanner {
         // 4) KeyTempoPlan — home root + mode from the SAME paths set_features_global uses, so
         //    section harmony matches the legacy derivation. base_ms_per_step from
         //    brightness→BPM, clamped to a Ballad window.
-        let home_mode =
+        // C6.6: hue selects a church mode (the colorist garnish); valence then PROJECTS it into
+        // the major/minor family it demands (it owns the third). `affect.valence` was seated on
+        // `u` above (line ~1159). With no `mode_valence_cuts` block this projection is a NO-OP and
+        // `home_mode` is the legacy pure-hue derivation, byte-for-byte. `home_mode` then flows
+        // UNCHANGED as a String into pick_progression/generate_chords/tonic_triad/Section.mode.
+        let hue_mode =
             crate::mapping_loader::lookup_range_map(&mappings.global.hue_to_mode, u.dominant_hue)
                 .unwrap_or_else(|| "Ionian".to_string());
+        let home_mode = valence_family_mode(
+            &hue_mode,
+            u.affect_valence,
+            &self.plan_mappings.affect.mode_valence_cuts,
+        );
         let home_root_midi = 60; // C4 seed (EngineConfig.root_midi default); A/Return stay home.
                                  // S24: resolve the per-section key offsets ONCE per plan, now that the form_spec and
                                  // home_mode are chosen (mirrors the S23 prominence resolve). `home_only`/absent scheme →
@@ -1380,20 +1494,80 @@ impl CompositionPlanner {
     }
 }
 
-/// Choose a melodic archetype from the image. Slice-1 ACTIVE subset is the original four
-/// (Arch, Descent, Ascent, NeighborTurn); hue picks the broad shape and edge_activity tips
-/// busy images toward more motion. Build-time only.
+/// Choose a melodic archetype from the image. The selector reaches ALL EIGHT
+/// `MotifArchetype` variants (S39 DP-6 widening — the former four-variant
+/// `edge_activity>=0.6→Ascent` short-circuit is gone). The axis is the affect
+/// circumplex (DP-3 COMPOSE): `arousal × valence` chooses the contour FAMILY,
+/// `vertical_emphasis` chooses up-vs-down WITHIN the family, and `dominant_hue`
+/// is the final colorist tiebreak. Build-time only; pure (no RNG, no clock).
+///
+/// affect-circumplex → contour FAMILY (the load-bearing axis):
+///   * high arousal + high valence (bright, joyful) → RISING (Ascent / RisingSequence).
+///   * low arousal + high valence (calm, pleasant) → ARCHED (Arch / InvertedArch).
+///   * low arousal + low valence (calm, dark) → FALLING (Descent / LeapStep).
+///   * high arousal + low valence (tense, agitated) → OSCILLATING (Pendulum / NeighborTurn).
+/// theory: arousal=energy and valence=mood are the two empirically-validated
+/// affect axes (Russell's circumplex); a rising line reads as lifting/positive
+/// and a falling line as settling/resolving, so this is a musically-meaningful
+/// mapping, not an arbitrary one. The selector only CHOOSES among the eight
+/// existing voice-leading-legal contours — it authors no new contour.
+///
+/// `affect_arousal`/`affect_valence` are the planner-filled composites (NOT the
+/// `-1.0` sentinel here — `plan()` seats them on `u` before this call), each
+/// 0..1 with 0.5 the neutral midpoint. `vertical_emphasis` is 0..1 (0.5 default,
+/// upper-mass > 0.5). `dominant_hue` is 0..360.
 fn pick_archetype(u: &ImageUnderstanding) -> MotifArchetype {
-    // Hue quadrant → broad melodic intent; a busy image (edge_activity high) leans active.
-    let hue = u.dominant_hue.rem_euclid(360.0);
-    if u.edge_activity >= 0.6 {
-        return MotifArchetype::Ascent;
-    }
-    match hue {
-        h if h < 90.0 => MotifArchetype::Arch,
-        h if h < 180.0 => MotifArchetype::NeighborTurn,
-        h if h < 270.0 => MotifArchetype::Descent,
-        _ => MotifArchetype::Arch,
+    // arousal/valence are the planner composites (0..1, 0.5 neutral). Split each at its
+    // midpoint into the four affect quadrants; `vertical_emphasis` then tips the choice
+    // toward the more-upward (>=0.5) or more-settling (<0.5) member of the family, and
+    // `dominant_hue` (warm half 0..180 vs cool half 180..360) breaks the remaining tie.
+    let arousal = u.affect_arousal;
+    let valence = u.affect_valence;
+    let high_arousal = arousal >= 0.5;
+    let high_valence = valence >= 0.5;
+    // vertical_emphasis high (upper-mass) → the rising/active member; low → the settling one.
+    let upper = u.vertical_emphasis >= 0.5;
+    // hue tiebreak: warm colors (red→yellow, 0..180) lean to the more energetic member.
+    let warm = u.dominant_hue.rem_euclid(360.0) < 180.0;
+
+    match (high_arousal, high_valence) {
+        // RISING family — bright + energetic reads as lifting/joyful.
+        (true, true) => {
+            // RisingSequence is the more developmental (busier) rise; Ascent the plain climb.
+            if upper || warm {
+                MotifArchetype::RisingSequence
+            } else {
+                MotifArchetype::Ascent
+            }
+        }
+        // ARCHED family — calm + pleasant reads as a balanced, singable shape.
+        (false, true) => {
+            // Arch (up-then-down) for upper-mass/warm; InvertedArch (the valley) otherwise.
+            if upper || warm {
+                MotifArchetype::Arch
+            } else {
+                MotifArchetype::InvertedArch
+            }
+        }
+        // FALLING family — calm + dark reads as settling/resolving downward.
+        (false, false) => {
+            // LeapStep opens with a leap (more upper motion) then falls; Descent is the plain fall.
+            if upper || warm {
+                MotifArchetype::LeapStep
+            } else {
+                MotifArchetype::Descent
+            }
+        }
+        // OSCILLATING family — energetic + dark reads as insistent/agitated turning.
+        (true, false) => {
+            // Pendulum is the wide, insistent tonic↔dominant oscillation (upper/warm);
+            // NeighborTurn the close, ornamental turn around the tonic.
+            if upper || warm {
+                MotifArchetype::Pendulum
+            } else {
+                MotifArchetype::NeighborTurn
+            }
+        }
     }
 }
 

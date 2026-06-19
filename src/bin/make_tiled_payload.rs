@@ -14,7 +14,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use image::{DynamicImage, GenericImageView, imageops::FilterType, ImageOutputFormat, RgbImage};
+use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageOutputFormat, RgbImage};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -26,11 +26,11 @@ struct TileEntry {
     h: u32,
     offset: u64,
     len: u64,
-    avg_color: [u8;3],
+    avg_color: [u8; 3],
     encoding: String, // e.g. "jpeg"
 }
 
-fn average_color_rgb(buf: &RgbImage) -> [u8;3] {
+fn average_color_rgb(buf: &RgbImage) -> [u8; 3] {
     let mut r_sum: u64 = 0;
     let mut g_sum: u64 = 0;
     let mut b_sum: u64 = 0;
@@ -41,8 +41,14 @@ fn average_color_rgb(buf: &RgbImage) -> [u8;3] {
         b_sum += px[2] as u64;
         count += 1;
     }
-    if count == 0 { return [0,0,0]; }
-    [(r_sum / count) as u8, (g_sum / count) as u8, (b_sum / count) as u8]
+    if count == 0 {
+        return [0, 0, 0];
+    }
+    [
+        (r_sum / count) as u8,
+        (g_sum / count) as u8,
+        (b_sum / count) as u8,
+    ]
 }
 
 fn encode_jpeg_bytes_from_rgb(buf: &RgbImage, quality: u8) -> Vec<u8> {
@@ -50,14 +56,16 @@ fn encode_jpeg_bytes_from_rgb(buf: &RgbImage, quality: u8) -> Vec<u8> {
     // Use image crate's JPEG encoder by converting to DynamicImage for convenience
     let dyn_img = DynamicImage::ImageRgb8(buf.clone());
     let mut cursor = std::io::Cursor::new(&mut v);
-    dyn_img.write_to(&mut cursor, ImageOutputFormat::Jpeg(quality)).expect("JPEG encoding failed");
+    dyn_img
+        .write_to(&mut cursor, ImageOutputFormat::Jpeg(quality))
+        .expect("JPEG encoding failed");
     v
 }
 
 fn make_pyramid(img: &DynamicImage, levels: usize) -> Vec<DynamicImage> {
     // produces [fullres, half, quarter, ...]
     let mut out = Vec::with_capacity(levels);
-    let (w,h) = img.dimensions();
+    let (w, h) = img.dimensions();
     for level in 0..levels {
         if level == 0 {
             out.push(img.clone());
@@ -116,11 +124,17 @@ fn tile_and_encode_level(
 
 fn print_usage(name: &str) {
     eprintln!("Usage:");
-    eprintln!("  {} <input.jpg> <out_payload.bin> [--tile-size N] [--levels L] [--quality Q]", name);
+    eprintln!(
+        "  {} <input.jpg> <out_payload.bin> [--tile-size N] [--levels L] [--quality Q]",
+        name
+    );
     eprintln!("Defaults: tile-size=64, levels=3, quality=80");
     eprintln!();
     eprintln!("Example:");
-    eprintln!("  {} image.jpg payload_tiled.bin --tile-size 64 --levels 3 --quality 80", name);
+    eprintln!(
+        "  {} image.jpg payload_tiled.bin --tile-size 64 --levels 3 --quality 80",
+        name
+    );
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -140,10 +154,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut i = 3usize;
     while i < args.len() {
         match args[i].as_str() {
-            "--tile-size" => { if let Some(v) = args.get(i+1) { tile_size = v.parse::<u32>().unwrap_or(tile_size); } i+=2; }
-            "--levels" => { if let Some(v) = args.get(i+1) { levels = v.parse::<usize>().unwrap_or(levels); } i+=2; }
-            "--quality" => { if let Some(v) = args.get(i+1) { quality = v.parse::<u8>().unwrap_or(quality); } i+=2; }
-            _ => { eprintln!("Unknown arg {}", args[i]); i+=1; }
+            "--tile-size" => {
+                if let Some(v) = args.get(i + 1) {
+                    tile_size = v.parse::<u32>().unwrap_or(tile_size);
+                }
+                i += 2;
+            }
+            "--levels" => {
+                if let Some(v) = args.get(i + 1) {
+                    levels = v.parse::<usize>().unwrap_or(levels);
+                }
+                i += 2;
+            }
+            "--quality" => {
+                if let Some(v) = args.get(i + 1) {
+                    quality = v.parse::<u8>().unwrap_or(quality);
+                }
+                i += 2;
+            }
+            _ => {
+                eprintln!("Unknown arg {}", args[i]);
+                i += 1;
+            }
         }
     }
 
@@ -167,7 +199,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let level_img = &pyramid[lvl_idx];
         // map lvl_idx -> stored level index (0 = coarsest)
         let level = (levels - 1 - lvl_idx) as u8;
-        let (mut entries, mut level_blobs) = tile_and_encode_level(level_img, tile_size, level, quality);
+        let (mut entries, mut level_blobs) =
+            tile_and_encode_level(level_img, tile_size, level, quality);
         manifest_entries.append(&mut entries);
         blobs.append(&mut level_blobs);
     }
@@ -199,8 +232,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         outf.write_all(b)?;
     }
 
-    println!("Wrote tiled payload: {} (orig {}x{}, levels {}, tile {})",
-             out, orig_w, orig_h, levels, tile_size);
-    println!("Manifest entries: {}, manifest bytes: {}", manifest_entries.len(), manifest_len);
+    println!(
+        "Wrote tiled payload: {} (orig {}x{}, levels {}, tile {})",
+        out, orig_w, orig_h, levels, tile_size
+    );
+    println!(
+        "Manifest entries: {}, manifest bytes: {}",
+        manifest_entries.len(),
+        manifest_len
+    );
     Ok(())
 }

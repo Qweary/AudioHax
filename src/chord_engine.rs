@@ -1417,6 +1417,13 @@ const ARTIC_WINDOW_HI: f32 = 1.10;
 /// deliberate no-op here — it exists as the documented seam the later characters
 /// (March→toward 0.55, Hymn→~1.0) ride on without re-touching the clamp.
 const BALLAD_ARTIC_BIAS: f32 = 1.0;
+/// S39 — the within-step hold multiplier a multi-step THEME note (motif `dur_steps > 1`)
+/// rides in the Melody SUSTAINED branch so it SINGS longer than a one-step note. The
+/// `sustained` closure's `.min(1.20)` overlap-ceiling cap clamps the product, so even
+/// from the window ceiling (1.10) this never rings past the next kernel step — the note's
+/// extra length is carried by its CONTINUATION rest, not by an across-step hold (freeze
+/// safe). Applied ONLY on a theme onset with `dur > 1`; `dur == 1` and free-select see ×1.0.
+const THEME_LONG_NOTE_SING: f32 = 1.15;
 /// The ritardando multiplier applied to a phrase-final note's hold. theory: as
 /// the phrase relaxes into its arrival the final note rings longer.
 const RITARDANDO_FACTOR: f32 = 1.30;
@@ -1917,7 +1924,19 @@ fn realize_rhythm(
                 // CONTINUOUS articulation curve (S13). At low activity base_frac ≈ 1.05,
                 // so the calm melody OVERLAPS across the step boundary and truly sings —
                 // the fix for "uniformly short" notes that the old hard 0.95 cap blocked.
-                vec![sustained(0, step_ms, base_frac)]
+                //
+                // S39 — a multi-step THEME note (dur_steps>1) gets a longer within-step
+                // hold so it SINGS toward the overlap ceiling (its continuation step is a
+                // theme-driven rest, so the onset+gap reads as the note's full length). The
+                // `sustained` closure's `.min(1.20)` cap keeps it inside the overlap ceiling
+                // — it NEVER rings across the next kernel step (no freeze break). A dur==1
+                // onset (every pre-S39 note), a non-onset step, and a free-select melody all
+                // see `theme_onset_dur_steps == None`/`Some(1)` → factor 1.0 → byte-identical.
+                let sing_frac = match theme_onset_dur_steps(ctx, step, features) {
+                    Some(d) if d > 1 => base_frac * THEME_LONG_NOTE_SING,
+                    _ => base_frac,
+                };
+                vec![sustained(0, step_ms, sing_frac)]
             }
         }
     }
@@ -2360,6 +2379,39 @@ impl MotifArchetype {
             MotifArchetype::RisingSequence => &[0, 1, 2, 1, 2, 3],
         }
     }
+
+    /// The archetype's DURATIONAL rhythm profile — one `dur_steps` weight per motif
+    /// note, in steps, cycled across the sampled contour by `resolve_motif`. Lives
+    /// HERE beside `contour()` because rhythm-vs-pitch are the two halves of the same
+    /// theory-owned motivic identity (a motif is a pitch shape AND a rhythm), and the
+    /// realizer reads only what these two produce. theory: each profile is an
+    /// AUGMENTATION pattern (1 == one step, 2 == a held note worth two) chosen to fit
+    /// the contour's gesture — e.g. an Arch leans on its endpoints (`2,1,1,2`: a longer
+    /// launch and a longer arrival framing the quicker climb/fall), a Descent runs even
+    /// and then lands long (`1,1,1,1,2`), a Pendulum is all augmentation (`2,2`: a slow
+    /// two-zone toll). every weight is >= 1 (the `MotifNote` contract) and every
+    /// profile is short enough that, cycled across the contour, it never collapses a
+    /// theme-bearing section below ~ceil(length/2) notes (the §4 shrink guard — proven
+    /// in `test_resolve_motif_shrink_guard`).
+    fn rhythm_profile(self) -> &'static [u8] {
+        match self {
+            // Endpoint-weighted: a longer launch and a longer arrival frame the climb.
+            MotifArchetype::Arch => &[2, 1, 1, 2],
+            MotifArchetype::InvertedArch => &[2, 1, 1, 2],
+            // Even running line that lands on a longer final degree.
+            MotifArchetype::Descent => &[1, 1, 1, 1, 2],
+            // A light lift that arrives long.
+            MotifArchetype::Ascent => &[1, 1, 2],
+            // Even turn that settles long on the resolution.
+            MotifArchetype::NeighborTurn => &[1, 1, 1, 1, 2],
+            // The opening leap gets the weight, then quick stepwise recovery.
+            MotifArchetype::LeapStep => &[2, 1, 1, 1, 1],
+            // All augmentation: a slow, insistent two-zone toll.
+            MotifArchetype::Pendulum => &[2, 2],
+            // A light developmental cell that arrives long.
+            MotifArchetype::RisingSequence => &[1, 1, 2],
+        }
+    }
 }
 
 /// Resolve a build-time `MotifArchetype` + image-derived range/length into the
@@ -2372,8 +2424,12 @@ impl MotifArchetype {
 ///                  to fill; clamped to a singable 1..=7 (a degree-7 span ≈ an
 ///                  octave). theory: edge_activity/complexity sets this band — calm →
 ///                  conjunct (small range), busy → wider leaps.
-/// `length_steps` — how many `MotifNote`s the theme runs for; the contour is sampled
-///                  /padded to this length. Clamped to >=1.
+/// `length_steps` — the motif's total DURATION in steps (Σ dur_steps), NOT its note
+///                  count. Each archetype's `rhythm_profile()` is cycled across the
+///                  sampled contour and durations accumulate until they fill
+///                  `length_steps`; the emitted note count is therefore <= length_steps.
+///                  Clamped to >=1. Guarantees: every `dur_steps >= 1` and
+///                  Σ dur_steps <= length_steps (the motif never over-runs its section).
 ///
 /// Determinism: pure function of its three inputs — no RNG, no clock.
 pub fn resolve_motif(
@@ -2391,31 +2447,60 @@ pub fn resolve_motif(
     let scale = range / NATIVE_SPAN;
 
     let len = length_steps.max(1);
-    let n_contour = contour.len();
+    let profile = archetype.rhythm_profile();
 
-    // Distribute `len` notes across the contour. If len >= n_contour we hold the
-    // tail; if len < n_contour we sample the FRONT (a natural truncation that still
-    // begins on the tonic — exactly what "head-only" fragmentation wants downstream).
-    (0..len)
-        .map(|i| {
-            // Sample index into the contour: walk the contour once, then hold its
-            // final degree for any extra steps (a sustained arrival, not a wrap —
-            // wrapping would restart the shape and read as a loop).
-            let ci = i.min(n_contour - 1);
-            let raw = contour[ci] as f32 * scale;
-            // Round to the nearest scale degree; the realizer maps degree → pitch.
-            let degree = raw.round() as i8;
-            MotifNote {
-                degree,
-                // Even 1-step durations in slice 1: the per-step rhythm comes from the
-                // realizer's existing rhythm layer, not the motif. theory: keeping the
-                // motif rhythmically plain in slice 1 means augmentation/diminution
-                // (Stage 7) can later scale dur_steps without colliding with a
-                // pre-baked rhythm here.
-                dur_steps: 1,
-            }
-        })
-        .collect()
+    // DURATIONAL-SUM-CAPPED emit. Walk the contour ONCE, giving each sampled degree the
+    // next duration from the archetype's cycled rhythm profile, and accumulate
+    // `dur_steps` until the running sum reaches `len`. The motif's note COUNT is now
+    // whatever fits in `len` steps (<= len), NOT a fixed `len`-long run of 1-step notes.
+    //
+    // Two invariants are load-bearing and enforced inline:
+    //   (1) dur_steps >= 1 always (the `MotifNote` contract).
+    //   (2) Σ dur_steps <= len always (the motif must NEVER over-run its section) — so a
+    //       profile weight that would cross the `len` boundary is CLAMPED to the exact
+    //       remaining budget. This is what makes Arch `[2,1,1,2]` land at Σ=5 (durs
+    //       2,1,1,1) for len=5 instead of overshooting to Σ=6.
+    let mut motif: Vec<MotifNote> = Vec::new();
+    let mut total: usize = 0;
+    for (i, &c) in contour.iter().enumerate() {
+        if total >= len {
+            break;
+        }
+        let remaining = len - total;
+        // Cycle the profile across the sampled notes; clamp the boundary-crossing note
+        // to `remaining` so Σ never exceeds `len`. `remaining >= 1` here (loop guard), so
+        // the clamped duration is always >= 1 — the contract holds.
+        let dur = (profile[i % profile.len()] as usize).min(remaining).max(1);
+        let raw = c as f32 * scale;
+        // Round to the nearest scale degree; the realizer maps degree → pitch.
+        let degree = raw.round() as i8;
+        motif.push(MotifNote {
+            degree,
+            dur_steps: dur as u8,
+        });
+        total += dur;
+    }
+
+    // STATIC-TAIL FIX (§4): if the whole contour was sampled and budget still remains,
+    // do NOT repeat the held final degree as a string of short notes (the old smear at
+    // the former `i.min(n_contour - 1)` hold). Instead extend the FINAL note into ONE
+    // long arrival that absorbs the remainder — a single sustained landing, not a wrap.
+    // This is the only held tail §4 permits, and it keeps Σ == len exactly.
+    if total < len {
+        if let Some(last) = motif.last_mut() {
+            last.dur_steps = last.dur_steps.saturating_add((len - total) as u8);
+        }
+    }
+
+    debug_assert!(
+        motif.iter().map(|n| n.dur_steps as usize).sum::<usize>() <= len,
+        "Σ dur_steps must never over-run length_steps"
+    );
+    debug_assert!(
+        motif.iter().all(|n| n.dur_steps >= 1),
+        "every MotifNote must carry dur_steps >= 1"
+    );
+    motif
 }
 
 /// Map a scale degree (relative to the section tonic, 0 == tonic) onto a sounding
@@ -2449,26 +2534,79 @@ fn degree_to_pitch(degree: i8, tonic_pc: u8, mode: &str, register_floor: u8) -> 
     seated.clamp(24, 108) as u8
 }
 
-/// The realizer's THEME-REPLAY decision (spec §2, task 2). Given the plan-relative
-/// `StepContext`, decide what pitch the MELODY role sounds on this step:
+/// Where a kernel step lands inside a DURATIONAL motif (S39). The motif `Vec` is now
+/// SHORTER than its step span — one entry per NOTE, each carrying `dur_steps >= 1` — so a
+/// kernel step no longer maps 1:1 to a motif index. This resolves a `step_in_section` to
+/// the motif NOTE that covers it (by walking cumulative `dur_steps`) and whether the step
+/// is that note's ONSET (its first covered step) or a CONTINUATION (a later covered step
+/// of a `dur_steps > 1` note). The freeze-safe realization plays the note at its onset and
+/// RESTS on its continuation steps — making the note's true length audible WITHOUT holding
+/// one emitted note across multiple kernel steps (the frozen kernel emits one note/step).
 ///
-///   * `thematic_role == Statement | Return` with a theme present → play the motif
-///     note for `ctx.step_in_section` (degree → pitch in the section's mode/key),
-///     returning `Some(pitch)`.
-///   * `variation == Fragmented` → play only the FIRST HALF of the motif; once past
-///     the head the melody role RESTS (returns `Some(None)` semantics via the outer
-///     Option: `Some(SILENT_MELODY)`), so the caller emits no melody note.
-///   * `Contrast | Coda | Development`, or no theme, or a non-Melody role → return
-///     `None`: the caller free-selects exactly as today (byte-stable back-compat).
+/// `motif` is sliced to `head_notes` first (the Fragmented head-vs-whole choice the caller
+/// makes), so this walks only the playable note span. Returns:
+///   * `MotifStep::Onset(note)` — `step` is this note's first covered step: PLAY it.
+///   * `MotifStep::Continuation` — a later covered step of a multi-step note: REST.
+///   * `MotifStep::PastEnd` — beyond Σ dur_steps of the head; the caller decides (Identity
+///     holds the last note, Fragmented rests).
+///
+/// FREEZE HINGE — when every note has `dur_steps == 1`, Σ dur_steps == note count, so step
+/// `s` lands exactly on note `s` as an `Onset` and `s >= note count` is `PastEnd` — i.e.
+/// IDENTICAL to the old 1:1 `motif[step_in_section]` index with the same past-end boundary.
+/// No `Continuation` is ever produced in the 1-step case, so the realized output is
+/// byte-for-byte unchanged. The `Continuation` arm is reachable ONLY for a `dur_steps > 1`
+/// note, which the old motif builder never produced — so it perturbs nothing frozen.
+enum MotifStep {
+    Onset(MotifNote),
+    Continuation,
+    PastEnd,
+}
+
+/// Resolve `step` against a motif slice via cumulative `dur_steps`. Pure helper for the
+/// theme realizer. See [`MotifStep`] for the freeze-hinge argument.
+fn motif_step_at(motif: &[MotifNote], step: usize) -> MotifStep {
+    let mut cum = 0usize;
+    for &note in motif {
+        let dur = note.dur_steps.max(1) as usize; // contract guarantees >=1; be defensive.
+        if step < cum + dur {
+            // step falls inside this note's [cum, cum+dur) span.
+            return if step == cum {
+                MotifStep::Onset(note)
+            } else {
+                MotifStep::Continuation
+            };
+        }
+        cum += dur;
+    }
+    MotifStep::PastEnd
+}
+
+/// The realizer's THEME-REPLAY decision (spec §2, task 2; S39 durational reconciliation).
+/// Given the plan-relative `StepContext`, decide what the MELODY role sounds on this step:
+///
+///   * `thematic_role == Statement | Return` with a theme present → map the step to its
+///     covering motif NOTE via cumulative `dur_steps` (S39). On the note's ONSET step,
+///     play it (degree → pitch in the section's mode/key) → `Some(Some(p))`. On a
+///     CONTINUATION step of a `dur_steps > 1` note, REST → `Some(None)`, so the note's
+///     length sings as one onset followed by silence (the freeze-safe realization — the
+///     kernel cannot hold one emitted note across steps).
+///   * `variation == Fragmented` → play only the FIRST HALF of the motif (by NOTE count);
+///     once past the head's step span the melody role RESTS → `Some(None)`.
+///   * past the whole motif's step span on an Identity section → hold the FINAL motif note
+///     as a sustained arrival (re-articulated each step, never a wrap-loop), matching the
+///     old past-end behavior.
+///   * `Contrast | Coda | Development`, or no theme, or a non-Melody role → `None`: the
+///     caller free-selects exactly as today (byte-stable back-compat).
 ///
 /// Returns `Option<Option<u8>>`:
 ///   * `None`          → not a theme-replay step; caller takes its existing path.
 ///   * `Some(Some(p))` → play the theme pitch `p`.
-///   * `Some(None)`    → theme-driven REST (Fragmented tail); caller emits nothing.
+///   * `Some(None)`    → theme-driven REST (motif continuation, or Fragmented tail).
 ///
-/// This keeps the realizer's free-select / velocity / rhythm bodies UNTOUCHED — the
-/// theme branch only substitutes (or silences) the melody PITCH; everything else
-/// (the Bass/Fill roles, velocity contour, rhythm patterns) is unchanged.
+/// This keeps the realizer's free-select / velocity / rhythm bodies UNTOUCHED — the theme
+/// branch only substitutes (or silences) the melody PITCH; everything else (Bass/Fill
+/// roles, velocity contour, rhythm patterns) is unchanged. When every motif note carries
+/// `dur_steps == 1` this is byte-identical to the pre-S39 1:1 index (see [`MotifStep`]).
 pub fn theme_melody_pitch(
     ctx: &crate::composition::StepContext,
     role: OrchestralRole,
@@ -2492,29 +2630,81 @@ pub fn theme_melody_pitch(
         return None;
     }
 
-    // FRAGMENTED (head-then-rest): the B-section continuity gesture. Play only the
-    // first half of the motif; past the head, the melody role rests. theory: head-
-    // only sequencing is the "developing" gesture — it keeps motivic continuity
-    // through a contrast without restating the whole tune (design-s15 §4.1/§4.2).
-    let head_len = match ctx.section.variation {
-        ThemeVariation::Fragmented => (theme.motif.len() + 1) / 2, // ceil(half)
+    // FRAGMENTED (head-then-rest): the B-section continuity gesture. Play only the FIRST
+    // HALF of the motif (by NOTE count — the "developing" gesture keeps motivic continuity
+    // through a contrast without restating the whole tune, design-s15 §4.1/§4.2). Slice the
+    // motif to the head NOTE span; the step→note mapping then walks only those notes'
+    // durations, so a multi-step head note still consumes its full duration before the rest.
+    let head_notes = match ctx.section.variation {
+        ThemeVariation::Fragmented => theme.motif.len().div_ceil(2), // ceil(half), by note count
         _ => theme.motif.len(),
     };
-    let motif_idx = ctx.step_in_section;
-    if motif_idx >= head_len {
-        // Past the playable span: Identity holds the final motif note (a sustained
-        // arrival, never a wrap-loop); Fragmented rests.
-        return match ctx.section.variation {
-            ThemeVariation::Fragmented => Some(None), // head consumed → melody rests
+    let head = &theme.motif[..head_notes];
+
+    // S39: map this step to its covering motif note via cumulative dur_steps. Onset plays,
+    // continuation rests, past-end falls to the variation-specific tail behavior below.
+    match motif_step_at(head, ctx.step_in_section) {
+        MotifStep::Onset(note) => Some(Some(theme_pitch(note.degree, ctx, chord, features))),
+        // A covered/continuation step of a dur_steps>1 note: the onset already sounded; this
+        // step is silent so the note reads as its full length (freeze-safe — no held note
+        // spans kernel steps). UNREACHABLE when all dur_steps==1 (the byte-freeze hinge).
+        MotifStep::Continuation => Some(None),
+        MotifStep::PastEnd => match ctx.section.variation {
+            // Past the head's step span: Fragmented rests (head consumed → melody silent).
+            ThemeVariation::Fragmented => Some(None),
+            // Identity holds the FINAL motif note as a sustained arrival (re-articulated each
+            // step past the end, never a wrap-loop) — byte-identical to the old past-end hold.
             _ => {
                 let last = theme.motif[theme.motif.len() - 1];
                 Some(Some(theme_pitch(last.degree, ctx, chord, features)))
             }
-        };
+        },
     }
+}
 
-    let note = theme.motif[motif_idx];
-    Some(Some(theme_pitch(note.degree, ctx, chord, features)))
+/// The `dur_steps` of the motif note whose ONSET lands on this melody step, or `None` when
+/// the step is NOT a theme onset (free-select, a continuation rest, a Fragmented/past-end
+/// tail, a non-Melody role, or theme:None). The Melody realize arm reads this to let a
+/// multi-step theme note SING a touch longer within the overlap ceiling (S39 — "lengthen
+/// the within-step hold toward the existing overlap ceiling so it sings"). It mirrors
+/// `theme_melody_pitch`'s exact gating so the two never disagree about onset-hood.
+///
+/// FREEZE: returns `Some(dur)` ONLY for `MotifStep::Onset`, and the only reader lengthens
+/// the hold ONLY when `dur > 1` — a `dur == 1` onset (every note in the pre-S39 motif) and
+/// every non-onset step return a hold-neutral value, so the realized output is unchanged on
+/// the freeze path. Pure: only `ctx.step_in_section` (a Copy) is read, nothing is mutated.
+fn theme_onset_dur_steps(
+    ctx: &crate::composition::StepContext,
+    step: &StepPlan,
+    features: &PerfFeatures,
+) -> Option<u8> {
+    use crate::composition::{ThematicRole, ThemeVariation};
+    let theme = ctx.theme?;
+    match ctx.section.thematic_role {
+        ThematicRole::Statement | ThematicRole::Return => {}
+        _ => return None,
+    }
+    if theme.motif.is_empty() {
+        return None;
+    }
+    // A theme onset only sounds where theme_melody_pitch would actually play a NEW note (and
+    // not at the past-end hold, which re-articulates the last note but is not a fresh onset).
+    // Confirm the seam agrees this step plays a pitch before trusting the motif walk.
+    match theme_melody_pitch(ctx, OrchestralRole::Melody, &step.chord, features) {
+        Some(Some(_)) => {}
+        _ => return None,
+    }
+    let head_notes = match ctx.section.variation {
+        ThemeVariation::Fragmented => theme.motif.len().div_ceil(2),
+        _ => theme.motif.len(),
+    };
+    let head = &theme.motif[..head_notes];
+    match motif_step_at(head, ctx.step_in_section) {
+        MotifStep::Onset(note) => Some(note.dur_steps.max(1)),
+        // past-end Identity hold re-articulates the last note but is not a fresh onset:
+        // treat it as dur 1 (no extra lengthening) so the sustained arrival is unperturbed.
+        _ => None,
+    }
 }
 
 /// Resolve one motif degree to a sounding melody pitch in the CURRENT section's
@@ -6571,39 +6761,99 @@ mod tests {
 
     // ── resolve_motif ────────────────────────────────────────────────────
 
-    /// PROPERTY: resolve_motif emits exactly `length_steps` notes (>=1), each with
-    /// a valid duration — the realizer reads a concrete, correctly-sized motif.
+    /// PROPERTY (DURATIONAL-SUM contract): resolve_motif emits 1..=length_steps notes,
+    /// each with dur_steps >= 1, whose durations SUM to exactly length_steps (the motif
+    /// fills its section without over-running it). The note count is <= length_steps —
+    /// it is no longer fixed at length_steps, because notes now carry real durations.
     #[test]
     fn test_resolve_motif_length_and_duration() {
         for &len in &[1usize, 4, 5, 8] {
             let m = resolve_motif(MotifArchetype::Arch, 4, len);
-            assert_eq!(m.len(), len, "must emit exactly the requested length");
+            assert!(!m.is_empty(), "motif must never be empty");
+            assert!(
+                m.len() <= len,
+                "note count {} must be <= length_steps {len} (durational contract)",
+                m.len()
+            );
             assert!(
                 m.iter().all(|n| n.dur_steps >= 1),
                 "every motif note must have dur_steps >= 1"
             );
+            let total: usize = m.iter().map(|n| n.dur_steps as usize).sum();
+            assert_eq!(
+                total, len,
+                "Σ dur_steps must equal length_steps (fills section, never over-runs)"
+            );
         }
         // length 0 is clamped to 1 (never an empty motif the realizer can't read).
-        assert_eq!(resolve_motif(MotifArchetype::Arch, 4, 0).len(), 1);
+        let m0 = resolve_motif(MotifArchetype::Arch, 4, 0);
+        assert_eq!(m0.len(), 1);
+        assert_eq!(
+            m0[0].dur_steps, 1,
+            "the len-0 floor is a single 1-step note"
+        );
+    }
+
+    /// PROPERTY (§4 shrink guard): augmentation-heavy rhythm profiles must NOT collapse a
+    /// theme-bearing section to a couple of notes plus a long held tail. For every
+    /// archetype at the canonical theme length (8 steps), the note count stays at or above
+    /// ceil(length/2), AND Σ dur_steps never exceeds length — so a wide profile lands as a
+    /// single long arrival (e.g. Descent: 5 notes, final dur 4) rather than a static smear.
+    #[test]
+    fn test_resolve_motif_shrink_guard() {
+        let archetypes = [
+            MotifArchetype::Arch,
+            MotifArchetype::InvertedArch,
+            MotifArchetype::Descent,
+            MotifArchetype::Ascent,
+            MotifArchetype::NeighborTurn,
+            MotifArchetype::LeapStep,
+            MotifArchetype::Pendulum,
+            MotifArchetype::RisingSequence,
+        ];
+        for len in [4usize, 5, 8] {
+            for arch in archetypes {
+                let m = resolve_motif(arch, 4, len);
+                let total: usize = m.iter().map(|n| n.dur_steps as usize).sum();
+                assert!(
+                    total <= len,
+                    "{arch:?} len={len}: Σ dur_steps {total} over-ran length",
+                );
+                let guard = len.div_ceil(2);
+                assert!(
+                    m.len() >= guard,
+                    "{arch:?} len={len}: {} notes < ceil(len/2)={guard} (shrink smear)",
+                    m.len()
+                );
+            }
+        }
     }
 
     /// PROPERTY: the Arch contour rises to an apex then falls back to (near) the
-    /// tonic — the defining "up then down" shape. Tests degrees, not pitches.
+    /// tonic — the defining "up then down" shape. Tests degrees, not pitches. Uses
+    /// length 8 so the full 5-degree contour ([0,2,4,2,0]) is sampled before the
+    /// durational cap (at length 5 the durational-sum contract emits only the first 4
+    /// degrees — still a valid arch head, but the closing return needs the longer run).
     #[test]
     fn test_resolve_motif_arch_is_up_then_down() {
-        let m = resolve_motif(MotifArchetype::Arch, 4, 5);
+        let m = resolve_motif(MotifArchetype::Arch, 4, 8);
         let degs: Vec<i8> = m.iter().map(|n| n.degree).collect();
-        // 0 .. apex .. 0 : strictly rises to the middle, then falls.
+        let apex = degs
+            .iter()
+            .position(|&d| d == *degs.iter().max().unwrap())
+            .unwrap();
+        // strictly rises to the apex, then falls from it.
         assert!(
-            degs[0] <= degs[1] && degs[1] <= degs[2],
+            degs[..=apex].windows(2).all(|w| w[1] >= w[0]),
             "must rise to apex: {degs:?}"
         );
         assert!(
-            degs[2] >= degs[3] && degs[3] >= degs[4],
+            degs[apex..].windows(2).all(|w| w[1] <= w[0]),
             "must fall from apex: {degs:?}"
         );
         assert_eq!(
-            degs[0], degs[4],
+            *degs.first().unwrap(),
+            *degs.last().unwrap(),
             "an arch returns to its starting degree: {degs:?}"
         );
     }
@@ -6758,13 +7008,31 @@ mod tests {
     }
 
     /// PROPERTY: Fragmented plays only the FIRST HALF of the motif then RESTS — the
-    /// head-then-silence continuity gesture. Past the head, the melody returns
-    /// `Some(None)` (a theme-driven rest), not a sounded note.
+    /// head-then-silence continuity gesture. S39: the head is the first ceil(n/2) NOTES,
+    /// but a step now maps to its covering note via cumulative `dur_steps`, so a head step
+    /// is either a note ONSET (sounds) or a `dur_steps>1` CONTINUATION (rests); past the
+    /// head's STEP SPAN the melody rests. This walks the head's true step span and checks
+    /// onset-sounds / continuation-rests / past-head-rests against the cumulative durations.
     #[test]
     fn test_theme_pitch_fragmented_head_then_rest() {
         let section = theme_section(ThematicRole::Statement, ThemeVariation::Fragmented, Some(0));
         let kt = home_key_tempo();
-        let motif = resolve_motif(MotifArchetype::Arch, 4, 8); // len 8 → head = 4
+        // Arch [2,1,1,2] over len 8 → notes [(0,2),(2,1),(4,1),(2,2),(0,2)] (5 notes, Σ=8).
+        let motif = resolve_motif(MotifArchetype::Arch, 4, 8);
+        let note_count = motif.len();
+        let head_notes = note_count.div_ceil(2); // ceil(5/2) == 3 → notes n0,n1,n2.
+                                                 // The head's step span = Σ dur_steps of the first `head_notes` notes, and the set of
+                                                 // ONSET steps = the cumulative offsets of those notes. Compute both from the motif.
+        let head_dur_sum: usize = motif[..head_notes]
+            .iter()
+            .map(|n| n.dur_steps as usize)
+            .sum();
+        let mut onset_steps = std::collections::BTreeSet::new();
+        let mut cum = 0usize;
+        for n in &motif[..head_notes] {
+            onset_steps.insert(cum);
+            cum += n.dur_steps as usize;
+        }
         let seed = ThemeSeed { id: 0, motif };
         let chord = c_major_triad();
         let mk = |step: usize| {
@@ -6778,36 +7046,49 @@ mod tests {
             };
             theme_melody_pitch(&ctx, OrchestralRole::Melody, &chord, &perf_mid())
         };
-        // Head (steps 0..=3) sounds; tail (4..) rests.
-        for step in 0..4 {
-            assert!(
-                matches!(mk(step), Some(Some(_))),
-                "fragmented head step {step} must sound"
-            );
+        // Within the head's step span: an onset step SOUNDS, a continuation step RESTS.
+        for step in 0..head_dur_sum {
+            if onset_steps.contains(&step) {
+                assert!(
+                    matches!(mk(step), Some(Some(_))),
+                    "fragmented head ONSET step {step} must sound"
+                );
+            } else {
+                assert_eq!(
+                    mk(step),
+                    Some(None),
+                    "fragmented head CONTINUATION step {step} (a dur>1 note's later step) must REST"
+                );
+            }
         }
-        for step in 4..8 {
+        // Past the head's step span: the head is consumed → the melody rests (head-then-silence).
+        for step in head_dur_sum..(head_dur_sum + 3) {
             assert_eq!(
                 mk(step),
                 Some(None),
-                "fragmented tail step {step} must REST (head-then-silence)"
+                "fragmented tail step {step} (past the head's step span) must REST"
             );
         }
     }
 
-    /// PROPERTY: Identity past the motif end HOLDS the final note (a sustained arrival),
-    /// never wraps/loops back to the head — a loop would read as the mechanical
-    /// repetition the whole theme layer exists to kill.
+    /// PROPERTY: Identity past the motif's STEP SPAN HOLDS the final note (a sustained
+    /// arrival), never wraps/loops back to the head. S39: the final note's ONSET is at step
+    /// `Σ dur_steps − last_note.dur_steps` (not at `motif.len()−1`), and any step at/after
+    /// `Σ dur_steps` is past the end and must hold that same final note.
     #[test]
     fn test_theme_pitch_identity_holds_not_loops() {
         let section = theme_section(ThematicRole::Return, ThemeVariation::Identity, Some(0));
         let kt = home_key_tempo();
+        // Ascent [1,1,2] over len 5 → notes [(0,1),(1,1),(2,2),(3,1)] (4 notes, Σ=5).
         let motif = resolve_motif(MotifArchetype::Ascent, 4, 5);
+        let total_steps: usize = motif.iter().map(|n| n.dur_steps as usize).sum();
+        // The final note's ONSET step = total_steps − its own duration.
+        let last_onset = total_steps - motif[motif.len() - 1].dur_steps as usize;
         let seed = ThemeSeed {
             id: 0,
             motif: motif.clone(),
         };
         let chord = c_major_triad();
-        let last_idx = motif.len() - 1;
         let mk = |step: usize| {
             let ctx = StepContext {
                 section: &section,
@@ -6819,15 +7100,15 @@ mod tests {
             };
             theme_melody_pitch(&ctx, OrchestralRole::Melody, &chord, &perf_mid())
         };
-        let at_end = mk(last_idx);
-        let past_end = mk(last_idx + 3);
+        let at_end = mk(last_onset); // the final note's onset — sounds.
+        let past_end = mk(total_steps + 2); // well past Σ dur_steps — the held arrival.
         assert!(
             matches!(at_end, Some(Some(_))),
-            "final motif step must sound"
+            "the final motif note's onset step must sound"
         );
         assert_eq!(
             at_end, past_end,
-            "Identity past the end must HOLD the final note, not loop to the head"
+            "Identity past the step-span end must HOLD the final note, not loop to the head"
         );
     }
 

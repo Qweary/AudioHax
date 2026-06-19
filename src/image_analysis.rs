@@ -9,14 +9,14 @@ use std::mem;
 /// - LocalFeatures: per-section features used to pick actual notes/velocity/articulation
 #[derive(Debug, Clone)]
 pub struct GlobalFeatures {
-    pub avg_hue: f32,            // 0..360
-    pub avg_saturation: f32,     // 0..100
-    pub avg_brightness: f32,     // 0..100 (value in HSV)
-    pub edge_density: f32,       // 0..1 proportion of edge pixels
-    pub hue_spread: f32,         // measure of how spread the hues are (0..1)
+    pub avg_hue: f32,               // 0..360
+    pub avg_saturation: f32,        // 0..100
+    pub avg_brightness: f32,        // 0..100 (value in HSV)
+    pub edge_density: f32,          // 0..1 proportion of edge pixels
+    pub hue_spread: f32,            // measure of how spread the hues are (0..1)
     pub texture_laplacian_var: f32, // variance of Laplacian (focus/texture)
-    pub shape_complexity: f32,   // crude metric: number of contours normalized
-    pub aspect_ratio: f32,       // width / height of image
+    pub shape_complexity: f32,      // crude metric: number of contours normalized
+    pub aspect_ratio: f32,          // width / height of image
 }
 
 #[derive(Debug, Clone)]
@@ -108,11 +108,23 @@ pub fn analyze_global(image: &Mat) -> Result<GlobalFeatures> {
     imgproc::canny(&gray, &mut edges, 50.0, 150.0, 3, false)?;
     let edge_count = core::count_non_zero(&edges)?;
     let total_pixels = (edges.rows() * edges.cols()) as f32;
-    let edge_density = if total_pixels > 0.0 { (edge_count as f32) / total_pixels } else { 0.0 };
+    let edge_density = if total_pixels > 0.0 {
+        (edge_count as f32) / total_pixels
+    } else {
+        0.0
+    };
 
     // Laplacian variance (measure of texture / focus)
     let mut lap = Mat::default();
-    imgproc::laplacian(&gray, &mut lap, core::CV_64F, 3, 1.0, 0.0, core::BORDER_DEFAULT)?;
+    imgproc::laplacian(
+        &gray,
+        &mut lap,
+        core::CV_64F,
+        3,
+        1.0,
+        0.0,
+        core::BORDER_DEFAULT,
+    )?;
     let mut mean_lap = core::Scalar::default();
     let mut stddev_lap = core::Scalar::default();
     core::mean_std_dev(&lap, &mut mean_lap, &mut stddev_lap, &core::no_array())?;
@@ -127,7 +139,7 @@ pub fn analyze_global(image: &Mat) -> Result<GlobalFeatures> {
         255.0,
         imgproc::THRESH_OTSU | imgproc::THRESH_BINARY,
     )?;
-    let mut contours = core::Vector::<core::Vector::<core::Point>>::new();
+    let mut contours = core::Vector::<core::Vector<core::Point>>::new();
     imgproc::find_contours(
         &thresh,
         &mut contours,
@@ -177,7 +189,11 @@ pub fn analyze_global(image: &Mat) -> Result<GlobalFeatures> {
 ///
 /// - `num_bars`: number of instrument subdivisions in the bar
 /// - `vertical`: if true, bar runs top->bottom and slices are vertical strips; if false, horizontal bar slices
-pub fn analyze_scan_bar(image: &Mat, num_bars: usize, vertical: bool) -> Result<Vec<ScanBarFeatures>> {
+pub fn analyze_scan_bar(
+    image: &Mat,
+    num_bars: usize,
+    vertical: bool,
+) -> Result<Vec<ScanBarFeatures>> {
     if image.empty() {
         return Err(anyhow!("Empty image passed to analyze_scan_bar"));
     }
@@ -274,13 +290,37 @@ pub fn analyze_local_basic(region: &Mat) -> Result<LocalFeatures> {
     imgproc::canny(&gray, &mut edges, 50.0, 150.0, 3, false)?;
     let edge_count = core::count_non_zero(&edges)?;
     let total_pixels = (edges.rows() * edges.cols()) as f32;
-    let edge_density = if total_pixels > 0.0 { (edge_count as f32) / total_pixels } else { 0.0 };
+    let edge_density = if total_pixels > 0.0 {
+        (edge_count as f32) / total_pixels
+    } else {
+        0.0
+    };
 
     // Edge orientation bias using Sobel gradients: compute mean of gradients
     let mut grad_x = Mat::default();
     let mut grad_y = Mat::default();
-    imgproc::sobel(&gray, &mut grad_x, core::CV_32F, 1, 0, 3, 1.0, 0.0, core::BORDER_DEFAULT)?;
-    imgproc::sobel(&gray, &mut grad_y, core::CV_32F, 0, 1, 3, 1.0, 0.0, core::BORDER_DEFAULT)?;
+    imgproc::sobel(
+        &gray,
+        &mut grad_x,
+        core::CV_32F,
+        1,
+        0,
+        3,
+        1.0,
+        0.0,
+        core::BORDER_DEFAULT,
+    )?;
+    imgproc::sobel(
+        &gray,
+        &mut grad_y,
+        core::CV_32F,
+        0,
+        1,
+        3,
+        1.0,
+        0.0,
+        core::BORDER_DEFAULT,
+    )?;
     let mut mean_gx = core::Scalar::default();
     let mut std_gx = core::Scalar::default();
     core::mean_std_dev(&grad_x, &mut mean_gx, &mut std_gx, &core::no_array())?;
@@ -288,12 +328,20 @@ pub fn analyze_local_basic(region: &Mat) -> Result<LocalFeatures> {
     let mut std_gy = core::Scalar::default();
     core::mean_std_dev(&grad_y, &mut mean_gy, &mut std_gy, &core::no_array())?;
     // If |gx| > |gy| -> horizontal bias, else vertical
-    let edge_orientation_bias =
-        (mean_gx[0] as f32 - mean_gy[0] as f32) / ((mean_gx[0].abs() + mean_gy[0].abs()) as f32 + 1e-6);
+    let edge_orientation_bias = (mean_gx[0] as f32 - mean_gy[0] as f32)
+        / ((mean_gx[0].abs() + mean_gy[0].abs()) as f32 + 1e-6);
 
     // Laplacian variance
     let mut lap = Mat::default();
-    imgproc::laplacian(&gray, &mut lap, core::CV_64F, 3, 1.0, 0.0, core::BORDER_DEFAULT)?;
+    imgproc::laplacian(
+        &gray,
+        &mut lap,
+        core::CV_64F,
+        3,
+        1.0,
+        0.0,
+        core::BORDER_DEFAULT,
+    )?;
     let mut mean_lap = core::Scalar::default();
     let mut stddev_lap = core::Scalar::default();
     core::mean_std_dev(&lap, &mut mean_lap, &mut stddev_lap, &core::no_array())?;
@@ -308,7 +356,7 @@ pub fn analyze_local_basic(region: &Mat) -> Result<LocalFeatures> {
         255.0,
         imgproc::THRESH_OTSU | imgproc::THRESH_BINARY,
     )?;
-    let mut contours = core::Vector::<core::Vector::<core::Point>>::new();
+    let mut contours = core::Vector::<core::Vector<core::Point>>::new();
     imgproc::find_contours(
         &thresh,
         &mut contours,
@@ -473,7 +521,12 @@ pub fn scan_image(
             0
         };
 
-        let bar_rect = core::Rect::new(x0, y0, if vertical_default { bar_w } else { width }, if vertical_default { height } else { bar_h });
+        let bar_rect = core::Rect::new(
+            x0,
+            y0,
+            if vertical_default { bar_w } else { width },
+            if vertical_default { height } else { bar_h },
+        );
 
         // divide the bar rect into `num_bars` sections *perpendicular* to the scan direction:
         // - vertical scan strip (moves L->R): split the strip across its height (horizontal slices)
@@ -490,7 +543,8 @@ pub fn scan_image(
                     (bar_rect.y + bar_rect.height) - y_i
                 } else {
                     per_h
-                }.max(1);
+                }
+                .max(1);
                 core::Rect::new(bar_rect.x, y_i, bar_rect.width, h)
             } else {
                 // split width into vertical slices
@@ -500,7 +554,8 @@ pub fn scan_image(
                     (bar_rect.x + bar_rect.width) - x_i
                 } else {
                     per_w
-                }.max(1);
+                }
+                .max(1);
                 core::Rect::new(x_i, bar_rect.y, w, bar_rect.height)
             };
 
@@ -534,9 +589,16 @@ pub fn scan_image(
 /// - `num_bars`: how many instrument subdivisions inside the strip
 /// - `vertical`: whether the strip is vertical (true=vertical strip moving left->right)
 /// Returns: a cloned Mat with overlays drawn.
-pub fn draw_scan_bar_overlay_for_rect(image: &Mat, bar_rect: core::Rect, num_bars: usize, vertical: bool) -> Result<Mat> {
+pub fn draw_scan_bar_overlay_for_rect(
+    image: &Mat,
+    bar_rect: core::Rect,
+    num_bars: usize,
+    vertical: bool,
+) -> Result<Mat> {
     if image.empty() {
-        return Err(anyhow!("Empty image passed to draw_scan_bar_overlay_for_rect"));
+        return Err(anyhow!(
+            "Empty image passed to draw_scan_bar_overlay_for_rect"
+        ));
     }
     if num_bars == 0 {
         return Err(anyhow!("num_bars must be > 0"));

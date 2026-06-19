@@ -144,6 +144,19 @@
       "default": "absent",
       "rules": [ { "when": [ {"knob":"complexity","op":"ge","lo":0.4,"hi":0.0} ], "pick": "fragment" } ]
     },
+    "motif_rhythm": {
+      "_note": "DATA MIRROR (DP-6): a tunable copy of the 8 archetype-fixed durational rhythm profiles authored inline in chord_engine.rs::MotifArchetype::rhythm_profile(). The inline Rust profiles are AUTHORITATIVE — resolve_motif does NOT read this block (no loader wiring this slice). Each profile is a list of dur_steps weights (steps, >= 1) cycled across the sampled contour until Σ dur_steps fills length_steps; Σ is then capped at length_steps so the motif never over-runs its section. Keep in sync with the inline profiles if either is edited.",
+      "profiles": {
+        "Arch":           [2, 1, 1, 2],
+        "InvertedArch":   [2, 1, 1, 2],
+        "Descent":        [1, 1, 1, 1, 2],
+        "Ascent":         [1, 1, 2],
+        "NeighborTurn":   [1, 1, 1, 1, 2],
+        "LeapStep":       [2, 1, 1, 1, 1],
+        "Pendulum":       [2, 2],
+        "RisingSequence": [1, 1, 2]
+      }
+    },
     "affect": {
       "arousal_weights": {
         "avg_saturation": 0.45,
@@ -163,7 +176,8 @@
         "lament":   { "bpm_min": 44,  "bpm_max": 66  },
         "hymn":     { "bpm_min": 60,  "bpm_max": 92  },
         "nocturne": { "bpm_min": 50,  "bpm_max": 80  }
-      }
+      },
+      "mode_valence_cuts": { "major_min": 0.55, "minor_max": 0.45 }
     },
     "character": {
       "default": "ballad",

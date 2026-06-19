@@ -1,10 +1,5 @@
 use anyhow::{anyhow, Result};
-use opencv::{
-    prelude::*,
-    videoio,
-    imgcodecs,
-    core,
-};
+use opencv::{core, imgcodecs, prelude::*, videoio};
 
 use std::path::Path;
 

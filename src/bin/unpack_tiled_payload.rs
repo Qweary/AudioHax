@@ -11,7 +11,7 @@ use std::env;
 use std::fs::File;
 use std::io::Read;
 
-use image::{DynamicImage, GenericImageView, ImageBuffer, RgbImage, imageops::FilterType, Pixel};
+use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageBuffer, Pixel, RgbImage};
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug)]
@@ -23,7 +23,7 @@ struct TileEntry {
     h: u32,
     offset: u64,
     len: u64,
-    avg_color: [u8;3],
+    avg_color: [u8; 3],
     encoding: String,
 }
 
@@ -51,25 +51,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Not a TLF1 payload".into());
     }
     let mut cursor = 4usize;
-    let levels = buf[cursor] as usize; cursor += 1;
-    let tile_size = u16::from_be_bytes([buf[cursor], buf[cursor+1]]) as u32; cursor += 2;
-    let orig_w = u16::from_be_bytes([buf[cursor], buf[cursor+1]]) as u32; cursor += 2;
-    let orig_h = u16::from_be_bytes([buf[cursor], buf[cursor+1]]) as u32; cursor += 2;
-    let manifest_len = u32::from_be_bytes([buf[cursor], buf[cursor+1], buf[cursor+2], buf[cursor+3]]) as usize; cursor += 4;
+    let levels = buf[cursor] as usize;
+    cursor += 1;
+    let tile_size = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]) as u32;
+    cursor += 2;
+    let orig_w = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]) as u32;
+    cursor += 2;
+    let orig_h = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]) as u32;
+    cursor += 2;
+    let manifest_len = u32::from_be_bytes([
+        buf[cursor],
+        buf[cursor + 1],
+        buf[cursor + 2],
+        buf[cursor + 3],
+    ]) as usize;
+    cursor += 4;
 
     if cursor + manifest_len > buf.len() {
         return Err("Manifest truncated".into());
     }
-    let manifest_json = &buf[cursor .. cursor + manifest_len];
+    let manifest_json = &buf[cursor..cursor + manifest_len];
     cursor += manifest_len;
     let tile_stream_start = cursor;
 
     let manifest: Vec<TileEntry> = serde_json::from_slice(manifest_json)?;
 
-    println!("Payload: levels={}, tile_size={}, orig={}x{}, manifest_entries={}", levels, tile_size, orig_w, orig_h, manifest.len());
+    println!(
+        "Payload: levels={}, tile_size={}, orig={}x{}, manifest_entries={}",
+        levels,
+        tile_size,
+        orig_w,
+        orig_h,
+        manifest.len()
+    );
 
     // Build full-resolution canvas
-    let mut canvas: RgbImage = ImageBuffer::from_pixel(orig_w, orig_h, image::Rgb([0u8,0u8,0u8]));
+    let mut canvas: RgbImage = ImageBuffer::from_pixel(orig_w, orig_h, image::Rgb([0u8, 0u8, 0u8]));
 
     // We'll draw tiles; entries may be in coarsest->fine order.
     // For each manifest entry attempt to decode blob; if fail, paint avg_color region.
@@ -77,12 +94,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let blob_start = tile_stream_start + (entry.offset as usize);
         let blob_end = blob_start + (entry.len as usize);
         if blob_end > buf.len() {
-            eprintln!("Tile blob out of bounds (entry {:?}) - using avg color", entry);
+            eprintln!(
+                "Tile blob out of bounds (entry {:?}) - using avg color",
+                entry
+            );
             // paint avg color in the full-res tile region
             paint_avg_on_canvas(&mut canvas, entry, tile_size, levels)?;
             continue;
         }
-        let blob = &buf[blob_start .. blob_end];
+        let blob = &buf[blob_start..blob_end];
         match image::load_from_memory(blob) {
             Ok(tile_img) => {
                 // compute mapping to full-res canvas
@@ -113,8 +133,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn paste_dynimage_into_rgb(canvas: &mut RgbImage, img: &DynamicImage, x: u32, y: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let (w,h) = img.dimensions();
+fn paste_dynimage_into_rgb(
+    canvas: &mut RgbImage,
+    img: &DynamicImage,
+    x: u32,
+    y: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (w, h) = img.dimensions();
     for yy in 0..h {
         for xx in 0..w {
             let px = img.get_pixel(xx, yy).to_rgb();
@@ -128,7 +153,12 @@ fn paste_dynimage_into_rgb(canvas: &mut RgbImage, img: &DynamicImage, x: u32, y:
     Ok(())
 }
 
-fn paint_avg_on_canvas(canvas: &mut RgbImage, entry: &TileEntry, tile_size: u32, levels: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn paint_avg_on_canvas(
+    canvas: &mut RgbImage,
+    entry: &TileEntry,
+    tile_size: u32,
+    levels: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let lvl_idx = (levels - 1).saturating_sub(entry.level as usize);
     let scale = 2u32.pow(lvl_idx as u32);
     let full_x = entry.tx * tile_size * scale;

@@ -271,8 +271,10 @@ fn run_render_wav(
         PrecomputedSource::new(&global_features, &steps)
     };
     #[cfg(not(feature = "opencv"))]
-    let source = {
-        use audiohax::pure_analysis::{load_pure_image, PureAnalysisSource, PureImageSource};
+    let (source, understanding) = {
+        use audiohax::pure_analysis::{
+            load_pure_image, understand_image_pure, PureAnalysisSource, PureImageSource,
+        };
         let psrc = match &render_args.image {
             Some(p) => PureImageSource::UserPath(p.clone()),
             None => {
@@ -280,13 +282,43 @@ fn run_render_wav(
             }
         };
         let img = load_pure_image(&psrc)?;
-        PureAnalysisSource::extract(&img, instrument_count, bar_thickness_frac, num_steps, None)?
+        // S37: the plan-first composer reads the SAME analyze_global_pure stats that
+        // global_features() exposes — derive the understanding off the same `img` here so it
+        // is live at the engine-build site without changing the source-extraction path.
+        let understanding = understand_image_pure(img.as_rgb())?;
+        let src = PureAnalysisSource::extract(
+            &img,
+            instrument_count,
+            bar_thickness_frac,
+            num_steps,
+            None,
+        )?;
+        (src, understanding)
     };
 
     let mut engine = PipelineEngine::new(mappings, engine_config);
+
+    // ── S37: install the COMPOSER plan (pure-Rust / default path). The plan-first composer
+    //    is the audible path; the S13 flat path is the fallback when mappings.json has no
+    //    `composition` block (compose_from_image -> false). The OpenCV arm stays on the legacy
+    //    set_features_global path (spec §4 Option A). ──
+    #[cfg(not(feature = "opencv"))]
+    let composed: bool = engine.compose_from_image(&understanding);
+    #[cfg(not(feature = "opencv"))]
+    if !composed {
+        // No `composition` block in mappings.json -> keep the S13 flat path, byte-identical
+        // to the pre-S37 binary.
+        engine.set_features_global(&source.global_features());
+    }
+    #[cfg(feature = "opencv")]
     engine.set_features_global(&source.global_features());
 
-    let total_steps = source.step_count();
+    // `total_steps` AND the deterministic ms-grid come FROM THE PLAN when composing, NOT from
+    // source.step_count()/config. Read them back via the read-only accessor (engine.rs:341).
+    let (total_steps, grid_ms_per_step): (usize, u64) = match engine.composition() {
+        Some(plan) => (plan.total_steps, plan.key_tempo.base_ms_per_step),
+        None => (source.step_count(), ms_per_step), // legacy fallback
+    };
     println!(
         "render --wav: {} steps, {} instruments → {}",
         total_steps,
@@ -309,7 +341,11 @@ fn run_render_wav(
         });
     }
     for step_idx in 0..total_steps {
-        let step_base_ms = step_idx as u64 * ms_per_step;
+        // S37: in compose mode the per-step cadence is the PLAN's base_ms_per_step, not the
+        // config ms_per_step — otherwise steps would be spaced at config tempo while the notes
+        // hold at plan tempo (a cadence + determinism break). Falls back to config when not
+        // composing (grid_ms_per_step == ms_per_step in that branch).
+        let step_base_ms = step_idx as u64 * grid_ms_per_step;
         for dec in engine.decide_step(&source, step_idx) {
             for ev in &dec.events {
                 let on_ms = step_base_ms + ev.offset_ms;
@@ -490,8 +526,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // DEFAULT (pure) path: acquire + analyze with the pure-Rust `pure_analysis` module.
     #[cfg(not(feature = "opencv"))]
-    let source = {
-        use audiohax::pure_analysis::{load_pure_image, PureAnalysisSource, PureImageSource};
+    let (source, understanding) = {
+        use audiohax::pure_analysis::{
+            load_pure_image, understand_image_pure, PureAnalysisSource, PureImageSource,
+        };
         let psrc = match &play_args.image {
             Some(p) => PureImageSource::UserPath(p.clone()),
             None => {
@@ -504,6 +542,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             img.width(),
             img.height()
         );
+        // S37: derive the composer's ImageUnderstanding off the SAME `img` (it reads the same
+        // analyze_global_pure stats global_features() exposes) so it is live at the
+        // engine-build site without disturbing the source-extraction path.
+        let understanding = understand_image_pure(img.as_rgb())?;
         let src = PureAnalysisSource::extract(
             &img,
             instrument_count,
@@ -516,11 +558,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             src.step_count()
         );
         println!("Global features: {:?}", src.global_features());
-        src
+        (src, understanding)
     };
 
-    // ── Build the engine + feed global features (the engine derives mode/plan) ──
+    // ── Build the engine + install the COMPOSER plan (S37) ──
+    // The plan-first composer is the audible path; the S13 flat path is the fallback when
+    // mappings.json has no `composition` block (compose_from_image -> false). The OpenCV arm
+    // stays on the legacy set_features_global path (spec §4 Option A).
     let mut engine = PipelineEngine::new(mappings, engine_config);
+    #[cfg(not(feature = "opencv"))]
+    let composed: bool = engine.compose_from_image(&understanding);
+    #[cfg(not(feature = "opencv"))]
+    if !composed {
+        engine.set_features_global(&source.global_features());
+    }
+    #[cfg(feature = "opencv")]
     engine.set_features_global(&source.global_features());
     println!("Engine mode: {}", engine.current_state().mode);
 
@@ -624,7 +676,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = sink.program_change(ch, prog);
     }
 
-    let total_steps = source.step_count();
+    // S37: drive the live loop off the PLAN's step count when composing, NOT
+    // source.step_count(). `play` has no absolute ms-grid (it schedules each note from
+    // ev.offset_ms relative to a per-step t0, so the plan's tempo is already honored inside
+    // each decision); only the total_steps swap is needed here. Plan-derived bind via the
+    // read-only accessor; legacy fallback to source.step_count() when not composing.
+    let total_steps = match engine.composition() {
+        Some(plan) => plan.total_steps,
+        None => source.step_count(),
+    };
     let mut rng = rand::thread_rng();
 
     for step_idx in 0..total_steps {

@@ -45,8 +45,9 @@
 
 use audiohax::chord_engine::ChordEngine;
 use audiohax::composition::{
-    CompositionPlanner, ImageUnderstanding, KeyScheme, KeySchemeSection, PlanMappings, Predicate,
-    ResolutionPolicy, SelectRule, SelectTable, ThematicRole,
+    valence_family_mode, CompositionPlanner, ImageUnderstanding, KeyScheme, KeySchemeSection,
+    ModeValenceCuts, PlanMappings, Predicate, ResolutionPolicy, SelectRule, SelectTable,
+    ThematicRole,
 };
 use audiohax::mapping_loader::{load_mappings, rebuild_mapping_table, MappingTable};
 
@@ -575,7 +576,9 @@ fn per_region_fallback_reproduces_k1() {
 
     // The K1 menu math, recomputed here from the SAME pinned thresholds (τ_lo 0.40 LOW-inclusive,
     // τ_hi 0.60 HIGH, τ_contrast 60°; HIGH and MID both lift to +7) to predict the expected offset.
-    // major/Ionian-family → relative −3, minor-family → +3.
+    // The relative-excursion direction on STRONG hue contrast (hue_dist >= 60°) depends on the
+    // home_mode FAMILY: `relative_offset` returns +3 for a minor-family home mode and −3 for a
+    // major/Ionian-family one. `minor_family` is therefore a property of the resolved home_mode.
     fn expected(region_valence: f32, hue_dist: f32, minor_family: bool) -> i8 {
         if hue_dist >= 60.0 {
             if minor_family {
@@ -590,9 +593,41 @@ fn per_region_fallback_reproduces_k1() {
         }
     }
 
-    // home_mode is hue-selected via hue_to_mode: hue 120 → Ionian (major), hue 250 → Aeolian (minor)
-    // (matching keyplan_s25.rs §5 notes). We drive the home mode by `dominant_hue`.
-    for &(dom_hue, minor_family) in &[(120.0f32, false), (250.0f32, true)] {
+    // C6.6: the home_mode FAMILY (major vs minor) is no longer hue-only — VALENCE owns the third.
+    // `home_mode = valence_family_mode(hue_mode, affect_valence, cuts)`, so before reading the
+    // relative-excursion sign we must derive `minor_family` from the PROJECTED home_mode, applying
+    // the SAME 0.55/0.45 cuts to the SAME whole-image `affect_valence` the planner computes — NOT
+    // from the raw hue. This mirrors `composition::valence_family_mode` exactly:
+    //   * `affect_valence` = the shipped VALENCE blend on this test's inputs
+    //     (avg_brightness = region_valence*100, avg_saturation = 50, fg_bg_contrast = 0.30):
+    //       v = 0.70*(avg_brightness/100) + 0.20*(avg_saturation/100) + 0.10*(0.5 + 0.5*fg_bg)
+    //         = 0.70*region_valence + 0.10 + 0.065 = 0.70*region_valence + 0.165
+    //   * v >= 0.55 → MAJOR family; v <= 0.45 → MINOR family; the dead band (0.45,0.55) leaves the
+    //     HUE-selected mode (and hence its family) untouched (legacy behaviour).
+    // We reuse the PUBLIC `valence_family_mode` so this expectation tracks the production rule
+    // automatically, then read the family off the resolved mode string (the same `minor_family`
+    // predicate `relative_offset` uses internally).
+    const MAJOR_MIN: f32 = 0.55; // == assets/mappings.json composition.affect.mode_valence_cuts
+    const MINOR_MAX: f32 = 0.45;
+    fn projected_minor_family(hue_mode: &str, region_valence: f32) -> bool {
+        let affect_valence = 0.70 * region_valence + 0.20 * 0.5 + 0.10 * (0.5 + 0.5 * 0.30);
+        let cuts = Some(ModeValenceCuts {
+            major_min: MAJOR_MIN,
+            minor_max: MINOR_MAX,
+        });
+        let resolved = valence_family_mode(hue_mode, affect_valence, &cuts);
+        let m = resolved.to_ascii_lowercase();
+        m.contains("aeolian")
+            || m.contains("minor")
+            || m.contains("dorian")
+            || m.contains("phrygian")
+            || m.contains("locrian")
+    }
+
+    // home_mode is hue-selected via hue_to_mode: hue 120 → Ionian (major-family hue), hue 250 →
+    // Aeolian (minor-family hue) (matching keyplan_s25.rs §5 notes). We drive the home mode by
+    // `dominant_hue`; `hue_mode` is the PRE-projection mode string for that hue.
+    for &(dom_hue, hue_mode) in &[(120.0f32, "Ionian"), (250.0f32, "Aeolian")] {
         for &region_valence in &[0.0f32, 0.39, 0.40, 0.41, 0.59, 0.60, 0.61, 1.0] {
             for &hue_dist in &[0.0f32, 90.0] {
                 // The B region (rank 0) carries the whole-image FALLBACK affect:
@@ -625,12 +660,15 @@ fn per_region_fallback_reproduces_k1() {
                     .find(|s| s.thematic_role == ThematicRole::Contrast)
                     .expect("a B Contrast")
                     .key_offset_semitones;
+                // C6.6: family from the PROJECTED home_mode (valence owns the third), not from hue.
+                let minor_family = projected_minor_family(hue_mode, region_valence);
                 let want = expected(region_valence, hue_dist, minor_family);
                 assert_eq!(
                     b, want,
                     "K1 reproduction (per-region == whole-image fallback) failed: \
-                     dom_hue {dom_hue} minor {minor_family} valence {region_valence} \
-                     hue_dist {hue_dist} → expected {want}, got {b} (scheme {:?})",
+                     dom_hue {dom_hue} hue_mode {hue_mode} projected_minor {minor_family} \
+                     valence {region_valence} hue_dist {hue_dist} → expected {want}, got {b} \
+                     (scheme {:?})",
                     plan.key_tempo.key_scheme
                 );
             }
