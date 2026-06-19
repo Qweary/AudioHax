@@ -1048,10 +1048,20 @@ fn seat_pc_in_band(pc: u8, lo: u8, hi: u8) -> u8 {
 /// `dominant_hue` is `u.dominant_hue` (degrees, 0..360). The `hue_to_pc` lookup reuses the
 /// existing `lookup_range_map` range-map primitive (the same `"lo-hi" -> value` idiom as
 /// `global.hue_to_mode`), so the pitch-class cuts stay Music Theory's single-writer field.
+/// Snap a fractional/denormalized hue (degrees) to the nearest integer degree on the
+/// 0..360 circle, so the integer-endpoint range tables (`hue_to_pc`, `hue_to_mode`) stop
+/// dropping inter-bucket fractional hues to their floor (design-s41-hue-gap-fix.md §1.3).
+/// `rem_euclid` normalizes wrap/negative drift FIRST, then `.round()` lands on a real
+/// bucket endpoint. A second `rem_euclid` after round keeps 359.6 -> 360 -> 0 on-circle.
+fn snap_hue_to_bucket_grid(hue: f32) -> f32 {
+    (hue.rem_euclid(360.0).round()).rem_euclid(360.0)
+}
+
 fn resolve_home_root_midi(home: Option<&HomeRootMap>, dominant_hue: f32) -> u8 {
     let Some(home) = home else {
         return LEGACY_HOME_ROOT_MIDI;
     };
+    let dominant_hue = snap_hue_to_bucket_grid(dominant_hue);
     // Range-map scan: matched value is the chromatic pitch class as a string (per Option-S1
     // schema). Any miss / parse failure / out-of-range value falls to the legacy 60 — we treat
     // bad data exactly like an absent block (same byte-for-byte floor; never panic).
@@ -1420,9 +1430,11 @@ impl CompositionPlanner {
         // `u` above (line ~1159). With no `mode_valence_cuts` block this projection is a NO-OP and
         // `home_mode` is the legacy pure-hue derivation, byte-for-byte. `home_mode` then flows
         // UNCHANGED as a String into pick_progression/generate_chords/tonic_triad/Section.mode.
-        let hue_mode =
-            crate::mapping_loader::lookup_range_map(&mappings.global.hue_to_mode, u.dominant_hue)
-                .unwrap_or_else(|| "Ionian".to_string());
+        let hue_mode = crate::mapping_loader::lookup_range_map(
+            &mappings.global.hue_to_mode,
+            snap_hue_to_bucket_grid(u.dominant_hue),
+        )
+        .unwrap_or_else(|| "Ionian".to_string());
         let home_mode = valence_family_mode(
             &hue_mode,
             u.affect_valence,
