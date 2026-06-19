@@ -163,17 +163,18 @@
       "rules": [ { "when": [ {"knob":"complexity","op":"ge","lo":0.4,"hi":0.0} ], "pick": "fragment" } ]
     },
     "motif_rhythm": {
-      "_note": "DATA MIRROR (DP-6): a tunable copy of the 8 archetype-fixed durational rhythm profiles authored inline in chord_engine.rs::MotifArchetype::rhythm_profile(). The inline Rust profiles are AUTHORITATIVE — resolve_motif does NOT read this block (no loader wiring this slice). Each profile is a list of dur_steps weights (steps, >= 1) cycled across the sampled contour until Σ dur_steps fills length_steps; Σ is then capped at length_steps so the motif never over-runs its section. Keep in sync with the inline profiles if either is edited.",
-      "profiles": {
-        "Arch":           [2, 1, 1, 2],
-        "InvertedArch":   [2, 1, 1, 2],
-        "Descent":        [1, 1, 1, 1, 2],
-        "Ascent":         [1, 1, 2],
-        "NeighborTurn":   [1, 1, 1, 1, 2],
-        "LeapStep":       [2, 1, 1, 1, 1],
-        "Pendulum":       [2, 2],
-        "RisingSequence": [1, 1, 2]
-      }
+      "_note": "DATA MIRROR (S41 DP-6 discipline retained): a tunable copy of the per-archetype rhythm-cell VOCABULARIES authored inline in chord_engine.rs::MotifArchetype::rhythm_cells(). The inline Rust cells are AUTHORITATIVE — resolve_motif_celled does NOT read this block (no loader wiring this slice; QG confirms inert). Each cell is a list of dur_steps weights (steps, >= 1) cycled across the sampled contour until Σ dur_steps fills length_steps; Σ is then capped at length_steps so the motif never over-runs its section. cell 0 of every archetype MUST equal the S39 single profile (freeze anchor) — the first row of every list below is the pre-S41 profile, byte-for-byte. Cell ordering is BROAD(1) -> BUSY(2) -> PROFILED/SYNCOPATED(3) (see the rhythm_cells doc). Keep in sync with the inline cells if either is edited.",
+      "cells": {
+        "Arch":           [[2, 1, 1, 2],    [2, 2, 2],    [1, 1, 1, 1],          [3, 1, 1, 1, 2]],
+        "InvertedArch":   [[2, 1, 1, 2],    [2, 2, 2],    [1, 1, 1, 1],          [1, 1, 2, 1, 1]],
+        "Descent":        [[1, 1, 1, 1, 2], [2, 2, 2],    [1, 1, 1, 1, 1],       [2, 1, 1, 1, 1]],
+        "Ascent":         [[1, 1, 2],       [2, 2],       [1, 1, 1, 1],          [1, 1, 1, 2]],
+        "NeighborTurn":   [[1, 1, 1, 1, 2], [2, 2],       [1, 1, 1, 1],          [2, 1, 1, 1, 1]],
+        "LeapStep":       [[2, 1, 1, 1, 1], [2, 2, 1],    [1, 1, 1, 1, 1],       [3, 1, 1, 1]],
+        "Pendulum":       [[2, 2],          [2, 2, 2],    [1, 1, 1, 1],          [3, 1]],
+        "RisingSequence": [[1, 1, 2],       [2, 2],       [1, 1, 1, 1, 1, 1],    [2, 1, 1]]
+      },
+      "_index_cuts": { "_axes": ["edge_activity (primary, busier->higher cell)", "complexity (secondary tiebreak)"], "_note": "Affect/Aesthetics (DP-A) fill the exact band edges; this is a MIRROR only — composition::pick_rhythm_cell is authoritative this slice and the inert cells above are not loader-wired." }
     },
     "affect": {
       "arousal_weights": {

@@ -38,7 +38,7 @@
 //!      `StepContext` path is ADDITIVE; engine_equivalence.rs remains the authority (this
 //!      net neither duplicates nor weakens it).
 
-use audiohax::chord_engine::{resolve_motif, MotifArchetype, MotifNote};
+use audiohax::chord_engine::{resolve_motif, resolve_motif_celled, MotifArchetype, MotifNote};
 use audiohax::composition::{
     CadenceStrength, Character, CompositionPlanner, ImageUnderstanding, Meter,
     OrchestrationProfile, PlanMappings, ResolutionPolicy, Section, StepContext, ThematicRole,
@@ -249,18 +249,37 @@ fn test_returning_theme_is_identity_recall_not_fresh() {
         "B (Contrast) is theme-absent — the max-contrast default"
     );
 
-    // The recalled degree sequence MATCHES the deterministic resolver output. Reproduce the
-    // planner's archetype/range/length choice (the pick_archetype + range/length formulas are
-    // pure functions of the image knobs — RNG-free) and compare degree sequences.
+    // The recalled line MATCHES the deterministic resolver output. Reproduce the planner's
+    // archetype/range/length choice (the pick_archetype + range/length formulas are pure functions
+    // of the image knobs — RNG-free). S41 RE-BLESS: the planner now SELECTS a per-image rhythm CELL
+    // (`pick_rhythm_cell`) — for this fixture (edge_activity 0.2 < CELL_EDGE_BROAD 0.33) it picks
+    // cell 1, NOT cell 0 — so the stored line is `resolve_motif_celled(.., cell)`, not the cell-0
+    // `resolve_motif`. The test's INTENT (the stored theme IS the deterministic resolver line for
+    // this image, i.e. a recall, not a fresh/random pick) is preserved EXACTLY; only the cell-0
+    // assumption is relaxed. We find which cell the planner selected by matching the stored line
+    // against the archetype's cell vocabulary, then assert the stored theme equals that
+    // deterministic resolver output (degree AND duration — a stronger check than the old
+    // degree-only compare, since the cell now also fixes the gait).
     let expected_archetype = MotifArchetype::Arch; // hue 30 (<90), edge<0.6 ⇒ Arch
     let range_degrees = (2.0 + uimg.edge_activity * 5.0).round() as u8; // 2..=7
     let length_steps = (3.0 + uimg.complexity * 5.0).round() as usize; // 3..=8
-    let expected = resolve_motif(expected_archetype, range_degrees, length_steps);
     let got = &plan.themes[0].motif;
+    let mut expected: Option<Vec<MotifNote>> = None;
+    for cell in 0..expected_archetype.rhythm_cell_count() {
+        let cand = resolve_motif_celled(expected_archetype, range_degrees, length_steps, cell);
+        if cand == *got {
+            expected = Some(cand);
+            break;
+        }
+    }
+    let expected = expected.expect(
+        "the stored theme must be a deterministic resolve_motif_celled line (the Identity recall \
+         is the resolver output for this image's archetype + selected cell, not a fresh pick)",
+    );
     assert_eq!(
-        degrees(got),
-        degrees(&expected),
-        "the stored theme is the deterministic resolve_motif line (Identity recall)"
+        *got, expected,
+        "the stored theme is the deterministic resolver line for the planner-selected cell \
+         (Identity recall, degree AND gait)"
     );
 
     // NOT a fresh/random line and NOT a degenerate flat sequence: the Arch contour

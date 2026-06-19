@@ -2380,37 +2380,128 @@ impl MotifArchetype {
         }
     }
 
-    /// The archetype's DURATIONAL rhythm profile — one `dur_steps` weight per motif
-    /// note, in steps, cycled across the sampled contour by `resolve_motif`. Lives
-    /// HERE beside `contour()` because rhythm-vs-pitch are the two halves of the same
-    /// theory-owned motivic identity (a motif is a pitch shape AND a rhythm), and the
-    /// realizer reads only what these two produce. theory: each profile is an
-    /// AUGMENTATION pattern (1 == one step, 2 == a held note worth two) chosen to fit
-    /// the contour's gesture — e.g. an Arch leans on its endpoints (`2,1,1,2`: a longer
-    /// launch and a longer arrival framing the quicker climb/fall), a Descent runs even
-    /// and then lands long (`1,1,1,1,2`), a Pendulum is all augmentation (`2,2`: a slow
-    /// two-zone toll). every weight is >= 1 (the `MotifNote` contract) and every
-    /// profile is short enough that, cycled across the contour, it never collapses a
-    /// theme-bearing section below ~ceil(length/2) notes (the §4 shrink guard — proven
-    /// in `test_resolve_motif_shrink_guard`).
-    fn rhythm_profile(self) -> &'static [u8] {
+    /// The archetype's RHYTHM-CELL VOCABULARY (S41 Finding-B): K = 4 musically-idiomatic
+    /// durational cells per contour, each a `dur_steps`-weight list (1 == one step, 2 == a
+    /// held note worth two steps, 3 == a dotted/long value), cycled across the sampled
+    /// contour by `resolve_motif_celled` exactly as the single S39 profile was. Lives HERE
+    /// beside `contour()` because rhythm-vs-pitch are the two halves of the same theory-owned
+    /// motivic identity (a motif is a pitch shape AND a rhythm), and the realizer reads only
+    /// what these two produce.
+    ///
+    /// theory — the GAIT DIMENSION. S39 welded one rhythm to each contour, so two images on
+    /// the same contour clapped identically (Finding B, the "clap test"). Here each contour
+    /// keeps its PITCH gesture but owns FOUR gaits that are all legal for that gesture, so the
+    /// SAME melodic shape can be clapped four different ways. The cell ordering is a
+    /// deliberate, monotone affect ramp the upstream selector (`pick_rhythm_cell`) indexes
+    /// into BROAD → BUSY:
+    ///   * cell 0 — the S39 profile (the back-compat anchor — `rhythm_cell(_, 0)` reproduces
+    ///     S39 byte-for-byte; HARD freeze constraint, NOT a taste call — see the §6 hinge in
+    ///     `docs/design-s41-findingB-rhythm-depth.md`).
+    ///   * cell 1 — BROADER / AUGMENTED. More 2s, the gesture in longer values: the calm,
+    ///     sustained reading of the same line (low arousal).
+    ///   * cell 2 — BUSIER / EVEN-SUBDIVIDED. All (or mostly) 1s: the gesture run as a quick,
+    ///     even, energetic line (high arousal, the moto-perpetuo reading).
+    ///   * cell 3 — PROFILED / SYNCOPATED. A dotted (3), long-short-short, or off-balance
+    ///     pattern: the same gesture given a characteristic, lilting/snapping rhythmic profile
+    ///     so two busy images still diverge on gait-shape, not just density.
+    ///
+    /// Every weight is >= 1 (the `MotifNote` contract). Each cell, cycled across the contour
+    /// and durational-sum-capped at `length_steps` by the UNCHANGED accumulation loop, honors
+    /// the same Σ-budget contract S39 did — so the realizer contract is unchanged across the
+    /// whole vocabulary (proven by `tests/motif_s41.rs` P5/P6 and the still-green
+    /// `tests/motif_s39.rs` cell-0 hinge).
+    fn rhythm_cells(self) -> &'static [&'static [u8]] {
         match self {
-            // Endpoint-weighted: a longer launch and a longer arrival frame the climb.
-            MotifArchetype::Arch => &[2, 1, 1, 2],
-            MotifArchetype::InvertedArch => &[2, 1, 1, 2],
-            // Even running line that lands on a longer final degree.
-            MotifArchetype::Descent => &[1, 1, 1, 1, 2],
-            // A light lift that arrives long.
-            MotifArchetype::Ascent => &[1, 1, 2],
-            // Even turn that settles long on the resolution.
-            MotifArchetype::NeighborTurn => &[1, 1, 1, 1, 2],
-            // The opening leap gets the weight, then quick stepwise recovery.
-            MotifArchetype::LeapStep => &[2, 1, 1, 1, 1],
-            // All augmentation: a slow, insistent two-zone toll.
-            MotifArchetype::Pendulum => &[2, 2],
-            // A light developmental cell that arrives long.
-            MotifArchetype::RisingSequence => &[1, 1, 2],
+            // ARCH 1-3-5-3-1 — endpoint-framed climb-and-fall.
+            //  0 S39: longer launch + longer arrival frame the quicker middle.
+            //  1 broad: all augmentation — a slow, spacious arch (sostenuto).
+            //  2 busy: even running quavers — the arch taken at speed.
+            //  3 profiled: a dotted launch (long-short) then even, a lilting upbeat into the rise.
+            MotifArchetype::Arch => &[&[2, 1, 1, 2], &[2, 2, 2], &[1, 1, 1, 1], &[3, 1, 1, 1, 2]],
+            // INVERTED-ARCH 5-3-1-3-5 — settle into the valley, lift back out.
+            //  0 S39 (shared with Arch in S39): endpoint-weighted.
+            //  1 broad: augmented descent-and-return, a sighing dip.
+            //  2 busy: even line through the valley.
+            //  3 profiled: weighted floor (the 2 lands on the valley bottom, degree 1) — the dip
+            //    is the long note, framing it as the gesture's center of gravity.
+            MotifArchetype::InvertedArch => {
+                &[&[2, 1, 1, 2], &[2, 2, 2], &[1, 1, 1, 1], &[1, 1, 2, 1, 1]]
+            }
+            // DESCENT 5-4-3-2-1 — stepwise fall that resolves.
+            //  0 S39: even fall, lands long on the tonic arrival.
+            //  1 broad: augmented descent — a slow, weighty settling.
+            //  2 busy: a perfectly even running scale (the moto-perpetuo fall).
+            //  3 profiled: a long-weighted HEAD (the 5 is held), then the fall accelerates —
+            //    a suspension-and-release shape idiomatic to a resolving descent.
+            MotifArchetype::Descent => &[
+                &[1, 1, 1, 1, 2],
+                &[2, 2, 2],
+                &[1, 1, 1, 1, 1],
+                &[2, 1, 1, 1, 1],
+            ],
+            // ASCENT 1-2-3-4-5 — stepwise lift, opening.
+            //  0 S39: light lift that arrives long.
+            //  1 broad: augmented rise — a slow, swelling crescendo of pitch.
+            //  2 busy: an even running scale up (the energetic lift).
+            //  3 profiled: even climb that arrives LONG on the goal degree — a goal-directed
+            //    rise that breathes at the top (anacrusis-to-downbeat shape).
+            MotifArchetype::Ascent => &[&[1, 1, 2], &[2, 2], &[1, 1, 1, 1], &[1, 1, 1, 2]],
+            // NEIGHBOR-TURN 1-2-1-7-1 — ornamental turn around the tonic.
+            //  0 S39: even turn settling long on the final resolution.
+            //  1 broad: a slow, expressive turn (each pole of the ornament sustained).
+            //  2 busy: a quick, even mordent-like turn — the ornament taken brightly.
+            //  3 profiled: a SNAP turn — long tonic anchor (2), then the ornament flicks fast
+            //    around it, a Lombard/Scotch-snap reading of the figure.
+            MotifArchetype::NeighborTurn => {
+                &[&[1, 1, 1, 1, 2], &[2, 2], &[1, 1, 1, 1], &[2, 1, 1, 1, 1]]
+            }
+            // LEAP-STEP 1-5-4-3-2 — an opening leap then a stepwise gap-fill.
+            //  0 S39: the opening leap gets the weight, then quick stepwise recovery.
+            //  1 broad: a sustained opening interval, then a measured fill (declamatory).
+            //  2 busy: even — the leap and fill run as one quick gesture.
+            //  3 profiled: a DOTTED opening (3 on the launch degree) — a heroic, fanfare-like
+            //    long-leap then a rapid gap-fill descent (a French-overture profile).
+            MotifArchetype::LeapStep => &[
+                &[2, 1, 1, 1, 1],
+                &[2, 2, 1],
+                &[1, 1, 1, 1, 1],
+                &[3, 1, 1, 1],
+            ],
+            // PENDULUM 1-5-1-5-1 — oscillating tonic↔dominant, insistent.
+            //  0 S39: all augmentation — a slow two-zone toll.
+            //  1 broad: still broader, every pole sustained — the deepest toll.
+            //  2 busy: even — a quick alternation, an insistent ostinato.
+            //  3 profiled: a DOTTED swing (long-short) — the pendulum given a lopsided, lurching
+            //    gait, the toll with an uneven swing to it.
+            MotifArchetype::Pendulum => &[&[2, 2], &[2, 2, 2], &[1, 1, 1, 1], &[3, 1]],
+            // RISING-SEQUENCE 1-2-3 / 2-3-4 — a 3-note cell sequenced up a step; developmental.
+            //  0 S39 (shared with Ascent in S39): a light developmental cell arriving long.
+            //  1 broad: augmented — each cell of the sequence stated broadly.
+            //  2 busy: even running line through both cells (a driving sequence).
+            //  3 profiled: a long-short-short within EACH 3-note cell ([2,1,1] repeated) — the
+            //    classic sequenced-motive gait where the cell head is accented on each repeat.
+            MotifArchetype::RisingSequence => {
+                &[&[1, 1, 2], &[2, 2], &[1, 1, 1, 1, 1, 1], &[2, 1, 1]]
+            }
         }
+    }
+
+    /// Select ONE rhythm cell from this archetype's vocabulary by a 0..K-1 `index`
+    /// (image-derived upstream by `composition::pick_rhythm_cell`). Defensive clamp so an
+    /// out-of-range index can never panic — it saturates to the busiest/last cell.
+    /// `rhythm_cell(_, 0)` is the S39 profile (the freeze anchor).
+    fn rhythm_cell(self, index: usize) -> &'static [u8] {
+        let cells = self.rhythm_cells();
+        cells[index.min(cells.len() - 1)]
+    }
+
+    /// The size K of this archetype's rhythm-cell vocabulary, so the plan-time selector
+    /// (`composition::pick_rhythm_cell`) can size the index it produces WITHOUT the static
+    /// cell table crossing the module boundary. `K >= 1` for every archetype (it is 4 for all
+    /// eight as authored; the slice type permits per-archetype variation — the only structural
+    /// rule is cell 0 == the S39 profile).
+    pub fn rhythm_cell_count(self) -> usize {
+        self.rhythm_cells().len()
     }
 }
 
@@ -2432,10 +2523,49 @@ impl MotifArchetype {
 ///                  Σ dur_steps <= length_steps (the motif never over-runs its section).
 ///
 /// Determinism: pure function of its three inputs — no RNG, no clock.
+///
+/// S41 (Finding B): this is the BACK-COMPAT entry point — equivalent to
+/// `resolve_motif_celled(archetype, range_degrees, length_steps, 0)`. Cell 0 of every
+/// archetype is the S39 `rhythm_profile()` value, so this wrapper reproduces the pre-S41
+/// bytes for every existing caller and golden. New plan-time callers that want an
+/// image-selected gait call `resolve_motif_celled` with a non-zero `cell_index`.
 pub fn resolve_motif(
     archetype: MotifArchetype,
     range_degrees: u8,
     length_steps: usize,
+) -> Vec<MotifNote> {
+    resolve_motif_celled(archetype, range_degrees, length_steps, 0)
+}
+
+/// Resolve a build-time `MotifArchetype` + image-derived range/length + an image-SELECTED
+/// rhythm-cell index into the concrete key-relative degree+duration sequence the realizer
+/// reads (spec §1.5; S41 Finding-B rhythm-depth). THE ONE PLACE contour → `MotifNote`
+/// happens. Called by `composition.rs` at plan build, never at tick time — so `MotifNote`
+/// stays frozen and the freeze is safe.
+///
+/// Identical to the S39 `resolve_motif` body in every respect EXCEPT the rhythm source: the
+/// archetype's single `rhythm_profile()` is replaced by `archetype.rhythm_cell(cell_index)`,
+/// one of the archetype's K idiomatic gaits (S41 §3). `cell_index == 0` selects the S39
+/// profile, making `resolve_motif_celled(.., 0)` byte-identical to the S39 `resolve_motif`
+/// (the freeze anchor — `tests/motif_s39.rs` and P5 in `tests/motif_s41.rs` pin it). The
+/// index is clamped defensively in `rhythm_cell`, so an out-of-range index can never panic.
+///
+/// `archetype`    — the chosen melodic shape (image-selected upstream).
+/// `range_degrees`— the span (in scale degrees) the contour is stretched/compressed to fill;
+///                  clamped to a singable 1..=7. theory: edge_activity/complexity sets this.
+/// `length_steps` — the motif's total DURATION in steps (Σ dur_steps), NOT its note count.
+///                  The selected cell is cycled across the sampled contour and durations
+///                  accumulate until they fill `length_steps`; the emitted note count is
+///                  therefore <= length_steps. Clamped to >=1. Guarantees, for EVERY cell:
+///                  every `dur_steps >= 1` and Σ dur_steps <= length_steps.
+/// `cell_index`   — which of the archetype's `rhythm_cell_count()` gaits to use (0 == S39).
+///
+/// Determinism: pure function of its four inputs — no RNG, no clock.
+pub fn resolve_motif_celled(
+    archetype: MotifArchetype,
+    range_degrees: u8,
+    length_steps: usize,
+    cell_index: usize,
 ) -> Vec<MotifNote> {
     let contour = archetype.contour();
     // The canonical contour spans degrees 0..=4 (a fifth). Re-scale that native span
@@ -2447,7 +2577,11 @@ pub fn resolve_motif(
     let scale = range / NATIVE_SPAN;
 
     let len = length_steps.max(1);
-    let profile = archetype.rhythm_profile();
+    // S41: the rhythm source is now the image-SELECTED cell, not the archetype-fixed S39
+    // profile. cell_index 0 == the S39 profile (freeze anchor); rhythm_cell clamps an
+    // out-of-range index defensively. Everything below this line is byte-unchanged from S39 —
+    // the same cycle-and-cap accumulation loop consumes `profile` exactly as before.
+    let profile = archetype.rhythm_cell(cell_index);
 
     // DURATIONAL-SUM-CAPPED emit. Walk the contour ONCE, giving each sampled degree the
     // next duration from the archetype's cycled rhythm profile, and accumulate

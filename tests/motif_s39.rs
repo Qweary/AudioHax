@@ -188,17 +188,32 @@ fn test_vocabulary_spread_reaches_most_archetypes() {
         let range_degrees = (2.0 + u.edge_activity * 5.0).round() as u8;
         let length_steps = (3.0 + u.complexity * 5.0).round() as usize;
 
-        // Identify the archetype by matching the full (degree, dur_steps) line — unique per
-        // archetype at fixed range/length (contour AND rhythm both come from the archetype).
+        // Identify the archetype by matching the full (degree, dur_steps) line. S41 RE-BLESS: the
+        // planner now SELECTS a per-image rhythm CELL (`pick_rhythm_cell`), so the stored motif is
+        // no longer guaranteed to be cell 0 — it may be any of the archetype's
+        // `rhythm_cell_count()` gaits. The test's INTENT is preserved exactly (the vocabulary
+        // reaches most archetypes); only the cell-0 assumption is relaxed: match against ANY cell
+        // of each archetype via `resolve_motif_celled(a, .., cell)`. The full (contour+rhythm) line
+        // is unique per (archetype, cell) at a fixed range/length, so the archetype read-back stays
+        // unambiguous. (`resolve_motif(a, ..)` == `resolve_motif_celled(a, .., 0)`, so cell 0 is
+        // still covered by the `0..count` loop — this is a strict superset of the S39 match.)
         let mut identified: Option<MotifArchetype> = None;
-        for &a in &all {
-            let cand = audiohax::chord_engine::resolve_motif(a, range_degrees, length_steps);
-            if cand == *got {
-                identified = Some(a);
-                break;
+        'archetype: for &a in &all {
+            for cell in 0..a.rhythm_cell_count() {
+                let cand = audiohax::chord_engine::resolve_motif_celled(
+                    a,
+                    range_degrees,
+                    length_steps,
+                    cell,
+                );
+                if cand == *got {
+                    identified = Some(a);
+                    break 'archetype;
+                }
             }
         }
-        let a = identified.expect("the stored motif must match some archetype's resolve_motif");
+        let a = identified
+            .expect("the stored motif must match some archetype's resolve_motif_celled (any cell)");
         *counts.entry(name(a)).or_insert(0) += 1;
         // Log archetype per fixture (visible with `--nocapture`).
         eprintln!("archetype: {}", name(a));

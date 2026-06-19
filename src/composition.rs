@@ -1483,7 +1483,17 @@ impl CompositionPlanner {
             // in steps from complexity (richer image = a slightly longer subject).
             let range_degrees = (2.0 + u.edge_activity * 5.0).round() as u8; // 2..=7
             let length_steps = (3.0 + u.complexity * 5.0).round() as usize; // 3..=8
-            let motif = chord_engine::resolve_motif(archetype, range_degrees, length_steps);
+                                                                            // S41 Finding B (lever A): the gait is no longer welded to the contour — the image
+                                                                            // selects one of the archetype's rhythm cells, so two images on the same archetype
+                                                                            // can still be clapped apart.
+            let cell_count = archetype.rhythm_cell_count();
+            let cell_index = pick_rhythm_cell(u, archetype, cell_count);
+            let motif = chord_engine::resolve_motif_celled(
+                archetype,
+                range_degrees,
+                length_steps,
+                cell_index,
+            );
             vec![ThemeSeed { id: 0, motif }]
         };
 
@@ -1715,6 +1725,60 @@ fn pick_archetype(u: &ImageUnderstanding) -> MotifArchetype {
             }
         }
     }
+}
+
+// ── S41 Finding B (lever A): image → rhythm-cell SELECTION band edges ─────────────────
+// These are the TASTE call (DP-A in `docs/design-s41-findingB-rhythm-depth.md`): the exact
+// cuts that decide which of an archetype's gaits an image rides. They are seeds — the
+// taste/affect reviewers confirm or refine them after this slice — so they live here as
+// named consts, easy to find and adjust without touching the selection logic.
+//
+// PRIMARY axis = `edge_activity` (rhythmic energy / arousal-faithful density). It drives the
+// calm→energetic ramp across the BROAD→BUSY portion of the vocabulary (cells 0,1,2):
+//   edge_activity <  CELL_EDGE_BROAD   → cell 1 (BROADER / augmented — the calmest gait)
+//   edge_activity <  CELL_EDGE_BUSY    → cell 0 (the S39 anchor — broad-but-moving)
+//   edge_activity >= CELL_EDGE_BUSY    → cell 2 (BUSIEST / even-subdivided — energetic)
+const CELL_EDGE_BROAD: f32 = 0.33;
+const CELL_EDGE_BUSY: f32 = 0.66;
+// SECONDARY axis = `complexity`. A high-complexity image is diverted onto cell 3 — the
+// PROFILED / SYNCOPATED CHARACTER gait — so two images of equal `edge_activity` do NOT
+// re-collapse onto the same density-picked cell: the busy/calm one keeps its density gait,
+// the visually-intricate one snaps to the character gait instead. This is the decorrelating
+// tiebreak (the clap-test win comes from two near-identical-energy images splitting gaits).
+const CELL_COMPLEXITY_PROFILED: f32 = 0.66;
+
+/// Pick a rhythm-cell index (`0..cell_count-1`) for the chosen `archetype` from the image's
+/// rhythmic energy. PRIMARY axis `edge_activity` selects along the BROAD→BUSY density ramp
+/// (cells 1/0/2); SECONDARY axis `complexity` diverts visually-intricate images onto the
+/// PROFILED/SYNCOPATED character gait (cell 3) so two equal-`edge_activity` images still
+/// diverge on gait rather than re-collapsing. Pure; no RNG, no clock. The returned index is
+/// clamped to `cell_count` so it can never index out of an archetype's vocabulary (the
+/// realizer also clamps defensively in `MotifArchetype::rhythm_cell`).
+///
+/// S41 Finding B (lever A): this is the planner half that breaks the S39 contour→rhythm
+/// weld — the same archetype now emits different gaits for different images, so the clap
+/// test stops collapsing onto the ~6 fixed S39 gaits. See
+/// `docs/design-s41-findingB-rhythm-depth.md` §3.4.
+fn pick_rhythm_cell(
+    u: &ImageUnderstanding,
+    _archetype: MotifArchetype,
+    cell_count: usize,
+) -> usize {
+    // SECONDARY first: a visually-intricate image takes the character gait (cell 3) regardless
+    // of where its density would land it — this is the decorrelating diversion. Only available
+    // when the vocabulary actually has a cell 3 (K >= 4 as authored); otherwise fall through to
+    // the density ramp and let the final clamp keep us in range.
+    let index = if u.complexity >= CELL_COMPLEXITY_PROFILED && cell_count > 3 {
+        3
+    } else if u.edge_activity < CELL_EDGE_BROAD {
+        1 // calm image → the broadest/augmented gait
+    } else if u.edge_activity < CELL_EDGE_BUSY {
+        0 // mid energy → the S39 anchor gait (broad-but-moving)
+    } else {
+        2 // busy image → the busiest/even-subdivided gait
+    };
+    // Clamp into this archetype's vocabulary (`cell_count >= 1`); saturates to the last cell.
+    index.min(cell_count.saturating_sub(1))
 }
 
 /// Clamp a template variation into the slice-1 active set `{Identity, Fragmented}`. Any
