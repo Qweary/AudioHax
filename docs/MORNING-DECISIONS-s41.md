@@ -57,18 +57,22 @@ no-seed varies.
 
 ---
 
-## 2. DECISION — RETIRE the Slice-3b density FREEZE-BREAK? (one-line confirm) ✅ recommended
+## 2. DECISION — RETIRE the Slice-3b density FREEZE-BREAK? → ✅ RETIRED (operator-confirmed 2026-06-19)
 
-**Recommendation: RETIRE Slice-3b and mark DP-1 moot.** Rationale (established
-pre-S41, confirmed this batch): the standing "sparse/structureless" density
+**RETIRED + DP-1 marked MOOT.** Rationale: the "sparse/structureless" density
 verdict was traced in S40 to a `play`-scheduler ARTIFACT, not an engine property
-— `render` proves the engine produces dense, in-tempo music, and your re-listen
-#2 ("notes ring out now, way better") confirmed the fixed path. The satisfying
-density fix (Slice-3b: `DENSITY_NEUTRAL 0.5→0.62` + arousal edge) was a
-FREEZE-BREAK requiring golden re-baseline (DP-1). Since density is good on the
-faithful path, the freeze-break is very likely DEAD — retiring it is a scope win
-(no golden churn, freeze anchor stays cold). **I did NOT build any freeze-break.**
-→ **Your call: confirm RETIRE (and DP-1 moot), or keep it parked.**
+(`render` produces dense in-tempo music; re-listen #2 "notes ring out now, way
+better" confirmed the fixed path). The S41 ear-verdict reinforced it — you heard a
+full texture (chords + recurring rhythms), no sparseness complaint. Decisive
+point: Slice-3b would RAISE default accompaniment density, which — given the S41
+finding that the melody is BURIED under the accompaniment — would worsen the
+buried-melody problem, not help it. So the freeze-break (`DENSITY_NEUTRAL 0.5→0.62`
++ arousal edge) is dead: the `engine_equivalence` goldens are NOT re-baselined
+(freeze anchor stays cold), DP-1 is MOOT, and `DENSITY_NEUTRAL`/`DENSITY_AROUSAL_SPAN`/
+`FILL_REST_ACTIVITY` are untouched. No freeze-break was ever built. Reversible only
+if a future re-listen genuinely reports sparseness on the faithful path (not the
+current evidence). The freeze-SAFE Slice-3a craft levers remain independently
+available if ever wanted — unaffected by this retirement.
 
 ---
 
