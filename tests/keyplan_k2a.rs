@@ -286,7 +286,9 @@ fn energy_descending_rank() {
 
 /// A non-zero per-section offset shifts the section's generated chord ROOTS by exactly that offset.
 /// This is the planner's re-root seam — composition.rs builds each section's chords with
-/// `generate_chords(home_root_midi + key_offset_semitones, …)` (NOT the literal home root). We
+/// `generate_chords(home_root_midi + key_offset_semitones, …)` (NOT the literal home root).
+/// (home_root_midi is the per-image home from S40 Slice-2; in this direct-`generate_chords`
+/// witness we pin it to the legacy 60 to isolate the re-root arithmetic.) We
 /// exercise that seam DIRECTLY and DETERMINISTICALLY via the PUBLIC, RNG-FREE
 /// `ChordEngine::generate_chords` with a FIXED progression (the plan()-internal progression comes
 /// from `pick_progression`/`thread_rng` and so cannot be compared across two plans — see the
@@ -301,7 +303,7 @@ fn harmony_reroots() {
     let m = mappings();
     let engine = ChordEngine::new(rebuild_mapping_table(&m));
     let progression: Vec<String> = vec!["I".into(), "IV".into(), "V".into(), "I".into()];
-    const HOME: u8 = 60; // C4, the planner's home_root_midi seed.
+    const HOME: u8 = 60; // C4 — the legacy/fallback home (planner default when no home_root block); pinned here to isolate the re-root law.
 
     // 1:1-mapping params: low edge (no V/x insert), brightness_drop 0 (no borrowed iv),
     // colorfulness 0 (no mode-mixture append). Deterministic — no RNG in generate_chords.

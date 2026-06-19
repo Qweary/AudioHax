@@ -159,6 +159,42 @@ pub struct CompositionMappings {
     /// `From<CompositionMappings>` impl in composition.rs.
     #[serde(default)]
     pub key_scheme_catalogue: Vec<crate::composition::KeyScheme>,
+    /// S40 / Slice-2 — the optional per-image home block (Finding #1). `#[serde(default)]`
+    /// back-compat floor: absent → `None` → the planner returns `home_root_midi = 60`
+    /// byte-for-byte (today's behavior). When present, the dominant hue selects a chromatic
+    /// pitch class (Music Theory single-writes the `hue_to_pc` cuts) which is seated into the
+    /// Theory-owned safe register band `[lo,hi]`. Carried onto `PlanMappings` by the
+    /// `From<CompositionMappings>` impl in composition.rs.
+    #[serde(default)]
+    pub home_root: Option<HomeRootMap>,
+}
+
+/// S40 / Slice-2 (Finding #1) — the per-image home block (schema Option S1, range-map shape).
+///
+/// `dominant_hue` (degrees) selects a chromatic pitch class via the `hue_to_pc` range map, and
+/// that pitch class is seated into the Theory-owned safe register band `[band.lo, band.hi]`.
+/// This is the FROZEN deserialize contract shared with the parallel Music Theory JSON lane:
+/// the `band` / `hue_to_pc` field names and shapes must not drift.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct HomeRootMap {
+    /// The Theory-owned safe register band the chosen pitch class is seated into. The band must
+    /// span exactly 12 semitones (`hi - lo == 11`) so every pitch class has exactly one
+    /// representative in-band; the shipped default is `[57,68]` (A3 … G#4).
+    pub band: HomeBand,
+    /// The hue→pitch-class range map: `"lo-hi"` (hue degrees) → `"pc"` (the chromatic pitch
+    /// class `0..=11` as a string, matching the existing `HashMap<String,String>` range-map
+    /// convention used by `global.hue_to_mode`). Music Theory single-writes the cuts.
+    pub hue_to_pc: HashMap<String, String>,
+}
+
+/// S40 / Slice-2 — the safe register band a seated home pitch class lands within. Theory-owned
+/// (register-safety guard); `hi` must not exceed 68 without re-deriving headroom margins.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct HomeBand {
+    /// Lowest MIDI note number of the safe band (inclusive).
+    pub lo: u8,
+    /// Highest MIDI note number of the safe band (inclusive). Must equal `lo + 11`.
+    pub hi: u8,
 }
 
 #[derive(Debug, Deserialize)]

@@ -17,7 +17,9 @@
 //! characters ship as schema (default-pinned) and are realized in later stages.
 
 use crate::chord_engine::{self, ChordEngine, MotifArchetype, StepPlan};
-use crate::mapping_loader::{rebuild_mapping_table, CompositionMappings, MappingTable};
+use crate::mapping_loader::{
+    rebuild_mapping_table, CompositionMappings, HomeRootMap, MappingTable,
+};
 
 /// Local mirror of the (private) `chord_engine::EDGE_ACTIVITY_RANGE_MAX` (== 0.05). The
 /// planner stores `edge_activity` already-normalized (0..1) but `generate_chords` wants the
@@ -973,6 +975,13 @@ pub struct PlanMappings {
     /// byte-stable.
     #[serde(default)]
     pub key_scheme_catalogue: Vec<KeyScheme>,
+    /// NEW S40 / Slice-2 — the optional per-image home block (Finding #1). `#[serde(default)]`
+    /// (`None`) back-compat floor: absent → `resolve_home_root_midi` returns 60 byte-for-byte.
+    /// When present, the dominant hue drives the per-piece home (hue → pitch class → seated into
+    /// the safe register band). Mirrors the loader's `CompositionMappings::home_root`; carried
+    /// across by the `From<CompositionMappings>` impl below.
+    #[serde(default)]
+    pub home_root: Option<HomeRootMap>,
 }
 
 impl From<CompositionMappings> for PlanMappings {
@@ -995,7 +1004,127 @@ impl From<CompositionMappings> for PlanMappings {
             prominence: c.prominence,
             prominence_catalogue: c.prominence_catalogue,
             key_scheme_catalogue: c.key_scheme_catalogue,
+            home_root: c.home_root,
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §2 (S40 Slice-2) — per-image HOME resolution: hue → pitch class → seated band
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The legacy/fallback home root (C4). Returned whenever the optional `home_root` block is
+/// absent or a hue does not match any cut — the defensive floor that reproduces today's
+/// behavior byte-for-byte (see work-order §2.2 / INV-4).
+const LEGACY_HOME_ROOT_MIDI: u8 = 60;
+
+/// Seat a chromatic pitch class as the nearest representative within the safe register band
+/// `[lo, hi]`. The result is the lowest MIDI note at-or-above `lo` whose `note % 12 == pc`,
+/// lifted one octave if it fell below `lo`.
+///
+/// Because a valid band spans exactly 12 semitones (`hi - lo == 11`), every one of the 12
+/// pitch classes has exactly one representative in-band, so the single lift step always lands
+/// `note ∈ [lo, hi]` — this is provable, not clamped (work-order §2.3 / GR-2). We
+/// `debug_assert` the upper bound rather than clamp it, so a band-width regression surfaces
+/// loudly in debug builds instead of being silently masked.
+fn seat_pc_in_band(pc: u8, lo: u8, hi: u8) -> u8 {
+    // Place `pc` in `lo`'s octave, then lift into the band if it fell below the floor.
+    let mut note = (lo - (lo % 12)) + pc;
+    if note < lo {
+        note += 12;
+    }
+    debug_assert!(
+        note <= hi,
+        "seat_pc_in_band: pc={pc} seated to {note} above band hi={hi} (band must span 12 semitones: hi-lo==11)"
+    );
+    note
+}
+
+/// Resolve the per-image home root MIDI from the dominant hue, seated into the safe register
+/// band. Returns 60 (C4) — the byte-for-byte legacy floor — when the optional `home_root`
+/// block is absent OR when the hue matches no cut OR when the matched pitch class is unparseable
+/// or out of `0..=11`. Never panics on bad data (work-order §2.2).
+///
+/// `dominant_hue` is `u.dominant_hue` (degrees, 0..360). The `hue_to_pc` lookup reuses the
+/// existing `lookup_range_map` range-map primitive (the same `"lo-hi" -> value` idiom as
+/// `global.hue_to_mode`), so the pitch-class cuts stay Music Theory's single-writer field.
+fn resolve_home_root_midi(home: Option<&HomeRootMap>, dominant_hue: f32) -> u8 {
+    let Some(home) = home else {
+        return LEGACY_HOME_ROOT_MIDI;
+    };
+    // Range-map scan: matched value is the chromatic pitch class as a string (per Option-S1
+    // schema). Any miss / parse failure / out-of-range value falls to the legacy 60 — we treat
+    // bad data exactly like an absent block (same byte-for-byte floor; never panic).
+    match crate::mapping_loader::lookup_range_map(&home.hue_to_pc, dominant_hue) {
+        Some(pc_str) => match pc_str.trim().parse::<u8>() {
+            Ok(pc) if pc <= 11 => seat_pc_in_band(pc, home.band.lo, home.band.hi),
+            _ => LEGACY_HOME_ROOT_MIDI,
+        },
+        None => LEGACY_HOME_ROOT_MIDI,
+    }
+}
+
+#[cfg(test)]
+mod home_root_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// GR-2: across the shipped safe band [57,68], every one of the 12 pitch classes seats to a
+    /// note inside the band and reduces back to the requested pitch class.
+    #[test]
+    fn seat_pc_in_band_all_pcs_in_band() {
+        let (lo, hi) = (57u8, 68u8);
+        for pc in 0u8..=11 {
+            let note = seat_pc_in_band(pc, lo, hi);
+            assert!(
+                (lo..=hi).contains(&note),
+                "pc {pc} seated to {note}, outside [{lo},{hi}]"
+            );
+            assert_eq!(note % 12, pc, "pc {pc} seated to wrong pitch class {note}");
+        }
+    }
+
+    /// INV-4: an absent home block resolves to the legacy 60 for every hue on the circle.
+    #[test]
+    fn resolve_home_none_is_legacy_60_across_hue_sweep() {
+        let mut hue = 0.0f32;
+        while hue < 360.0 {
+            assert_eq!(resolve_home_root_midi(None, hue), 60);
+            hue += 5.0;
+        }
+    }
+
+    /// INV-3: a present block with two cross-bucket hues yields two DIFFERENT in-band homes.
+    #[test]
+    fn resolve_home_present_cross_bucket_hues_differ_and_in_band() {
+        let mut hue_to_pc = HashMap::new();
+        hue_to_pc.insert("0-29".to_string(), "0".to_string()); // C
+        hue_to_pc.insert("30-59".to_string(), "7".to_string()); // G
+        let home = HomeRootMap {
+            band: crate::mapping_loader::HomeBand { lo: 57, hi: 68 },
+            hue_to_pc,
+        };
+        let a = resolve_home_root_midi(Some(&home), 10.0);
+        let b = resolve_home_root_midi(Some(&home), 45.0);
+        assert_ne!(a, b, "cross-bucket hues must seat to different homes");
+        assert!((57..=68).contains(&a) && (57..=68).contains(&b));
+        assert_eq!(a % 12, 0); // C
+        assert_eq!(b % 12, 7); // G
+    }
+
+    /// Bad-data defense: unmatched hue, unparseable value, and out-of-range pc all fall to 60.
+    #[test]
+    fn resolve_home_bad_data_falls_to_legacy_60() {
+        let mut hue_to_pc = HashMap::new();
+        hue_to_pc.insert("0-29".to_string(), "13".to_string()); // out of 0..=11
+        hue_to_pc.insert("30-59".to_string(), "x".to_string()); // unparseable
+        let home = HomeRootMap {
+            band: crate::mapping_loader::HomeBand { lo: 57, hi: 68 },
+            hue_to_pc,
+        };
+        assert_eq!(resolve_home_root_midi(Some(&home), 10.0), 60); // out-of-range pc
+        assert_eq!(resolve_home_root_midi(Some(&home), 45.0), 60); // unparseable
+        assert_eq!(resolve_home_root_midi(Some(&home), 200.0), 60); // unmatched hue
     }
 }
 
@@ -1299,14 +1428,19 @@ impl CompositionPlanner {
             u.affect_valence,
             &self.plan_mappings.affect.mode_valence_cuts,
         );
-        let home_root_midi = 60; // C4 seed (EngineConfig.root_midi default); A/Return stay home.
-                                 // S24: resolve the per-section key offsets ONCE per plan, now that the form_spec and
-                                 // home_mode are chosen (mirrors the S23 prominence resolve). `home_only`/absent scheme →
-                                 // all-zero (byte-stable). The section loop reads `offsets[i]`; the KeyTempoPlan spine
-                                 // clones this Vec.
-                                 // S28/K3: capture the resolved scheme handle ONCE so its `pivot`/`resolution` flags can
-                                 // be copied onto each Section below. `home_only`/absent scheme → `None` → identity carry
-                                 // (`pivot:false`, `resolution:Resolve`), which keeps the realizer's pivot gate dead.
+        // S40 Slice-2: the per-image home, derived from the dominant hue (hue → pitch class →
+        // seated into the safe register band). 60 (C4) is the defensive fallback returned when
+        // no `home_root` block is present (or a hue/pc fails to resolve) — byte-for-byte legacy.
+        // A/Return stay home; every section re-roots to `home_root_midi + key_offset_semitones`.
+        let home_root_midi =
+            resolve_home_root_midi(self.plan_mappings.home_root.as_ref(), u.dominant_hue);
+        // S24: resolve the per-section key offsets ONCE per plan, now that the form_spec and
+        // home_mode are chosen (mirrors the S23 prominence resolve). `home_only`/absent scheme →
+        // all-zero (byte-stable). The section loop reads `offsets[i]`; the KeyTempoPlan spine
+        // clones this Vec.
+        // S28/K3: capture the resolved scheme handle ONCE so its `pivot`/`resolution` flags can
+        // be copied onto each Section below. `home_only`/absent scheme → `None` → identity carry
+        // (`pivot:false`, `resolution:Resolve`), which keeps the realizer's pivot gate dead.
         let key_scheme_handle =
             lookup_key_scheme(&self.plan_mappings.key_scheme_catalogue, &key_scheme_id);
         let scheme_pivot = key_scheme_handle.map(|s| s.pivot).unwrap_or(false);

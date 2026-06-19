@@ -100,6 +100,24 @@
     }
   },
   "composition": {
+    "home_root": {
+      "_note": "S40 Slice-2 Finding #1 (per-image HOME). dominant_hue (deg, 0..360) -> chromatic pitch class -> seated into the [57,68] register band by the planner. ABSENT block => home_root_midi = 60 (C4) byte-for-byte (serde default None). The [lo,hi] band is the Theory-owned register-safety guard (design-s38-theory.md 2.2): hi MUST NOT exceed 68 without re-deriving the 81<<96 / 103<<108 headroom margins, because melody floor 67 + bright-lift + a degree-+7 motif already sits near the top-end clamp; the band spans exactly 12 semitones [57=A3 .. 68=G#4] so every pitch class has exactly one in-band representative (seating is total). hue->pc rationale: UNIFORM 30-deg-per-pc synesthetic color-wheel -> chromatic-wheel identity (red=hue 0 -> C/pc 0, ascending clockwise around both 12-fold circles). Chosen over a non-uniform perceptual spacing because the uniform 1:1 spreads natural-image hues most EVENLY across all 12 homes -- directly serving cross-image differentiation (the 'by ~4th image, motifs sound familiar' observation): a 30-deg hue rotation always lands a new chromatic home, and no large hue range collapses onto one pc. Coherent with global.hue_to_mode (same hue-domain 'lo-hi' convention over 0..360): warm reds/oranges (Phrygian/Lydian) take the low chromatic homes C..D#, greens (Ionian) the central E..F, cyans/blues (Dorian/Aeolian) F#..G#, violets/magentas (Mixolydian) A..A#, wrapping back toward B at the red boundary -- color heat tracks rising chromatic center without contradicting the mode the same hue picks.",
+      "band": { "lo": 57, "hi": 68 },
+      "hue_to_pc": {
+        "0-29":    "0",
+        "30-59":   "1",
+        "60-89":   "2",
+        "90-119":  "3",
+        "120-149": "4",
+        "150-179": "5",
+        "180-209": "6",
+        "210-239": "7",
+        "240-269": "8",
+        "270-299": "9",
+        "300-329": "10",
+        "330-359": "11"
+      }
+    },
     "form_catalogue": [
       { "id": "rounded_binary", "sections": [
           {"label":"A",  "role":"Statement","rel_len":1.0,"theme":0,"variation":"Identity","boundary_cadence":"Half"},
