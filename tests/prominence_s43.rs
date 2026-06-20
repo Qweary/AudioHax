@@ -277,11 +277,19 @@ fn guard1_foreground_exists_on_every_section_of_both_renders() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// MUSICAL PROPERTY: the two images land on DIFFERENT prominence tiers. `example.jpg`
-/// (fg_bg_contrast ≥ 0.10) ESCALATES to `subject_melody` (Melody weight 1.0); `Lena.png`
-/// (fg_bg_contrast < 0.10) stays on the `melody_forward` default (Melody weight 0.78).
-/// Resolved through the REAL planner on each image's ACTUAL features — proving the gate
-/// fires for `example` and NOT for `Lena`, the second per-image distinction (how
-/// assertively the melody leads) layered on the theme/no-theme difference.
+/// (subject_size in [0.05,0.55] AND fg_bg_contrast ≥ 0.10) ESCALATES to `subject_melody`
+/// (Melody weight 1.0); `Lena.png` (fg_bg_contrast 0.052 < 0.10) routes to the SHALLOW
+/// field tier `melody_lead_gentle` (Melody weight 0.72). Resolved through the REAL planner
+/// on each image's ACTUAL features — proving the melody leads MORE assertively on the
+/// separated-subject image than on the low-contrast field image (the per-image divergence).
+///
+/// S47 RE-DERIVATION (spec-s47-slice1-build.md §2c — the image-conditioned prominence FAMILY,
+/// operator-locked 3 tiers deep/mid/shallow): the OLD Lena pin was 0.78 (`melody_forward`,
+/// the single pre-S47 default). The new SelectTable routes a low-`fg_bg_contrast` field image
+/// to the SHALLOW `melody_lead_gentle` tier (Melody 0.72), where the texture legitimately
+/// shares focus rather than forcing a strong lead on an abstract/field image. 0.78 was
+/// superseded by 0.72 as the intended SHALLOW-tier resolution. The PRESERVED property — the
+/// two images DIVERGE in melody assertiveness (example 1.0 > Lena 0.72) — holds with headroom.
 #[test]
 fn guard2_per_image_resolution_divergence() {
     let m = mappings();
@@ -301,17 +309,18 @@ fn guard2_per_image_resolution_divergence() {
 
     let ex_mel = weight_of(&ex[0], LayerRole::Melody).expect("example Melody weight");
     let lena_mel = weight_of(&lena[0], LayerRole::Melody).expect("Lena Melody weight");
-    eprintln!("[guard2] resolved Melody weight: example={ex_mel:.3} (subject_melody=1.0 expected), Lena={lena_mel:.3} (melody_forward=0.78 expected)");
+    eprintln!("[guard2] resolved Melody weight: example={ex_mel:.3} (subject_melody=1.0 expected), Lena={lena_mel:.3} (melody_lead_gentle=0.72 expected)");
 
     // The escalation gate FIRED for example → full subject_melody lift (Melody 1.0).
     assert!(
         (ex_mel - 1.0).abs() < 1e-6,
         "example.jpg must ESCALATE to subject_melody (Melody 1.0); resolved {ex_mel:.3}"
     );
-    // The gate did NOT fire for Lena → the melody_forward default (Melody 0.78).
+    // Lena (fg_bg_contrast < 0.10) routes to the SHALLOW field tier melody_lead_gentle
+    // (Melody 0.72) — the S47 image-conditioned recession family, not the old 0.78 default.
     assert!(
-        (lena_mel - 0.78).abs() < 1e-6,
-        "Lena.png must stay on the melody_forward default (Melody 0.78); resolved {lena_mel:.3}"
+        (lena_mel - 0.72).abs() < 1e-6,
+        "Lena.png must route to the melody_lead_gentle SHALLOW tier (Melody 0.72); resolved {lena_mel:.3}"
     );
     // The load-bearing point: the two images DIVERGE — different profiles, not the same one.
     assert!(

@@ -298,6 +298,146 @@ fn step_shape_key(step_evs: &[&NoteEvent], ms_per_step: u64) -> (usize, Vec<(u64
     (step_evs.len(), frac)
 }
 
+// ── S46 figure-ground helpers (reuse the same streams; no new render path). ──
+
+/// Onset COUNT per global step for a role's stamped events — the first element of the S45
+/// `step_shape_key` (count of NoteEvents the role emitted on that step). RNG-free / structural.
+/// This is the per-(step,role) onset density quantity F1/F2/F5 read.
+fn onsets_per_step(events: &[StampedEvent]) -> std::collections::BTreeMap<usize, usize> {
+    let mut mp: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    for se in events {
+        *mp.entry(se.step).or_insert(0) += 1;
+    }
+    mp
+}
+
+/// onset_density(role) = total onsets / sounding steps (onsets per step over the render).
+/// DETERMINISTIC (onset count is the rhythm template). Returns 0.0 for a silent role.
+fn onset_density(events: &[StampedEvent]) -> f32 {
+    let per = onsets_per_step(events);
+    if per.is_empty() {
+        return 0.0;
+    }
+    let total: usize = per.values().sum();
+    total as f32 / per.len() as f32
+}
+
+/// The melody-vs-other onset COUNT per step, restricted to the global steps where BOTH the
+/// melody and `other` co-sound. Used by F1's per-step hard sign and F5b's recession invariant.
+fn cosounding_onset_pairs(
+    melody: &[StampedEvent],
+    other: &[StampedEvent],
+) -> Vec<(usize, usize, usize)> {
+    // (step, melody_onsets, other_onsets) for each step both sound.
+    let mel = onsets_per_step(melody);
+    let oth = onsets_per_step(other);
+    let mut out = Vec::new();
+    for (step, mo) in &mel {
+        if let Some(oo) = oth.get(step) {
+            out.push((*step, *mo, *oo));
+        }
+    }
+    out
+}
+
+/// per-step representative pitch map (first event of the step), keyed by global step.
+fn pitch_by_step(events: &[StampedEvent]) -> std::collections::BTreeMap<usize, u8> {
+    let mut mp: std::collections::BTreeMap<usize, u8> = std::collections::BTreeMap::new();
+    for se in events {
+        mp.entry(se.step).or_insert(se.ev.note);
+    }
+    mp
+}
+
+/// motion FRACTION for a role: of consecutive sounding step-pairs, the fraction where the
+/// per-step representative pitch CHANGES (reuses `per_step_pitch` + `motion_dir`, the M1.2
+/// computation generalized per role). SEEDED (absolute pitch). 0.0 for <2 sounding steps.
+fn motion_fraction(events: &[StampedEvent]) -> f32 {
+    let steps = per_step_pitch(events);
+    let (mut moves, mut holds) = (0usize, 0usize);
+    for w in steps.windows(2) {
+        if w[0].1 == w[1].1 {
+            holds += 1;
+        } else {
+            moves += 1;
+        }
+    }
+    if moves + holds == 0 {
+        0.0
+    } else {
+        moves as f32 / (moves + holds) as f32
+    }
+}
+
+/// Pearson correlation sign helper (returns the correlation coefficient; the metric reads its
+/// SIGN). Returns 0.0 when undefined (fewer than 2 points or zero variance).
+fn correlation(xs: &[f32], ys: &[f32]) -> f32 {
+    let n = xs.len();
+    if n < 2 || n != ys.len() {
+        return 0.0;
+    }
+    let nf = n as f32;
+    let mx = xs.iter().sum::<f32>() / nf;
+    let my = ys.iter().sum::<f32>() / nf;
+    let mut cov = 0.0;
+    let mut vx = 0.0;
+    let mut vy = 0.0;
+    for i in 0..n {
+        let dx = xs[i] - mx;
+        let dy = ys[i] - my;
+        cov += dx * dy;
+        vx += dx * dx;
+        vy += dy * dy;
+    }
+    if vx <= 0.0 || vy <= 0.0 {
+        return 0.0;
+    }
+    cov / (vx.sqrt() * vy.sqrt())
+}
+
+/// The image-conditioned figure-strength CLASS (spec-s46 §0.4), binned from `fg_bg_contrast`
+/// (the same DEEP≥0.25 / SHALLOW<0.10 binning the slice-1 prominence family routes on, so the
+/// scorecard's required-margin tier matches the build's recession tier — spec-s47 §3 note).
+#[derive(Clone, Copy, PartialEq)]
+enum FigureStrength {
+    Subject, // DEEP: a strong lead is justified — the melody MUST clearly win.
+    Mid,     // a moderate lead.
+    Field,   // SHALLOW: an even texture is correct — the melody need not win, only not-lose.
+}
+
+fn figure_strength(fg_bg_contrast: f32) -> FigureStrength {
+    if fg_bg_contrast >= 0.25 {
+        FigureStrength::Subject
+    } else if fg_bg_contrast < 0.10 {
+        FigureStrength::Field
+    } else {
+        FigureStrength::Mid
+    }
+}
+
+/// F1's image-conditioned required margin `f(fg_bg_contrast)` (spec-s46 §1 F1(b), operator
+/// decision 7): a POSITIVE required margin only on SUBJECT images (≈ +0.30 onsets/step), a
+/// moderate one on MID, ≈ 0 on FIELD. The SIGN is load-bearing (the HARD floor `>= 0` applies
+/// on EVERY image regardless); these magnitudes are the ear-tuned tier — see spec-s47 §3.
+fn f1_required_margin(fg_bg_contrast: f32) -> f32 {
+    match figure_strength(fg_bg_contrast) {
+        FigureStrength::Subject => 0.30,
+        FigureStrength::Mid => 0.15,
+        FigureStrength::Field => 0.0,
+    }
+}
+
+/// F2's image-conditioned recession ceiling `g(fg_bg_contrast)` (spec-s46 §1 F2(b)): the bed
+/// generates ≤ ~70% of the figure's onsets on SUBJECT images, relaxing toward ≈ 1.0 on FIELD.
+/// The HARD floor (`activity_ratio <= 1.0 + ε`) applies on every image regardless.
+fn f2_recession_ceiling(fg_bg_contrast: f32) -> f32 {
+    match figure_strength(fg_bg_contrast) {
+        FigureStrength::Subject => 0.70,
+        FigureStrength::Mid => 0.85,
+        FigureStrength::Field => 1.00,
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The per-image scorecard. Returns the per-layer verdicts for the rollup.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -312,6 +452,21 @@ struct LayerVerdicts {
     form: Verdict,
     parallel_perfect_count: usize, // REGRESSION GUARD: ≤ documented music-forced residual when CounterMelody routed (spec M1.4, minimized-not-zero)
     figuration_ids_all_valid: bool,
+    // ── S46 figure-ground additive fields (spec-s46 §3, mirroring parallel_perfect_count). ──
+    /// The F1–F5 rollup verdict (Varied/Partial/Flat/Na/Crash).
+    figure_ground: Verdict,
+    /// F1_margin = onset_density(Melody) − max(onset_density of other present roles), onsets/step.
+    melody_most_active_margin: f32,
+    /// F3_frac — fraction of co-sounding steps where melody_pitch ≥ max(other concurrent pitches).
+    melody_highest_frac: f32,
+    /// F5b — the REGRESSION-GATED count: per co-sounding (step,bed-role) pairs where
+    /// bed_onsets(step) > melody_onsets(step) (the background out-moving the foreground).
+    bg_recession_violations: usize,
+    /// F5a — all-pair onset-distinctness fraction across concurrently-sounding role pairs.
+    rhythm_distinct_frac: f32,
+    /// The image's `fg_bg_contrast` (figure-strength signal), carried so the per-image
+    /// assertion loop can recompute the F1 image-conditioned required margin (S47 F1 promotion).
+    fg_bg_contrast: f32,
 }
 
 fn scorecard_for(name: &str, m: &MappingTable, pm: &PlanMappings) -> LayerVerdicts {
@@ -863,6 +1018,313 @@ fn scorecard_for(name: &str, m: &MappingTable, pm: &PlanMappings) -> LayerVerdic
         streams.section_roles.iter().map(|s| s.len()).collect::<Vec<_>>()
     );
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // S46 FIGURE-GROUND HIERARCHY block (F1–F5, spec-s46-figure-ground-metrics.md).
+    // The CROSS-LAYER question S45 does not answer: do the moving layers stand in the
+    // right FIGURE-GROUND relationship — is the melody the FIGURE and the rest the
+    // GROUND? Reuses the EXACT streams collected above; no new render path. The bar is
+    // RELATIONAL / image-conditioned via `fg_bg_contrast` (spec §0.4), never absolute.
+    // ═══════════════════════════════════════════════════════════════════════════
+    let mev_fg = streams.by_role.get("Melody").cloned().unwrap_or_default();
+    let pad_fg = streams.by_role.get("Pad").cloned().unwrap_or_default();
+    let fill_fg = streams
+        .by_role
+        .get("HarmonicFill")
+        .cloned()
+        .unwrap_or_default();
+    let counter_fg = streams
+        .by_role
+        .get("CounterMelody")
+        .cloned()
+        .unwrap_or_default();
+
+    // The bed roles present this render (Pad/Fill always present; Counter only when routed).
+    let mut bed_roles: Vec<(&'static str, &Vec<StampedEvent>)> = Vec::new();
+    if !pad_fg.is_empty() {
+        bed_roles.push(("Pad", &pad_fg));
+    }
+    if !fill_fg.is_empty() {
+        bed_roles.push(("HarmonicFill", &fill_fg));
+    }
+    let counter_routed_fg = !counter_fg.is_empty();
+    if counter_routed_fg {
+        bed_roles.push(("CounterMelody", &counter_fg));
+    }
+
+    let fg_class = figure_strength(u.fg_bg_contrast);
+    let fg_class_str = match fg_class {
+        FigureStrength::Subject => "SUBJECT(deep)",
+        FigureStrength::Mid => "MID",
+        FigureStrength::Field => "FIELD(shallow)",
+    };
+
+    let mel_density = onset_density(&mev_fg);
+    let mel_motion = motion_fraction(&mev_fg);
+
+    println!("──────────────────────────────────────────────────────────────────");
+    println!("FIGURE-GROUND (S46 F1–F5)  | figure-strength: {fg_class_str} (fg_bg_contrast {:.3}) | melody onset-density {mel_density:.3}/step", u.fg_bg_contrast);
+
+    // ── F1 — MELODY-IS-MOST-ACTIVE. Perceptual property: the FIGURE must generate the
+    //    densest onset stream — the melody's onset density must exceed every other
+    //    concurrent role's by an image-justified margin. The direct figure-ground gate.
+    //    DETERMINISTIC (onset count is the rhythm template, RNG-free). S47: PROMOTED from
+    //    reported to ASSERTED — the hard floor (margin ≥ 0) on every image + the subject
+    //    margin on SUBJECT images are now red-bar gates in the per-image loop (see below);
+    //    the value/threshold is still PRINTED here as the before/after instrument. ──
+    let mut max_other_density = 0.0_f32;
+    let mut busiest_bed = "(none)";
+    for (rn, evs) in &bed_roles {
+        let d = onset_density(evs);
+        if d > max_other_density {
+            max_other_density = d;
+            busiest_bed = rn;
+        }
+    }
+    let f1_margin = mel_density - max_other_density;
+    let f1_thr = f1_required_margin(u.fg_bg_contrast);
+    let f1_tag = if f1_margin < 0.0 {
+        "FAIL" // INVERTED — bed strictly busier than the melody (the literal operator signal 2)
+    } else if f1_margin < f1_thr {
+        "WEAK" // non-negative but below the image-conditioned required lead
+    } else {
+        "OK"
+    };
+    println!(
+        "  F1 melody-most-active : margin {f1_margin:+.3} onsets/step (busiest bed {busiest_bed} @ {max_other_density:.3}) | thr ≥{f1_thr:+.2} (hard floor ≥0) [{f1_tag}]  DETERMINISTIC"
+    );
+
+    // ── F2 — BACKGROUND-RECESSION (activity). Perceptual property: background roles
+    //    recede in ACTIVITY, not only level — the bed generates fewer onsets and moves
+    //    less than the figure. activity_ratio DETERMINISTIC; motion_ratio SEEDED. ──
+    let f2_ceiling = f2_recession_ceiling(u.fg_bg_contrast);
+    let f2_eps = 0.001_f32;
+    println!(
+        "  F2 bg-recession       : (activity_ratio thr ≤{f2_ceiling:.2} / hard ≤1.0; motion_ratio reported SEEDED)"
+    );
+    for (rn, evs) in &bed_roles {
+        let bd = onset_density(evs);
+        let activity_ratio = if mel_density > 0.0 {
+            bd / mel_density
+        } else {
+            f32::INFINITY
+        };
+        let motion_ratio = if mel_motion > 0.0 {
+            motion_fraction(evs) / mel_motion
+        } else {
+            f32::INFINITY
+        };
+        let tag = if activity_ratio > 1.0 + f2_eps {
+            "FAIL" // bed strictly MORE active than the melody (the F5 invariant in ratio form)
+        } else if activity_ratio > f2_ceiling {
+            "WEAK"
+        } else {
+            "OK"
+        };
+        println!(
+            "       {rn:<13} activity_ratio {activity_ratio:.3}  motion_ratio {motion_ratio:.3}  [{tag}]"
+        );
+    }
+
+    // ── F3 — MELODY-IS-HIGHEST. Perceptual property: the figure occupies the TOP of the
+    //    texture — the melody's pitch is the highest sounding pitch on the vast majority
+    //    of co-sounding steps. RELATIONAL (melody vs the actual concurrent voices).
+    //    SEEDED (absolute pitch / chord draw), pinned under SEED 42. ──
+    let mel_pitch = pitch_by_step(&mev_fg);
+    let bed_pitch_maps: Vec<std::collections::BTreeMap<usize, u8>> = bed_roles
+        .iter()
+        .map(|(_, evs)| pitch_by_step(evs))
+        .collect();
+    let mut f3_cosounding = 0usize;
+    let mut f3_highest = 0usize;
+    for (step, &mp) in &mel_pitch {
+        let mut max_other: Option<u8> = None;
+        for bm in &bed_pitch_maps {
+            if let Some(&bp) = bm.get(step) {
+                max_other = Some(max_other.map_or(bp, |x| x.max(bp)));
+            }
+        }
+        if let Some(mo) = max_other {
+            f3_cosounding += 1;
+            if mp >= mo {
+                f3_highest += 1;
+            }
+        }
+    }
+    let f3_frac = if f3_cosounding == 0 {
+        0.0
+    } else {
+        f3_highest as f32 / f3_cosounding as f32
+    };
+    let f3_thr = 0.95_f32;
+    let f3_tag = if f3_frac >= f3_thr { "OK" } else { "FAIL" };
+    println!(
+        "  F3 melody-highest     : {f3_frac:.3} of {f3_cosounding} co-sounding steps (thr ≥{f3_thr:.2}) [{f3_tag}]  SEEDED"
+    );
+
+    // ── F4 — INVERSE-COMPENSATION PRESENT. Perceptual property: the NON-LEVEL help the
+    //    melody receives should be INVERSE to its realized register height above the bed —
+    //    a low-seated melody gets MORE separation, a high-seated one less. A first-class
+    //    engine shows a NEGATIVE correlation(register_gap, separation). Reported (slice-3
+    //    territory): expected ≈ 0 / ABSENT today (help is register-blind). SEEDED. ──
+    // register_gap(step) = melody_pitch − max(bed_pitch); separation(step) = whether the
+    // melody's onset offset differs from the bed's downbeat onset on that step (the M1.3-class
+    // onset-distinctness, computed melody-vs-bed). Correlated across co-sounding steps.
+    let mel_off = {
+        let mut mp: std::collections::BTreeMap<usize, u64> = std::collections::BTreeMap::new();
+        for se in &mev_fg {
+            mp.entry(se.step).or_insert(se.ev.offset_ms);
+        }
+        mp
+    };
+    let bed_off_maps: Vec<std::collections::BTreeMap<usize, u64>> = bed_roles
+        .iter()
+        .map(|(_, evs)| {
+            let mut mp: std::collections::BTreeMap<usize, u64> = std::collections::BTreeMap::new();
+            for se in *evs {
+                mp.entry(se.step).or_insert(se.ev.offset_ms);
+            }
+            mp
+        })
+        .collect();
+    let mut f4_gaps: Vec<f32> = Vec::new();
+    let mut f4_seps: Vec<f32> = Vec::new();
+    for (step, &mp) in &mel_pitch {
+        let mut max_other: Option<u8> = None;
+        for bm in &bed_pitch_maps {
+            if let Some(&bp) = bm.get(step) {
+                max_other = Some(max_other.map_or(bp, |x| x.max(bp)));
+            }
+        }
+        if let Some(mo) = max_other {
+            let gap = mp as f32 - mo as f32;
+            // separation: fraction of bed roles whose onset offset differs from the melody's.
+            let m_off = mel_off.get(step).copied();
+            let (mut diff, mut total) = (0usize, 0usize);
+            for bom in &bed_off_maps {
+                if let (Some(mo_off), Some(bo_off)) = (m_off, bom.get(step).copied()) {
+                    total += 1;
+                    if mo_off != bo_off {
+                        diff += 1;
+                    }
+                }
+            }
+            let sep = if total == 0 {
+                0.0
+            } else {
+                diff as f32 / total as f32
+            };
+            f4_gaps.push(gap);
+            f4_seps.push(sep);
+        }
+    }
+    let f4_corr = correlation(&f4_gaps, &f4_seps);
+    let f4_tag = if f4_corr < 0.0 { "OK" } else { "FAIL" };
+    println!(
+        "  F4 inverse-comp       : corr(register_gap, separation) {f4_corr:+.3} (thr negative) [{f4_tag}]  SEEDED (≈0/ABSENT expected pre-fix)"
+    );
+
+    // ── F5a — PER-ROLE RHYTHM DISTINCTNESS (signal 7, anti-fusion). Perceptual property:
+    //    concurrently-sounding roles must NOT share an identical onset grid (the S42 fusion
+    //    signature). F5a = fraction of co-sounding step×role-pairs with DISTINCT onset
+    //    offsets — the M1.3 metric generalized to ALL role pairs. DETERMINISTIC. ──
+    // Build per-(step) offset sets per role, then compare all present role pairs per step.
+    let mut role_off_by_step: std::collections::BTreeMap<
+        &'static str,
+        std::collections::BTreeMap<usize, Vec<u64>>,
+    > = std::collections::BTreeMap::new();
+    for (rname, evs) in &streams.by_role {
+        let entry = role_off_by_step.entry(rname).or_default();
+        for se in evs {
+            entry.entry(se.step).or_default().push(se.ev.offset_ms);
+        }
+    }
+    let role_names: Vec<&'static str> = role_off_by_step.keys().copied().collect();
+    let mut f5a_pairs = 0usize;
+    let mut f5a_distinct = 0usize;
+    for step in 0..plan.total_steps {
+        for i in 0..role_names.len() {
+            for j in (i + 1)..role_names.len() {
+                let a = role_off_by_step
+                    .get(role_names[i])
+                    .and_then(|m| m.get(&step));
+                let b = role_off_by_step
+                    .get(role_names[j])
+                    .and_then(|m| m.get(&step));
+                if let (Some(av), Some(bv)) = (a, b) {
+                    f5a_pairs += 1;
+                    let mut as_ = av.clone();
+                    let mut bs_ = bv.clone();
+                    as_.sort_unstable();
+                    bs_.sort_unstable();
+                    if as_ != bs_ {
+                        f5a_distinct += 1;
+                    }
+                }
+            }
+        }
+    }
+    let f5a_frac = if f5a_pairs == 0 {
+        0.0
+    } else {
+        f5a_distinct as f32 / f5a_pairs as f32
+    };
+    let f5a_thr = 0.50_f32;
+    let f5a_tag = if f5a_frac >= f5a_thr { "OK" } else { "FAIL" };
+
+    // ── F5b — BACKGROUND-ACTIVITY-RECESSION INVARIANT (the HARD GATE). Perceptual property:
+    //    on EVERY step a bed role co-sounds with the melody, bed_onsets ≤ melody_onsets —
+    //    the background must never out-MOVE the foreground. bg_recession_violations counts
+    //    the (step, bed-role) pairs where bed_onsets > melody_onsets. DETERMINISTIC. This is
+    //    the activity-recession invariant that pins S46's gain and forbids re-inversion. ──
+    let mut bg_recession_violations = 0usize;
+    let mut f5b_breakdown: Vec<(&'static str, usize)> = Vec::new();
+    for (rn, evs) in &bed_roles {
+        let pairs = cosounding_onset_pairs(&mev_fg, evs);
+        let v = pairs.iter().filter(|(_, mo, bo)| bo > mo).count();
+        bg_recession_violations += v;
+        f5b_breakdown.push((rn, v));
+    }
+    println!(
+        "  F5a rhythm-distinct   : {f5a_frac:.3} of {f5a_pairs} co-sounding role-pairs (thr ≥{f5a_thr:.2}) [{f5a_tag}]  DETERMINISTIC"
+    );
+    println!(
+        "  F5b bg-recession viol : {bg_recession_violations} (per-bed: {:?}) [REGRESSION GATE]  DETERMINISTIC",
+        f5b_breakdown
+    );
+
+    // ── The figure-ground ROLLUP (spec-s46 §3). Weights the NON-LEVEL cues (F1 activity,
+    //    F2 recession, F3 highest, F5 rhythm) above the level floor: VARIED iff F1
+    //    (margin ≥ image-conditioned thr AND ≥ 0), F2 (every bed ratio ≤ image thr), F3
+    //    (≥ 0.95), F4 (corr negative), F5 (F5a ≥ 0.5 AND F5b ≤ residual) all hold; FLAT if
+    //    the melody is out-competed (F1 < 0 or F5b > 0); PARTIAL otherwise. Figure-ground is
+    //    measurable on all six (Pad/Fill always present); counter-relative parts fold in only
+    //    when routed. ──
+    let f1_ok = f1_margin >= 0.0 && f1_margin >= f1_thr;
+    let f2_ok = bed_roles.iter().all(|(_, evs)| {
+        let r = if mel_density > 0.0 {
+            onset_density(evs) / mel_density
+        } else {
+            f32::INFINITY
+        };
+        r <= f2_ceiling
+    });
+    let f3_ok = f3_frac >= f3_thr;
+    let f4_ok = f4_corr < 0.0;
+    let f5_ok = f5a_frac >= f5a_thr && bg_recession_violations == 0;
+    let out_competed = f1_margin < 0.0 || bg_recession_violations > 0;
+    let figure_ground = if f1_ok && f2_ok && f3_ok && f4_ok && f5_ok {
+        Verdict::Varied
+    } else if out_competed {
+        Verdict::Flat
+    } else {
+        Verdict::Partial
+    };
+    println!(
+        "  figure_ground ROLLUP  : {} (F1 {f1_tag} / F2 {} / F3 {f3_tag} / F4 {f4_tag} / F5a {f5a_tag} / F5b viol {bg_recession_violations})",
+        figure_ground.tag(),
+        if f2_ok { "OK" } else { "FAIL/WEAK" }
+    );
+
     // ── Per-image rollup verdict (spec §8b) ──
     let present: Vec<Verdict> = [
         counter_verdict,
@@ -905,6 +1367,12 @@ fn scorecard_for(name: &str, m: &MappingTable, pm: &PlanMappings) -> LayerVerdic
         form: form_verdict,
         parallel_perfect_count,
         figuration_ids_all_valid,
+        figure_ground,
+        melody_most_active_margin: f1_margin,
+        melody_highest_frac: f3_frac,
+        bg_recession_violations,
+        rhythm_distinct_frac: f5a_frac,
+        fg_bg_contrast: u.fg_bg_contrast,
     }
 }
 
@@ -913,6 +1381,33 @@ fn yn(b: bool) -> &'static str {
         "PASS"
     } else {
         "flat"
+    }
+}
+
+/// The S46 F5b regression bound: per-image MEASURED `bg_recession_violations` residual,
+/// image-keyed exactly as M1.4's `forced_residual_bound` is. PIN to the measured value so the
+/// gate is GREEN on the current tree and fails ONLY if a future change INTRODUCES NEW violations
+/// beyond it. This is a regression gate (it brackets the gain), NOT a pass gate.
+///
+/// S47 TIGHTENING (spec-s46-figure-ground-metrics.md §2.3 — the staged-bound discipline): the
+/// S47 figure-ground hierarchy slice (governor + melody activity floor + image-conditioned
+/// prominence family + Pad activity recession) DROVE the F5b residual to 0 on ALL SIX images.
+/// The PRE-FIX residual was example=21 Lena=18 Img1=4 Img2=0 Img3=18 magic=12 (the live inverted
+/// count — the Pad out-onsetting the held melody on calm steps). RE-MEASURED post-fix on the
+/// current validated working tree (seed 42, `cargo test`): the residual is 0 on every image.
+/// The bound is therefore TIGHTENED to 0 across the board, so any FUTURE change that RE-INTRODUCES
+/// even a single bed-out-moves-melody violation now FAILS the gate — the gate brackets the S47 win.
+/// (Re-measured, not assumed; the pre-fix non-zero bounds were committed with the pre-fix tree and
+/// are now superseded by the slice that earned the gain.)
+fn s46_recession_bound(name: &str) -> usize {
+    match name {
+        "example.jpg" => 0,
+        "Lena.png" => 0,
+        "AudioHaxImg1.jpg" => 0,
+        "AudioHaxImg2.jpg" => 0,
+        "AudioHaxImg3.jpg" => 0,
+        "magicstudio-art.jpg" => 0,
+        _ => 0, // any newly-routed image is held to the post-S47 zero-violation invariant
     }
 }
 
@@ -928,6 +1423,12 @@ fn crash_verdicts() -> LayerVerdicts {
         form: Verdict::Crash,
         parallel_perfect_count: 0,
         figuration_ids_all_valid: true,
+        figure_ground: Verdict::Crash,
+        melody_most_active_margin: 0.0,
+        melody_highest_frac: 0.0,
+        bg_recession_violations: 0,
+        rhythm_distinct_frac: 0.0,
+        fg_bg_contrast: 0.0,
     }
 }
 
@@ -1048,6 +1549,67 @@ fn variety_scorecard_sweep() {
                 "[{name}] every resolved figuration id must be a real figuration_catalogue entry"
             );
         }
+        // ── S46 F5b — THE HARD REGRESSION ASSERTION (spec-s46 §2; the S46 analogue of M1.4). ──
+        // bg_recession_violations: per co-sounding (step, bed-role) pairs where bed_onsets >
+        // melody_onsets (the background out-MOVING the foreground). Post-S47, F5b AND F1 (hard
+        // floor + subject margin) red-bar; F2/F3/F4 remain REPORTED-not-asserted (F4 is the
+        // slice-3 inverse-compensation instrument and STAYS reported; F2/F3 print value +
+        // threshold + tag without failing). The bound is PINNED to the MEASURED residual
+        // (image-keyed, exactly as forced_residual_bound is for M1.4); the S47 hierarchy slice
+        // TIGHTENED it to 0 on all six (the gate now brackets the gain) — it FAILS only if a
+        // FUTURE change RE-INTRODUCES a violation. A regression gate, NOT a pass gate.
+        if v.figure_ground != Verdict::Crash {
+            assert!(
+                v.bg_recession_violations <= s46_recession_bound(name),
+                "[{name}] S46 F5b background-activity-recession REGRESSED: the invariant holds \
+                 bed_onsets ≤ melody_onsets per co-sounding step; the documented post-S47 residual \
+                 for this image is {} (the S47 slice drove this to 0); got {} violations — a NEW \
+                 recession violation was introduced beyond the baselined residual (the S47 gain \
+                 must be HELD: this gate brackets it, never let it walk back)",
+                s46_recession_bound(name),
+                v.bg_recession_violations
+            );
+        }
+        // ── S47 F1 PROMOTION — reported → ASSERTED where slice 1 now clears it (spec-s46 §2
+        // "as slice 1 lands, F1 can be PROMOTED from reported to asserted"; spec-s47 §3).
+        //
+        // (1) THE HARD FLOOR — `F1_margin ≥ 0` on EVERY image (the literal operator signal 2:
+        //     the background is NEVER strictly busier than the melody). Pre-S47 this was the
+        //     live inversion (a negative margin on the counter-routed calm images); the governor
+        //     + activity floor + Pad recession made it positive on all six (measured: example
+        //     +1.154 / Lena +0.500 / Img1 +1.000 / Img2 +1.194 / Img3 +1.250 / magic +0.832), so
+        //     the hard-floor invariant is now ASSERTED. A future regression to a negative margin
+        //     (bed out-onsetting the melody on average) fails the gate.
+        //
+        // (2) THE SUBJECT MARGIN — `F1_margin ≥ f(fg_bg_contrast)` ASSERTED only on SUBJECT
+        //     images, where it currently clears with large headroom (Img1 +1.000 vs thr +0.30 →
+        //     headroom +0.70; Img2 +1.194 vs +0.30 → headroom +0.894). The MID/FIELD required
+        //     margins (example/Img3 vs +0.15; Lena/magic vs +0.0) stay REPORTED (the printed
+        //     row carries them) and are NOT pinned here — the hard floor already binds them, and
+        //     the richer subject margin is asserted only where the headroom is unambiguous (per
+        //     spec-s47 §3: "if a subject image is only marginally over f, keep it reported"; here
+        //     both SUBJECT images are well over f, so both are asserted).
+        if v.figure_ground != Verdict::Crash {
+            assert!(
+                v.melody_most_active_margin >= 0.0,
+                "[{name}] S47 F1 hard floor REGRESSED: the melody must NEVER be strictly less \
+                 active than the busiest bed role (background out-onsetting the foreground is the \
+                 literal figure-ground inversion, operator signal 2); F1_margin = {:+.3} \
+                 onsets/step went negative",
+                v.melody_most_active_margin
+            );
+            if figure_strength(v.fg_bg_contrast) == FigureStrength::Subject {
+                let req = f1_required_margin(v.fg_bg_contrast);
+                assert!(
+                    v.melody_most_active_margin >= req,
+                    "[{name}] S47 F1 subject-margin REGRESSED: a SUBJECT image (fg_bg_contrast \
+                     {:.3}) must lead by the image-conditioned margin f = {req:+.2} onsets/step; \
+                     F1_margin = {:+.3} fell below it",
+                    v.fg_bg_contrast,
+                    v.melody_most_active_margin
+                );
+            }
+        }
         verdicts.push((name, v));
     }
 
@@ -1103,6 +1665,38 @@ fn variety_scorecard_sweep() {
     println!("  L5 Rhythm         : {}", worst(|v| v.rhythm));
     println!("  L6 Theme variation: {}", worst(|v| v.theme));
     println!("  L7 Form/texture   : {}", worst(|v| v.form));
+    println!("══════════════════════════════════════════════════════════════════");
+
+    // ── SET-LEVEL FIGURE-GROUND BEFORE-COLUMN (S46): the per-image F1 margin / F3 highest /
+    //    F5a distinct / F5b violations + rollup, captured as the "before" half of the
+    //    before/after instrument the S47 slice measures its AFTER state against. Worst
+    //    figure_ground status across the set is reported alongside the per-image numbers. ──
+    println!("\n══════════════════════════════════════════════════════════════════");
+    println!("SET-LEVEL FIGURE-GROUND (S46 F1–F5) BEFORE-COLUMN — pre-fix baseline:");
+    println!(
+        "  figure_ground worst-of-set: {}",
+        worst(|v| v.figure_ground)
+    );
+    println!(
+        "  {:<22} {:>10} {:>10} {:>10} {:>8}  {}",
+        "image", "F1_margin", "F3_frac", "F5a_dist", "F5b_viol", "rollup"
+    );
+    for (name, v) in &verdicts {
+        if v.figure_ground == Verdict::Crash {
+            println!("  {name:<22}  *** CRASH (no figure-ground metrics measured) ***");
+            continue;
+        }
+        println!(
+            "  {:<22} {:>+10.3} {:>10.3} {:>10.3} {:>8}  {}",
+            name,
+            v.melody_most_active_margin,
+            v.melody_highest_frac,
+            v.rhythm_distinct_frac,
+            v.bg_recession_violations,
+            v.figure_ground.tag()
+        );
+    }
+    println!("  (S47 F5b bound TIGHTENED to 0 on all six — the regression gate now brackets the figure-ground gain)");
     println!("══════════════════════════════════════════════════════════════════");
 
     // CRASH REPORT — the high-value finding: any image whose REAL render panicked.
@@ -1162,6 +1756,215 @@ fn scorecard_engine_frozen() {
         got, ENGINE_SHA256,
         "src/engine.rs sha256 changed — the scorecard harness adds TEST code only; expected \
          {ENGINE_SHA256}, got {got}"
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SEAT-GUARD WITNESS (the Architect's flagged decision point, spec-s47 §4 / §8.5).
+//
+// The upcoming slice-1 seat-order guard folds an additive
+//   floor = raw.max(COUNTER_CEILING + MIN_FIGURE_GAP)
+// UNDER the existing single `.clamp(24,96)` at chord_engine.rs:1271, so the realized
+// melody seat is structurally above the counter ceiling. With MIN_FIGURE_GAP = 2 and
+// COUNTER_CEILING = 67, the guard is a NO-OP on the freeze path IFF every golden's
+// realized melody seat already sits at ≥ 69 (67 + 2). This witness drives the SAME
+// frozen kernel (`decide_instrument_action`) over the `engine_equivalence` golden
+// renders and reports each golden's realized melody seat + its lift above 67, with a
+// loud PASS/FAIL on "all goldens seat ≥ 69". A golden seating in [67, 69) would force
+// the const lower (or a hand-re-derivation) before the seat guard can land — the
+// producer MUST know before the guard lands (spec-s47 §8.5; the one freeze risk).
+//
+// This mirrors the engine_equivalence golden harness (G_MELODY_NOTE=79=67+12 is the
+// canonical bright-path melody golden); the dark byte-identical sweep bar (bright=41)
+// is the critical case where the brightness lift goes NEGATIVE.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// The documented seat-guard constants (NOT yet in src — this is the PRE-FIX tree; the
+/// const lands WITH slice 1). COUNTER_CEILING == MELODY_REGISTER_FLOOR == 67
+/// (chord_engine.rs:3478/:1222); MIN_FIGURE_GAP recommended start == 2 (spec-s47 §3).
+const WITNESS_COUNTER_CEILING: u8 = 67;
+const WITNESS_MIN_FIGURE_GAP: u8 = 2;
+
+#[test]
+fn seat_guard_witness_melody_seats_above_counter_ceiling() {
+    use audiohax::chord_engine::{Chord, PhrasePosition, StepPlan};
+    use audiohax::engine::{
+        decide_instrument_action, CadenceStrength, KeyTempoPlan, OrchestrationProfile,
+        ResolutionPolicy, ScanBarFeatures, Section, StepContext, ThematicRole, ThemeVariation,
+    };
+
+    const MS_PER_STEP: u64 = 200;
+
+    // The engine_equivalence FIXED plan (root-position C-major; PhraseStart + PAC), verbatim.
+    let c_major = || Chord {
+        name: "I".to_string(),
+        notes: vec![60, 64, 67],
+    };
+    let plan = vec![
+        StepPlan {
+            chord: c_major(),
+            phrase_index: 0,
+            position_in_phrase: 0,
+            phrase_len: 4,
+            position: PhrasePosition::PhraseStart,
+            velocity: 80,
+        },
+        StepPlan {
+            chord: c_major(),
+            phrase_index: 0,
+            position_in_phrase: 3,
+            phrase_len: 4,
+            position: PhrasePosition::PerfectAuthenticCadence,
+            velocity: 96,
+        },
+    ];
+    let kt = KeyTempoPlan {
+        home_root_midi: 60,
+        home_mode: "Ionian".to_string(),
+        base_ms_per_step: MS_PER_STEP,
+        key_scheme: vec![0],
+        tempo_scheme: vec![MS_PER_STEP],
+    };
+    let sec = Section {
+        label: "A".to_string(),
+        step_len: plan.len(),
+        thematic_role: ThematicRole::Statement,
+        key_offset_semitones: 0,
+        ms_per_step: MS_PER_STEP,
+        mode: "Ionian".to_string(),
+        progression: vec![],
+        theme: None,
+        variation: ThemeVariation::Identity,
+        boundary_cadence: CadenceStrength::Perfect,
+        pivot: false,
+        resolution: ResolutionPolicy::Resolve,
+        density: 0.5,
+        orchestration: OrchestrationProfile::identity(),
+        steps: plan.to_vec(),
+    };
+    let ctx = StepContext::single_section_default(&sec, &kt);
+    let bar = |sat: f32, bright: f32, edge: f32| ScanBarFeatures {
+        bar_index: 0,
+        avg_hue: 0.0,
+        avg_saturation: sat,
+        avg_brightness: bright,
+        edge_density: edge,
+        texture_laplacian_var: 0.0,
+        hue_hist: Vec::new(),
+    };
+
+    // The melody is the TOP instrument (inst num-1). Enumerate the golden renders the
+    // engine_equivalence net pins: the bright golden bars (bright=55, lift +1 → G_MELODY 79)
+    // and the dark byte-identical sweep bar (bright=41, lift NEGATIVE — the critical case).
+    // For each, walk every step × every instrument and capture the MELODY-role realized seat.
+    struct GoldenBar {
+        label: &'static str,
+        sat: f32,
+        bright: f32,
+        edge: f32,
+        num: usize,
+    }
+    let golden_bars = [
+        GoldenBar {
+            label: "golden bright bar (sat60 bright55) num=2",
+            sat: 60.0,
+            bright: 55.0,
+            edge: 0.2,
+            num: 2,
+        },
+        GoldenBar {
+            label: "golden bright bar (sat60 bright55) num=4",
+            sat: 60.0,
+            bright: 55.0,
+            edge: 0.2,
+            num: 4,
+        },
+        GoldenBar {
+            label: "golden bright bar (sat60 bright55) num=1 (lone melody)",
+            sat: 60.0,
+            bright: 55.0,
+            edge: 0.2,
+            num: 1,
+        },
+        GoldenBar {
+            label: "cadence hot bar (sat100 bright55) num=2",
+            sat: 100.0,
+            bright: 55.0,
+            edge: 0.5,
+            num: 2,
+        },
+        GoldenBar {
+            label: "cadence cold bar (sat0 bright55) num=2",
+            sat: 0.0,
+            bright: 55.0,
+            edge: 0.5,
+            num: 2,
+        },
+        GoldenBar {
+            label: "DARK byte-identical sweep bar (sat73 bright41) num=4",
+            sat: 73.0,
+            bright: 41.0,
+            edge: 0.6,
+            num: 4,
+        },
+    ];
+
+    let seat_floor = WITNESS_COUNTER_CEILING + WITNESS_MIN_FIGURE_GAP; // 69
+
+    println!("\n╔══════════════════════════════════════════════════════════════════╗");
+    println!("║  SEAT-GUARD WITNESS — realized melody seats vs COUNTER_CEILING(67)+MIN_FIGURE_GAP(2)=69  ║");
+    println!("║  (PRE-FIX tree; the seat guard `.max(67+2)` is a no-op iff every seat ≥ 69)             ║");
+    println!("╚══════════════════════════════════════════════════════════════════╝");
+
+    let mut all_pass = true;
+    let mut min_seat_overall = u8::MAX;
+    for gb in &golden_bars {
+        let f = bar(gb.sat, gb.bright, gb.edge);
+        let melody_inst = gb.num - 1;
+        // Walk both plan steps (PhraseStart + cadence); the cadence step yields one note.
+        let mut seats: Vec<u8> = Vec::new();
+        for step in 0..plan.len() {
+            let d =
+                decide_instrument_action(&f, melody_inst, step, gb.num, &plan, MS_PER_STEP, &ctx);
+            for ev in &d.events {
+                seats.push(ev.note);
+            }
+        }
+        let min_seat = seats.iter().copied().min().unwrap_or(0);
+        min_seat_overall = min_seat_overall.min(min_seat);
+        let lift = min_seat as i16 - WITNESS_COUNTER_CEILING as i16;
+        let pass = min_seat >= seat_floor;
+        if !pass {
+            all_pass = false;
+        }
+        println!(
+            "  {:<55} min melody seat = {min_seat}  (lift above 67 = {lift:+})  seats {seats:?}  => {}",
+            gb.label,
+            if pass {
+                "PASS (≥69; guard no-op)"
+            } else {
+                "*** FAIL — seat IN [67,69): guard WOULD RAISE this golden ***"
+            }
+        );
+    }
+    println!("──────────────────────────────────────────────────────────────────");
+    println!(
+        "SEAT-GUARD WITNESS VERDICT: {} (min seat across all goldens = {min_seat_overall}; floor = {seat_floor})",
+        if all_pass {
+            "PASS — every golden seats ≥ 69; MIN_FIGURE_GAP=2 is a no-op on the freeze path"
+        } else {
+            "FAIL — ≥1 golden seats in [67,69); MIN_FIGURE_GAP=2 WOULD perturb the freeze"
+        }
+    );
+
+    // This witness REPORTS (it is the producer's gating signal); it does NOT red-bar the
+    // pre-fix tree — a FAIL here is a real finding the producer must act on (lower the const
+    // or hand-re-derive that golden in the slice-1 commit), surfaced LOUDLY in the printed
+    // verdict above and in the Test Engineer's return to the lead. We assert only the trivial
+    // invariant that the witness actually measured seats (so a silent zero-render is caught).
+    assert!(
+        min_seat_overall != u8::MAX,
+        "seat-guard witness measured no melody seats — the golden render produced no events"
     );
 }
 

@@ -370,19 +370,39 @@
           { "role": "HarmonicFill",  "weight": 0.4 },
           { "role": "Pad",           "weight": 0.3 },
           { "role": "Bass",          "weight": 0.5 } ] },
+
+      { "id": "melody_lead_strong", "layers": [
+          { "role": "Melody",        "weight": 0.90 },
+          { "role": "CounterMelody", "weight": 0.45 },
+          { "role": "HarmonicFill",  "weight": 0.30 },
+          { "role": "Pad",           "weight": 0.30 },
+          { "role": "Bass",          "weight": 0.50 } ] },
       { "id": "melody_forward", "layers": [
           { "role": "Melody",        "weight": 0.78 },
           { "role": "CounterMelody", "weight": 0.58 },
           { "role": "HarmonicFill",  "weight": 0.40 },
           { "role": "Pad",           "weight": 0.40 },
+          { "role": "Bass",          "weight": 0.50 } ] },
+      { "id": "melody_lead_gentle", "layers": [
+          { "role": "Melody",        "weight": 0.72 },
+          { "role": "CounterMelody", "weight": 0.65 },
+          { "role": "HarmonicFill",  "weight": 0.45 },
+          { "role": "Pad",           "weight": 0.45 },
           { "role": "Bass",          "weight": 0.50 } ] }
     ],
     "prominence": {
       "default": "melody_forward",
       "rules": [
-        { "when": [ {"knob":"subject_size",  "op":"in_range","lo":0.05,"hi":0.55},
+        { "_comment": "DEEP/subject: high fg_bg_contrast → a clear separated subject justifies a strong lead + deep bed recession. FIRST so it wins over the gentler tiers. EAR-TUNABLE threshold [0.20,0.30]; the SIGN (higher contrast → deeper tier) is load-bearing.",
+          "when": [ {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ],
+          "pick": "melody_lead_strong" },
+        { "_comment": "The existing subject_melody escalation tier — PRESERVED verbatim; a small, separated subject in the mid-contrast band.",
+          "when": [ {"knob":"subject_size",  "op":"in_range","lo":0.05,"hi":0.55},
                     {"knob":"fg_bg_contrast","op":"ge","lo":0.10,"hi":0.0} ],
-          "pick": "subject_melody" }
+          "pick": "subject_melody" },
+        { "_comment": "SHALLOW/field: low contrast, even energy → the texture legitimately shares focus (no forced lead on an abstract image). EAR-TUNABLE threshold [0.08,0.12].",
+          "when": [ {"knob":"fg_bg_contrast","op":"lt","lo":0.10,"hi":0.0} ],
+          "pick": "melody_lead_gentle" }
       ]
     }
   }

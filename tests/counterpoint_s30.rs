@@ -752,7 +752,10 @@ fn test_determinism_of_realized_counter() {
 ///
 /// ADVERSARIAL WITNESS: `IV → iii → I` (all interior) — the exact progression that historically
 /// produced melody 71→67 against counter 64→60 (a textbook parallel fifth). It now realizes
-/// counter 59→60 = CONTRARY motion against the melody, and forms NO parallel perfect.
+/// melody 71→79 (the S47 seat guard lifts the I-chord melody above the counter ceiling) against
+/// counter 59→60 — SIMILAR motion into DIFFERENT perfect classes (P8→P5), forming NO parallel
+/// perfect. (Pre-S47 the melody descended 71→67 and the motion read CONTRARY; the no-parallel-
+/// perfect invariant is the binding property and is preserved by the seat-guarded realization.)
 ///
 /// BROADER BATTERY: every ordered diatonic triple over the 6 consonant triads is realized and
 /// EVERY counter↔melody transition is checked — so the gate is exercised at T (si0→si1) AND at
@@ -766,15 +769,28 @@ fn test_no_audible_parallel_perfect_counter_vs_melody() {
     let (cn, mn) = (line[2].0, line[2].1.expect("melody sounds at si=2"));
     assert_eq!(
         (mp, cp, mn, cn),
-        (71, 59, 67, 60),
-        "witness drifted: expected melody 71->67 / counter 59->60 for IV->iii->I (the fixed, \
-         CONTRARY realization); got melody {mp}->{mn} / counter {cp}->{cn}. Re-derive."
+        (71, 59, 79, 60),
+        "witness drifted: expected melody 71->79 / counter 59->60 for IV->iii->I (the S47 \
+         seat-guarded realization); got melody {mp}->{mn} / counter {cp}->{cn}. Re-derive."
     );
+    // S47 RE-DERIVATION (seat-order guard §2b): the OLD pin was melody 71->67 (DESCENDING into
+    // the counter ceiling) with counter 59->60 (ascending) = CONTRARY motion. The S47 seat
+    // guard now floors the I-chord melody seat to >= COUNTER_CEILING+MIN_FIGURE_GAP and
+    // re-seats it to 79, so the melody ASCENDS 71->79 instead of descending to 67. With the
+    // counter also ascending 59->60, the realized motion is now SIMILAR, not contrary. This is
+    // the spec'd consequence of lifting the melody above the counter band (figure-on-top), NOT
+    // a counter regression: the CONTRARY classification was a side effect of the old low melody
+    // seat. The contrapuntal property this test actually validates — NO AUDIBLE PARALLEL
+    // PERFECT — is PRESERVED: ic(71,59)=0 (P8) -> ic(79,60)=7 (P5) are DIFFERENT perfect
+    // classes, so the engine's own `has_parallel_perfects` gate is satisfied (pp == false,
+    // asserted below). The motion-direction pin is updated from Contrary to Similar to track
+    // the seat-guarded reality while the no-parallel-perfect invariant remains the binding gate.
     assert_eq!(
         rel_motion(mp, mn, cp, cn),
-        Rel::Contrary,
-        "the once-parallel IV->iii->I boundary must now move CONTRARY (melody {mp}->{mn} \
-         descends, counter {cp}->{cn} ascends)"
+        Rel::Similar,
+        "the IV->iii->I boundary now moves SIMILAR (melody {mp}->{mn} ascends via the S47 seat \
+         guard, counter {cp}->{cn} ascends) — into DIFFERENT perfect classes, so still no \
+         parallel perfect"
     );
     assert!(
         !forms_parallel_perfect(mp, mn, cp, cn),
@@ -824,8 +840,9 @@ fn test_no_audible_parallel_perfect_counter_vs_melody() {
 /// `vii` the counter is split BY DESIGN into two intentional behaviors:
 ///
 ///   * the 4 openers I, ii, iii, vi SIDESTEP to a CONSONANT terminal counter (the safe default,
-///     no dissonance at all): I/iii/vi land 62 (D, a CONSONANT m3 vs melody F=77, ic 3); ii
-///     lands 65 (F, ic 0 — an octave-class consonance vs the F=77 melody);
+///     no dissonance at all): iii/vi land 62 (D, a CONSONANT m3 vs melody F=77, ic 3); I/ii
+///     land 65 (F, ic 0 — an octave-class consonance vs the F=77 melody). [S47: I shifted
+///     62→65 because the counter now tracks the seat-guarded (lifted) opener melody.]
 ///   * the 2 openers IV, V deliberately KEEP a PREPARED DISSONANT terminal sonority — the
 ///     diminished "bite". IV→vii lands 59 (B, a TRITONE ic 6 vs melody 77) approached from the
 ///     realized penult 57 by a +2 STEP; V→vii lands 59 (tritone ic 6) from penult 59 by a HELD
@@ -840,7 +857,8 @@ fn test_no_audible_parallel_perfect_counter_vs_melody() {
 /// a genuine prepared, in-band, terminal dissonance. The explicit |approach motion| ≤ 2 check on
 /// the bite cases means a future BLUNT leap-in dissonance (an un-prepared bite) would FAIL here.
 ///
-/// WITNESSES (re-derived against the realized engine; melody 77/F, band tones B=59,D=62,F=65):
+/// WITNESSES (re-derived against the realized engine; melody 77/F, band tones B=59,D=62,F=65;
+/// S47 seat guard + counter-tracking shifts the I opener's terminal counter 62→65):
 ///   * `iii → vii` (kept consonant witness): terminal counter 62 vs melody 77 = m3 (ic 3).
 ///   * `IV → vii` (prepared bite): penult 57 → terminal 59 (tritone ic 6), approach +2 STEP.
 ///   * `V → vii`  (prepared bite): penult 59 → terminal 59 (tritone ic 6), approach motion 0.
@@ -873,7 +891,15 @@ fn test_terminal_diminished_keeps_prepared_bite() {
 
     // 2) The 4 CONSONANT openers (I, ii, iii, vi) — terminal vii is a consonance against the
     //    melody. Drift-guarded to the exact realized counter pitch per opener (62, except ii=65).
-    let consonant_witnesses: &[(&str, u8)] = &[("I", 62), ("ii", 65), ("iii", 62), ("vi", 62)];
+    // S47 RE-DERIVATION (seat-order guard §2b + counter-tracking, chord_engine.rs:3971-3977):
+    // the counter recomputes the melody it tracks (`melody_pitch_for`) WITH the seat guard
+    // applied (a counter is present by construction), so the opener-step melody it reads is the
+    // seat-guarded (lifted) pitch. For I and ii this shifts the realized terminal counter from
+    // 62 to 65 (F, ic 0 vs melody F=77 — still a consonant octave-class sidestep, no bite);
+    // iii and vi land 62 (D, ic 3 m3) unchanged. The OLD I=62 pin was superseded by the
+    // counter honestly tracking the lifted melody (the spec's anti-phantom-melody intent). The
+    // PRESERVED property — every consonant opener stays CONSONANT (no bite) — holds for all four.
+    let consonant_witnesses: &[(&str, u8)] = &[("I", 65), ("ii", 65), ("iii", 62), ("vi", 62)];
     for &(name, want) in consonant_witnesses {
         let opener = consonant_corpus()
             .into_iter()
@@ -973,11 +999,13 @@ fn test_terminal_diminished_keeps_prepared_bite() {
 /// clausula is a documented FUTURE-SLICE refinement, and we assert the no-leap guaranteed level
 /// here, universally.
 ///
-/// WITNESSES (re-derived against the realized engine):
+/// WITNESSES (re-derived against the realized engine; S47 seat guard lifts the melody to 79 on
+/// the counter-routed counterpoint fixtures — the counter close is unchanged):
 ///   * `ii → IV → V → I` (kept adversarial witness — once a 4-semitone leap): penult 55 →
-///     final 55 (move 0, an OBLIQUE hold onto P8/ic 0). I/iii/IV close identically (55→55).
+///     final 55 (move 0, an OBLIQUE hold onto a P15/ic 0 vs the lifted melody 79). I/iii/IV
+///     close identically (55→55).
 ///   * `V → IV → V → I` and `vi → IV → V → I` (the S32-closed openers — once a 7-semitone leap):
-///     penult 62 → final 60 (a −2 STEP onto a P5, ic 7, NO leap).
+///     penult 62 → final 60 (a −2 STEP onto a P5/P12, ic 7, NO leap, vs the lifted melody 79).
 #[test]
 fn test_cadence_resolves_perfect_no_leap() {
     // 1) The kept adversarial witness: the once-leaping ii->IV->V->I close is a no-leap hold.
@@ -988,10 +1016,19 @@ fn test_cadence_resolves_perfect_no_leap() {
     let ml = ml.expect("melody sounds on the PAC close");
     assert_eq!(
         (cp, cl, ml),
-        (55, 55, 67),
-        "witness drifted: expected penult 55 -> final 55 vs melody 67 (the no-leap OBLIQUE hold, \
-         a P8 ic 0); got {cp} -> {cl} vs melody {ml}. Re-derive."
+        (55, 55, 79),
+        "witness drifted: expected penult 55 -> final 55 vs melody 79 (the no-leap OBLIQUE hold, \
+         ic 0 / a perfect octave-class); got {cp} -> {cl} vs melody {ml}. Re-derive."
     );
+    // S47 RE-DERIVATION (seat-order guard, spec-s47-slice1-build.md §2b): the OLD pin was
+    // melody 67 (= MELODY_REGISTER_FLOOR / COUNTER_CEILING). The counterpoint fixtures route a
+    // CounterMelody, so the S47 seat guard now floors the melody seat to
+    // `COUNTER_CEILING(67) + MIN_FIGURE_GAP(2) = 69` and `seat_pc_in_register` re-seats the
+    // pitch class at the next slot >= 69 -> 79. The melody is structurally lifted ABOVE the
+    // counter ceiling (figure-on-top, the intended S47 change), so 67 was superseded by 79.
+    // The COUNTER is unchanged (55 -> 55): the seat guard touches only the melody seat; the
+    // contrapuntal property (perfect no-leap close) is preserved — 55 vs 79 is a P15 (ic 0,
+    // still perfect) reached by counter motion 0.
     assert!(
         is_perfect(cl, ml),
         "PT-8 REGRESSED: the cadence close is not a perfect consonance (counter {cl} vs melody \
@@ -1016,11 +1053,14 @@ fn test_cadence_resolves_perfect_no_leap() {
         let ml = ml.expect("melody sounds on the PAC close");
         assert_eq!(
             (cp, cl, ml),
-            (62, 60, 67),
-            "witness drifted: expected {}->IV->V->I penult 62 -> final 60 vs melody 67 (the S32 \
-             no-leap STEP onto a P5, ic 7); got {cp} -> {cl} vs melody {ml}. Re-derive.",
+            (62, 60, 79),
+            "witness drifted: expected {}->IV->V->I penult 62 -> final 60 vs melody 79 (the S32 \
+             no-leap STEP onto a P5/P12, ic 7); got {cp} -> {cl} vs melody {ml}. Re-derive.",
             opener.name
         );
+        // S47 RE-DERIVATION (seat-order guard §2b): melody 67 -> 79 (lifted above the counter
+        // ceiling exactly as the ii->IV->V->I witness above). The counter is unchanged
+        // (62 -> 60); ic(60,79)=7 is still a P5-class (P12), so the no-leap P5 close holds.
         assert_eq!(
             ic(cl, ml),
             7,

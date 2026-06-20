@@ -655,44 +655,61 @@ fn test_held_period_pitch_advances_across_steps() {
     }
 }
 
-/// §3.6 test 5 (complementary rhythm) + the held/static onset contrast: when the melody is
-/// ACTIVE (high edge_activity → it subdivides), the counter holds ONE sustained tone at
-/// offset 0 (stays out of the way, the OBLIQUE case); when the chord is HELD/static, the
-/// counter is the moving voice and onsets OFF the downbeat (step_ms/4). The onset offset is
-/// the structural discriminator — RNG-robust, no pitch literal.
+/// §3.6 test 5 (complementary rhythm) + the activity-class onset contrast.
+///
+/// S47 RE-DERIVATION (spec-s47-slice1-build.md §2a.3 — THE GOVERNOR): pass 1's counter
+/// governor REPLACED the old `held_chord || melody_static` predicate (which routed the counter
+/// to its MOVING off-beat onset precisely when the melody held — the figure-ground INVERSION)
+/// with a rule keyed on the MELODY's `ActivityClass`:
+///   * a SUBDIVIDING melody (high edge_activity → it moves) → the counter takes its MOVING
+///     branch (a guaranteed off-beat onset at step_ms/4) — PRESERVING S45 (melody moves →
+///     counter moves);
+///   * a SUSTAINED melody (low edge_activity → it holds) → the counter RECEDES to one
+///     sustained tone at offset 0 (the OBLIQUE case) so the background never out-moves the
+///     held foreground.
+/// So the OLD witness (active melody → counter at offset 0; held CHORD → counter at step_ms/4)
+/// is INVERTED by design: the discriminator is now the melody's ACTIVITY, not the chord-held
+/// flag. The onset-offset CONTRAST the test validates is preserved under the new governor —
+/// an active melody yields a moving counter (step_ms/4), a holding melody a receding counter
+/// (offset 0) — re-derived below against the real engine. The onset offset stays the
+/// structural discriminator — RNG-robust, no pitch literal.
 #[test]
 fn test_complementary_rhythm_onset_contrast() {
-    // ACTIVE melody, chord CHANGING (G→C so NOT a held period): high edge → melody
-    // subdivides → counter holds underneath at offset 0.
+    // ACTIVE/SUBDIVIDING melody (high edge_activity): the melody moves, so the counter takes
+    // its MOVING branch — a guaranteed off-beat onset at step_ms/4 (S45 preserved).
     let active = realize_counter(step(g_major(), 0), step(c_major(), 1), &perf(0.30));
     assert_eq!(
         active.len(),
         1,
-        "an active-melody counter sounds one sustained tone, got {}",
+        "an active-melody counter sounds one moving tone, got {}",
         active.len()
     );
     assert_eq!(
-        active[0].offset_ms, 0,
-        "under an ACTIVE melody the counter holds underneath at offset 0 (oblique)"
+        active[0].offset_ms,
+        MS_PER_STEP / 4,
+        "under a SUBDIVIDING melody the counter MOVES off the downbeat at step_ms/4 (S45 preserved)"
     );
 
-    // HELD chord: the counter is the MOVING voice → off-beat onset at step_ms/4.
-    let held = realize_counter(step(c_major(), 0), step(c_major(), 1), &perf(0.30));
+    // HOLDING/SUSTAINED melody (very low edge_activity → the melody falls to one held tone):
+    // the governor recedes the counter to ONE sustained tone at offset 0 (the OBLIQUE case),
+    // so the background never out-moves the held foreground. (No Melody prominence in this
+    // fixture → neutral 0.5 → no activity floor, so the melody genuinely reaches SUSTAINED.)
+    let holding = realize_counter(step(c_major(), 0), step(c_major(), 1), &perf(0.005));
     assert_eq!(
-        held.len(),
+        holding.len(),
         1,
-        "a held-period counter sounds one moving tone, got {}",
-        held.len()
+        "a holding-melody counter sounds one sustained tone, got {}",
+        holding.len()
     );
     assert_eq!(
-        held[0].offset_ms,
-        MS_PER_STEP / 4,
-        "under a HELD chord the counter moves and onsets OFF the downbeat at step_ms/4"
+        holding[0].offset_ms, 0,
+        "under a SUSTAINED melody the counter RECEDES underneath at offset 0 (oblique)"
     );
-    // The onset offsets DIFFER → the rhythm is genuinely complementary, not constant.
+    // The onset offsets DIFFER → the rhythm is genuinely complementary, not constant: a moving
+    // melody draws a moving counter, a holding melody draws a receding (offset-0) counter.
     assert_ne!(
-        active[0].offset_ms, held[0].offset_ms,
-        "the counter's onset must DIFFER between the active-melody and held-chord cases"
+        active[0].offset_ms, holding[0].offset_ms,
+        "the counter's onset must DIFFER between the subdividing-melody and holding-melody cases"
     );
 }
 

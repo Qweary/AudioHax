@@ -1014,6 +1014,261 @@ const PROMINENCE_REG_SPAN: f32 = 4.0;
 /// continuous curve carries.
 const PROMINENCE_RHY_SHIFT: f32 = 0.10;
 
+// ----------------------------------------------------------------------------
+// S47 SLICE 1 — THE FIGURE-GROUND ACTIVITY HIERARCHY (melody-most-active).
+//
+// theory: figure-ground segregation rests FIRST on rhythmic ACTIVITY (the ear's
+// strongest stream-segregation cue for a timbre-flat synth texture), not on level.
+// The melody must be the busiest line and the background must recede in onset
+// density. The S46 defect was an ACTIVITY INVERSION — on a calm image the melody
+// fell to one held tone while the CounterMelody took a guaranteed off-beat onset,
+// so the background out-moved the foreground. The fix is a coarse, RNG-free
+// activity CLASS the Counter arm reads off the MELODY so it can stay one rank
+// below a holding melody (the governor), plus a prominence-keyed FLOOR so a
+// foreground melody never falls all the way to a held tone (the floor).
+// ----------------------------------------------------------------------------
+
+/// The Melody arm's three rhythm-band cutoffs (in `edge_activity` units), centered
+/// on the freeze identity (`prom_shift == 0` at neutral weight). EXTRACTED to named
+/// consts so the Melody arm (:1943-1992) and `melody_activity_class` read ONE source
+/// — the helper's classification can never drift from the arm it mirrors (spec §8.2).
+/// theory: ARPEGGIO is the busiest band (≥3 onsets), SYNCOPATED pushes the meter (2
+/// onsets off the beat), DOTTED is the minimum real motion (a long-short pair, 2
+/// onsets), and below DOTTED the line SUSTAINS (1 held tone). These values are the
+/// SAME 0.80/0.55/0.25 the arm has always used — extracting them is byte-neutral.
+const MELODY_ARP_CUTOFF: f32 = 0.80; // → ARPEGGIO band (the busiest figure)
+const MELODY_SYNC_CUTOFF: f32 = 0.55; // → SYNCOPATED band
+const MELODY_DOTTED_CUTOFF: f32 = 0.25; // → DOTTED band (minimum real motion); below → SUSTAINED
+
+/// The realized rhythmic-activity CLASS of a voice on a step — coarse, RNG-free, and
+/// structural (a function of `edge_activity` + the arm's band, never of absolute pitch).
+/// Ordering IS the figure-ground rank: Sustained < Oblique < Subdividing. The Counter arm
+/// reads the MELODY's class to stay strictly BELOW it on a HOLDING melody (the hierarchy
+/// invariant), so the background never out-moves the foreground. Under identity there is no
+/// Counter instrument and prominence is neutral, so this is never consulted on the freeze
+/// path → byte-neutral. `Ord` is derived so the governor can compare classes directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ActivityClass {
+    /// One held tone, no real motion (the Melody SUSTAINED arm).
+    Sustained,
+    /// Minimum real motion — a long-short pair / a single sustained tone (the DOTTED band).
+    Oblique,
+    /// ≥2 onsets pushing/spreading the beat (the SYNCOPATED + ARPEGGIO bands).
+    Subdividing,
+}
+
+/// The melody's activity class for THIS step, derived from the SAME 4-band ladder the Melody
+/// arm uses (:1943-1992) — extracted so the Counter arm can govern off it WITHOUT duplicating
+/// the cutoff logic. Pure; reads only `edge_activity`, the prominence rhythm shift `prom_shift`
+/// (the melody's own :1941-1942 value, passed in so the helper takes no `ctx`), and
+/// `pre_cadence`.
+///
+/// theory: the Melody arm has FOUR rhythm bands (arpeggio / syncopated / dotted / sustained)
+/// but the figure-ground rank has THREE classes. The mapping (locked S46 theory lens, spec
+/// §2a.2): DOTTED→Oblique (a long-short pair is the melody's minimum-real-motion, so it lets
+/// the counter recede to a single tone rather than move), SYNCOPATED+ARPEGGIO→Subdividing
+/// (both push ≥2 onsets against/across the beat, so the melody is unambiguously moving and the
+/// counter may keep its moving inner texture — PRESERVES S45). The cutoffs MUST stay 1:1 with
+/// the live Melody arm — both now read the shared MELODY_*_CUTOFF consts so they cannot drift.
+fn melody_activity_class(edge_activity: f32, prom_shift: f32, pre_cadence: bool) -> ActivityClass {
+    // Mirrors the Melody arm's band ladder EXACTLY. The arm's ARPEGGIO band (> ARP_CUTOFF)
+    // and SYNCOPATED band (> SYNC_CUTOFF) BOTH map to Subdividing (≥2 onsets pushing/spreading
+    // the beat), so a single `> SYNC_CUTOFF` test covers both — ARP_CUTOFF > SYNC_CUTOFF, so
+    // anything clearing ARP also clears SYNC (the ARP_CUTOFF const is retained as the arm's
+    // own band boundary). pre_cadence forces the ARPEGGIO band, also Subdividing. Below SYNC
+    // but above DOTTED is Oblique (minimum real motion); below DOTTED is Sustained (held tone).
+    if pre_cadence || edge_activity > (MELODY_SYNC_CUTOFF - prom_shift) {
+        ActivityClass::Subdividing // ARPEGGIO + SYNCOPATED bands — the melody MOVES
+    } else if edge_activity > (MELODY_DOTTED_CUTOFF - prom_shift) {
+        ActivityClass::Oblique // DOTTED band — minimum real motion
+    } else {
+        ActivityClass::Sustained // the SUSTAINED arm — one held tone
+    }
+}
+
+/// The melody-prominence weight ABOVE which the activity FLOOR bites (strict `>`): a
+/// FOREGROUND melody (resolved weight > this) never falls to SUSTAINED on a calm image —
+/// it is floored up one rank to the DOTTED (Oblique) band so it always out-moves the
+/// governed counter's single sustained tone. Set EXACTLY at PROMINENCE_NEUTRAL so an
+/// identity/neutral melody (weight == 0.5) is UNAFFECTED (strict `>` is false → the
+/// SUSTAINED arm runs byte-identically); every genuine foreground weight (> 0.5) floors.
+/// theory: a line that is the declared figure must MOVE; a held foreground over a moving
+/// bed is the figure-ground inversion from the foreground side. EAR-TUNABLE [0.50, 0.60].
+const ACTIVITY_FLOOR_THRESHOLD: f32 = 0.50;
+
+/// The minimum clear margin (in semitones) the melody seat must hold ABOVE the counter
+/// ceiling — a POSITIVE gap (operator decision 5: a clear seat, not a tie). High-voice
+/// superiority wants the figure unambiguously on top, so the seat floor is
+/// `COUNTER_CEILING + this` whenever a counter is present. EAR-TUNABLE [1, 5] (the taste
+/// gate sizes it). GATED on counter-present (spec §2b / operator decision A): the
+/// engine_equivalence goldens are synthetic no-counter bars, so the guard never fires
+/// there → the freeze holds.
+const MIN_FIGURE_GAP: u8 = 2; // recommended start; range [1, 5] — see spec §3
+
+// ----------------------------------------------------------------------------
+// S47 SLICE 4 — THE BED ACTIVITY RECESSION (pass 2: make the melody the FIGURE).
+//
+// theory: pass 1 (the governor + activity floor) made the COUNTER recede below the
+// melody, but the figure-ground instrumentation proved the live F5b/F1 defect is
+// PAD-driven, not counter-driven — the Pad out-onsets the melody on co-sounding
+// steps (block bed = `pad_voices` simultaneous tones at offset 0 → 3 events/step;
+// figured bed = the figure's 2..4-onset burst), while the melody carries ~2. The
+// metric (`onsets_per_step`) counts each Pad NoteEvent, so a 3-voice chord stab IS
+// 3 "onsets" by F5b's lens even though the ear hears one attack. The fix RECEDES the
+// Pad's per-step ONSET COUNT below the melody's, image-conditioned by the resolved
+// Pad prominence weight pass 1 already wired: a deeper-recessed Pad (weight 0.30)
+// caps one onset BELOW the melody (a STRICT positive F1 lead — the figure clearly
+// wins on a strong-subject image), a shallow Pad (weight 0.45) caps AT the melody
+// (near-even — correct for a FIELD image, no forced lead). It NEVER hollows the bed
+// to silence (the floor; re-opening the S45 static-bed defect is forbidden) and is a
+// NO-OP at neutral weight 0.5 (the identity / golden / synthetic-bar path), so
+// engine.rs stays byte-frozen exactly as the melody floor is.
+// ----------------------------------------------------------------------------
+
+/// The Pad-prominence weight AT/ABOVE which the bed recession is a NO-OP (the freeze hinge):
+/// the cap only bites for a genuinely RECESSED Pad (resolved weight strictly `<` this). Set
+/// EXACTLY at PROMINENCE_NEUTRAL so an identity/neutral Pad (weight == 0.5 — the value
+/// `prominence_weight` returns when the section's prominence Vec is EMPTY, i.e. the golden /
+/// synthetic-bar path) is UNAFFECTED: the cap returns "no cap" and the Pad arm runs
+/// byte-identically. Every real recessed Pad (0.30 / 0.40 / 0.45) clears the strict `<` and
+/// recedes. This mirrors ACTIVITY_FLOOR_THRESHOLD's freeze-pivot gating on the melody side.
+const PAD_RECESSION_THRESHOLD: f32 = 0.50;
+
+/// The Pad-prominence weight AT/BELOW which the bed recedes ONE EXTRA onset — STRICTLY below
+/// the melody (a POSITIVE F1 margin) rather than merely even with it. theory: a deep-tier Pad
+/// (resolved weight 0.30, the subject_melody / melody_lead_strong tiers a strong, separated
+/// subject selects) accompanies a melody that MUST be the unambiguous figure, so the bed sheds
+/// one more onset to clear a real activity gap; a shallow-tier Pad (0.45, the melody_lead_gentle
+/// FIELD tier) caps merely AT the melody (near-even — an abstract/field image legitimately shares
+/// focus, so no forced lead). Lower resolved weight → fewer Pad onsets, integrating the cap with
+/// the pass-1 recession family. Placed between the deep (0.30) and shallow (0.45) tiers; the mid
+/// (0.40) tier reads as deep here, which is the intended musical call (a melody-forward section
+/// still wants a clear figure). EAR-TUNABLE [0.35, 0.45].
+const PAD_DEEP_RECESSION_CEILING: f32 = 0.40;
+
+/// The Pad onset FLOOR — the bed never recedes below ONE sounding onset per step (it RECEDES in
+/// activity, it does NOT go silent). theory: a SILENT bed re-opens the static-bed defect S45
+/// fixed; the recession thins the bed's activity while keeping it sounding. So the cap is floored
+/// here even on the deepest tier against the calmest melody (Sustained → mel_min 1, deep gap 1 →
+/// 0, floored back to 1). FIXED at 1 (a bed of zero voices is not a bed).
+const PAD_ONSET_FLOOR: usize = 1;
+
+/// The weak-beat the receded BLOCK bed displaces its stab onto — a fraction of the step. theory:
+/// a block bed is a SIMULTANEOUS chord stab at offset 0 (the downbeat, where the melody attacks);
+/// when the recession thins it to a single stab, leaving it on offset 0 would FUSE its onset grid
+/// with the Bass/Fill/Melody downbeat (the S42 fusion signature F5a red-bars). So the surviving
+/// stab is moved to the "and" of the beat (the back half of the step) — a classic off-beat comp —
+/// keeping the Pad OFF the melody's strong beat (the prompt's weak-beat steer) while preserving its
+/// onset COUNT (so F5b stays satisfied — displacement changes WHERE the onset sits, not HOW MANY).
+/// A FIGURED bed already keeps its surviving onsets off the downbeat (the recession drops the
+/// offset-0 onsets first), so it is never displaced. EAR-TUNABLE [0.5, 0.75] (the off-beat feel).
+const PAD_WEAK_BEAT_FRAC: f32 = 0.5;
+
+/// The MINIMUM onset count the Melody arm emits for a given activity class — the relative
+/// reference the Pad cap recedes under so `bed_onsets ≤ melody_onsets` holds on EVERY co-sounding
+/// step (the F5b invariant), INCLUDING the busiest melody steps (so the CLIMAX-BLOOM cross-arc
+/// invariant survives: when a later texture-arc slice blooms the melody to ARPEGGIO/3+ onsets, the
+/// bed may bloom too while staying under it). theory: the Melody arm (:2116-2168) emits ARPEGGIO→3
+/// / SYNCOPATED→2 / DOTTED→2 / SUSTAINED→1 onsets; mapped onto the 3 figure-ground classes the
+/// MINIMUM is Sustained→1, Oblique(DOTTED)→2, Subdividing(SYNC or ARP)→2. Using the class MINIMUM
+/// (2 for Subdividing, not 3) is the CONSERVATIVE choice: on an ARPEGGIO step the melody emits 3
+/// and the capped-at-2 bed stays strictly under — the invariant can never be violated by an
+/// optimistic read. Pure; mirrors the arm's per-band counts (kept 1:1 in the unit tests).
+fn melody_min_onsets(class: ActivityClass) -> usize {
+    match class {
+        ActivityClass::Sustained => 1,   // one held tone
+        ActivityClass::Oblique => 2,     // DOTTED long-short pair
+        ActivityClass::Subdividing => 2, // SYNCOPATED (2) — the MIN of {SYNC 2, ARP 3}
+    }
+}
+
+/// The maximum onset count the Pad bed may emit THIS step so it recedes BELOW (deep tier) or
+/// AT (shallow tier) the melody's activity, image-conditioned by the resolved Pad prominence
+/// weight `pad_w` and the melody's activity `class`. Returns `None` == NO CAP (the freeze hinge:
+/// a neutral Pad runs unbounded/byte-identical); `Some(k)` == cap to at most `k` onsets, never
+/// below PAD_ONSET_FLOOR.
+///
+/// theory (the recession law): a recessed Pad must satisfy `bed_onsets ≤ melody_onsets` on every
+/// co-sounding step (F5b). The cap is RELATIVE to the melody's per-class minimum so the bed tracks
+/// the melody (preserving CLIMAX-BLOOM) rather than pinning to an absolute low count. The DEEP
+/// tier sheds one EXTRA onset for a STRICT positive F1 lead; the SHALLOW tier caps at the melody
+/// for near-even. The floor guarantees the bed never hollows to silence.
+///
+/// FREEZE: at `pad_w == PROMINENCE_NEUTRAL` (0.5 — the identity / golden / synthetic-bar path,
+/// where `prominence_weight` returns neutral) the strict `<` is FALSE → `None` → no cap → the Pad
+/// arm is byte-identical. Only a real recessed Pad (weight < 0.5) is ever capped.
+fn pad_onset_cap(pad_w: f32, class: ActivityClass) -> Option<usize> {
+    if pad_w >= PAD_RECESSION_THRESHOLD {
+        return None; // neutral / non-recessed Pad — the freeze hinge, no cap
+    }
+    let mel = melody_min_onsets(class);
+    // Deep tier (weight ≤ ceiling): one onset BELOW the melody (strict positive lead).
+    // Shallow tier: AT the melody (near-even). Floored so the bed never hollows.
+    let capped = if pad_w <= PAD_DEEP_RECESSION_CEILING {
+        mel.saturating_sub(1)
+    } else {
+        mel
+    };
+    Some(capped.max(PAD_ONSET_FLOOR))
+}
+
+/// Thin a built Pad event list DOWN to at most `cap` onsets, RECEDING the bed off the melody's
+/// strong beat: it drops the onsets NEAREST the downbeat (offset 0 — where the melody attacks)
+/// FIRST, keeping the latest (weak-beat) onsets, so the bed recedes in activity WITHOUT hollowing
+/// and stays clear of the figure's downbeat attack. theory: figure-ground segregation wants the
+/// bed off the melody's accent; dropping the downbeat-coincident onsets is the cleanest activity
+/// recession that also opens the strong beat for the figure.
+///
+/// THE BLOCK-BED CASE (every event at offset 0 — a simultaneous chord stab): the events are tied
+/// on offset, so the thinning keeps the FIRST `cap` seated voices (the harmonically essential inner
+/// tones, seated low→high) — a thinner stab, still sounding. But a single surviving stab left on
+/// offset 0 would FUSE its onset grid with the Bass/Fill/Melody downbeat (the F5a anti-fusion
+/// signal). So when EVERY surviving onset is still on the downbeat, the stab is DISPLACED to the
+/// weak beat (PAD_WEAK_BEAT_FRAC) — an off-beat comp that keeps the bed off the melody's accent
+/// AND distinct from the other beds, WITHOUT changing the onset COUNT (F5b is count-based, so the
+/// displacement is F5b-neutral). The hold is re-fitted into the remaining step so the displaced
+/// stab never over-runs the step more than the block bed already did.
+///
+/// A `cap` ≥ len is the identity (returns the list unchanged). Pure.
+fn recede_pad_onsets(mut events: Vec<NoteEvent>, cap: usize, step_ms: u64) -> Vec<NoteEvent> {
+    if events.len() <= cap {
+        return events; // already at/under the cap — nothing to recede (covers the no-cap path)
+    }
+    // Index sorted by offset DESCENDING so the LATEST (weak-beat) onsets are kept first; ties
+    // (the block bed's all-offset-0 stab) break on original index so the first `cap` kept are the
+    // lowest seated voices (the essential inner harmony). We mark which original indices to KEEP,
+    // then rebuild in ORIGINAL order so the emitted list stays in onset/seat order.
+    let mut order: Vec<usize> = (0..events.len()).collect();
+    order.sort_by(|&a, &b| {
+        events[b]
+            .offset_ms
+            .cmp(&events[a].offset_ms)
+            .then(a.cmp(&b))
+    });
+    let keep: std::collections::BTreeSet<usize> = order.into_iter().take(cap).collect();
+    let mut out: Vec<NoteEvent> = Vec::with_capacity(cap);
+    for (i, ev) in events.drain(..).enumerate() {
+        if keep.contains(&i) {
+            out.push(ev);
+        }
+    }
+    // F5a anti-fusion: if EVERY surviving onset is still on the downbeat (the block-bed stab — no
+    // weak-beat onset survived to keep the bed off the beat), displace the stab to the weak beat so
+    // its onset grid does not fuse with the Bass/Fill/Melody downbeat. Count-preserving (F5b-safe).
+    if out.iter().all(|e| e.offset_ms == 0) {
+        let weak = (step_ms as f32 * PAD_WEAK_BEAT_FRAC).round() as u64;
+        // Re-fit each displaced onset's hold into [weak, step_ms × PAD_OVERLAP_FRAC] so it sounds
+        // through the back of the step (the block bed's legato ceiling) without a multi-step ring.
+        let ceil = ((step_ms as f32) * PAD_OVERLAP_FRAC).round() as u64;
+        let hold = ceil.saturating_sub(weak).max(1);
+        for e in &mut out {
+            e.offset_ms = weak;
+            e.hold_ms = hold;
+        }
+    }
+    out
+}
+
 /// Prominence weight (0..1) for `role`, read off `ctx.section.orchestration.prominence`.
 /// theory: returns PROMINENCE_NEUTRAL (0.5) when the section's prominence is EMPTY
 /// (identity / uniform) OR the role is unlisted — so the legacy realization is
@@ -1113,6 +1368,14 @@ pub fn realize_step(
     // the identity-profile default — so this read is inert on the legacy path and
     // the Pad branch never fires there). Read zero-copy off the borrowed section.
     let pad_voices = ctx.section.orchestration.pad_voices;
+    // S47 seat-order-guard gate: is a CounterMelody present in THIS ensemble? Computed
+    // off the SAME `assign_role` the realizer uses, over every instrument index, so the
+    // guard fires exactly when (and only when) a counter actually sounds. On the identity
+    // path the profile is identity → `assign_role` delegates to `instrument_role`, which
+    // never yields CounterMelody, so this is FALSE on the freeze path → the seat guard is
+    // a no-op there and the engine_equivalence goldens are byte-stable (spec §2b).
+    let counter_present = (0..num_instruments)
+        .any(|i| assign_role(i, num_instruments, ctx) == OrchestralRole::CounterMelody);
     let is_cadence = matches!(
         step.position,
         PhrasePosition::HalfCadence | PhrasePosition::PerfectAuthenticCadence
@@ -1151,6 +1414,7 @@ pub fn realize_step(
             num_instruments,
             features,
             prominence_w,
+            counter_present,
         ),
     };
 
@@ -1233,6 +1497,14 @@ fn role_pitch(
     // (the pad_voices precedent) — realize_step's signature is unchanged. Drives the
     // centered register lift; at 0.5 the lift is exactly 0 (byte-frozen identity).
     prominence_w: f32,
+    // S47 seat-order guard gate (additive PRIVATE param, the prominence_w precedent —
+    // realize_step's signature is unchanged). TRUE iff a CounterMelody is present in the
+    // active ensemble. When true, the Melody seat is floored to COUNTER_CEILING +
+    // MIN_FIGURE_GAP so a dark-image brightness drop can never seat the melody INTO the
+    // counter band (the register inversion). GATED on counter-present so the guard never
+    // fires on the synthetic no-counter engine_equivalence goldens → the freeze holds
+    // (spec §2b / operator decision A). FALSE everywhere on the identity/freeze path.
+    counter_present: bool,
 ) -> u8 {
     let notes = &chord.notes;
     if notes.is_empty() {
@@ -1268,7 +1540,23 @@ fn role_pitch(
             // 96, so the melody never clamps flat at the top (no_inversion_invariant holds).
             let prom_lift =
                 ((prominence_w - PROMINENCE_NEUTRAL) * PROMINENCE_REG_SPAN).round() as i16;
-            let floor = (MELODY_REGISTER_FLOOR as i16 + lift + prom_lift).clamp(24, 96) as u8;
+            let raw = MELODY_REGISTER_FLOOR as i16 + lift + prom_lift;
+            // S47 SEAT-ORDER GUARD (spec §2b): when a CounterMelody is present, the melody
+            // seat must sit a clear MIN_FIGURE_GAP above the counter ceiling — high-voice
+            // superiority wants the figure unambiguously on top. On a dark image `lift` can be
+            // −12, pulling `raw` (≈55-57) INTO the counter band [55, 67); the `.max(...)` lifts
+            // it back to a clear seat. theory: melody-on-top becomes STRUCTURAL, not an
+            // emergent accident of brightness. GATED on `counter_present` (operator decision A):
+            // the engine_equivalence goldens are synthetic no-counter bars, so the guard never
+            // fires there and the freeze holds; it fires exactly where the register inversion
+            // can occur (counter-routed dark images). Folded UNDER the SAME single .clamp(24,96)
+            // (the Risk-1 sum-clamp discipline) so the summed lift can never escape the band.
+            let seat_floor = if counter_present {
+                COUNTER_CEILING as i16 + MIN_FIGURE_GAP as i16
+            } else {
+                i16::MIN // no-op floor on the no-counter / identity path
+            };
+            let floor = raw.max(seat_floor).clamp(24, 96) as u8;
             seat_pc_in_register(pc, floor)
         }
         // Pad and CounterMelody both seat a representative INNER tone in the fill
@@ -1766,7 +2054,7 @@ fn realize_rhythm(
             // so no two bed voices collapse onto the same pitch (the spirit of
             // upper_voices_well_spaced — a bed of unisons is not a bed).
             let notes = &step.chord.notes;
-            if notes.is_empty() || pad_voices == 0 {
+            let pad_events = if notes.is_empty() || pad_voices == 0 {
                 // Defensive: a chord with no tones (or a profile that named a Pad
                 // with 0 voices) holds nothing. Fall back to one supporting tone so
                 // the instrument is not silent.
@@ -1825,6 +2113,29 @@ fn realize_rhythm(
                         })
                         .collect(),
                 }
+            };
+            // S47 SLICE 4 — THE BED ACTIVITY RECESSION (pass 2). Cap the Pad's per-step ONSET
+            // COUNT so it recedes BELOW (deep tier) or AT (shallow tier) the melody's activity,
+            // image-conditioned by the resolved Pad prominence weight pass 1 wired. This is the
+            // PAD-side complement of the pass-1 melody floor / counter governor: it drives F5b
+            // (bed_onsets > melody_onsets) toward 0 and flips F1 (the melody out-onsets the bed)
+            // POSITIVE on deep-tier images. theory: the cap is RELATIVE to the melody's per-class
+            // minimum onsets, so the bed tracks the melody (CLIMAX-BLOOM survives) rather than
+            // pinning to an absolute low; `recede_pad_onsets` keeps the bed OFF the melody's
+            // downbeat (drops the offset-0 onsets first) and never hollows it to silence (the
+            // PAD_ONSET_FLOOR). FREEZE: on the identity / golden / synthetic-bar path the section's
+            // prominence Vec is EMPTY → `prominence_weight` returns PROMINENCE_NEUTRAL (0.5) →
+            // `pad_onset_cap` returns None → no cap → the Pad arm is byte-identical (mirrors the
+            // melody floor's no-op-at-0.5 gating; the engine_equivalence goldens are no-Pad
+            // synthetic bars, so this is doubly inert there).
+            let pad_w = prominence_weight(ctx, OrchestralRole::Pad);
+            let melody_prom_shift = (prominence_weight(ctx, OrchestralRole::Melody)
+                - PROMINENCE_NEUTRAL)
+                * PROMINENCE_RHY_SHIFT;
+            let m_class = melody_activity_class(edge_activity, melody_prom_shift, pre_cadence);
+            match pad_onset_cap(pad_w, m_class) {
+                Some(cap) => recede_pad_onsets(pad_events, cap, step_ms),
+                None => pad_events,
             }
         }
 
@@ -1895,31 +2206,67 @@ fn realize_rhythm(
 
             let with_note = |ev: NoteEvent| NoteEvent { note: cnt, ..ev };
 
-            // RHYTHM (§3.3) + HELD-PERIOD ACTIVATION (§3.4).
-            if held_chord || melody_static {
-                // MOVING mode: a GUARANTEED off-beat onset (no rest-as-gesture), a
-                // single delayed note at step_ms/4 — the moving line that weaves under
-                // the held/static harmony and fills the operator's "empty period."
-                let offset = step_ms / 4;
-                let slot = step_ms - offset;
-                let mut ev = sustained(offset, slot, base_frac);
-                ev = with_note(ev);
-                vec![ev]
-            } else if edge_activity > 0.55 {
-                // The melody is ACTIVE (it subdivides — arpeggio/syncopated bands): the
-                // counter holds ONE sustained tone underneath (the OBLIQUE case), staying
-                // out of the melody's way. Onset 0, one note for the full step.
-                vec![with_note(sustained(0, step_ms, base_frac))]
-            } else {
-                // Both voices calm and the chord is changing: the texture may breathe —
-                // rest-as-gesture on a weak interior beat, gated on FILL_REST_ACTIVITY
-                // exactly like the fill, so a genuinely near-static image gets the
-                // occasional counter-rest. Otherwise one sustained tone.
+            // RHYTHM (§3.3) + THE FIGURE-GROUND ACTIVITY GOVERNOR (S47 slice 1, spec §2a.3).
+            //
+            // theory: the counter is a GAIN (S45's moving inner texture) but must never
+            // out-MOVE the foreground. The activation is now governed by the MELODY's
+            // activity class so the counter recedes EXACTLY ONE RANK below the melody:
+            //   • melody Subdividing (it moves — arpeggio/syncopated) → counter MOVING
+            //     (the guaranteed off-beat onset) — the counter keeps its inner motion;
+            //     PRESERVES S45 (when the melody moves, the counter moves).
+            //   • melody Oblique (dotted — minimum real motion) → counter OBLIQUE (one
+            //     sustained tone, onset 0) — it recedes below the melody's ≥2 onsets.
+            //   • melody Sustained (it HOLDS — the calm-image inversion case) → counter
+            //     OBLIQUE-or-rest (NEVER the guaranteed onset) — the fix: a holding melody
+            //     no longer lets the background take the onset the foreground lacks.
+            // The OLD predicate (`held_chord || melody_static` → MOVING) was the inversion:
+            // it routed the counter to MOVING precisely when the melody held. The counter is
+            // NEVER silenced — a holding-melody step gives it a sustained tone (or the
+            // existing breathing rest-as-gesture on a weak interior beat), never a mute.
+            //
+            // The melody's class is computed off the MELODY role's prominence shift (the
+            // governor asks "how active is the MELODY," spec §8.4) — NOT the counter's.
+            let melody_prom_shift = (prominence_weight(ctx, OrchestralRole::Melody)
+                - PROMINENCE_NEUTRAL)
+                * PROMINENCE_RHY_SHIFT;
+            let m_class = melody_activity_class(edge_activity, melody_prom_shift, pre_cadence);
+            // `held_chord` / `melody_static` are retained for clarity of intent: the Sustained
+            // class is precisely the held/static case the governor now recedes (asserted in the
+            // unit tests), but the CLASS — not these flags — drives the routing.
+            let _ = (held_chord, melody_static);
+            // The OBLIQUE/rest recession body, shared by the Oblique and Sustained arms: one
+            // sustained tone underneath, or (on a genuinely near-static changing chord) the
+            // existing breathing rest-as-gesture on a weak interior beat. NEVER the guaranteed
+            // onset, so the counter cannot out-move a melody that is not Subdividing.
+            let oblique_or_rest = || -> Vec<NoteEvent> {
                 let weak_interior = !step.position_in_phrase.is_multiple_of(2);
                 if edge_activity < FILL_REST_ACTIVITY && weak_interior {
                     Vec::new()
                 } else {
                     vec![with_note(sustained(0, step_ms, base_frac))]
+                }
+            };
+            match m_class {
+                ActivityClass::Subdividing => {
+                    // MOVING mode: a GUARANTEED off-beat onset at step_ms/4 — the moving inner
+                    // line weaving under the active melody (PRESERVE S45: melody moves → counter
+                    // moves). theory: two simultaneously moving lines are legitimate counterpoint
+                    // when the figure is the busier one; the seat guard + the melody's ≥2-onset
+                    // density keep the melody the figure even as the counter moves.
+                    let offset = step_ms / 4;
+                    let slot = step_ms - offset;
+                    vec![with_note(sustained(offset, slot, base_frac))]
+                }
+                ActivityClass::Oblique => {
+                    // The melody has minimal real motion (dotted, ≥2 onsets): the counter
+                    // recedes one rank to ONE sustained tone (onset 0), staying under the figure.
+                    vec![with_note(sustained(0, step_ms, base_frac))]
+                }
+                ActivityClass::Sustained => {
+                    // THE FIX: the melody HOLDS — the counter must NOT take the guaranteed onset
+                    // that out-moves the held foreground. It recedes to a sustained tone (or the
+                    // existing breathing rest), one rank below a holding melody. Never silenced.
+                    oblique_or_rest()
                 }
             }
         }
@@ -1938,9 +2285,22 @@ fn realize_rhythm(
             // (0.5-0.5)*RHY_SHIFT == 0.0 → cutoffs are exactly 0.80/0.55/0.25, byte-stable.
             // The `pre_cadence ||` disjunct is UNCHANGED so the cadence acceleration path
             // is never shifted (protects the cadence golden).
-            let prom_shift =
-                (prominence_weight(ctx, role) - PROMINENCE_NEUTRAL) * PROMINENCE_RHY_SHIFT;
-            if pre_cadence || edge_activity > (0.80 - prom_shift) {
+            let melody_w = prominence_weight(ctx, role);
+            let prom_shift = (melody_w - PROMINENCE_NEUTRAL) * PROMINENCE_RHY_SHIFT;
+            // S47 activity FLOOR: a FOREGROUND melody (resolved weight > threshold) must
+            // never fall all the way to a held tone on a calm image — that is the
+            // figure-ground inversion seen from the foreground side (a held figure under a
+            // moving bed). When the band ladder would otherwise select SUSTAINED, FLOOR the
+            // melody up one rank to the DOTTED (Oblique) band so it carries ≥2 onsets and
+            // always out-moves the governed counter's single sustained tone. theory: the
+            // declared figure must MOVE. Identity neutrality: at neutral weight (0.5) the
+            // strict `>` is FALSE → no floor → the SUSTAINED arm runs byte-identically; and
+            // a recessive (<0.5) melody is likewise unaffected. The floor only LIFTS a band
+            // selection that was already SUSTAINED, so it can never reduce activity.
+            let floor_to_dotted = melody_w > ACTIVITY_FLOOR_THRESHOLD
+                && melody_activity_class(edge_activity, prom_shift, pre_cadence)
+                    == ActivityClass::Sustained;
+            if pre_cadence || edge_activity > (MELODY_ARP_CUTOFF - prom_shift) {
                 // ARPEGGIO / acceleration: spread chord-tone onsets evenly across
                 // the step (more onsets, shorter values) — the active, driving
                 // figure. theory: subdividing the beat is the melody's way of
@@ -1953,7 +2313,7 @@ fn realize_rhythm(
                         sustained(offset, slot, STACCATO_FRAC)
                     })
                     .collect()
-            } else if edge_activity > (0.55 - prom_shift) {
+            } else if edge_activity > (MELODY_SYNC_CUTOFF - prom_shift) {
                 // SYNCOPATED: delay the onset off the downbeat by 1/4 step, then
                 // a second onset, pushing against the meter. theory: syncopation
                 // displaces the accent to energize an active-but-not-busy melody.
@@ -1962,10 +2322,13 @@ fn realize_rhythm(
                     sustained(quarter, step_ms / 2, PORTATO_FRAC),
                     sustained(step_ms * 3 / 4, step_ms / 4, STACCATO_FRAC),
                 ]
-            } else if edge_activity > (0.25 - prom_shift) {
+            } else if floor_to_dotted || edge_activity > (MELODY_DOTTED_CUTOFF - prom_shift) {
                 // DOTTED: a long-short pair (onsets at 0 and 2/3; holds 2/3 and
                 // 1/3) — the lilting mid-activity figure. theory: the dotted
                 // rhythm is the default expressive subdivision of a singing line.
+                // S47: `floor_to_dotted` ALSO routes a calm FOREGROUND melody here
+                // (the activity floor — a foreground figure gets the minimum real
+                // motion rather than holding under a moving bed).
                 let two_thirds = step_ms * 2 / 3;
                 vec![
                     sustained(0, two_thirds, PORTATO_FRAC),
@@ -3605,6 +3968,13 @@ fn melody_pitch_for(
             // the SAME value realize_step threads for the Melody role, so a theme note
             // lifts identically to a free-selected one. Empty prominence → 0.5 → no lift.
             prominence_weight(ctx, OrchestralRole::Melody),
+            // S47: `melody_pitch_for` is reached ONLY from the CounterMelody arm (the
+            // counter recomputing the melody it tracks). A counter is therefore present by
+            // construction, so the seat guard MUST apply here too — otherwise the counter
+            // would track the UN-guarded melody pitch while the melody actually sounds the
+            // seat-guarded one, re-introducing a phantom-melody divergence (the S45-CP-FIX
+            // class of bug). `true` keeps the counter's register-relative motion honest.
+            true,
         ),
     };
     // Stage 2: LAND-HOME PAC re-voicing — identical guard/call to realize_step:1163.
@@ -7800,43 +8170,48 @@ mod tests {
         }
     }
 
-    /// §3.6 test 4 (the operator "empty periods" verdict — the load-bearing one): two
-    /// consecutive steps on the SAME voiced chord (`held_chord == true`) → the counter
-    /// SOUNDS on the held step with an off-beat onset (`offset_ms == step_ms/4`), and its
-    /// pitch DIFFERS from the seed it would carry from the prior step (something moves
-    /// underneath the held chord — not a re-struck stab, not a rest).
+    /// §3.6 test 4, RE-AUTHORED for the S47 FIGURE-GROUND GOVERNOR (slice 1). The PRE-S47
+    /// behavior — a held chord + STATIC melody routed the counter to a GUARANTEED off-beat
+    /// onset — was precisely the activity INVERSION S46 diagnosed: the background moved while
+    /// the foreground held. The S47 governor recedes the counter to ONE rank below the
+    /// melody's class, so on a HOLDING (Sustained) melody the counter now takes its OBLIQUE
+    /// sustained tone (onset 0), NEVER the off-beat onset. It still SOUNDS (never silenced
+    /// here — the chord changes are absent so the rest-as-gesture gate does not fire), and it
+    /// still steps to a NEW chord tone across the held run (the moving-LINE pitch behavior is
+    /// preserved — it is the off-beat ONSET that recedes, not the line's contrapuntal motion).
+    /// The companion test `test_counter_moves_when_melody_subdividing` proves PRESERVE-S45:
+    /// when the melody MOVES, the counter takes its off-beat onset again.
     #[test]
-    fn test_counter_held_period_fills_and_moves() {
-        // SAME voiced chord on both steps → held period. A near-static melody (free-
-        // select top tone is identical across identical chords → mel_dir Hold).
+    fn test_counter_recedes_under_holding_melody() {
+        // SAME voiced chord on both steps → held period; the free-select top tone is identical
+        // across identical chords → the melody HOLDS (mel_dir Hold). The fixture's prominence
+        // is uniform-neutral (0.5), so the activity floor does NOT lift the melody — it stays
+        // Sustained, and the governor recedes the counter.
         let held = c_major_triad();
         let (sec, kt) =
             counter_ctx_parts(counter_step(held.clone(), 0), counter_step(held.clone(), 1));
-        let f = perf_mid(); // calm-ish; held-period activation must override any rest
+        let f = perf_mid(); // calm; the melody falls to Sustained → the governor recedes the counter
         let evs = realize_counter(&sec, &kt, &f);
         assert_eq!(
             evs.len(),
             1,
-            "a held-period counter must SOUND (no rest-as-gesture), got {} events",
+            "the receded counter still SOUNDS one sustained tone (never silenced here), got {} events",
             evs.len()
         );
-        let step_ms = sec.ms_per_step;
         assert_eq!(
-            evs[0].offset_ms,
-            step_ms / 4,
-            "a held-period counter must onset OFF the downbeat at step_ms/4"
+            evs[0].offset_ms, 0,
+            "S47 GOVERNOR: under a HOLDING melody the counter recedes to its OBLIQUE sustained \
+             tone at onset 0 — it must NOT take the guaranteed off-beat onset that out-moves \
+             the held foreground (the inversion the governor fixes)"
         );
-        // The moving-line guarantee: the held step's counter pitch differs from what the
-        // PRIOR step of the held run actually sounds — the line STEPS to a new chord tone
-        // (the advancing seed rotates the seat each held step), so consecutive held steps
-        // are NOT the same re-struck stab. Compared against the prior step's ACTUAL
-        // realized pitch (step index 0), not a static prior-chord seed proxy.
+        // The moving-LINE pitch behavior is unchanged by the governor: the held step's counter
+        // pitch still differs from the prior step's realized pitch (contrapuntal motion of the
+        // line is preserved; only the off-beat ONSET receded).
         let prev_ctx = StepContext {
             section: &sec,
             step_in_section: 0,
             theme: None,
             key_tempo: &kt,
-            // S28/K3 — identity carry: this test ctx never modulates.
             prev_key_offset_semitones: None,
         };
         let prev_evs = realize_step(&sec.steps[0], 2, 4, &f, sec.ms_per_step, &prev_ctx);
@@ -7847,9 +8222,36 @@ mod tests {
         );
         assert_ne!(
             evs[0].note, prev_evs[0].note,
-            "the counter must step to a NEW chord tone across the held run (moving line, \
+            "the counter LINE still steps to a new chord tone across the held run (moving line, \
              not a re-struck stab): step1 note {} == step0 note {}",
             evs[0].note, prev_evs[0].note
+        );
+    }
+
+    /// PRESERVE-S45 (binding): when the melody MOVES (Subdividing — a busy image), the S47
+    /// governor lets the counter keep its MOVING off-beat onset. The counter recedes ONLY
+    /// relative to a holding melody; a moving melody keeps the moving inner texture S45 routed
+    /// in. This is the complement of `test_counter_recedes_under_holding_melody`.
+    #[test]
+    fn test_counter_moves_when_melody_subdividing() {
+        let held = c_major_triad();
+        let (sec, kt) =
+            counter_ctx_parts(counter_step(held.clone(), 0), counter_step(held.clone(), 1));
+        // A BUSY image: edge_density high enough that the melody is Subdividing
+        // (edge_activity > MELODY_SYNC_CUTOFF). With the fixture density 0.6 the nudge is
+        // +0.05; raw 0.04/0.05 == 0.8 → edge_activity clamps near 0.85 → Subdividing.
+        let busy = PerfFeatures {
+            saturation: 50.0,
+            brightness: 50.0,
+            edge_density: 0.04,
+        };
+        let evs = realize_counter(&sec, &kt, &busy);
+        assert_eq!(evs.len(), 1, "the moving counter sounds one off-beat note");
+        assert_eq!(
+            evs[0].offset_ms,
+            sec.ms_per_step / 4,
+            "PRESERVE-S45: a SUBDIVIDING melody lets the counter keep its moving off-beat \
+             onset at step_ms/4 — the counter recedes only relative to a HOLDING melody"
         );
     }
 
@@ -7904,10 +8306,13 @@ mod tests {
                 1,
                 "each held step sounds exactly one counter note"
             );
+            // S47 GOVERNOR: `perf_mid` is calm → the melody is Sustained → the counter recedes
+            // to its OBLIQUE sustained tone at onset 0 (it no longer takes the off-beat onset
+            // over a holding melody). The advancing-LINE proof below is unaffected — the line
+            // still weaves through ≥2 chord tones; only the off-beat onset receded.
             assert_eq!(
-                evs[0].offset_ms,
-                section.ms_per_step / 4,
-                "every held step onsets off the downbeat (rhythmic fill still holds)"
+                evs[0].offset_ms, 0,
+                "under a holding (calm) melody the receded counter onsets at 0 (oblique sustained)"
             );
             // The Slice-2 contract still holds per step: chord tone in the counter band.
             let chord_pcs: Vec<u8> = held.notes.iter().map(|n| n % 12).collect();
@@ -8020,21 +8425,31 @@ mod tests {
         );
     }
 
-    /// §3.6 test 5 / §6.4 (the supersession witness): on a held-chord/static-melody step
-    /// the counter onsets OFF the downbeat (step_ms/4), where the OLD HarmonicFill stub
-    /// would have onset at 0 — so the counter is NO LONGER a HarmonicFill delegate. This
-    /// is the in-file analogue of the retired texture_s17 stub-equals assertion.
+    /// §3.6 test 5 / §6.4 (the supersession witness), updated for S47: on a held chord with a
+    /// MOVING (Subdividing) melody — a busy image — the counter takes its off-beat onset at
+    /// step_ms/4, where the OLD HarmonicFill stub would have onset at 0, so the counter is NO
+    /// LONGER a HarmonicFill delegate. (The witness moved from a STATIC-melody step to a
+    /// moving-melody step because the S47 governor now correctly recedes the counter to onset
+    /// 0 over a HOLDING melody — the off-beat onset is reserved for a moving melody. The
+    /// supersession claim is unchanged; the witness step is chosen so the counter is in its
+    /// moving mode.)
     #[test]
     fn test_counter_no_longer_harmonicfill_delegate() {
         let held = c_major_triad();
         let (sec, kt) =
             counter_ctx_parts(counter_step(held.clone(), 0), counter_step(held.clone(), 1));
-        let f = perf_mid();
+        // BUSY image → the melody is Subdividing → the governor lets the counter MOVE
+        // (PRESERVE-S45), so the off-beat-onset supersession witness is observable.
+        let f = PerfFeatures {
+            saturation: 50.0,
+            brightness: 50.0,
+            edge_density: 0.04,
+        };
         let counter = realize_counter(&sec, &kt, &f);
         assert_eq!(counter.len(), 1, "counter sounds on the held step");
         assert_ne!(
             counter[0].offset_ms, 0,
-            "the real counter onsets OFF the downbeat (step_ms/4) on a held/static step — \
+            "the real counter onsets OFF the downbeat (step_ms/4) under a moving melody — \
              the HarmonicFill figure would onset at 0; the stub is superseded"
         );
         // And it is the documented step_ms/4 offset.
@@ -8922,5 +9337,390 @@ mod tests {
             s34_realize_pad(&sec_walk, &kt, 0, &f),
             "the Pad bed is independent of the bass pattern"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // S47 SLICE 1 — THE FIGURE-GROUND HIERARCHY. Pure-property tests for the
+    // new helpers (ActivityClass / melody_activity_class), the governor's
+    // class→counter-mode mapping, the activity floor's SUSTAINED→DOTTED lift,
+    // and the seat-order guard arithmetic + its counter-present gate. RNG-free.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// PROPERTY: the activity rank IS the figure-ground ordering Sustained < Oblique <
+    /// Subdividing. The governor compares classes via this `Ord`, so the ordering is
+    /// load-bearing — a holding melody (Sustained) must compare strictly below a moving one.
+    #[test]
+    fn s47_activity_class_ordering_is_figure_ground_rank() {
+        assert!(ActivityClass::Sustained < ActivityClass::Oblique);
+        assert!(ActivityClass::Oblique < ActivityClass::Subdividing);
+        assert!(ActivityClass::Sustained < ActivityClass::Subdividing);
+    }
+
+    /// PROPERTY: `melody_activity_class` mirrors the Melody arm's 4→3 band mapping EXACTLY
+    /// — ARPEGGIO+SYNCOPATED → Subdividing (the melody moves), DOTTED → Oblique (minimum
+    /// real motion), below DOTTED → Sustained (one held tone). At neutral prom_shift the
+    /// cutoffs are the shared MELODY_*_CUTOFF consts the arm reads, so they cannot drift.
+    #[test]
+    fn s47_melody_activity_class_band_mapping() {
+        let s = 0.0; // neutral prom_shift
+                     // ARPEGGIO band (> 0.80) → Subdividing.
+        assert_eq!(
+            melody_activity_class(0.90, s, false),
+            ActivityClass::Subdividing
+        );
+        // SYNCOPATED band (> 0.55, ≤ 0.80) → Subdividing (≥2 onsets pushing the meter).
+        assert_eq!(
+            melody_activity_class(0.60, s, false),
+            ActivityClass::Subdividing
+        );
+        // DOTTED band (> 0.25, ≤ 0.55) → Oblique (a long-short pair, minimum real motion).
+        assert_eq!(
+            melody_activity_class(0.40, s, false),
+            ActivityClass::Oblique
+        );
+        // Below DOTTED (≤ 0.25) → Sustained (the held-tone arm — the inversion case).
+        assert_eq!(
+            melody_activity_class(0.10, s, false),
+            ActivityClass::Sustained
+        );
+    }
+
+    /// PROPERTY: `pre_cadence` forces the ARPEGGIO band (Subdividing) regardless of
+    /// edge_activity — the cadence-acceleration path the arm protects.
+    #[test]
+    fn s47_melody_activity_class_pre_cadence_forces_subdividing() {
+        assert_eq!(
+            melody_activity_class(0.0, 0.0, true),
+            ActivityClass::Subdividing,
+            "a pre-cadence step subdivides into the arrival → Subdividing"
+        );
+    }
+
+    /// PROPERTY: a FOREGROUND prom_shift lowers the cutoffs, so a borderline-calm melody
+    /// reaches the DOTTED band sooner (the S23 rhythm bias, mirrored 1:1 in the helper).
+    /// At edge 0.24 with a foreground shift (0.05) the dotted cutoff drops 0.25→0.20, so
+    /// 0.24 > 0.20 → Oblique; with neutral shift 0.24 ≤ 0.25 → Sustained.
+    #[test]
+    fn s47_melody_activity_class_prom_shift_lowers_cutoffs() {
+        assert_eq!(
+            melody_activity_class(0.24, 0.0, false),
+            ActivityClass::Sustained
+        );
+        assert_eq!(
+            melody_activity_class(0.24, 0.05, false),
+            ActivityClass::Oblique,
+            "a foreground melody subdivides more readily — the cutoff shift reaches DOTTED"
+        );
+    }
+
+    /// PROPERTY (the GOVERNOR's class→counter-mode law): the counter takes the MOVING branch
+    /// (the guaranteed off-beat onset) IFF the melody is Subdividing; for Oblique and
+    /// Sustained the counter recedes (it does NOT move). This is the inversion fix:
+    /// historically the counter moved whenever the melody held — now it moves only when the
+    /// melody moves, PRESERVING S45 (melody moves → counter moves) without out-moving a
+    /// holding melody. We assert the boundary the governor's `match` branches on.
+    #[test]
+    fn s47_governor_counter_moves_iff_melody_subdividing() {
+        let counter_moves = |class: ActivityClass| class == ActivityClass::Subdividing;
+        // Melody moves → counter MOVES (S45 preserved).
+        assert!(counter_moves(melody_activity_class(0.90, 0.0, false))); // arpeggio
+        assert!(counter_moves(melody_activity_class(0.60, 0.0, false))); // syncopated
+                                                                         // Melody at minimum motion → counter RECEDES (one rank below).
+        assert!(!counter_moves(melody_activity_class(0.40, 0.0, false))); // dotted → Oblique
+                                                                          // Melody HOLDS → counter RECEDES (the fix — no guaranteed onset over a held melody).
+        assert!(!counter_moves(melody_activity_class(0.10, 0.0, false))); // sustained
+    }
+
+    /// PROPERTY (the ACTIVITY FLOOR): a FOREGROUND melody (weight > threshold) that the band
+    /// ladder would otherwise SUSTAIN is floored up to the DOTTED (Oblique) band, so it
+    /// carries ≥2 onsets and out-moves the governed counter. A neutral (== 0.5) or recessive
+    /// melody is UNAFFECTED (byte-stable). This replicates the EXACT `floor_to_dotted`
+    /// predicate the Melody arm uses.
+    #[test]
+    fn s47_activity_floor_lifts_foreground_sustained_to_dotted() {
+        let edge_calm = 0.10; // below the dotted cutoff → the un-floored class is Sustained
+        let floor_fires = |weight: f32| -> bool {
+            let prom_shift = (weight - PROMINENCE_NEUTRAL) * PROMINENCE_RHY_SHIFT;
+            weight > ACTIVITY_FLOOR_THRESHOLD
+                && melody_activity_class(edge_calm, prom_shift, false) == ActivityClass::Sustained
+        };
+        // Foreground (> 0.5) on a calm image → the floor FIRES (Sustained → Dotted).
+        assert!(
+            floor_fires(0.78),
+            "a foreground melody must not hold on a calm image — floor it to Dotted"
+        );
+        assert!(floor_fires(0.90));
+        // Neutral identity weight → NO floor (strict `>` is false) → byte-stable SUSTAINED.
+        assert!(
+            !floor_fires(0.50),
+            "the identity/neutral melody (0.5) must be a no-op — the byte-freeze hinge"
+        );
+        // Recessive melody → NO floor.
+        assert!(!floor_fires(0.40));
+    }
+
+    /// PROPERTY: the floor only LIFTS an already-Sustained selection — it never fires when the
+    /// band ladder already chose a moving band (so it can only ADD activity, never remove it).
+    #[test]
+    fn s47_activity_floor_noop_when_melody_already_moving() {
+        let edge_busy = 0.60; // syncopated band → Subdividing even before the floor
+        let weight = 0.90_f32;
+        let prom_shift = (weight - PROMINENCE_NEUTRAL) * PROMINENCE_RHY_SHIFT;
+        let floor_fires = weight > ACTIVITY_FLOOR_THRESHOLD
+            && melody_activity_class(edge_busy, prom_shift, false) == ActivityClass::Sustained;
+        assert!(
+            !floor_fires,
+            "the floor must not fire on an already-moving melody — it only lifts SUSTAINED"
+        );
+    }
+
+    /// PROPERTY (the SEAT-ORDER GUARD + its counter-present gate): on a DARK image the
+    /// brightness lift is −12, which without the guard seats the melody INTO the counter band
+    /// [55, 67). With a counter present the guard floors the seat to COUNTER_CEILING +
+    /// MIN_FIGURE_GAP (a clear seat above the counter). With NO counter present the guard is a
+    /// no-op (the freeze gate) and the melody seats at its dark, low pitch. Driven directly
+    /// through `role_pitch` (pure).
+    #[test]
+    fn s47_seat_guard_lifts_dark_melody_only_when_counter_present() {
+        let chord = c_major_triad(); // top tone pc = G (67 % 12 == 7)
+        let dark = PerfFeatures {
+            saturation: 50.0,
+            brightness: 0.0, // bright_octaves == -1 → lift == -12 (the dark drop)
+            edge_density: 0.0,
+        };
+        // NO counter present → guard is a no-op → the dark melody seats LOW (below the ceiling).
+        let seat_no_counter = role_pitch(
+            OrchestralRole::Melody,
+            &chord,
+            0,
+            1,
+            &dark,
+            PROMINENCE_NEUTRAL,
+            false,
+        );
+        assert!(
+            seat_no_counter < COUNTER_CEILING,
+            "no counter → no guard → the dark melody drops below the counter ceiling \
+             (seat {seat_no_counter}, ceiling {COUNTER_CEILING}) — the freeze-path behavior"
+        );
+        // Counter present → the guard floors the seat to a CLEAR margin above the ceiling.
+        let seat_with_counter = role_pitch(
+            OrchestralRole::Melody,
+            &chord,
+            0,
+            1,
+            &dark,
+            PROMINENCE_NEUTRAL,
+            true,
+        );
+        assert!(
+            seat_with_counter >= COUNTER_CEILING + MIN_FIGURE_GAP,
+            "counter present → the melody seat must clear COUNTER_CEILING + MIN_FIGURE_GAP \
+             (seat {seat_with_counter}, floor {})",
+            COUNTER_CEILING + MIN_FIGURE_GAP
+        );
+    }
+
+    /// PROPERTY: the seat guard is a NO-OP on a BRIGHT image even with a counter present — a
+    /// bright melody already seats well above the counter ceiling, so the `.max(...)` floor
+    /// never bites (it only rescues a DARK-dropped melody). Confirms the guard is additive,
+    /// not a constant clamp.
+    #[test]
+    fn s47_seat_guard_noop_on_bright_melody() {
+        let chord = c_major_triad();
+        let bright = PerfFeatures {
+            saturation: 50.0,
+            brightness: 100.0, // bright_octaves == +1 → lift == +12
+            edge_density: 0.0,
+        };
+        let seat_no_counter = role_pitch(
+            OrchestralRole::Melody,
+            &chord,
+            0,
+            1,
+            &bright,
+            PROMINENCE_NEUTRAL,
+            false,
+        );
+        let seat_with_counter = role_pitch(
+            OrchestralRole::Melody,
+            &chord,
+            0,
+            1,
+            &bright,
+            PROMINENCE_NEUTRAL,
+            true,
+        );
+        assert_eq!(
+            seat_no_counter, seat_with_counter,
+            "a bright melody already sits well above the counter ceiling — the guard must be \
+             a no-op (it only rescues a dark-dropped seat), so counter-present cannot move it"
+        );
+        assert!(seat_with_counter >= COUNTER_CEILING + MIN_FIGURE_GAP);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // S47 SLICE 4 — THE BED ACTIVITY RECESSION (pass 2) unit tests.
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// A test Pad event at `offset_ms` (hold/note/velocity are immaterial to the cap arithmetic).
+    fn pad_ev(offset_ms: u64) -> NoteEvent {
+        NoteEvent {
+            note: 60,
+            velocity: 64,
+            hold_ms: 100,
+            offset_ms,
+        }
+    }
+
+    /// PROPERTY: `melody_min_onsets` mirrors the Melody arm's per-class minimum onset counts 1:1
+    /// (Sustained→1 held tone, Oblique→2 DOTTED long-short pair, Subdividing→2 the MIN of {SYNC 2,
+    /// ARP 3}). The Subdividing case is the CONSERVATIVE 2 (not 3) so the cap can never violate
+    /// `bed ≤ melody` on a SYNCOPATED step while still letting an ARPEGGIO step bloom above it.
+    #[test]
+    fn s47_pad_melody_min_onsets_mirrors_arm() {
+        assert_eq!(melody_min_onsets(ActivityClass::Sustained), 1);
+        assert_eq!(melody_min_onsets(ActivityClass::Oblique), 2);
+        assert_eq!(
+            melody_min_onsets(ActivityClass::Subdividing),
+            2,
+            "Subdividing must read the MIN (SYNCOPATED=2), not the ARPEGGIO=3, so the cap is safe \
+             on the busiest co-sounding step the class admits"
+        );
+    }
+
+    /// PROPERTY (THE FREEZE WITNESS): at neutral Pad weight (PROMINENCE_NEUTRAL == 0.5 — the
+    /// identity / golden / synthetic-bar path) `pad_onset_cap` returns None (NO cap) for EVERY
+    /// melody class, so the Pad arm runs byte-identically and engine.rs stays frozen. This is the
+    /// pass-2 analogue of the melody floor's no-op-at-0.5 hinge. A weight just ABOVE neutral (a
+    /// hypothetically FOREGROUND Pad) is also uncapped (strict `<` gate).
+    #[test]
+    fn s47_pad_onset_cap_noop_at_neutral_weight() {
+        for class in [
+            ActivityClass::Sustained,
+            ActivityClass::Oblique,
+            ActivityClass::Subdividing,
+        ] {
+            assert_eq!(
+                pad_onset_cap(PROMINENCE_NEUTRAL, class),
+                None,
+                "neutral Pad weight 0.5 must be the freeze hinge — no cap on any class"
+            );
+            assert_eq!(
+                pad_onset_cap(0.7, class),
+                None,
+                "a Pad weight above neutral must also be uncapped (the strict `<` gate)"
+            );
+        }
+    }
+
+    /// PROPERTY (IMAGE-CONDITIONED DEPTH): a DEEPER-recessed Pad (lower resolved weight) caps to
+    /// FEWER onsets. The deep tier (weight ≤ PAD_DEEP_RECESSION_CEILING, e.g. 0.30) caps ONE BELOW
+    /// the melody's class minimum (a STRICT positive F1 lead); the shallow tier (e.g. 0.45) caps AT
+    /// the melody (near-even). So for an Oblique/Subdividing melody (min 2) deep→1, shallow→2, and
+    /// deep < shallow — lower weight ⇒ fewer Pad onsets, the recession-family integration.
+    #[test]
+    fn s47_pad_onset_cap_deeper_tier_fewer_onsets() {
+        // Oblique melody (min 2): deep caps to 1 (strict lead), shallow caps to 2 (even).
+        let deep = pad_onset_cap(0.30, ActivityClass::Oblique).unwrap();
+        let shallow = pad_onset_cap(0.45, ActivityClass::Oblique).unwrap();
+        assert_eq!(
+            deep, 1,
+            "deep tier (0.30) recedes one BELOW the melody's 2 onsets"
+        );
+        assert_eq!(
+            shallow, 2,
+            "shallow tier (0.45) recedes to EVEN with the melody"
+        );
+        assert!(
+            deep < shallow,
+            "lower resolved Pad weight ⇒ FEWER Pad onsets (the image-conditioned depth)"
+        );
+        // Subdividing melody (min 2) behaves the same (the cap reads the class minimum).
+        assert_eq!(pad_onset_cap(0.30, ActivityClass::Subdividing).unwrap(), 1);
+        assert_eq!(pad_onset_cap(0.45, ActivityClass::Subdividing).unwrap(), 2);
+    }
+
+    /// PROPERTY (THE NO-HOLLOWING FLOOR): the cap NEVER drops the Pad to 0 onsets — even the
+    /// DEEPEST tier against the CALMEST melody (Sustained → min 1, deep gap 1 → 0) is floored back
+    /// to PAD_ONSET_FLOOR (1). A silent bed re-opens the S45 static-bed defect, so the bed recedes
+    /// in ACTIVITY but always keeps ≥1 sounding onset.
+    #[test]
+    fn s47_pad_onset_cap_never_hollows() {
+        assert_eq!(
+            pad_onset_cap(0.30, ActivityClass::Sustained).unwrap(),
+            PAD_ONSET_FLOOR,
+            "deep tier against a Sustained melody would compute 0 — must floor to 1 (no hollow)"
+        );
+        // And the floor holds across every (tier, class) combination the recession can hit.
+        for w in [0.30_f32, 0.40, 0.45, 0.49] {
+            for class in [
+                ActivityClass::Sustained,
+                ActivityClass::Oblique,
+                ActivityClass::Subdividing,
+            ] {
+                assert!(
+                    pad_onset_cap(w, class).unwrap() >= PAD_ONSET_FLOOR,
+                    "the bed must never recede below {PAD_ONSET_FLOOR} onset (w={w}, {class:?})"
+                );
+            }
+        }
+    }
+
+    /// PROPERTY (THE CAP ARITHMETIC + WEAK-BEAT DISPLACEMENT on the BLOCK bed): a 3-voice block-bed
+    /// stab (all at offset 0) capped to 1 keeps ONE onset (no hollow) and DISPLACES it OFF the
+    /// downbeat to the weak beat (so its onset grid does not fuse with the Bass/Fill/Melody downbeat
+    /// — the F5a anti-fusion steer). The onset COUNT is preserved by the displacement (F5b-safe).
+    #[test]
+    fn s47_recede_block_bed_thins_and_displaces_off_downbeat() {
+        let step_ms = 200_u64;
+        let block = vec![pad_ev(0), pad_ev(0), pad_ev(0)]; // 3-voice simultaneous stab
+        let out = recede_pad_onsets(block, 1, step_ms);
+        assert_eq!(
+            out.len(),
+            1,
+            "capped to 1 onset (deep tier), never hollowed to 0"
+        );
+        assert_ne!(
+            out[0].offset_ms, 0,
+            "the surviving block-bed stab must be DISPLACED off the downbeat (F5a anti-fusion)"
+        );
+        let expected_weak = (step_ms as f32 * PAD_WEAK_BEAT_FRAC).round() as u64;
+        assert_eq!(
+            out[0].offset_ms, expected_weak,
+            "displaced to the weak beat"
+        );
+    }
+
+    /// PROPERTY (FIGURED bed recession — drop the DOWNBEAT-nearest onsets first, KEEP weak beats):
+    /// a 4-onset broken-chord figure (offsets 0, 50, 100, 150 over a 200 ms step) capped to 2 keeps
+    /// the TWO LATEST (weak-beat) onsets and drops the offset-0 (downbeat) onset — so the bed
+    /// recedes off the melody's strong beat. The kept onsets are returned in original (ascending
+    /// offset) order, and because a weak-beat onset survives, NO displacement is applied.
+    #[test]
+    fn s47_recede_figured_bed_drops_downbeat_keeps_weak_beats() {
+        let step_ms = 200_u64;
+        let figure = vec![pad_ev(0), pad_ev(50), pad_ev(100), pad_ev(150)];
+        let out = recede_pad_onsets(figure, 2, step_ms);
+        assert_eq!(out.len(), 2, "capped to 2 onsets");
+        let offs: Vec<u64> = out.iter().map(|e| e.offset_ms).collect();
+        assert_eq!(
+            offs,
+            vec![100, 150],
+            "the two LATEST (weak-beat) onsets are kept; the offset-0 downbeat is dropped first, \
+             and a surviving weak-beat onset means NO re-displacement"
+        );
+    }
+
+    /// PROPERTY: a cap ≥ the event count is the IDENTITY (nothing is thinned or displaced) — the
+    /// no-op path a shallow-tier cap takes when the bed is already at/under the melody's onsets.
+    #[test]
+    fn s47_recede_pad_onsets_identity_when_under_cap() {
+        let step_ms = 200_u64;
+        let figure = vec![pad_ev(0), pad_ev(100)];
+        let out = recede_pad_onsets(figure.clone(), 2, step_ms);
+        assert_eq!(out, figure, "cap == len → unchanged");
+        let out2 = recede_pad_onsets(figure.clone(), 5, step_ms);
+        assert_eq!(out2, figure, "cap > len → unchanged");
     }
 }
