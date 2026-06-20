@@ -1014,6 +1014,28 @@ const PROMINENCE_REG_SPAN: f32 = 4.0;
 /// continuous curve carries.
 const PROMINENCE_RHY_SHIFT: f32 = 0.10;
 
+/// S48 SLICE 3 (2a.ii) — the CounterMelody's STRUCTURAL velocity recession below the
+/// melody. theory (figure-ground, the LEVEL FINISH): the counter is already activity-
+/// recessed (the S47 governor keeps it one rank below a holding melody) and register-
+/// recessed (it sits under COUNTER_CEILING); a modest NEGATIVE velocity bias completes the
+/// figure-ground gap from the LEVEL side, mirroring the Pad's −3 structural floor. Kept
+/// SMALLER than the Pad's −3 because the counter is a MOVING line, not a flat bed — it must
+/// stay audible as a real second voice (S45: the counter MOVES, never silence it). The bias
+/// only RECEDES level (bounded; the final round().clamp(1,127) holds the floor), it does not
+/// mute. SIGN fixed negative; magnitude is the ear-tunable start [1.0, 4.0]. NO-OP on the
+/// freeze path: under identity there is no CounterMelody instrument, so this arm is never
+/// reached on the engine_equivalence goldens.
+const COUNTER_VEL_BIAS: f32 = 2.0;
+
+/// S48 SLICE 3 (2a.ii) — the HarmonicFill's STRUCTURAL velocity recession. theory: the fill
+/// is the connective INNER tissue under the line; a gentle recession keeps it below the
+/// melody without hollowing the harmony. Kept SMALLER than the counter's bias — the fill is
+/// more recessive than the counter by role (it supports, it does not sing a second line).
+/// SIGN fixed negative; magnitude ear-tunable [0.5, 2.0]. The arm is `!is_cadence`-guarded
+/// and the synthetic engine_equivalence goldens are NO-COUNTER melody/bass bars that emit no
+/// HarmonicFill event, so this bias is freeze-neutral on the goldens (spec §4 witness).
+const FILL_VEL_BIAS: f32 = 1.0;
+
 // ----------------------------------------------------------------------------
 // S47 SLICE 1 — THE FIGURE-GROUND ACTIVITY HIERARCHY (melody-most-active).
 //
@@ -1104,6 +1126,65 @@ const ACTIVITY_FLOOR_THRESHOLD: f32 = 0.50;
 /// engine_equivalence goldens are synthetic no-counter bars, so the guard never fires
 /// there → the freeze holds.
 const MIN_FIGURE_GAP: u8 = 2; // recommended start; range [1, 5] — see spec §3
+
+// ----------------------------------------------------------------------------
+// S48 SLICE 3 — INVERSE-REGISTER COMPENSATION (the figure-ground FINISH, F4).
+//
+// theory: a melody seated LOW in its range self-projects LEAST — it sits close to
+// the bed ceiling, so the register cue that normally puts the figure on top is weak.
+// The fix is NON-LEVEL (DP-3: level NEVER for the comp; the level lever is the
+// SEPARATE 2a bed-recession). A low-seated melody is held as the figure by SEPARATION
+// instead: it attacks OFF the bed's downbeat (rhythmic separation, the PRIMARY tool)
+// and detaches its articulation (the SECONDARY tool). The amount of help is INVERSE to
+// the realized seat height — a melody clearly above the bed needs none (factor 0.0), a
+// melody dropping toward the bed band needs the most (factor 1.0). This drives the F4
+// metric correlation(register_gap, separation) NEGATIVE: small gap → high separation.
+// ----------------------------------------------------------------------------
+
+/// The max fraction of `step_ms` the melody's FIRST onset is pushed off the downbeat at FULL
+/// compensation (factor 1.0). theory (DP-3 rank 1, rhythmic separation FIRST): a low-seated
+/// melody attacks on the "and" of the beat — DISTINCT from the bed's offset-0 downbeat — so it
+/// reads as a separate stream without getting louder. Kept ≤ step_ms/4 (the same off-beat the
+/// counter's MOVING mode uses) so the pushed onset never crosses into the next beat and never
+/// collides with the SYNCOPATED band's own step_ms/4 displacement. SIGN fixed POSITIVE (push
+/// LATER); magnitude ear-tunable [0.125, 0.375].
+const COMP_OFFSET_FRAC: f32 = 0.25;
+
+/// The max reduction of `base_frac` (articulation) at FULL compensation. theory (DP-3 rank 4,
+/// articulation SECOND): a low-seated melody gets CRISPER, more detached notes — perceptual
+/// figure-ground separation the ear hears even where the F4 onset-offset metric does not read
+/// it. SIGN fixed NEGATIVE on base_frac (more detached when low); floored at ARTIC_WINDOW_LO so
+/// the note never clicks. Magnitude ear-tunable [0.05, 0.20]. LEVEL is NEVER a comp tool (DP-3)
+/// — this nudges DURATION, not velocity.
+const COMP_ARTIC_DETACH: f32 = 0.10;
+
+/// The inverse-register compensation FACTOR for a melody seated at `seat` relative to the bed
+/// ceiling — 0.0 when the melody sits clearly ABOVE the bed (no help needed), rising LINEARLY
+/// toward 1.0 as the realized seat approaches/drops into the bed band (a LOW-seated melody needs
+/// MORE separation to hold figure WITHOUT a louder level — the realization of "a melody low in
+/// its range self-projects least and needs more help, via non-level tools"). Pure; RNG-free; a
+/// function of the realized seat ONLY. The bed reference is COUNTER_CEILING (67) — the same
+/// ceiling the seat guard uses; the help band is [FILL_REGISTER_FLOOR(55), COUNTER_CEILING +
+/// MIN_FIGURE_GAP(69)). theory (DP-3): help is INVERSE to register height — the low melody gets
+/// the separation, the high one does not. Returns 0.0 at/above (COUNTER_CEILING + MIN_FIGURE_GAP)
+/// (== 69, the guarded seat floor) and ramps to 1.0 at FILL_REGISTER_FLOOR (== 55). Monotone
+/// NON-increasing in `seat` (FIXED direction; the LINEAR shape is the ear-tunable craft call).
+/// If the seat-guard's MIN_FIGURE_GAP moves at the taste gate, this zero-crossing tracks it 1:1
+/// (it reads the SAME const) — no extra edit (spec §8 watch-item 1 coupling).
+fn inverse_register_compensation(seat: u8) -> f32 {
+    let ceiling = (COUNTER_CEILING + MIN_FIGURE_GAP) as f32; // 69 — at/above → no help (0.0)
+    let floor = FILL_REGISTER_FLOOR as f32; // 55 — at/below → full help (1.0)
+    let s = seat as f32;
+    if s >= ceiling {
+        return 0.0; // clearly on top of the bed — the register cue already segregates it
+    }
+    if s <= floor {
+        return 1.0; // in/under the bed band — needs the most non-level separation
+    }
+    // LINEAR ramp over (floor, ceiling): factor 1.0 at the floor, 0.0 at the ceiling, monotone
+    // NON-increasing in seat. (ceiling > floor structurally — 69 > 55 — so no divide-by-zero.)
+    (ceiling - s) / (ceiling - floor)
+}
 
 // ----------------------------------------------------------------------------
 // S47 SLICE 4 — THE BED ACTIVITY RECESSION (pass 2: make the melody the FIGURE).
@@ -1473,6 +1554,7 @@ pub fn realize_step(
         step,
         pad_voices,
         ctx,
+        counter_present,
     )
 }
 
@@ -1678,6 +1760,15 @@ fn realize_velocity(
         // the background, not a second tune. Unreachable under the identity
         // profile, so this never touches the byte-frozen default path.
         OrchestralRole::Pad if !is_cadence => vel -= 3.0,
+        // S48 SLICE 3 (2a.ii) — the LEVEL FINISH: give the CounterMelody and HarmonicFill a
+        // STRUCTURAL level floor BELOW the melody, completing the figure-ground gap from the
+        // level side (the Pad's −3 precedent above). The counter recedes more than the fill
+        // by role, both less than the Pad (a moving inner line must stay audible — S45). Both
+        // `!is_cadence`-guarded like every arm above; the cadence ring is exempt. Under
+        // identity neither role exists on the goldens, so this is byte-neutral on the freeze
+        // path (the synthetic engine_equivalence bars carry only Melody+Bass — spec §4).
+        OrchestralRole::CounterMelody if !is_cadence => vel -= COUNTER_VEL_BIAS,
+        OrchestralRole::HarmonicFill if !is_cadence => vel -= FILL_VEL_BIAS,
         _ => {}
     }
 
@@ -1797,6 +1888,14 @@ fn realize_rhythm(
     // pitch off it; mirrors the `pad_voices` precedent — a private-fn param, NOT a
     // realize_step signature change. Inert on the identity path (no Counter inst).
     ctx: &crate::composition::StepContext,
+    // S48 SLICE 3 (2b.4) — is a CounterMelody present in THIS ensemble? Additive PRIVATE param
+    // on this free fn (the pad_voices/ctx precedent — realize_step's PUBLIC signature is
+    // UNCHANGED), threading the SAME value realize_step already computed (:1377-1378) and
+    // already passes to role_pitch. The inverse-register comp fires iff this is true (plus a
+    // foreground prominence weight + !is_cadence) — so on the synthetic no-counter
+    // engine_equivalence goldens (counter_present == false) every comp term short-circuits and
+    // the freeze holds, EXACTLY as the seat guard's counter_present gate does.
+    counter_present: bool,
 ) -> Vec<NoteEvent> {
     // S13: normalize the RAW per-bar edge density into a 0..1 ACTIVITY knob. The old
     // code compared raw edge (≈0.005 on real photos) against 0.25/0.70 cutoffs, so
@@ -1872,6 +1971,37 @@ fn realize_rhythm(
     // clamp back into the window so the bias can't escape the pleasant range.
     .mul_add(BALLAD_ARTIC_BIAS, 0.0)
     .clamp(ARTIC_WINDOW_LO, ARTIC_WINDOW_HI);
+
+    // S48 SLICE 3 (2b) — INVERSE-REGISTER COMPENSATION factor for THIS step's melody.
+    // theory: a melody low in its range self-projects least, so it earns NON-LEVEL separation
+    // (DP-3: level NEVER here) inverse to its realized seat. GATE (spec §2b.4, the lead's
+    // confirmed decision): fire iff a counter is present (the primary freeze witness — the
+    // synthetic no-counter goldens have counter_present == false → comp is a NO-OP → 9/9
+    // byte-green), AND the melody is a genuine FOREGROUND voice (prominence > the activity
+    // floor; neutral 0.5 fails the strict `>` → no comp on the identity path), AND it is not a
+    // cadence (the cadence ring early-returns above and is structurally untouched). On the
+    // freeze path ALL THREE are false, so `comp` is 0.0 and every comp term below is inert.
+    let comp = if matches!(role, OrchestralRole::Melody)
+        && counter_present
+        && prominence_weight(ctx, OrchestralRole::Melody) > ACTIVITY_FLOOR_THRESHOLD
+        && !is_cadence
+    {
+        inverse_register_compensation(note)
+    } else {
+        0.0
+    };
+
+    // S48 SLICE 3 (2b.3) — THE SECONDARY (articulation) comp tool: nudge base_frac toward MORE
+    // DETACHED (smaller fraction → crisper, more separated notes) as the comp rises. theory
+    // (DP-3 rank 4, articulation SECOND to the onset push): a low-seated melody gets crisper
+    // attacks the ear reads as figure-ground separation. LEVEL is NEVER a comp tool (DP-3) — we
+    // shorten DURATION, never raise velocity. Floored at ARTIC_WINDOW_LO so it stays in the
+    // pleasant window and never clicks. comp == 0.0 (high-seated / freeze path) → byte-unchanged.
+    let base_frac = if comp > 0.0 {
+        (base_frac - comp * COMP_ARTIC_DETACH).max(ARTIC_WINDOW_LO)
+    } else {
+        base_frac
+    };
 
     // Phrase-end ritardando: cadence (and the pre-cadence approach) lengthen the
     // sounding duration so the arrival rings. Applied as a multiplier on the
@@ -2300,59 +2430,103 @@ fn realize_rhythm(
             let floor_to_dotted = melody_w > ACTIVITY_FLOOR_THRESHOLD
                 && melody_activity_class(edge_activity, prom_shift, pre_cadence)
                     == ActivityClass::Sustained;
-            if pre_cadence || edge_activity > (MELODY_ARP_CUTOFF - prom_shift) {
-                // ARPEGGIO / acceleration: spread chord-tone onsets evenly across
-                // the step (more onsets, shorter values) — the active, driving
-                // figure. theory: subdividing the beat is the melody's way of
-                // generating forward motion, intensified into a cadence.
-                let n = if pre_cadence { 4 } else { 3 };
-                let slot = step_ms / n as u64;
-                (0..n)
-                    .map(|k| {
-                        let offset = (k as u64) * slot;
-                        sustained(offset, slot, STACCATO_FRAC)
-                    })
-                    .collect()
-            } else if edge_activity > (MELODY_SYNC_CUTOFF - prom_shift) {
-                // SYNCOPATED: delay the onset off the downbeat by 1/4 step, then
-                // a second onset, pushing against the meter. theory: syncopation
-                // displaces the accent to energize an active-but-not-busy melody.
-                let quarter = step_ms / 4;
-                vec![
-                    sustained(quarter, step_ms / 2, PORTATO_FRAC),
-                    sustained(step_ms * 3 / 4, step_ms / 4, STACCATO_FRAC),
-                ]
-            } else if floor_to_dotted || edge_activity > (MELODY_DOTTED_CUTOFF - prom_shift) {
-                // DOTTED: a long-short pair (onsets at 0 and 2/3; holds 2/3 and
-                // 1/3) — the lilting mid-activity figure. theory: the dotted
-                // rhythm is the default expressive subdivision of a singing line.
-                // S47: `floor_to_dotted` ALSO routes a calm FOREGROUND melody here
-                // (the activity floor — a foreground figure gets the minimum real
-                // motion rather than holding under a moving bed).
-                let two_thirds = step_ms * 2 / 3;
-                vec![
-                    sustained(0, two_thirds, PORTATO_FRAC),
-                    sustained(two_thirds, step_ms - two_thirds, STACCATO_FRAC),
-                ]
-            } else {
-                // SUSTAINED (low edge_activity): one long tone whose length rides the
-                // CONTINUOUS articulation curve (S13). At low activity base_frac ≈ 1.05,
-                // so the calm melody OVERLAPS across the step boundary and truly sings —
-                // the fix for "uniformly short" notes that the old hard 0.95 cap blocked.
-                //
-                // S39 — a multi-step THEME note (dur_steps>1) gets a longer within-step
-                // hold so it SINGS toward the overlap ceiling (its continuation step is a
-                // theme-driven rest, so the onset+gap reads as the note's full length). The
-                // `sustained` closure's `.min(1.20)` cap keeps it inside the overlap ceiling
-                // — it NEVER rings across the next kernel step (no freeze break). A dur==1
-                // onset (every pre-S39 note), a non-onset step, and a free-select melody all
-                // see `theme_onset_dur_steps == None`/`Some(1)` → factor 1.0 → byte-identical.
-                let sing_frac = match theme_onset_dur_steps(ctx, step, features) {
-                    Some(d) if d > 1 => base_frac * THEME_LONG_NOTE_SING,
-                    _ => base_frac,
+            // S48 SLICE 3 (2b.2): mark the band as PUSHABLE iff its FIRST onset currently sits
+            // ON the downbeat (offset 0) — only the DOTTED and SUSTAINED bands. The ARPEGGIO and
+            // SYNCOPATED bands already place their first onset OFF the downbeat (k=0 spread /
+            // step_ms/4), where the counter MOVES (Subdividing) at step_ms/4 — pushing them would
+            // double-displace and risk F5a re-fusion (spec §2b.2). So `pushable` gates the
+            // inverse-comp onset push to exactly the calm/low-activity bands the F4 metric reads.
+            let (mut events, pushable): (Vec<NoteEvent>, bool) =
+                if pre_cadence || edge_activity > (MELODY_ARP_CUTOFF - prom_shift) {
+                    // ARPEGGIO / acceleration: spread chord-tone onsets evenly across
+                    // the step (more onsets, shorter values) — the active, driving
+                    // figure. theory: subdividing the beat is the melody's way of
+                    // generating forward motion, intensified into a cadence.
+                    let n = if pre_cadence { 4 } else { 3 };
+                    let slot = step_ms / n as u64;
+                    let ev = (0..n)
+                        .map(|k| {
+                            let offset = (k as u64) * slot;
+                            sustained(offset, slot, STACCATO_FRAC)
+                        })
+                        .collect();
+                    (ev, false) // already spread off the downbeat — NOT pushable
+                } else if edge_activity > (MELODY_SYNC_CUTOFF - prom_shift) {
+                    // SYNCOPATED: delay the onset off the downbeat by 1/4 step, then
+                    // a second onset, pushing against the meter. theory: syncopation
+                    // displaces the accent to energize an active-but-not-busy melody.
+                    let quarter = step_ms / 4;
+                    let ev = vec![
+                        sustained(quarter, step_ms / 2, PORTATO_FRAC),
+                        sustained(step_ms * 3 / 4, step_ms / 4, STACCATO_FRAC),
+                    ];
+                    (ev, false) // first onset already at step_ms/4 — NOT pushable
+                } else if floor_to_dotted || edge_activity > (MELODY_DOTTED_CUTOFF - prom_shift) {
+                    // DOTTED: a long-short pair (onsets at 0 and 2/3; holds 2/3 and
+                    // 1/3) — the lilting mid-activity figure. theory: the dotted
+                    // rhythm is the default expressive subdivision of a singing line.
+                    // S47: `floor_to_dotted` ALSO routes a calm FOREGROUND melody here
+                    // (the activity floor — a foreground figure gets the minimum real
+                    // motion rather than holding under a moving bed).
+                    let two_thirds = step_ms * 2 / 3;
+                    let ev = vec![
+                        sustained(0, two_thirds, PORTATO_FRAC),
+                        sustained(two_thirds, step_ms - two_thirds, STACCATO_FRAC),
+                    ];
+                    (ev, true) // first onset at 0 (low-seat case) — PUSHABLE for the comp
+                } else {
+                    // SUSTAINED (low edge_activity): one long tone whose length rides the
+                    // CONTINUOUS articulation curve (S13). At low activity base_frac ≈ 1.05,
+                    // so the calm melody OVERLAPS across the step boundary and truly sings —
+                    // the fix for "uniformly short" notes that the old hard 0.95 cap blocked.
+                    //
+                    // S39 — a multi-step THEME note (dur_steps>1) gets a longer within-step
+                    // hold so it SINGS toward the overlap ceiling (its continuation step is a
+                    // theme-driven rest, so the onset+gap reads as the note's full length). The
+                    // `sustained` closure's `.min(1.20)` cap keeps it inside the overlap ceiling
+                    // — it NEVER rings across the next kernel step (no freeze break). A dur==1
+                    // onset (every pre-S39 note), a non-onset step, and a free-select melody all
+                    // see `theme_onset_dur_steps == None`/`Some(1)` → factor 1.0 → byte-identical.
+                    let sing_frac = match theme_onset_dur_steps(ctx, step, features) {
+                        Some(d) if d > 1 => base_frac * THEME_LONG_NOTE_SING,
+                        _ => base_frac,
+                    };
+                    (vec![sustained(0, step_ms, sing_frac)], true) // single onset at 0 — PUSHABLE
                 };
-                vec![sustained(0, step_ms, sing_frac)]
+
+            // S48 SLICE 3 (2b.2) — THE PRIMARY (rhythmic-separation) comp tool: push the melody's
+            // FIRST onset OFF the bed's downbeat, scaled by the inverse-register comp. theory
+            // (DP-3 rank 1, the F4 driver): a LOW-seated melody (comp → 1.0) attacks on the "and"
+            // (≈ step_ms/4) — DISTINCT from the bed's offset-0 downbeat → high F4 separation; a
+            // HIGH-seated melody (comp 0.0) stays on the downbeat → low separation → the F4
+            // correlation(register_gap, separation) goes NEGATIVE. Confined to the PUSHABLE
+            // (DOTTED/SUSTAINED) bands whose first onset is at 0; on those steps the counter is at
+            // offset 0 / sustained (Oblique/Sustained classes), so the pushed onset (≈ step_ms/4)
+            // is DISTINCT from the counter — F5a separation IMPROVES, never fuses (spec §2b.2).
+            // COUNT-PRESERVING (the recede_pad_onsets precedent): we move WHERE the first onset
+            // sits, never HOW MANY events — so F5b (bed_onsets ≤ melody_onsets) and F1 cannot
+            // regress. comp == 0.0 on the freeze/high-seat path → the push is a no-op (offset
+            // stays 0, hold unchanged) → byte-identical. LEVEL is NEVER touched here (DP-3).
+            if comp > 0.0 && pushable {
+                if let Some(first) = events.first_mut() {
+                    let offset_push = (comp * COMP_OFFSET_FRAC * step_ms as f32).round() as u64;
+                    if offset_push > 0 {
+                        // Re-fit the pushed onset's hold into the room remaining BEFORE the step
+                        // boundary so it does not ring across into the next step (the same intent
+                        // as the recede_pad_onsets re-fit) — count is unchanged, only this onset's
+                        // offset+hold move. The fit preserves the onset's articulation FRACTION
+                        // against the shortened remaining slot, then bounds it so it cannot exceed
+                        // the step (no new overlap the original did not have).
+                        let room = step_ms.saturating_sub(offset_push).max(1);
+                        let prev_hold = first.hold_ms.max(1);
+                        let refit = prev_hold.min(room);
+                        first.offset_ms = offset_push;
+                        first.hold_ms = refit.max(1);
+                    }
+                }
             }
+
+            events
         }
     }
 }
@@ -9722,5 +9896,181 @@ mod tests {
         assert_eq!(out, figure, "cap == len → unchanged");
         let out2 = recede_pad_onsets(figure.clone(), 5, step_ms);
         assert_eq!(out2, figure, "cap > len → unchanged");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // S48 SLICE 3 — INVERSE-REGISTER COMPENSATION + the LEVEL FINISH tests.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// PROPERTY (the comp BOUNDARIES): the factor is 0.0 at/above the guarded seat floor
+    /// (COUNTER_CEILING + MIN_FIGURE_GAP == 69 — the melody is clearly on top, no help) and
+    /// rises to 1.0 at/below FILL_REGISTER_FLOOR (55 — the melody is in/under the bed band and
+    /// needs the most non-level separation). theory: help is INVERSE to register height.
+    #[test]
+    fn s48_inverse_register_compensation_boundaries() {
+        // At/above 69 → no help (the high-seat / freeze-side zero).
+        assert_eq!(inverse_register_compensation(69), 0.0);
+        assert_eq!(inverse_register_compensation(72), 0.0);
+        assert_eq!(inverse_register_compensation(96), 0.0);
+        // At/below 55 → full help.
+        assert_eq!(inverse_register_compensation(55), 1.0);
+        assert_eq!(inverse_register_compensation(40), 1.0);
+        // The zero-crossing tracks COUNTER_CEILING + MIN_FIGURE_GAP (1:1 with the seat guard).
+        assert_eq!(
+            inverse_register_compensation(COUNTER_CEILING + MIN_FIGURE_GAP),
+            0.0,
+            "the comp's high-seat zero must sit exactly at the guarded seat floor (spec §8)"
+        );
+    }
+
+    /// PROPERTY (the comp MONOTONICITY): the factor is monotone NON-INCREASING in the seat —
+    /// a LOWER seat never gets LESS help than a higher one. theory (DP-3, FIXED direction): the
+    /// low melody self-projects least, so it earns the most separation; the direction is the
+    /// load-bearing invariant (the magnitude/shape is ear-tunable).
+    #[test]
+    fn s48_inverse_register_compensation_monotone_non_increasing() {
+        let mut prev = inverse_register_compensation(40);
+        for seat in 41u8..=96 {
+            let cur = inverse_register_compensation(seat);
+            assert!(
+                cur <= prev + f32::EPSILON,
+                "comp must not RISE as the seat rises (seat {seat}: {cur} > prev {prev})"
+            );
+            prev = cur;
+        }
+        // A mid-band seat gets STRICTLY more help than a higher mid-band seat (it is a real ramp,
+        // not a flat step): seat 58 (deep in the bed band) > seat 66 (just under the ceiling).
+        assert!(
+            inverse_register_compensation(58) > inverse_register_compensation(66),
+            "a lower-seated melody earns strictly more non-level separation in the ramp"
+        );
+    }
+
+    /// PROPERTY (the PRIMARY tool is COUNT-PRESERVING): the inverse-comp onset push moves WHERE
+    /// the melody's FIRST onset sits, never HOW MANY events — so F5b (bed_onsets ≤ melody_onsets)
+    /// and F1 cannot regress. Replicates the arm's exact push logic (the
+    /// s47_activity_floor test's replication discipline) on the two PUSHABLE band shapes: DOTTED
+    /// stays 2 onsets, SUSTAINED stays 1, and the first onset moves OFF the downbeat at full comp.
+    #[test]
+    fn s48_comp_offset_push_preserves_onset_count() {
+        let step_ms: u64 = 240;
+        // The arm's push (full comp == 1.0): offset_push = round(1.0 * COMP_OFFSET_FRAC * step_ms).
+        let comp = 1.0_f32;
+        let offset_push = (comp * COMP_OFFSET_FRAC * step_ms as f32).round() as u64;
+        assert!(
+            offset_push > 0,
+            "full comp must actually push the onset off the downbeat"
+        );
+        let push_first = |mut events: Vec<NoteEvent>| -> Vec<NoteEvent> {
+            if let Some(first) = events.first_mut() {
+                let room = step_ms.saturating_sub(offset_push).max(1);
+                let prev_hold = first.hold_ms.max(1);
+                let refit = prev_hold.min(room);
+                first.offset_ms = offset_push;
+                first.hold_ms = refit.max(1);
+            }
+            events
+        };
+        // DOTTED shape: two onsets (at 0 and 2/3) — stays TWO after the push.
+        let two_thirds = step_ms * 2 / 3;
+        let dotted = vec![
+            NoteEvent {
+                note: 60,
+                velocity: 76,
+                hold_ms: two_thirds,
+                offset_ms: 0,
+            },
+            NoteEvent {
+                note: 60,
+                velocity: 76,
+                hold_ms: step_ms - two_thirds,
+                offset_ms: two_thirds,
+            },
+        ];
+        let pushed = push_first(dotted);
+        assert_eq!(
+            pushed.len(),
+            2,
+            "DOTTED must stay 2 onsets (count-preserving)"
+        );
+        assert_eq!(
+            pushed[0].offset_ms, offset_push,
+            "the first DOTTED onset moves off 0"
+        );
+        assert_eq!(
+            pushed[1].offset_ms, two_thirds,
+            "the SECOND DOTTED onset is untouched"
+        );
+        assert!(
+            pushed[0].offset_ms + pushed[0].hold_ms <= step_ms,
+            "the pushed onset's hold is re-fit so it does not ring across the step boundary"
+        );
+        // SUSTAINED shape: a single onset at 0 — stays ONE after the push.
+        let sustained_ev = vec![NoteEvent {
+            note: 60,
+            velocity: 76,
+            hold_ms: step_ms,
+            offset_ms: 0,
+        }];
+        let pushed_s = push_first(sustained_ev);
+        assert_eq!(
+            pushed_s.len(),
+            1,
+            "SUSTAINED must stay 1 onset (count-preserving)"
+        );
+        assert_eq!(
+            pushed_s[0].offset_ms, offset_push,
+            "the single SUSTAINED onset moves off 0"
+        );
+        assert!(
+            pushed_s[0].offset_ms + pushed_s[0].hold_ms <= step_ms,
+            "the pushed SUSTAINED onset's hold is re-fit within the step"
+        );
+    }
+
+    /// PROPERTY (the LEVEL FINISH — 2a.ii velocity-bias arms): the CounterMelody and HarmonicFill
+    /// RECEDE in level BELOW an EQUAL-prominence Melody — completing the figure-ground gap from the
+    /// level side. Driven directly through `realize_velocity` (pure of ctx). At equal prominence the
+    /// only velocity difference is the per-role structural bias (Melody +2, Counter −COUNTER_VEL_BIAS,
+    /// Fill −FILL_VEL_BIAS), so counter < melody and fill < melody, and the counter recedes MORE than
+    /// the fill (a moving line stays MORE audible than the connective tissue). S45 preserved: the
+    /// bias only RECEDES level (bounded by the 1..=127 clamp), it does NOT mute.
+    #[test]
+    fn s48_counter_fill_recede_below_equal_prominence_melody() {
+        let chord = c_major_triad();
+        let step = StepPlan {
+            chord,
+            phrase_index: 0,
+            position_in_phrase: 2, // a plain interior beat (not cadence/start) so the arms fire
+            phrase_len: 8,
+            position: PhrasePosition::Interior,
+            velocity: 80,
+        };
+        let features = PerfFeatures {
+            saturation: 60.0,
+            brightness: 50.0,
+            edge_density: 0.3,
+        };
+        // Equal prominence (neutral) for all three roles → the ONLY difference is the per-role bias.
+        let w = PROMINENCE_NEUTRAL;
+        let mel = realize_velocity(&step, &features, false, OrchestralRole::Melody, w);
+        let counter = realize_velocity(&step, &features, false, OrchestralRole::CounterMelody, w);
+        let fill = realize_velocity(&step, &features, false, OrchestralRole::HarmonicFill, w);
+        assert!(
+            counter < mel,
+            "the counter must recede below an equal-prominence melody (counter {counter} < melody {mel})"
+        );
+        assert!(
+            fill < mel,
+            "the fill must recede below an equal-prominence melody (fill {fill} < melody {mel})"
+        );
+        assert!(
+            counter < fill,
+            "the counter recedes MORE than the fill (counter {counter} < fill {fill}) — bias 2.0 vs 1.0"
+        );
+        assert!(
+            counter >= 1,
+            "S45: the counter recedes in LEVEL but is never muted to silence"
+        );
     }
 }

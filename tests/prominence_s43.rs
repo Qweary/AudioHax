@@ -279,17 +279,20 @@ fn guard1_foreground_exists_on_every_section_of_both_renders() {
 /// MUSICAL PROPERTY: the two images land on DIFFERENT prominence tiers. `example.jpg`
 /// (subject_size in [0.05,0.55] AND fg_bg_contrast ≥ 0.10) ESCALATES to `subject_melody`
 /// (Melody weight 1.0); `Lena.png` (fg_bg_contrast 0.052 < 0.10) routes to the SHALLOW
-/// field tier `melody_lead_gentle` (Melody weight 0.72). Resolved through the REAL planner
+/// field tier `melody_lead_gentle` (Melody weight 0.74). Resolved through the REAL planner
 /// on each image's ACTUAL features — proving the melody leads MORE assertively on the
 /// separated-subject image than on the low-contrast field image (the per-image divergence).
 ///
 /// S47 RE-DERIVATION (spec-s47-slice1-build.md §2c — the image-conditioned prominence FAMILY,
 /// operator-locked 3 tiers deep/mid/shallow): the OLD Lena pin was 0.78 (`melody_forward`,
 /// the single pre-S47 default). The new SelectTable routes a low-`fg_bg_contrast` field image
-/// to the SHALLOW `melody_lead_gentle` tier (Melody 0.72), where the texture legitimately
-/// shares focus rather than forcing a strong lead on an abstract/field image. 0.78 was
-/// superseded by 0.72 as the intended SHALLOW-tier resolution. The PRESERVED property — the
-/// two images DIVERGE in melody assertiveness (example 1.0 > Lena 0.72) — holds with headroom.
+/// to the SHALLOW `melody_lead_gentle` tier (Melody 0.74 — S48 slice-3 re-baseline, raised
+/// from 0.72 by the LEVEL finish, spec-s48 §2a.i; kept GENTLEST of the three tiers so a field
+/// image is not forced into a hard lead), where the texture legitimately shares focus rather
+/// than forcing a strong lead on an abstract/field image. 0.78 was superseded by the shallow
+/// tier as the intended SHALLOW-tier resolution. Routing is UNCHANGED (Lena still routes
+/// shallow); only the seeded weight literal moved. The PRESERVED property — the two images
+/// DIVERGE in melody assertiveness (example 1.0 > Lena 0.74) — holds with headroom.
 #[test]
 fn guard2_per_image_resolution_divergence() {
     let m = mappings();
@@ -309,7 +312,7 @@ fn guard2_per_image_resolution_divergence() {
 
     let ex_mel = weight_of(&ex[0], LayerRole::Melody).expect("example Melody weight");
     let lena_mel = weight_of(&lena[0], LayerRole::Melody).expect("Lena Melody weight");
-    eprintln!("[guard2] resolved Melody weight: example={ex_mel:.3} (subject_melody=1.0 expected), Lena={lena_mel:.3} (melody_lead_gentle=0.72 expected)");
+    eprintln!("[guard2] resolved Melody weight: example={ex_mel:.3} (subject_melody=1.0 expected), Lena={lena_mel:.3} (melody_lead_gentle=0.74 expected)");
 
     // The escalation gate FIRED for example → full subject_melody lift (Melody 1.0).
     assert!(
@@ -317,10 +320,11 @@ fn guard2_per_image_resolution_divergence() {
         "example.jpg must ESCALATE to subject_melody (Melody 1.0); resolved {ex_mel:.3}"
     );
     // Lena (fg_bg_contrast < 0.10) routes to the SHALLOW field tier melody_lead_gentle
-    // (Melody 0.72) — the S47 image-conditioned recession family, not the old 0.78 default.
+    // (Melody 0.74) — the S47 image-conditioned recession family re-baselined by the S48
+    // slice-3 LEVEL finish (0.72→0.74); routing is unchanged, only the weight literal moved.
     assert!(
-        (lena_mel - 0.72).abs() < 1e-6,
-        "Lena.png must route to the melody_lead_gentle SHALLOW tier (Melody 0.72); resolved {lena_mel:.3}"
+        (lena_mel - 0.74).abs() < 1e-6,
+        "Lena.png must route to the melody_lead_gentle SHALLOW tier (Melody 0.74, S48 re-baseline); resolved {lena_mel:.3}"
     );
     // The load-bearing point: the two images DIVERGE — different profiles, not the same one.
     assert!(
@@ -333,11 +337,17 @@ fn guard2_per_image_resolution_divergence() {
 // GUARD 3 — TWO-TIER PRESERVED (escalation strictly louder than default, both above neutral)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// MUSICAL PROPERTY: `subject_melody.Melody (1.0) > melody_forward.Melody (0.78) > 0.5`
+/// MUSICAL PROPERTY: `subject_melody.Melody (1.0) > melody_forward.Melody (0.82) > 0.5`
 /// (neutral). The escalation tier is strictly louder than the always-on default tier,
 /// which is strictly above the neutral 0.500 — so the two tiers are themselves a source
 /// of per-image identity (how assertively the melody leads), never collapsing into one
 /// level. Read straight from the real `prominence_catalogue`.
+///
+/// S48 SLICE-3 RE-BASELINE (spec-s48-slice3-build.md §2a.i — the LEVEL finish): the mid
+/// `melody_forward` Melody weight was raised 0.78 → 0.82 to widen the melody-vs-bed velocity
+/// gap (the operator's "bump the melody volume"). Routing is UNCHANGED; only the seeded weight
+/// literal moved. The two-tier ordering (subject_melody 1.0 > melody_forward 0.82 > 0.5) holds
+/// with headroom.
 #[test]
 fn guard3_two_tier_strictly_ordered() {
     let m = mappings();
@@ -364,8 +374,9 @@ fn guard3_two_tier_strictly_ordered() {
         "subject_melody.Melody must be the full lift 1.0; got {subject:.3}"
     );
     assert!(
-        (forward - 0.78).abs() < 1e-6,
-        "melody_forward.Melody must be the seeded 0.78; got {forward:.3}"
+        (forward - 0.82).abs() < 1e-6,
+        "melody_forward.Melody must be the S48 slice-3 re-baselined 0.82 (raised from 0.78 by \
+         the LEVEL finish, spec-s48 §2a.i); got {forward:.3}"
     );
 }
 

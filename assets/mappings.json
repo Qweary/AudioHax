@@ -372,19 +372,19 @@
           { "role": "Bass",          "weight": 0.5 } ] },
 
       { "id": "melody_lead_strong", "layers": [
-          { "role": "Melody",        "weight": 0.90 },
+          { "role": "Melody",        "weight": 0.92 },
           { "role": "CounterMelody", "weight": 0.45 },
           { "role": "HarmonicFill",  "weight": 0.30 },
           { "role": "Pad",           "weight": 0.30 },
           { "role": "Bass",          "weight": 0.50 } ] },
       { "id": "melody_forward", "layers": [
-          { "role": "Melody",        "weight": 0.78 },
+          { "role": "Melody",        "weight": 0.82 },
           { "role": "CounterMelody", "weight": 0.58 },
           { "role": "HarmonicFill",  "weight": 0.40 },
           { "role": "Pad",           "weight": 0.40 },
           { "role": "Bass",          "weight": 0.50 } ] },
       { "id": "melody_lead_gentle", "layers": [
-          { "role": "Melody",        "weight": 0.72 },
+          { "role": "Melody",        "weight": 0.74 },
           { "role": "CounterMelody", "weight": 0.65 },
           { "role": "HarmonicFill",  "weight": 0.45 },
           { "role": "Pad",           "weight": 0.45 },
