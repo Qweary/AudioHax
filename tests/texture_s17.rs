@@ -430,26 +430,41 @@ fn test_countermelody_is_no_longer_harmonicfill_delegate() {
     let counter = realize_under(counter_profile, &step, 0, 3, &feats);
     let fill = realize_under(OrchestrationProfile::identity(), &step, 1, 3, &feats);
 
-    // The HarmonicFill onsets at 0; the real counter onsets OFF the downbeat.
+    // The real counter onsets OFF the downbeat at step_ms/4. The HarmonicFill, AS OF S49
+    // SLICE 2 (L2 bed phase-separation), no longer onsets on the downbeat either — it is
+    // displaced to its OWN weak-beat phase (step_ms/2, the BED_PHASE_FRAC), DISTINCT from
+    // both the melody's downbeat (0) and the counter's step_ms/4. The property this test
+    // locks — the counter is NOT a HarmonicFill delegate (they sit on DIFFERENT onset
+    // grids) — is preserved and in fact STRENGTHENED (both beds now phase-separate). This
+    // is a documented S49-L2 TEST edit (the same kind of consciously-retired stale literal
+    // as the S18 stub-equality retirement above); the freeze net (engine_equivalence.rs)
+    // is untouched and byte-green.
     assert_eq!(
         fill.len(),
         1,
         "the HarmonicFill reference must sound a single onset on this strong beat"
     );
-    assert_eq!(fill[0].offset_ms, 0, "HarmonicFill onsets on the downbeat");
     assert_eq!(
         counter.len(),
         1,
         "the counter sounds a single moving note on a held/static step"
     );
-    assert_ne!(
-        counter[0].offset_ms, 0,
-        "the real counter onsets OFF the downbeat — it is NOT a HarmonicFill delegate"
-    );
     assert_eq!(
         counter[0].offset_ms,
         MS_PER_STEP / 4,
         "the held/static counter onset is the documented step_ms/4 off-beat placement"
+    );
+    // The counter and the (now phase-separated) HarmonicFill sit on DISTINCT onset grids —
+    // the actual delegate-disproof property, unchanged by L2.
+    assert_ne!(
+        counter[0].offset_ms, fill[0].offset_ms,
+        "the counter and HarmonicFill onset on DIFFERENT grids — the counter is not a delegate"
+    );
+    // L2 witness: the HarmonicFill is phase-separated to its own weak beat (step_ms/2).
+    assert_eq!(
+        fill[0].offset_ms,
+        MS_PER_STEP / 2,
+        "S49 L2: the HarmonicFill bed is phase-separated to the half-beat (BED_PHASE_FRAC)"
     );
 }
 

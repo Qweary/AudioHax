@@ -1570,6 +1570,51 @@ fn s46_recession_bound(name: &str) -> usize {
     }
 }
 
+/// S49 SLICE 2 — the F5a PER-ROLE RHYTHM-DISTINCTNESS PRE-SLICE-2 BASELINE (per image).
+///
+/// F5a (`rhythm_distinct_frac` — the fraction of co-sounding role-pairs whose per-step onset
+/// offset GRIDS differ) was REPORTED-only before slice 2: every role keyed off the ONE shared
+/// `edge_activity` against ONE shared cutoff set, so between-role rhythm read FLAT. Slice 2 adds
+/// per-role onset GRIDS — L1 (per-role band-cutoff bias: melody subdivides sooner) + L2 (the
+/// HarmonicFill bed onset phase-separated off the melody's downbeat to `step_ms/2`) + L3
+/// (articulation contrast) — so F5a is now PROMOTABLE from reported toward a baseline-relative
+/// SIGN assertion, exactly as S47 promoted F1 (hard floor + subject margin) and S48 promoted F4
+/// (scoped sign-gate): assert the DIRECTION the slice-2 behavior fires, N/A-honest where it does
+/// not, and let an honesty guard red-bar a real defect.
+///
+/// THE BASELINE (measured on the PRE-slice-2 tree, seed 42, `cargo test`, this Test Engineer
+/// pass — `git stash` of the chord_engine.rs slice-2 diff, re-run, restore): example=0.654
+/// Lena=0.667 Img1=0.533 Img2=0.667 Img3=0.667 magic=0.660. The POST-slice-2 measurement on the
+/// same six (same seed, same scorecard) is example=0.663 Lena=0.750 Img1=0.533 Img2=0.667
+/// Img3=0.750 magic=0.660 — i.e. F5a ROSE on Lena (+0.083) and Img3 (+0.083) and HELD on the
+/// other four. (Why only two rose: L2 fires where a bed role onsets ON the downbeat — the
+/// HarmonicFill on the `pad_bed` / `pad_broken_wave` routes. The three `pad_bed_counter` images
+/// route Pad+CounterMelody+NO HarmonicFill, and the Pad/Counter grids were ALREADY off-downbeat
+/// pre-slice-2, so their offset-distinctness is unchanged by L2 — L1's effect there is on onset
+/// COUNTS, which this offset-grid metric does not read. See the Test Engineer's return note: the
+/// offset-grid F5a measures L2's face of slice 2, not L1's; the count face shows in F1's margin,
+/// which ROSE on example +1.154→+1.692.)
+///
+/// THE ASSERTION (the promotion): per image, F5a must NOT FALL BELOW its pre-slice-2 baseline
+/// (a small float epsilon tolerated) AND must clear the slice-2 floor 0.50. This is a
+/// SIGN/non-regression gate, NOT a tuned magnitude: it pins that slice-2's per-role grids did not
+/// REGRESS the distinctness on any image and held the rise where L2 fired — the magnitude (how
+/// much) stays REPORTED in the scorecard row for the taste gate to size. A future change that
+/// FUSES two roles' grids (the S42 fusion regression) drops F5a below baseline and red-bars here.
+fn s49_f5a_baseline(name: &str) -> f32 {
+    match name {
+        "example.jpg" => 0.654,
+        "Lena.png" => 0.667,
+        "AudioHaxImg1.jpg" => 0.533,
+        "AudioHaxImg2.jpg" => 0.667,
+        "AudioHaxImg3.jpg" => 0.667,
+        "magicstudio-art.jpg" => 0.660,
+        // Any newly-routed image is held only to the slice-2 floor (0.50) — no per-image baseline
+        // exists for it, so the baseline term is the floor itself (the assertion reduces to ≥0.50).
+        _ => 0.50,
+    }
+}
+
 /// All-Crash verdicts for an image whose REAL render panicked (no metrics measured).
 fn crash_verdicts() -> LayerVerdicts {
     LayerVerdicts {
@@ -1869,6 +1914,58 @@ fn variety_scorecard_sweep() {
                     v.melody_most_active_margin
                 );
             }
+        }
+        // ── S49 SLICE 2 — F5a PROMOTION (reported → baseline-relative SIGN assertion). ───────────
+        // PERCEPTUAL PROPERTY: concurrently-sounding roles must NOT share an identical onset GRID
+        // (the S42 fusion signature). Before slice 2 every role keyed off the ONE shared
+        // `edge_activity` against ONE shared cutoff set, so F5a was REPORTED-only. Slice 2 gives
+        // each role a DISTINCT onset grid — L1 (melody subdivides sooner) + L2 (HarmonicFill bed
+        // phase-separated off the melody downbeat to step_ms/2) + L3 (articulation contrast) — so
+        // F5a is PROMOTED here, exactly as S47 promoted F1 and S48 promoted F4.
+        //
+        // THE ASSERTION (sign/direction, NOT a tuned magnitude — spec §5 / the build's "assert
+        // the DIRECTION not a specific number" instruction): per image, the measured F5a must
+        //   (1) clear the slice-2 FLOOR (≥ 0.50 — the hard anti-fusion floor on every image), AND
+        //   (2) NOT FALL BELOW its pre-slice-2 baseline (a small float epsilon tolerated) — the
+        //       per-role grids slice 2 introduced must not REGRESS distinctness on any image, and
+        //       must HOLD the rise on the images where L2 fired (Lena +0.083, Img3 +0.083).
+        // The magnitude (how MUCH each role's grid differs) stays REPORTED in the F5a scorecard
+        // row above for the taste gate to size. A future change that FUSES two roles' onset grids
+        // (re-introducing the S42 fusion) drops F5a below baseline and RED-BARS here — the honesty
+        // guard. (F5a measures the OFFSET-GRID face of slice 2 — L2's phase-separation; L1's
+        // onset-COUNT face shows in F1's margin, which the S47 F1 gate above already asserts.)
+        if v.figure_ground != Verdict::Crash {
+            let f5a_floor = 0.50_f32;
+            let baseline = s49_f5a_baseline(name);
+            let eps = 0.005_f32; // float-jitter tolerance on the baseline-relative sign
+            assert!(
+                v.rhythm_distinct_frac >= f5a_floor,
+                "[{name}] S49 F5a anti-fusion FLOOR REGRESSED: per-role onset-grid distinctness \
+                 {:.3} fell below the hard floor {f5a_floor:.2} — two or more concurrently-sounding \
+                 roles share an identical onset grid (the S42 fusion signature the slice-2 per-role \
+                 grids exist to prevent)",
+                v.rhythm_distinct_frac
+            );
+            assert!(
+                v.rhythm_distinct_frac >= baseline - eps,
+                "[{name}] S49 F5a per-role rhythm-distinctness REGRESSED below the pre-slice-2 \
+                 baseline: measured {:.3} < baseline {baseline:.3} (−{eps:.3} eps) — slice 2's \
+                 per-role onset grids (L1 melody-subdivides + L2 HarmonicFill phase-separation + L3 \
+                 articulation contrast) FUSED a role pair that was distinct before, a figure-ground \
+                 regression (the gate brackets the slice-2 grid gain, never lets it walk back)",
+                v.rhythm_distinct_frac
+            );
+            let rose = v.rhythm_distinct_frac > baseline + eps;
+            println!(
+                "  [F5a ASSERTED] {name}: rhythm_distinct {:.3} ≥ floor {f5a_floor:.2} AND ≥ \
+                 pre-slice-2 baseline {baseline:.3}{}  [OK]",
+                v.rhythm_distinct_frac,
+                if rose {
+                    " (ROSE above baseline — slice-2 per-role grids added distinctness here)"
+                } else {
+                    " (HELD at baseline; magnitude reported for the taste gate)"
+                }
+            );
         }
         verdicts.push((name, v));
     }

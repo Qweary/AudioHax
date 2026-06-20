@@ -1363,7 +1363,7 @@ const BASE_STEPS_PER_SECTION: usize = 8;
 /// the engine_equivalence goldens cannot move. This is the byte-stability proof.
 const HOME_ENERGY_NEUTRAL: f32 = 0.5; // f(this) == DENSITY_NEUTRAL exactly (byte-stability proof)
 const DENSITY_NEUTRAL: f32 = 0.5;
-const DENSITY_ENERGY_SPAN: f32 = 0.30;
+const DENSITY_ENERGY_SPAN: f32 = 0.38;
 const DENSITY_FLOOR: f32 = 0.35;
 const DENSITY_CEIL: f32 = 0.65;
 

@@ -1108,6 +1108,110 @@ fn melody_activity_class(edge_activity: f32, prom_shift: f32, pre_cadence: bool)
     }
 }
 
+// ----------------------------------------------------------------------------
+// S49 SLICE 2 — PER-ROLE RHYTHMIC IDENTITY (L1: the per-role band-cutoff bias).
+//
+// theory: figure-ground segregation rests FIRST on rhythmic ACTIVITY. The S47/S48
+// passes made the melody the busiest line and the bed recede, but EVERY role's band
+// selection still keys off the ONE shared `edge_activity` against ONE shared cutoff set,
+// so between-role rhythm reads FLAT — all roles "see" the same busyness and resolve to a
+// fixed per-role body, never a per-role onset GRID. L1 generalizes the melody-only
+// `prom_shift` nudge into a per-ROLE band-cutoff bias: the melody is biased TOWARD
+// subdivision (cutoffs LOWERED → reaches arpeggio/syncopation sooner → a busier surface),
+// the bed roles biased AWAY (cutoffs RAISED → steadier). The bias is ADDED to the existing
+// `prom_shift` term in the SAME `(CUTOFF - shift)` expression the band ladder and
+// `melody_activity_class` already use, so the helper and the arm stay 1:1 (spec §7).
+// ----------------------------------------------------------------------------
+
+/// L1 per-role rhythm-bias magnitudes (in `edge_activity`/cutoff units), ADDED to the existing
+/// `prom_shift` so a positive value LOWERS the effective cutoffs (`CUTOFF - (prom_shift + bias)`)
+/// → the role reaches a busier band sooner. SIGNS are load-bearing and FIXED (spec §3): the
+/// MELODY is POSITIVE (toward subdivision — the figure must MOVE) and the BED roles are
+/// NON-POSITIVE (toward sustained — the bed stays steady), so `bed_onsets ≤ melody_onsets`
+/// (F1/F5b) is preserved/strengthened by construction, never inverted. Magnitudes are
+/// CONSERVATIVE build-start defaults flagged TASTE-SIZED for the standing taste/affect +
+/// aesthetics gate (Affect §8 ∥ Aesthetics §9) — the gate sizes the final numbers so each role
+/// reads as its own line WITHOUT the texture fragmenting (the slice-2 failure mode); the build
+/// lands the structure at these starting values. Ranges (spec §3): melody [+0.03, +0.10]; bed
+/// [−0.03, −0.10].
+const MELODY_RHYTHM_BIAS: f32 = 0.06; // → subdivides sooner (more active foreground)
+const FILL_RHYTHM_BIAS: f32 = -0.05; // inner bed → steadier
+const PAD_RHYTHM_BIAS: f32 = -0.05; // harmony bed → steadier
+const BASS_RHYTHM_BIAS: f32 = -0.10; // the floor → steadiest of all
+
+/// L2 — the WEAK-BEAT fraction of `step_ms` the HarmonicFill bed onset is DISPLACED onto so it
+/// leaves the melody's downbeat (offset 0). theory (spec §2 item 2): a bed onset on offset 0
+/// FUSES its onset grid with the melody's downbeat attack (the F5a anti-fusion signal); moving
+/// it to the "and" of the beat phase-separates the bed as its own stream. The default is the
+/// HALF-beat (0.5) — DELIBERATELY DISTINCT from the counter's MOVING `step_ms/4` and the melody's
+/// downbeat 0 (spec §7: `step_ms/2 ≠ step_ms/4 ≠ 0` is collision-free), and the SAME phase the
+/// receded block-Pad stab already uses (`PAD_WEAK_BEAT_FRAC`) so the two beds share ONE off-beat
+/// grid rather than fragmenting. COUNT-PRESERVING (the `recede_pad_onsets` precedent): it moves
+/// WHERE the onset sits, never HOW MANY → F5b/F1 untouched. CONSERVATIVE build-start; SIGN fixed
+/// POSITIVE (off the downbeat); magnitude TASTE-SIZED [0.375, 0.625] (spec §3), and the taste
+/// gate confirms no collision on the 6-image set.
+const BED_PHASE_FRAC: f32 = 0.5;
+
+/// L3 — the MELODY's per-role articulation DETACH bias: a NEGATIVE nudge on `base_frac` so the
+/// foreground melody is CRISPER / more detached than the bed (a third figure cue — articulation
+/// contrast). theory (spec §2 item 3 / §3): the melody is the figure, so it speaks with a more
+/// articulated surface; the bed connects under it. SIGN fixed NEGATIVE on `base_frac` (more
+/// detached). Composes BEFORE the window clamp (stays pleasant) and BEFORE the S48 comp detach
+/// (the comp still rides on top for the low-seat case). FREEZE: gated freeze-neutral on the
+/// foreground-weight pivot (like L1) → 0.0 at neutral 0.5 → the melody-79 golden's `base_frac` is
+/// the unchanged `curve_frac`. CONSERVATIVE build-start; magnitude TASTE-SIZED [0.0, 0.12] (spec §3).
+const MELODY_ARTIC_DETACH_BIAS: f32 = 0.07;
+
+// L3 — the BASS's per-role articulation CONNECT bias is implemented INLINE at the Bass match arm
+// (`OrchestralRole::Bass if counter_present => curve_frac.max(ARTIC_WINDOW_LO)`), not as a named
+// const: the Fill connected-floor lean generalized to the bass so the bed sustains smoothly UNDER
+// the melody. SIGN positive (more connected); GATED on `counter_present` (the ONE golden-reachable
+// L3 term) so the no-counter goldens keep the legacy `curve_frac` byte-identically. See that match
+// arm for the full theory note (spec §2 item 3 / §3, §4/§8).
+
+/// The per-role band-cutoff rhythm bias (L1) — a SEPARATE additive term centered at 0.0 for
+/// every role, summed with the prominence `prom_shift` in the band ladder + `melody_activity_class`
+/// so each role resolves the SAME `edge_activity` to a DISTINCT onset grid. Positive (melody)
+/// LOWERS the effective cutoffs (busier sooner); non-positive (bed) RAISES them (steadier).
+///
+/// FREEZE: the MELODY bias is gated freeze-neutral at its CALL SITES by the foreground-weight
+/// pivot (`melody_w > ACTIVITY_FLOOR_THRESHOLD`), exactly as the S47 floor + S48 comp are — at
+/// neutral weight 0.5 the caller passes 0.0, so the melody-79 goldens select the SAME band
+/// (SUSTAINED, offset 0) byte-identically. The BED biases only matter inside the Pad / Fill /
+/// CounterMelody arms, which are NOT entered on the synthetic no-counter goldens (melody-79 +
+/// bass-36 only); the CounterMelody/Pad arms read the melody's class (governor side) where the
+/// MELODY bias is the relevant term, and the bias raising a bed role's own cutoffs only ever
+/// makes it steadier (never up into ARPEGGIO — spec §8.2). The Bass arm carries NO band ladder
+/// (it is sustained/walking/pedal), so its bias is unread there and never moves the bass-36
+/// golden. Returns 0.0 for any role with no band-ladder differentiation (Melody handled at the
+/// gated call site, not here, so the freeze witness is local to the caller).
+fn role_rhythm_bias(role: OrchestralRole) -> f32 {
+    match role {
+        OrchestralRole::Melody => MELODY_RHYTHM_BIAS,
+        OrchestralRole::HarmonicFill => FILL_RHYTHM_BIAS,
+        OrchestralRole::Pad => PAD_RHYTHM_BIAS,
+        OrchestralRole::Bass => BASS_RHYTHM_BIAS,
+        OrchestralRole::CounterMelody => 0.0, // governed off the MELODY class; no own band ladder
+    }
+}
+
+/// The MELODY's TOTAL band-cutoff shift for THIS step — the prominence `prom_shift` PLUS the
+/// L1 per-role rhythm bias, gated freeze-neutral. theory/spec §7 (shared-cutoff coupling): the
+/// Melody arm's band ladder AND the governor's `melody_activity_class` (read from the Counter
+/// arm + the Pad cap) MUST see the SAME melody class, so they MUST read the SAME shift. This
+/// single source guarantees they cannot drift. FREEZE: the L1 bias is gated on the foreground-
+/// weight pivot (`melody_w > ACTIVITY_FLOOR_THRESHOLD`) — at neutral weight 0.5 the strict `>`
+/// is FALSE → the bias is 0.0 → the shift is EXACTLY the legacy `(w-0.5)*RHY_SHIFT` (== 0.0 at
+/// neutral) → the goldens are byte-identical.
+fn melody_total_rhythm_shift(melody_w: f32) -> f32 {
+    let bias = if melody_w > ACTIVITY_FLOOR_THRESHOLD {
+        role_rhythm_bias(OrchestralRole::Melody)
+    } else {
+        0.0
+    };
+    (melody_w - PROMINENCE_NEUTRAL) * PROMINENCE_RHY_SHIFT + bias
+}
+
 /// The melody-prominence weight ABOVE which the activity FLOOR bites (strict `>`): a
 /// FOREGROUND melody (resolved weight > this) never falls to SUSTAINED on a calm image —
 /// it is floored up one rank to the DOTTED (Oblique) band so it always out-moves the
@@ -1348,6 +1452,35 @@ fn recede_pad_onsets(mut events: Vec<NoteEvent>, cap: usize, step_ms: u64) -> Ve
         }
     }
     out
+}
+
+/// L2 (S49 slice 2) — PHASE-SEPARATE a bed onset OFF the melody's downbeat. Displaces every
+/// onset currently sitting ON the downbeat (offset 0) to the weak-beat fraction `phase_frac` of
+/// `step_ms`, re-fitting its hold into the room remaining before the step boundary so it does not
+/// ring across into the next step. theory (spec §2 item 2): a HarmonicFill bed that attacks on
+/// offset 0 fuses its onset grid with the melody's downbeat (the F5a fusion signal); moving it to
+/// the "and" gives the bed its OWN phase, distinct from the melody (0) and the counter (step_ms/4).
+///
+/// COUNT-PRESERVING (the `recede_pad_onsets` precedent, proven freeze-neutral): it moves WHERE the
+/// onset sits, never HOW MANY → onset counts byte-stable → F5b/F1 untouched. An onset already OFF
+/// the downbeat is left alone (a figured/multi-onset bed already keeps its grid off the beat).
+/// Pure. (The bed FLOOR / deep-bed-thinness WATCH is upstream of this — this never DROPS an onset,
+/// so it cannot hollow the bed; spec §8 watch-5.)
+fn phase_separate_bed(mut events: Vec<NoteEvent>, phase_frac: f32, step_ms: u64) -> Vec<NoteEvent> {
+    let weak = (step_ms as f32 * phase_frac).round() as u64;
+    if weak == 0 {
+        return events; // a 0 phase fraction is the identity (no displacement)
+    }
+    let room = step_ms.saturating_sub(weak).max(1);
+    for e in &mut events {
+        if e.offset_ms == 0 {
+            // Re-fit the hold into the remaining room so the displaced onset does not over-run the
+            // step (the same intent as recede_pad_onsets / the S48 comp re-fit). Count unchanged.
+            e.hold_ms = e.hold_ms.min(room).max(1);
+            e.offset_ms = weak;
+        }
+    }
+    events
 }
 
 /// Prominence weight (0..1) for `role`, read off `ctx.section.orchestration.prominence`.
@@ -1959,12 +2092,33 @@ fn realize_rhythm(
     // 1 is Ballad-only and BALLAD_ARTIC_BIAS == 1.0 (identity), so the bias is a no-op
     // and the window re-scale is the only change this slice makes.
     let curve_frac = ARTIC_WINDOW_HI + (ARTIC_WINDOW_LO - ARTIC_WINDOW_HI) * edge_activity;
+    // S49 SLICE 2 (L3) — the MELODY's articulation-detach gate. theory: the foreground melody is
+    // CRISPER than the bed, but ONLY when it is a genuine FOREGROUND voice — gated on the SAME
+    // foreground-weight pivot as L1 so at neutral weight 0.5 the strict `>` is FALSE → 0.0 bias →
+    // the melody-79 golden's `base_frac` is the unchanged `curve_frac` (spec §4 freeze witness).
+    let melody_detach = if matches!(role, OrchestralRole::Melody)
+        && prominence_weight(ctx, OrchestralRole::Melody) > ACTIVITY_FLOOR_THRESHOLD
+    {
+        MELODY_ARTIC_DETACH_BIAS
+    } else {
+        0.0
+    };
     let base_frac = match role {
         // Fill biases toward the connected end so inner voices sustain under the line.
         // Floor it at the window LOW, not LEGATO_FRAC (0.95): clamping a HarmonicFill
         // up to 0.95 would punch ABOVE the busy-end of the new window and re-introduce
         // a discontinuity. The window low (0.55) is the right connected-leaning floor.
         OrchestralRole::HarmonicFill => curve_frac.max(ARTIC_WINDOW_LO),
+        // S49 SLICE 2 (L3) — the MELODY detaches: a NEGATIVE base_frac nudge (crisper foreground),
+        // gated freeze-neutral above. Composes BEFORE the window clamp and BEFORE the S48 comp
+        // detach (the comp still rides on top for the low-seat case). DURATION-only — F1/F3 (onset
+        // count / pitch) untouched. Floored by the clamp below so it never clicks.
+        OrchestralRole::Melody => curve_frac - melody_detach,
+        // S49 SLICE 2 (L3) — the BASS connects: the Fill connected-floor lean generalized to the
+        // bed so the bass sustains smoothly under the figure. GATED on `counter_present` — the ONE
+        // golden-reachable L3 term (the Bass arm runs on the bass-36 golden); `false` on the
+        // no-counter goldens → the legacy `curve_frac` → byte-identical rounded `hold_ms` (spec §4/§8).
+        OrchestralRole::Bass if counter_present => curve_frac.max(ARTIC_WINDOW_LO),
         _ => curve_frac,
     }
     // Apply the per-character articulation bias (slice-1 Ballad == 1.0, no-op), then
@@ -2159,11 +2313,34 @@ fn realize_rhythm(
             // near-static texture (activity < FILL_REST_ACTIVITY) rests; the calm-image
             // bed (activity ≈ 0.08 on the calm fixture is still above this floor only by
             // a hair — see the const's note) now SOUNDS instead of resting.
-            if edge_activity < FILL_REST_ACTIVITY && weak_interior {
+            //
+            // S49 SLICE 2 (L1) — per-role rhythm bias on the bed's ONE busyness decision. The
+            // Fill is a BED role, biased TOWARD steadier (NON-POSITIVE `role_rhythm_bias`). The
+            // only busyness decision a Fill makes is whether to break into a rest-as-gesture (a
+            // momentary activity event); the negative bed bias LOWERS the effective rest cutoff so
+            // the inner bed holds steady more readily and only rests on a genuinely flatter field —
+            // a steadier bed grid distinct from the melody's. This NEVER hollows the bed beyond the
+            // legacy behavior (it makes rests RARER, the bed MORE present — the safe side of the
+            // deep-bed-thinness WATCH, spec §8 watch-5). FREEZE: the Fill arm is not entered on the
+            // synthetic no-counter goldens (no Fill instrument there), so this is inert on the
+            // freeze path. SIGN fixed NON-POSITIVE; magnitude TASTE-SIZED (spec §3).
+            let fill_rest_cutoff = FILL_REST_ACTIVITY + role_rhythm_bias(role);
+            if edge_activity < fill_rest_cutoff && weak_interior {
                 // rest-as-gesture: emit NO event.
                 Vec::new()
             } else {
-                vec![sustained(0, step_ms, base_frac)]
+                // S49 SLICE 2 (L2) — PHASE-SEPARATE the inner bed onset OFF the melody's downbeat.
+                // The Fill onset sits at offset 0 (the same downbeat the melody attacks); displace
+                // it to the weak beat (BED_PHASE_FRAC) so the inner bed reads as its OWN onset grid,
+                // distinct from the melody (0) and the counter (step_ms/4). COUNT-PRESERVING (the
+                // recede_pad_onsets precedent) → F5b/F1 untouched; F5a (rhythm-distinctness) can only
+                // improve. FREEZE: the Fill arm is an inner-voice role never assigned on the
+                // single-instrument synthetic goldens, so this is inert on the freeze path.
+                phase_separate_bed(
+                    vec![sustained(0, step_ms, base_frac)],
+                    BED_PHASE_FRAC,
+                    step_ms,
+                )
             }
         }
 
@@ -2259,9 +2436,10 @@ fn realize_rhythm(
             // melody floor's no-op-at-0.5 gating; the engine_equivalence goldens are no-Pad
             // synthetic bars, so this is doubly inert there).
             let pad_w = prominence_weight(ctx, OrchestralRole::Pad);
-            let melody_prom_shift = (prominence_weight(ctx, OrchestralRole::Melody)
-                - PROMINENCE_NEUTRAL)
-                * PROMINENCE_RHY_SHIFT;
+            // S49 SLICE 2 (L1): the governor's view of the MELODY class MUST match the melody arm's
+            // (spec §7) — read the SAME `melody_total_rhythm_shift` (prominence + gated L1 bias).
+            let melody_prom_shift =
+                melody_total_rhythm_shift(prominence_weight(ctx, OrchestralRole::Melody));
             let m_class = melody_activity_class(edge_activity, melody_prom_shift, pre_cadence);
             match pad_onset_cap(pad_w, m_class) {
                 Some(cap) => recede_pad_onsets(pad_events, cap, step_ms),
@@ -2356,9 +2534,11 @@ fn realize_rhythm(
             //
             // The melody's class is computed off the MELODY role's prominence shift (the
             // governor asks "how active is the MELODY," spec §8.4) — NOT the counter's.
-            let melody_prom_shift = (prominence_weight(ctx, OrchestralRole::Melody)
-                - PROMINENCE_NEUTRAL)
-                * PROMINENCE_RHY_SHIFT;
+            // S49 SLICE 2 (L1): the governor reads the MELODY's class off the SAME
+            // `melody_total_rhythm_shift` the melody arm uses (prominence + gated L1 bias) so the
+            // governor and the arm cannot drift (spec §7 shared-cutoff coupling).
+            let melody_prom_shift =
+                melody_total_rhythm_shift(prominence_weight(ctx, OrchestralRole::Melody));
             let m_class = melody_activity_class(edge_activity, melody_prom_shift, pre_cadence);
             // `held_chord` / `melody_static` are retained for clarity of intent: the Sustained
             // class is precisely the held/static case the governor now recedes (asserted in the
@@ -2416,7 +2596,12 @@ fn realize_rhythm(
             // The `pre_cadence ||` disjunct is UNCHANGED so the cadence acceleration path
             // is never shifted (protects the cadence golden).
             let melody_w = prominence_weight(ctx, role);
-            let prom_shift = (melody_w - PROMINENCE_NEUTRAL) * PROMINENCE_RHY_SHIFT;
+            // S49 SLICE 2 (L1) — the melody's TOTAL cutoff shift now folds in the per-ROLE rhythm
+            // bias (gated freeze-neutral) so the melody subdivides sooner than the bed (distinct
+            // per-role onset GRIDS). The single `melody_total_rhythm_shift` source is shared with the
+            // governor/Pad-cap (spec §7), and at neutral weight is EXACTLY the legacy term (0.0 at
+            // 0.5) → byte-identical goldens (spec §4).
+            let prom_shift = melody_total_rhythm_shift(melody_w);
             // S47 activity FLOOR: a FOREGROUND melody (resolved weight > threshold) must
             // never fall all the way to a held tone on a calm image — that is the
             // figure-ground inversion seen from the foreground side (a held figure under a
