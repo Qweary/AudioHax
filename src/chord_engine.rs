@@ -866,10 +866,20 @@ pub enum OrchestralRole {
     /// Never rests; the widest single-role simultaneous note count. This is the
     /// "all the harmony / all the background" layer — the held bed under the tune.
     Pad,
-    /// A second melodic line moving under/around the Melody. Its realization is
-    /// STUBBED for now: it delegates to the HarmonicFill figure (a real counter-
-    /// line is a later slice — a pure realization fill, no signature change). It
-    /// is unreachable under the behaviour-neutral identity profile, so byte-neutral.
+    /// A second melodic line moving under/around the Melody — a GENUINE
+    /// species-counterpoint voice, fully realized in `realize_rhythm`'s
+    /// `CounterMelody` arm (:1818). On every emitted event it recomputes the
+    /// melody's pitch this/prev step for contrary motion, replays the realized
+    /// previous counter pitch deterministically, and selects its own pitch through
+    /// the shared `realized_counter_pitch_with_prev` (:3538) — the fifth-species
+    /// figure driver `pick_counter_figure` (:4652) gated by the species predicates
+    /// `is_legal_passing`/`neighbor`/`suspension`/`cambiata` (:4141–4259), with
+    /// parallel-perfect avoidance, a cadential clausula (:1604), and held-period
+    /// activation (the guaranteed off-beat onset that fills a static harmony's
+    /// empty period). The single `role_pitch` seat it shares with the inner
+    /// voices (:1271) is therefore only a DEAD anchor — `realize_rhythm` overwrites
+    /// it on every emitted event. It is unreachable under the behaviour-neutral
+    /// identity profile (no Counter instrument), so byte-neutral on the freeze path.
     CounterMelody,
 }
 
@@ -1265,9 +1275,12 @@ fn role_pitch(
         // register, exactly like HarmonicFill. theory: the Pad's full multi-tone
         // bed is built in realize_rhythm directly off the chord (one note can't
         // express it); the single base_note role_pitch returns here is only the
-        // anchor pitch the other realize machinery threads through. The
-        // CounterMelody stub delegates to the fill figure for now. Both therefore
-        // share the inner-tone seating below so they sit under the melody.
+        // anchor pitch the other realize machinery threads through. For
+        // CounterMelody this seat is a DEAD anchor — `realize_rhythm`'s species
+        // arm (:1818) overwrites it on every emitted event with the moving
+        // counter-line's own pitch. It shares the inner-tone seating below only as
+        // a harmless default (the value never sounds). Both therefore share the
+        // inner-tone seating below so they sit under the melody.
         OrchestralRole::HarmonicFill | OrchestralRole::Pad | OrchestralRole::CounterMelody => {
             // An INNER chord tone, spread across the fill instruments so two
             // fills don't double the same tone, placed in the middle register
@@ -1825,13 +1838,31 @@ fn realize_rhythm(
             // identity profile (no Counter inst), so byte-neutral on the freeze path.
             let si = ctx.step_in_section;
             // The prior step's plan, or None at a section start (no contrary constraint).
-            let prev: Option<&StepPlan> = si.checked_sub(1).and_then(|p| ctx.section.steps.get(p));
+            // S45-CP-FIX (tiling consistency): fetch the prior step by the realizer's own
+            // `% len` wrap so a TILED section past `steps.len()` reads the tiled phrase's prior
+            // step (the one that actually sounded) instead of falling off the stored phrase to
+            // `None` — which would short-circuit `prev_counter` to the synthetic seed below and
+            // DIVERGE from the live tiled line. On an untiled section `% len` is the identity →
+            // byte-identical. (The melody index stays raw, matching the Melody role's own motif
+            // index; see `realized_counter_pitch_with_prev`.)
+            let counter_len = ctx.section.steps.len();
+            let prev: Option<&StepPlan> = match (si.checked_sub(1), counter_len) {
+                (Some(p), l) if l > 0 => Some(&ctx.section.steps[p % l]),
+                _ => None,
+            };
 
             // Melody pitch THIS step and the PREVIOUS step, recomputed exactly as the
             // Melody instrument computes it. Some(p) == sounds p; None == the melody
             // rests this step (treated as Hold for the contrary rule, a gap for rhythm).
             let m_now = melody_pitch_for(ctx, step, features);
-            let m_prev = prev.and_then(|p| melody_pitch_for_step(ctx, p, features));
+            let m_prev = match (si.checked_sub(1), prev) {
+                (Some(prev_si), Some(p)) => {
+                    let mut prev_ctx = *ctx;
+                    prev_ctx.step_in_section = prev_si;
+                    melody_pitch_for(&prev_ctx, p, features)
+                }
+                _ => None,
+            };
             let mel_dir = motion_dir(m_prev, m_now);
 
             // Held-period / melody-static detection (§3.4 — the "empty periods" answer).
@@ -3042,6 +3073,83 @@ fn pivot_chord_events(
     }])
 }
 
+/// The CounterMelody's REALIZED pitch when the step at `(ctx.section, si)` is voiced by the
+/// PIVOT path (`pivot_chord_events`) rather than the species counter arm — i.e. the dominant
+/// SEVENTH seat the V7 pivot gives the inner voice. `None` when this step is NOT a pivot step.
+///
+/// theory / why this exists (S45-CP-FIX): at a modulating section's step-0 boundary the counter
+/// does not sound its species line — `realize_step` returns the pivot voicing BEFORE the counter
+/// arm. The species REPLAY (`realized_prev_counter`) must therefore reconstruct THIS pitch at a
+/// pivot step, not the §3.1 seed, or the next step's `prev_counter` would disagree with what the
+/// boundary actually sounded — re-introducing a cross-step inconsistency the M1.4 independence
+/// guard then cannot see (the residual pivot-boundary parallels the scorecard measured). This
+/// recomputes the SAME `dom_seventh_pc` seat `pivot_chord_events` voices for the CounterMelody,
+/// keyed off the borrowed ctx at index `si`, so the replay tracks the live boundary exactly.
+/// Pure / RNG-free. Byte-neutral on the freeze net (no pivot on identity/home_only).
+fn pivot_counter_pitch(
+    ctx: &crate::composition::StepContext,
+    features: &PerfFeatures,
+    si: usize,
+) -> Option<u8> {
+    pivot_role_pitch(ctx, features, si, OrchestralRole::CounterMelody)
+}
+
+/// The MELODY's REALIZED pitch when the step is a PIVOT step (the dominant FIFTH the V7 pivot
+/// gives the top line), or `None` when not a pivot step. The melody analogue of
+/// [`pivot_counter_pitch`]: the counter must see the melody that ACTUALLY sounds at the
+/// boundary (the pivot dom-5th), not the species free-select pitch, or its M1.4 independence
+/// check at the step AFTER the pivot answers the wrong melody direction. Same gate/seat as the
+/// Melody arm of `pivot_chord_events`. Pure / byte-neutral on the freeze net.
+fn pivot_melody_pitch(
+    ctx: &crate::composition::StepContext,
+    features: &PerfFeatures,
+    si: usize,
+) -> Option<u8> {
+    pivot_role_pitch(ctx, features, si, OrchestralRole::Melody)
+}
+
+/// Shared pivot-voicing recompute for the two melodic roles the counter's M1.4 logic reads
+/// (Melody = dom 5th, CounterMelody = dom 7th). Mirrors the EXACT gate + per-role seat of
+/// `pivot_chord_events` so the species replay / melody-view reconstruct the pitch the pivot
+/// boundary actually sounds. `None` unless `(ctx.section, si)` is a real modulating step-0
+/// boundary. Bass/Pad are not reconstructed here (the counter never reads them).
+fn pivot_role_pitch(
+    ctx: &crate::composition::StepContext,
+    features: &PerfFeatures,
+    si: usize,
+    role: OrchestralRole,
+) -> Option<u8> {
+    if !ctx.section.pivot || si != 0 {
+        return None;
+    }
+    let prev_off = ctx.prev_key_offset_semitones?;
+    let dest_off = ctx.section.key_offset_semitones;
+    if prev_off == dest_off {
+        return None;
+    }
+    let home_root_pc = (ctx.key_tempo.home_root_midi % 12) as i16;
+    let dest_root_pc = (home_root_pc + dest_off as i16).rem_euclid(12) as u8;
+    let dom_root_pc = (dest_root_pc + 7) % 12;
+    let bright_octaves = ((features.brightness - 50.0) / 50.0).clamp(-1.0, 1.0);
+    match role {
+        OrchestralRole::Melody => {
+            // Dominant 5th on top, seated at the MELODY floor + full bright lift (pivot §Melody).
+            let dom_fifth_pc = (dom_root_pc + 7) % 12;
+            let lift = (bright_octaves * 12.0).round() as i16;
+            let floor = (MELODY_REGISTER_FLOOR as i16 + lift).clamp(24, 96) as u8;
+            Some(seat_pc_in_register(dom_fifth_pc, floor))
+        }
+        OrchestralRole::CounterMelody => {
+            // Dominant 7th (V7 color), seated at the FILL floor + half bright lift (pivot §inner).
+            let dom_seventh_pc = (dom_root_pc + 10) % 12;
+            let lift = ((bright_octaves * 6.0).round() as i16).clamp(-12, 12);
+            let floor = (FILL_REGISTER_FLOOR as i16 + lift).clamp(24, 96) as u8;
+            Some(seat_pc_in_register(dom_seventh_pc, floor))
+        }
+        _ => None,
+    }
+}
+
 /// Is the land-home authentic cadence armed at THIS step (S28/K3)? `true` only when the scheme's
 /// `ResolutionPolicy::Resolve` forced the final section to offset 0 AND `pivot == true` AND this
 /// is the final section's closing Perfect-cadence step. When armed, the realizer STRENGTHENS the
@@ -3457,20 +3565,37 @@ fn motion_dir(prev: Option<u8>, now: Option<u8>) -> MotionDir {
 ///
 /// theory: the counter must see the melody to move against it, but `realize_step` is
 /// stateless per-instrument and never receives the melody's pitch. It IS re-derivable:
-/// the melody pitch is a pure function of (ctx, chord, features) via the same theme
-/// seam (`theme_melody_pitch`) and free-select (`role_pitch`) the Melody arm uses.
+/// the melody pitch is a pure function of (ctx, chord, features) via the SAME pipeline the
+/// Melody arm runs — the theme seam (`theme_melody_pitch`) / free-select (`role_pitch`),
+/// THEN the two cadence/modulation RE-VOICINGS the Melody role applies on top (the
+/// `land_home` PAC strengthening and the opening V→I pivot resolution). The re-voicings were
+/// the missing piece (S45-CP-FIX): without them the counter saw the UN-revoiced free-select
+/// pitch while the melody actually SOUNDED the re-voiced one, so the counter computed motion
+/// against a phantom melody and the M1.4 independence guard answered the wrong direction —
+/// the residual strictly-parallel pairs the scorecard measured. Replicating both stages here
+/// makes the counter's `m_now`/`m_prev` byte-identical to the melody the ear hears.
 fn melody_pitch_for(
     ctx: &crate::composition::StepContext,
     step: &StepPlan,
     features: &PerfFeatures,
 ) -> Option<u8> {
-    match theme_melody_pitch(ctx, OrchestralRole::Melody, &step.chord, features) {
-        Some(None) => None,       // theme-driven rest → the melody is silent this step
-        Some(Some(p)) => Some(p), // theme pitch
+    // Stage 0: PIVOT boundary — at a modulating section's step 0 the melody sounds the V7
+    // pivot's dominant 5th (via `pivot_chord_events`), which PRE-EMPTS the free-select/theme +
+    // cadence/modulation pipeline below (realize_step returns the pivot events before that path
+    // ever runs). The counter must read THIS pitch so its M1.4 motion check at the next step is
+    // against the melody that actually sounded at the boundary.
+    if let Some(p) = pivot_melody_pitch(ctx, features, ctx.step_in_section) {
+        return Some(p);
+    }
+    // Stage 1: the free-select / theme pitch (a theme-driven rest stays a rest — the
+    // re-voicings below only re-point an EXISTING pitch, never resurrect a rested step).
+    let base = match theme_melody_pitch(ctx, OrchestralRole::Melody, &step.chord, features) {
+        Some(None) => return None, // theme-driven rest → the melody is silent this step
+        Some(Some(p)) => p,        // theme pitch
         // Free-select: inst_idx/num are irrelevant for the Melody arm of role_pitch
         // (it seats the chord's TOP tone, independent of index), so a synthetic
         // (idx 0, num 1) is correct and avoids guessing the real ensemble width.
-        None => Some(role_pitch(
+        None => role_pitch(
             OrchestralRole::Melody,
             &step.chord,
             0,
@@ -3480,14 +3605,32 @@ fn melody_pitch_for(
             // the SAME value realize_step threads for the Melody role, so a theme note
             // lifts identically to a free-selected one. Empty prominence → 0.5 → no lift.
             prominence_weight(ctx, OrchestralRole::Melody),
-        )),
-    }
+        ),
+    };
+    // Stage 2: LAND-HOME PAC re-voicing — identical guard/call to realize_step:1163.
+    let base = if land_home_is_armed(ctx, step.position) {
+        land_home_pitch(OrchestralRole::Melody, ctx, &step.chord)
+    } else {
+        base
+    };
+    // Stage 3: OPENING V→I pivot resolution — identical guard/call to realize_step:1178.
+    let base = if pivot_resolution_is_armed(ctx) {
+        pivot_resolution_pitch(OrchestralRole::Melody, ctx)
+    } else {
+        base
+    };
+    Some(base)
 }
 
 /// Recompute the MELODY pitch for an ARBITRARY prior step `p`, by re-pointing the
 /// borrowed context's `step_in_section` at that step so the theme seam reads the
 /// right motif index. Pure: only the `step_in_section` field is overridden (a Copy
 /// of the borrowed context), nothing is mutated through the references.
+///
+/// S45-CP-FIX: the live realize path no longer calls this (the counter's prior-melody read is
+/// inlined in `realized_counter_pitch_with_prev` so it can re-point to the TILED prior step);
+/// the helper is retained for the counterpoint unit tests, hence `cfg(test)`.
+#[cfg(test)]
 fn melody_pitch_for_step(
     ctx: &crate::composition::StepContext,
     p: &StepPlan,
@@ -3521,6 +3664,35 @@ fn seed_prev_counter(prev: Option<&StepPlan>, step: &StepPlan) -> u8 {
     nearest_counter_tone(seed_chord, anchor).unwrap_or(anchor)
 }
 
+/// The nearest band CHORD TONE whose motion is CONTRARY/OBLIQUE to a moving melody, CONSONANT
+/// against the sounding melody, and not a parallel perfect — the witness-safe M1.4 independence
+/// substitute for a plain Sustain landing that would otherwise be strictly parallel. Returns
+/// `None` when the chord offers no such tone (then the caller keeps its original landing rather
+/// than manufacture a non-chord-tone hold — that floor is what keeps the species "structural
+/// sustain is consonant" invariant and its witnesses intact). Deterministic / RNG-free.
+fn nearest_consonant_independent_counter(
+    chord: &Chord,
+    prev_counter: u8,
+    m_prev: Option<u8>,
+    m_now: Option<u8>,
+    mel_dir: MotionDir,
+) -> Option<u8> {
+    let cf = m_now?; // a moving melody implies a sounding CF; guard anyway.
+    counter_candidate_pitches(chord, prev_counter)
+        .into_iter()
+        // CONTRARY or OBLIQUE (never similar to the melody) — the M1.4 independence.
+        .filter(|&c| motion_dir(Some(prev_counter), Some(c)) != mel_dir)
+        // CONSONANT against the sounding melody — never trade a parallel for a raw dissonance.
+        .filter(|&c| is_consonant(c, cf))
+        // No parallel/hidden perfect across the prev->now transition (the same two-point guard).
+        .filter(|&c| match m_prev {
+            Some(mp) => !has_parallel_perfects(&[mp, prev_counter], &[cf, c]),
+            None => true,
+        })
+        // Closest to where the line just sat — a connected step.
+        .min_by_key(|&c| (c as i16 - prev_counter as i16).abs())
+}
+
 /// S30-CP-FIX — the REALIZED counter pitch this step would sound, GIVEN the realized prior
 /// counter pitch `prev_counter`. This is the exact pitch-selection the CounterMelody realize
 /// arm performs (held-run rotation seed / §3.1 LOCK seed → figure driver), factored into a
@@ -3542,23 +3714,55 @@ fn realized_counter_pitch_with_prev(
     si: usize,
     prev_counter: u8,
 ) -> u8 {
-    let prev: Option<&StepPlan> = si.checked_sub(1).and_then(|p| ctx.section.steps.get(p));
+    // S45-CP-FIX (tiling consistency): fetch the prior/next STEP-PLAN by the realizer's own
+    // `% len` wrap, so a TILED section's prev/next chord is the tiled phrase's chord (the one
+    // that actually sounds at that tiled position), not a raw index that falls off the end of
+    // the stored phrase. On an untiled section `% len` is the identity → byte-identical. The
+    // MELODY index stays RAW (`step_in_section = si`, and the prev melody read at raw `si-1`):
+    // the melody role itself indexes its own motif by the raw section-local step and resolves
+    // past-end via `motif_step_at` (Identity-hold / wrap), so the counter must read the melody
+    // the SAME raw way to move against the line that actually sounds.
+    let len = ctx.section.steps.len();
+    let prev: Option<&StepPlan> = match (si.checked_sub(1), len) {
+        (Some(p), l) if l > 0 => Some(&ctx.section.steps[p % l]),
+        _ => None,
+    };
     // Re-point the borrowed ctx at THIS step so the melody/theme seam reads the right index
     // (the replay path computes earlier steps; the live arm passes its own ctx unchanged).
     let mut step_ctx = *ctx;
     step_ctx.step_in_section = si;
     let m_now = melody_pitch_for(&step_ctx, step, features);
-    let m_prev = prev.and_then(|p| melody_pitch_for_step(&step_ctx, p, features));
+    // The prior melody pitch at the RAW previous section-local step (its own motif index).
+    let m_prev = match si.checked_sub(1) {
+        Some(prev_si) if prev.is_some() => {
+            let mut prev_ctx = *ctx;
+            prev_ctx.step_in_section = prev_si;
+            melody_pitch_for(&prev_ctx, prev.unwrap(), features)
+        }
+        _ => None,
+    };
     let mel_dir = motion_dir(m_prev, m_now);
 
     let held_chord = prev.is_some_and(|p| p.chord.notes == step.chord.notes);
     let melody_static = mel_dir == MotionDir::Hold || m_now.is_none();
     let held_run_index = held_run_position(ctx.section, si);
     let held_target = advancing_seed_counter(step, held_run_index);
-    let next_chord: Option<&Chord> = ctx.section.steps.get(si + 1).map(|s| &s.chord);
+    // The NEXT step's chord. `None` ONLY at the section's GENUINE terminal (the last step of
+    // the whole tiled span, `si + 1 >= step_len`) — that `None` is the §GAP-2 terminal-figure /
+    // terminal-diminished-bite gate and MUST be preserved (a wrapped next-chord there would
+    // suppress the terminal bite and the witnesses that pin it). For any INTERIOR tiled step
+    // (`si + 1 < step_len`) the next chord is the tiled phrase's chord at `(si + 1) % len` — the
+    // one that actually sounds next — so a tiled section's lookahead tracks the repeating phrase
+    // rather than falling off the stored steps. On an untiled section `step_len == len`, so this
+    // is `None` exactly at the last step and `steps[si + 1]` everywhere else — byte-identical.
+    let next_chord: Option<&Chord> = if len > 0 && si + 1 < ctx.section.step_len {
+        Some(&ctx.section.steps[(si + 1) % len].chord)
+    } else {
+        None
+    };
     let figures_enabled = !(held_chord || melody_static);
 
-    let (cnt, _figure) = pick_counter_figure(
+    let (cnt, figure) = pick_counter_figure(
         &step.chord,
         prev_counter,
         m_prev,
@@ -3570,6 +3774,32 @@ fn realized_counter_pitch_with_prev(
         held_target,
         figures_enabled,
     );
+    // S45-CP-FIX (M1.4, witness-safe): if the ordinary first-species (Sustain) landing moves
+    // STRICTLY SIMILAR (same direction) to a MOVING melody — the strict parallel spec-s45 §M1.4
+    // forbids ("the arm is BUILT so the counter is never parallel; parallel fraction == 0
+    // deterministically") — re-point it to the nearest CONSONANT contrary/oblique chord tone, if
+    // one exists. Strictly SCOPED so the deliberate, witnessed counterpoint arms are untouched:
+    //   * only the plain `Sustain` figure (the dissonant Passing/Neighbor/Suspension figures own
+    //     their approach+resolution and are left as-is);
+    //   * only `Interior`/`HalfCadence` steps (PhraseStart opening, PAC clausula, and the
+    //     terminal-diminished bite run their own pitch formula and are left as-is);
+    //   * the substitute is a CONSONANT band chord tone only — never a non-chord-tone "hold",
+    //     so the species "every structural sustain is consonant" floor and the dissonance-
+    //     resolution witnesses are preserved; when the chord offers no consonant contrary/oblique
+    //     tone the original `cnt` stands (the chord genuinely forces similar motion there).
+    let cnt = if figure == CounterFigure::Sustain
+        && matches!(
+            step.position,
+            PhrasePosition::Interior | PhrasePosition::HalfCadence
+        )
+        && mel_dir != MotionDir::Hold
+        && motion_dir(Some(prev_counter), Some(cnt)) == mel_dir
+    {
+        nearest_consonant_independent_counter(&step.chord, prev_counter, m_prev, m_now, mel_dir)
+            .unwrap_or(cnt)
+    } else {
+        cnt
+    };
 
     // S33-CP-FIX (GAP-4) — PENULT LOOKAHEAD REWORK (design §1.2 Option 1).
     //
@@ -3649,24 +3879,57 @@ fn realized_counter_pitch_with_prev(
 /// realization O(n²) in the worst case. Sections are short (a phrase, ≤ a few dozen steps), so
 /// this is negligible; it is also RNG-free and fully deterministic (PT-9 preserved). The
 /// `seen`/depth guard caps the recursion at the section length as a defensive floor against a
-/// malformed `step_in_section` (it can never legitimately exceed the step count).
+/// malformed `step_in_section`.
+///
+/// S45-CP-FIX (tiling consistency) — `step_in_section` CAN legitimately exceed the stored
+/// step count. The planner distributes `total_steps` across sections by `rel_len` share, so a
+/// section's `step_len` (its slice of the global cursor) is unrelated to its `plan_phrases`
+/// length: a section TILES when `step_len > steps.len()` (first surfaced by routing real images
+/// to `pad_bed_counter`). The global cursor walks `step_in_section` PAST `steps.len()`, and the
+/// realizer voices the WRAPPED step `steps[step_idx % len]` (engine.rs:723) at each TILED
+/// position — so the same phrase REPEATS in time, e.g. a 3-step phrase tiled to 11 steps sounds
+/// `0 1 2 0 1 2 0 1 2 0 1`.
+///
+/// The replay therefore must walk the ACTUAL TILED SEQUENCE in time — recurse on `si-1` (the
+/// real previous step), NOT on `(si % len) - 1` — and fetch each step's chord/plan via
+/// `steps[i % len]` exactly as the live realizer does. Recursing on the wrapped phrase index
+/// would make the replay's reconstructed prior pitch DISAGREE with the live emission across a
+/// tile boundary (the live step `si=3` of a len-3 phrase sounds the realized pitch carried from
+/// `si=2`, but a phrase-wrapped replay would re-OPEN it as phrase-position-0), and that
+/// disagreement re-introduces the very cross-step inconsistency the realized-prev memory exists
+/// to prevent — including parallels the M1.4 guard then cannot see. Recursing on the tiled
+/// position keeps the replayed prior pitch byte-identical to what step `si-1` actually emitted.
+/// Recursion depth is `si` (≤ `step_len`, a few dozen) — negligible, RNG-free, deterministic.
+/// On an UNtiled section (`step_len <= len`) `i % len == i`, so every step replays byte-identically.
 fn realized_prev_counter(
     ctx: &crate::composition::StepContext,
     features: &PerfFeatures,
     si: usize,
 ) -> u8 {
+    let steps = &ctx.section.steps;
+    let len = steps.len();
+    if len == 0 {
+        // Degenerate section with no stored steps — there is no chord to seat a seed off.
+        // Open the line on a neutral counter-register anchor (never panics). The arm only
+        // reaches here on a malformed plan; the empty-plan guard in decide_instrument_action
+        // already returns a silent step before this on the live path.
+        return (FILL_REGISTER_FLOOR + COUNTER_CEILING) / 2;
+    }
+    // `realized_prev_counter(si)` returns the realized counter pitch at step `si - 1`.
     let Some(prev_idx) = si.checked_sub(1) else {
-        // BASE CASE: si == 0 has no prior step. The opening pitch is seeded off THIS chord
-        // (the §3.1 seed with no prior), matching the as-built section-start behavior.
-        let step = &ctx.section.steps[si];
-        return seed_prev_counter(None, step);
+        // BASE CASE: si == 0 has no prior step (the seed BEFORE the section opening).
+        return seed_prev_counter(None, &steps[0]);
     };
-    let Some(prev_step) = ctx.section.steps.get(prev_idx) else {
-        // Defensive: malformed plan — fall back to the synthetic seed for THIS step.
-        let step = &ctx.section.steps[si];
-        return seed_prev_counter(ctx.section.steps.get(prev_idx.wrapping_add(1)), step);
-    };
-    // The realized pitch at `prev_idx` = its own realized-prev fed through the shared pick.
+    // The realized pitch at `prev_idx`. If THAT step is a PIVOT boundary, it sounded the V7
+    // pivot voicing (the dom-7th seat), NOT the species line — return it directly, because the
+    // species recompute below would mis-reconstruct it as a free-select tone and the next step's
+    // M1.4 independence check would then answer against a phantom prior counter pitch.
+    if let Some(p) = pivot_counter_pitch(ctx, features, prev_idx) {
+        return p;
+    }
+    // Otherwise the previous TILED step's chord/plan, fetched via the realizer's own `% len`
+    // wrap, with its realized pitch fed through the shared pick — tracking the live tiled line.
+    let prev_step = &steps[prev_idx % len];
     let prev_prev_counter = realized_prev_counter(ctx, features, prev_idx);
     realized_counter_pitch_with_prev(ctx, prev_step, features, prev_idx, prev_prev_counter)
 }
@@ -3838,10 +4101,14 @@ fn pick_counter_pitch(
         return prev_counter; // defensive: no chord tone at all → hold (never panics)
     }
     // HELD-RUN TARGET FAST-PATH: land on the rotation's chosen tone iff it is a legal
-    // chord-tone candidate AND does not create a parallel perfect against the melody.
-    // This is what makes the held line actually ADVANCE to a new tone each step (the
-    // rotation owns "which tone"); the scored path's contrary-while-static bonus would
-    // otherwise pull the pick off the target. Legality (no parallel perfect) still wins.
+    // chord-tone candidate AND does not create a parallel perfect against the melody AND
+    // does not move STRICTLY SIMILAR to the melody (M1.4: the counter is never parallel to
+    // the melody across a sounding pair — spec-s45 §M1.4 HARD). The rotation owns "which
+    // tone" for an INDEPENDENT step, but it must defer to the scored path when its tone would
+    // shadow the melody's direction; the scored path then finds a contrary/oblique tone (or
+    // the oblique hold), keeping the held line moving WITHOUT paralleling the tune. A static
+    // melody (mel_dir == Hold) has no direction to parallel, so the fast-path is unchanged
+    // there (the common held-period case — melody static under the held chord).
     if let Some(t) = held_target {
         if cands.contains(&t) {
             let creates_parallel = match (m_prev, m_now) {

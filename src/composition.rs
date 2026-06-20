@@ -1606,6 +1606,35 @@ impl CompositionPlanner {
             let section_density = (DENSITY_NEUTRAL + DENSITY_ENERGY_SPAN * (energy_i - 0.5))
                 .clamp(DENSITY_FLOOR, DENSITY_CEIL);
 
+            // S45/Slice-1: PER-SECTION Pad figuration variation. The plan resolves ONE figuration
+            // once (above, :1524) and `.clone()`s it onto every section, so a figured comp runs the
+            // same cell as a ~32-bar ostinato — the "same piece" identity-fixer. Here we give the
+            // inner texture a departure-and-return ARC: anchor roles (Statement/Return/Coda) keep
+            // the profile's base figuration cell; departure roles (Contrast/Development) take a
+            // CONTRASTING broken/arpeggiated cell from the SAME catalogue, so the comp reads
+            // block A → broken B → block A′ instead of one cell forever.
+            //
+            // FREEZE-SAFETY (identity path byte-stable): this override fires ONLY when the profile
+            // carries a base figuration handle (`orchestration.figuration.is_some()`) — i.e. only on
+            // the figured `pad_*` profiles. On the identity profile AND on `pad_bed`/`pad_bed_counter`
+            // (figuration == None → figuration_resolved == None), the `if let` below never runs, so
+            // the cloned `figuration_resolved` stays exactly what the once-per-plan resolve produced
+            // (None on identity → the realizer takes the byte-stable block bed). The identity section
+            // therefore emits identical bytes. The override only re-resolves the EXISTING catalogue
+            // mechanism the realizer already consumes per section — no new realization path.
+            let mut section_orch = orchestration.clone();
+            if let Some(base_fig_id) = orchestration.figuration.as_deref() {
+                let section_fig_id = section_figuration_id(base_fig_id, tpl.role);
+                // Re-resolve against the SAME figuration_catalogue the once-per-plan resolve used; an
+                // unresolved id falls back to the already-cloned base spec (never to None — a figured
+                // profile keeps figuring), so a missing catalogue entry degrades gracefully.
+                if let Some(spec) =
+                    lookup_figuration(&self.plan_mappings.figuration_catalogue, section_fig_id)
+                {
+                    section_orch.figuration_resolved = Some(spec.clone());
+                }
+            }
+
             sections.push(Section {
                 label: tpl.label.clone(),
                 step_len,
@@ -1622,7 +1651,7 @@ impl CompositionPlanner {
                 pivot: scheme_pivot, // S28/K3 — from the resolved scheme
                 resolution: scheme_resolution, // S28/K3 — from the resolved scheme
                 density: section_density, // S29/MX-4: f(source-region energy), 0.5 on identity
-                orchestration: orchestration.clone(),
+                orchestration: section_orch,
                 steps,
             });
         }
@@ -1810,6 +1839,74 @@ fn lookup_orchestration<'a>(
 /// `figuration_resolved == None` and the realizer falls back to the block bed.
 fn lookup_figuration<'a>(catalogue: &'a [FigurationSpec], id: &str) -> Option<&'a FigurationSpec> {
     catalogue.iter().find(|f| f.id == id)
+}
+
+/// S45/Slice-1 — PER-SECTION Pad figuration arc. Given the orchestration profile's BASE figuration
+/// cell id and a section's [`ThematicRole`], return the figuration cell id THIS section should use,
+/// so the inner Pad texture departs and returns instead of running one ostinato for the whole piece.
+///
+/// theory (departure-and-return in the FIGURATION, not the harmony): the anchor roles that state and
+/// re-state the material — `Statement`, `Return`, and the receding `Coda` — keep the profile's BASE
+/// cell, so the home texture is stable and recognizable on its return (A … A′). The contrasting
+/// roles — `Contrast` and `Development` — take a partner cell of a CONTRASTING ONSET-DENSITY CLASS,
+/// so the middle of the form animates (or settles) the same chords with a perceptibly different
+/// accompaniment FEEL, not merely a different cell at the same density (block A → broken B → block
+/// A′, or vice-versa).
+///
+/// S45/Slice-1 DENSITY-CLASS FIX: the prior `_ => broken_chord_wave` catch-all swapped the cell but
+/// often kept the DENSITY — an already-broken 4-onset base departing to another 4-onset broken cell
+/// is broken→broken, no FELT density change (the scorecard's PARTIAL verdict, M2.2). The fix pairs
+/// each base with a partner whose onset-density class is DIFFERENT, reading the catalogue's onset
+/// counts (assets/mappings.json `figuration_catalogue`):
+///
+///   DENSE  (4 onsets): alberti, broken_chord_up, broken_chord_wave, stride
+///   MEDIUM (3 onsets): arp_waltz, oom_pah_pah
+///   SPARSE (≤2 onsets): block (0, sustained), block_comp_24 (2), oom_pah (2)
+///
+/// The rule: a DENSE/broken base departs DOWN to a SPARSE block-feel partner (the texture SETTLES
+/// in the middle, then re-animates on the return); a SPARSE/MEDIUM block-feel base departs UP to a
+/// DENSE broken/arpeggiated partner (the texture ANIMATES, then re-settles on the return). Either
+/// way the departure crosses the density class, so the contrast is heard, and the base's own cell
+/// is the home the `Return` comes back to. Every partner is an EXISTING catalogue cell (no new
+/// realization). An unrecognized base falls back to the broken wave (a safe DENSE partner) so the
+/// departure is never a no-op.
+fn section_figuration_id(base_id: &str, role: ThematicRole) -> &str {
+    match role {
+        // Anchor roles hold the base cell — the return must sound like the opening.
+        ThematicRole::Statement | ThematicRole::Return | ThematicRole::Coda => base_id,
+        // Departure roles take a partner of a CONTRASTING onset-density class (see table above).
+        ThematicRole::Contrast | ThematicRole::Development => match base_id {
+            // ── DENSE (4-onset broken) bases depart DOWN to a SPARSE block-feel: 4 → ≤2 onsets,
+            //    the middle of the form SETTLES from a busy break to a chordal/sustained feel. ──
+            // Undulating broken → block stabs on beats 2&4 (DENSE → SPARSE, broken → block).
+            "alberti" => "block_comp_24",
+            // Ascending break → sustained block chord (DENSE → SPARSE, the clearest "come to rest").
+            "broken_chord_up" => "block",
+            // Wave break → sustained block chord (DENSE → SPARSE, broken → sustained).
+            "broken_chord_wave" => "block",
+            // Stride leap (4) → block stabs (2) (DENSE → SPARSE, leaping bass → on-beat chordal).
+            "stride" => "block_comp_24",
+
+            // ── MEDIUM (3-onset) bases depart UP to a DENSE (4-onset) broken cell: the middle
+            //    ANIMATES with a busier, differently-contoured break. ──
+            // Rising waltz arpeggio (3) → undulating wave break (4) (MEDIUM → DENSE, new contour).
+            "arp_waltz" => "broken_chord_wave",
+            // Bass-chord-chord (3) → ascending break (4) (MEDIUM → DENSE, oom-pah feel → broken).
+            "oom_pah_pah" => "broken_chord_up",
+
+            // ── SPARSE (≤2-onset block-feel) bases depart UP to a DENSE (4-onset) broken cell:
+            //    the design's marquee block→broken animation. ──
+            // Sustained block (0) → undulating wave break (4) (SPARSE → DENSE, block → broken).
+            "block" => "broken_chord_wave",
+            // Block stabs (2) → ascending break (4) (SPARSE → DENSE, chordal → broken).
+            "block_comp_24" => "broken_chord_up",
+            // Bass-chord 2-feel (2) → undulating broken alberti (4) (SPARSE → DENSE, oom-pah → broken).
+            "oom_pah" => "alberti",
+
+            // Unrecognized base → a safe DENSE broken partner (departure is never a no-op).
+            _ => "broken_chord_wave",
+        },
+    }
 }
 
 /// Look up a [`BassPatternSpec`] by id in the bass-pattern catalogue (S34). Mirrors
@@ -2209,10 +2306,12 @@ mod tests {
         assert_eq!(table.select(&u_with(0.1, 0.0)), "d");
     }
 
-    /// S18 Slice 2: the texture axis selects the CounterMelody-bearing `pad_bed_counter`
-    /// profile when the foreground is busy AND a real subject/ground stratification exists
-    /// (both predicates AND), else falls back to the `pad_bed` default. RNG-free, no planner —
-    /// directly over the loaded `texture` SelectTable.
+    /// S18 Slice 2 / S45-Slice-1 RE-TUNE: the texture axis selects the CounterMelody-bearing
+    /// `pad_bed_counter` profile when a real subject/ground stratification exists — gated on
+    /// `fg_bg_contrast` (the discriminating axis: 0.052–0.341 on real images), with
+    /// `foreground_energy` only a TOKEN floor (≥0.015 — real images emit 0.003–0.039, so the old
+    /// 0.15 fe gate fired on ZERO real images). New gate: `fe≥0.015 AND ct≥0.15`. Else falls back
+    /// to the `pad_bed` default. RNG-free, no planner — directly over the loaded `texture` SelectTable.
     #[test]
     fn texture_selects_pad_bed_counter_on_busy_foreground_subject() {
         let pm: PlanMappings = mappings()
@@ -2222,26 +2321,28 @@ mod tests {
             .into();
         let texture = &pm.texture;
 
-        // Busy foreground (≥0.35) AND real subject (fg_bg_contrast ≥0.20) → pad_bed_counter.
+        // Real subject/ground stratification (fg_bg_contrast ≥0.15) AND a real-scale foreground
+        // energy (≥0.015, the token floor) → pad_bed_counter. (fe 0.034 is a typical real value.)
         let counter = ImageUnderstanding {
-            foreground_energy: 0.5,
+            foreground_energy: 0.034,
             fg_bg_contrast: 0.3,
             ..ImageUnderstanding::neutral()
         };
         assert_eq!(texture.select(&counter), "pad_bed_counter");
 
-        // Quiet foreground → the rule does NOT fire; default pad_bed (no counter).
+        // No real subject (fg_bg_contrast below the 0.15 gate) → the rule does NOT fire even with
+        // ample foreground energy; default pad_bed (no counter). This is now the REAL discriminator.
         let quiet = ImageUnderstanding {
-            foreground_energy: 0.1,
-            fg_bg_contrast: 0.3,
+            foreground_energy: 0.5,
+            fg_bg_contrast: 0.084,
             ..ImageUnderstanding::neutral()
         };
         assert_eq!(texture.select(&quiet), "pad_bed");
 
-        // Busy foreground but no real subject (low contrast) → rule does NOT fire; default.
+        // Foreground energy at/below the token floor (≥0.015 fails) → rule does NOT fire; default.
         let no_subject = ImageUnderstanding {
-            foreground_energy: 0.5,
-            fg_bg_contrast: 0.05,
+            foreground_energy: 0.0,
+            fg_bg_contrast: 0.3,
             ..ImageUnderstanding::neutral()
         };
         assert_eq!(texture.select(&no_subject), "pad_bed");
