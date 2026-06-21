@@ -335,26 +335,47 @@ fn test_p3_no_single_gait_dominates() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// P4: a single affect corner (held FIXED so `pick_archetype` returns ONE contour) swept across the
-/// rhythm-cell selector axes — `edge_activity` ramped low/mid/high (→ cells 1/0/2) and `complexity`
-/// pushed above the PROFILED cut (→ cell 3) — must yield >=3 DISTINCT gaits on that ONE archetype.
-/// This is the clap-test proxy stated directly: clap two of THESE themes (same contour) and they
-/// no longer share a gait. We confirm post-hoc that all swept fixtures DID land on one archetype
-/// (the corner holds the quadrant), then assert the variance floor on the held-constant contour.
+/// LIVE rhythm-cell selector axis must yield >=3 DISTINCT gaits on that ONE archetype. This is the
+/// clap-test proxy stated directly: clap two of THESE themes (same contour) and they no longer
+/// share a gait — the image moves the gait. We confirm post-hoc that all swept fixtures DID land on
+/// one archetype (the corner holds the quadrant), then assert the variance floor on the
+/// held-constant contour.
+///
+/// MECHANISM under the REVERTED cell axis (`CELL_EDGE_BROAD=0.33`, `CELL_EDGE_BUSY=0.66`,
+/// `CELL_COMPLEXITY_PROFILED=0.66` — pre-S50; the S50 lowering to 0.20 was reverted as a
+/// flawed-premise regression). `pick_rhythm_cell` runs ONLY on the theme path, and a theme exists
+/// only when `complexity >= 0.4` (theme_behaviour "fragment", mappings.json). The PROFILED divert
+/// onto the character gait (cell 3) fires at `complexity >= 0.66`. So for a themed image whose
+/// complexity sits in [0.4, 0.66) the cell is chosen by the EDGE RAMP:
+///   `edge_activity < 0.33` → cell 1 (broadest); `[0.33, 0.66)` → cell 0 (S39 anchor);
+///   `>= 0.66` → cell 2 (busiest).
+/// Because PROFILED (0.66) now sits ABOVE the 0.4 theme gate, the edge ramp is REACHABLE for themed
+/// images again — `edge_activity` is NOT inert. (It was inert only under the reverted S50 0.20 gate,
+/// where every themed image's complexity >= 0.4 > 0.20 force-pinned cell 3.)
+///
+/// THIS RE-BLESS (post-revert): the sweep returns to the Architect's preferred form — hold
+/// complexity FIXED at a mid value in [0.4, 0.66) (0.5, below the 0.66 PROFILED cut so the divert
+/// does NOT fire and the theme is still present) and sweep `edge_activity` across the three ramp
+/// bands (0.10 → cell 1, 0.50 → cell 0, 0.80 → cell 2). Three distinct cells on the held Arch
+/// contour realize three distinct gaits, re-proving that the revert restored edge-ramp reachability
+/// for themed images. (edge_activity also moves `range_degrees`, which only reinforces the gait
+/// distinction.)
 #[test]
 fn test_p4_same_contour_image_moves_the_gait() {
     let m = mappings();
     let planner = CompositionPlanner::new(plan_mappings(&m));
 
-    // Hold a bright+flat affect corner FIXED (low arousal / high valence → the ARCHED family) and
-    // vary ONLY the two selector axes. edge_activity 0.10/0.45/0.80 ramps the density cells (1/0/2);
-    // complexity 0.85 (> the 0.66 PROFILED cut) diverts to the character cell (3). Same hue/
-    // brightness/saturation throughout → the affect quadrant (hence the archetype) is constant.
-    let corner = |edge: f32, cplx: f32| img(85.0, 10.0, 0.1, cplx, edge, 40.0, 0.8);
+    // Hold a bright+flat affect corner FIXED (low arousal / high valence → the ARCHED family) with
+    // complexity PINNED at 0.5 — a mid value in [0.4, 0.66): the theme is PRESENT (>= 0.4) and the
+    // PROFILED cell-3 divert does NOT fire (< 0.66), so the EDGE RAMP is the live selector. Vary
+    // ONLY edge_activity across the three ramp bands. Same hue/brightness/saturation/complexity
+    // throughout → the affect quadrant (hence the archetype) and the theme length are constant; only
+    // the edge-driven cell (and range) move.
+    let corner = |edge: f32| img(85.0, 10.0, 0.1, 0.5, edge, 40.0, 0.8);
     let sweep = [
-        corner(0.10, 0.45), // calm, simple   → cell 1
-        corner(0.45, 0.45), // mid,  simple    → cell 0 (the S39 anchor)
-        corner(0.80, 0.45), // busy, simple    → cell 2
-        corner(0.45, 0.85), // mid,  intricate → cell 3 (character/profiled diversion)
+        corner(0.10), // edge < 0.33 → cell 1 (broadest gait)
+        corner(0.50), // edge in [0.33, 0.66) → cell 0 (S39 anchor gait)
+        corner(0.80), // edge >= 0.66 → cell 2 (busiest gait)
     ];
 
     // Confirm the corner holds ONE archetype across the whole sweep (the premise of the clap test:

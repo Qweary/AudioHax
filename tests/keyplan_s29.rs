@@ -378,15 +378,27 @@ fn pivot_voicing_carries_dom7() {
 ///   (ii) AUDIBLE — at the SAME image features, the realized melody onset COUNT differs measurably
 ///        between a high-energy excursion (density 0.65) and a home section (density 0.5). The
 ///        density nudge `(density − 0.5) * DENSITY_ACTIVITY_GAIN(0.5)` shifts edge_activity by
-///        +0.075 on the excursion; with edge_density chosen so the home activity sits AT the
-///        melody arpeggio band cutoff (0.80), the +0.075 tips the excursion OVER it: home →
-///        SYNCOPATED (2 onsets), excursion → ARPEGGIO (3 onsets). A different onset count is a
-///        measurable busyness difference — proof the density read is AUDIBLE, not merely SET.
+///        +0.075 on the excursion; with edge_density chosen so the home activity sits JUST BELOW
+///        the melody arpeggio band cutoff (after the S50 spread), the +0.075 tips the excursion
+///        OVER it: home → SYNCOPATED (2 onsets), excursion → ARPEGGIO (3 onsets). A different
+///        onset count is a measurable busyness difference — proof the density read is AUDIBLE.
+///
+/// S50 RE-BLESS (spec-s50 §3.3 / §6 step 5 — fixture re-calibration, NOT a production defect). The
+/// OLD fixture pinned edge_density 0.04 → base 0.80, exactly AT the ARPEGGIO cutoff. S50 added the
+/// monotone `band_activity_spread` (chord_engine.rs:1097) on the band-ladder comparison input:
+/// for input x >= CENTER(0.40), spread(x) = 0.40 + (x-0.40)*GAIN_HIGH(1.4). So base 0.80 maps to
+/// spread 0.96 — home is now ALREADY saturated at ARPEGGIO (3 onsets) and the excursion can add
+/// nothing (3 vs 3 → the strict `excursion > home` fails). RE-CALIBRATED edge_density to 0.033 so
+/// that AFTER the spread the home sits in SYNCOPATED with headroom for the nudge to cross into
+/// ARPEGGIO. The INTENDED property — "a higher-density excursion sounds BUSIER (more onsets) than
+/// home at the same features" — is unchanged and still exercised across a real band boundary.
 ///
 /// edge_density math (EDGE_ACTIVITY_RANGE_MAX == 0.05): base = (edge_density / 0.05).clamp(0,1).
-/// edge_density 0.04 → base 0.80 exactly. Home nudge 0.0 → activity 0.80 (NOT > 0.80 → syncopated,
-/// 2 onsets). Excursion nudge +0.075 → activity 0.875 (> 0.80 → arpeggio, 3 onsets). Identity
-/// orchestration ⇒ empty prominence ⇒ prom_shift 0.0, so the bands are the bare 0.80/0.55/0.25.
+/// edge_density 0.033 → base 0.66. Home nudge 0.0 → activity 0.66 → spread 0.40+(0.66-0.40)*1.4 =
+/// 0.764 (in (0.55, 0.80] → SYNCOPATED, 2 onsets). Excursion nudge +0.075 → activity 0.735 →
+/// spread 0.40+(0.735-0.40)*1.4 = 0.869 (> 0.80 → ARPEGGIO, 3 onsets). Identity orchestration ⇒
+/// empty prominence ⇒ prom_shift 0.0, so the bands are the bare 0.80/0.55/0.25 (the spread does the
+/// re-positioning; the cut constants are unchanged — spec §2.A).
 #[test]
 fn density_varies_between_home_and_excursion() {
     let kt = key_tempo();
@@ -403,9 +415,11 @@ fn density_varies_between_home_and_excursion() {
         position: PhrasePosition::Interior,
         velocity: 80,
     };
-    // edge_density 0.04 puts the HOME (density 0.5, nudge 0) activity exactly AT the 0.80 arpeggio
-    // cutoff — the band boundary the density nudge tips the excursion across.
-    let f = perf(0.04);
+    // S50: edge_density 0.033 → base 0.66 → spread 0.764, putting HOME (density 0.5, nudge 0) in
+    // the SYNCOPATED band with headroom; the +0.075 excursion nudge → spread 0.869 tips it across
+    // the 0.80 ARPEGGIO cutoff. (Pre-S50 this used 0.04, exactly AT the cutoff, but the S50 spread
+    // now saturates 0.04→0.96 at ARPEGGIO already — see the doc comment above.)
+    let f = perf(0.033);
 
     // The modest in-band densities the planner's energy→density map produces (spec §2.2): a home
     // section is the neutral midpoint; a high-energy excursion is the ceiling.
@@ -453,14 +467,14 @@ fn density_varies_between_home_and_excursion() {
     assert_eq!(
         home_melody.len(),
         2,
-        "home (density 0.5, activity 0.80) sits in the SYNCOPATED band → 2 onsets; got \
+        "home (density 0.5, base 0.66 → spread 0.764) sits in the SYNCOPATED band → 2 onsets; got \
          {home_melody:?}"
     );
     assert_eq!(
         excursion_melody.len(),
         3,
-        "excursion (density 0.65, activity 0.875) is tipped into the ARPEGGIO band → 3 onsets; \
-         got {excursion_melody:?}"
+        "excursion (density 0.65, activity 0.735 → spread 0.869) is tipped into the ARPEGGIO band \
+         → 3 onsets; got {excursion_melody:?}"
     );
 }
 

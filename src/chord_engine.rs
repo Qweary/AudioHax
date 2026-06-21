@@ -1062,6 +1062,47 @@ const MELODY_ARP_CUTOFF: f32 = 0.80; // → ARPEGGIO band (the busiest figure)
 const MELODY_SYNC_CUTOFF: f32 = 0.55; // → SYNCOPATED band
 const MELODY_DOTTED_CUTOFF: f32 = 0.25; // → DOTTED band (minimum real motion); below → SUSTAINED
 
+// S50 — RHYTHM-VARIETY RE-RANGE (the band side). These three are TASTE-OWNED VALUES set by the
+// Affect/Aesthetics reconciliation (design-s50-affect-cutpoints.md §1 ∥ design-s50-aesthetics-
+// cutpoints.md §1; the lead reconciled the two lenses to these numbers). They parameterize
+// `band_activity_spread` below; they do NOT move the band cut constants above (0.80/0.55/0.25 stay
+// frozen — the spread does the re-positioning so `melody_activity_class` and the arm keep ONE shared
+// cutoff source, spec §2.A).
+const BAND_SPREAD_CENTER: f32 = 0.40; // pivot = the natural-photo activity centroid AND freeze-neutral reference
+const BAND_SPREAD_GAIN_LOW: f32 = 1.8; // slope below center (opens the calm side toward SUSTAINED)
+const BAND_SPREAD_GAIN_HIGH: f32 = 1.4; // slope at/above center (opens the busy side toward SYNC/ARP)
+
+/// S50 — re-range the BAND-INPUT activity onto the real-image distribution. Maps the measured
+/// natural-photo cluster across the full 0..1 decision range so the EXISTING band cuts
+/// (0.80/0.55/0.25) bite again — instead of every real photo pancaking onto DOTTED. The transform
+/// is a one-knee piecewise-linear stretch about `BAND_SPREAD_CENTER`, monotone non-decreasing, with
+/// a FIXED POINT at the center (identity there → the band ladder is byte-neutral at the reference
+/// activity, spec §3.2) and identity whenever both gains are 1.0 (the gate can disable the spread).
+///
+/// theory: rhythmic subdivision should track visual activity (the affect bridge: more visual energy
+/// → more onsets), but natural photographs occupy a COMPRESSED activity sub-band (≈0.30–0.51 edge
+/// for four of the six bundled images), so a raw mapping collapses them all into one band. A linear
+/// stretch about the cluster centroid re-expands that compressed sub-band so the calm tail can reach
+/// SUSTAINED and the busy tail can reach SYNCOPATED/ARPEGGIO — i.e. SUSTAINED..ARPEGGIO are all
+/// REACHABLE for real photos. The slope is ASYMMETRIC (low side > high side) on purpose: the calm
+/// side opens hard toward SUSTAINED (a calm image should genuinely hold), while the busy side opens
+/// only enough to separate the one genuinely-busy image into ARPEGGIO WITHOUT flinging the
+/// mid-cluster into the "computer-like fragmentation" failure (the over-drive guard).
+///
+/// Pure, RNG-free, free fn (the `melody_total_rhythm_shift` precedent). Applied ONLY to the
+/// band-ladder comparison input and (mirrored) inside `melody_activity_class` so the helper stays
+/// 1:1 with the arm — NEVER to the articulation curve, the FILL_REST check, or the `/0.05`
+/// normalization (the freeze discipline that keeps the diversity_s13 articulation goldens
+/// byte-identical, spec §3.3).
+fn band_activity_spread(edge_activity: f32) -> f32 {
+    let slope = if edge_activity < BAND_SPREAD_CENTER {
+        BAND_SPREAD_GAIN_LOW
+    } else {
+        BAND_SPREAD_GAIN_HIGH
+    };
+    (BAND_SPREAD_CENTER + (edge_activity - BAND_SPREAD_CENTER) * slope).clamp(0.0, 1.0)
+}
+
 /// The realized rhythmic-activity CLASS of a voice on a step — coarse, RNG-free, and
 /// structural (a function of `edge_activity` + the arm's band, never of absolute pitch).
 /// Ordering IS the figure-ground rank: Sustained < Oblique < Subdividing. The Counter arm
@@ -1099,9 +1140,14 @@ fn melody_activity_class(edge_activity: f32, prom_shift: f32, pre_cadence: bool)
     // anything clearing ARP also clears SYNC (the ARP_CUTOFF const is retained as the arm's
     // own band boundary). pre_cadence forces the ARPEGGIO band, also Subdividing. Below SYNC
     // but above DOTTED is Oblique (minimum real motion); below DOTTED is Sustained (held tone).
-    if pre_cadence || edge_activity > (MELODY_SYNC_CUTOFF - prom_shift) {
+    // S50 — mirror the band ladder's `band_activity_spread` on the comparison input so this helper
+    // stays 1:1 with the Melody arm (the governor MUST see the same melody class the arm renders).
+    // Spread is identity at BAND_SPREAD_CENTER and when the gains are 1.0, so the freeze witness is
+    // preserved; the cut CONSTANTS stay 0.80/0.55/0.25 (spec §3.3).
+    let spread = band_activity_spread(edge_activity);
+    if pre_cadence || spread > (MELODY_SYNC_CUTOFF - prom_shift) {
         ActivityClass::Subdividing // ARPEGGIO + SYNCOPATED bands — the melody MOVES
-    } else if edge_activity > (MELODY_DOTTED_CUTOFF - prom_shift) {
+    } else if spread > (MELODY_DOTTED_CUTOFF - prom_shift) {
         ActivityClass::Oblique // DOTTED band — minimum real motion
     } else {
         ActivityClass::Sustained // the SUSTAINED arm — one held tone
@@ -2621,8 +2667,16 @@ fn realize_rhythm(
             // step_ms/4), where the counter MOVES (Subdividing) at step_ms/4 — pushing them would
             // double-displace and risk F5a re-fusion (spec §2b.2). So `pushable` gates the
             // inverse-comp onset push to exactly the calm/low-activity bands the F4 metric reads.
+            // S50 — RHYTHM-VARIETY RE-RANGE: the band ladder compares the SPREAD activity (the
+            // natural-photo cluster fanned across the full decision range) against the unchanged cut
+            // constants, so distinct images land on distinct bands instead of all collapsing onto
+            // DOTTED. Applied to the BAND-LADDER comparison input ONLY — `edge_activity` itself is
+            // left UNMAPPED for the articulation curve / FILL_REST / `/0.05` (the freeze discipline,
+            // spec §3.3). Composes WITH `prom_shift` exactly as before: spread the activity, THEN
+            // compare against `CUTOFF - prom_shift` (the per-role L1 bias + prominence are untouched).
+            let band_edge = band_activity_spread(edge_activity);
             let (mut events, pushable): (Vec<NoteEvent>, bool) =
-                if pre_cadence || edge_activity > (MELODY_ARP_CUTOFF - prom_shift) {
+                if pre_cadence || band_edge > (MELODY_ARP_CUTOFF - prom_shift) {
                     // ARPEGGIO / acceleration: spread chord-tone onsets evenly across
                     // the step (more onsets, shorter values) — the active, driving
                     // figure. theory: subdividing the beat is the melody's way of
@@ -2636,7 +2690,7 @@ fn realize_rhythm(
                         })
                         .collect();
                     (ev, false) // already spread off the downbeat — NOT pushable
-                } else if edge_activity > (MELODY_SYNC_CUTOFF - prom_shift) {
+                } else if band_edge > (MELODY_SYNC_CUTOFF - prom_shift) {
                     // SYNCOPATED: delay the onset off the downbeat by 1/4 step, then
                     // a second onset, pushing against the meter. theory: syncopation
                     // displaces the accent to energize an active-but-not-busy melody.
@@ -2646,7 +2700,7 @@ fn realize_rhythm(
                         sustained(step_ms * 3 / 4, step_ms / 4, STACCATO_FRAC),
                     ];
                     (ev, false) // first onset already at step_ms/4 — NOT pushable
-                } else if floor_to_dotted || edge_activity > (MELODY_DOTTED_CUTOFF - prom_shift) {
+                } else if floor_to_dotted || band_edge > (MELODY_DOTTED_CUTOFF - prom_shift) {
                     // DOTTED: a long-short pair (onsets at 0 and 2/3; holds 2/3 and
                     // 1/3) — the lilting mid-activity figure. theory: the dotted
                     // rhythm is the default expressive subdivision of a singing line.
@@ -9757,16 +9811,21 @@ mod tests {
 
     /// PROPERTY: a FOREGROUND prom_shift lowers the cutoffs, so a borderline-calm melody
     /// reaches the DOTTED band sooner (the S23 rhythm bias, mirrored 1:1 in the helper).
-    /// At edge 0.24 with a foreground shift (0.05) the dotted cutoff drops 0.25→0.20, so
-    /// 0.24 > 0.20 → Oblique; with neutral shift 0.24 ≤ 0.25 → Sustained.
+    /// S50 re-bless: the helper now SPREADS its input through `band_activity_spread` before the
+    /// band comparison (mirroring the arm 1:1). At edge 0.30 the spread is
+    /// 0.40 + (0.30-0.40)*GAIN_LOW(1.8) = 0.22, which sits between DOTTED-0.05(0.20) and
+    /// DOTTED(0.25): with a foreground shift (0.05) the dotted cutoff drops 0.25→0.20, so
+    /// 0.22 > 0.20 → Oblique; with neutral shift 0.22 ≤ 0.25 → Sustained. The PROPERTY (a
+    /// foreground shift reaches DOTTED sooner) is unchanged; only the boundary edge value moves
+    /// because the comparison input is now the spread value.
     #[test]
     fn s47_melody_activity_class_prom_shift_lowers_cutoffs() {
         assert_eq!(
-            melody_activity_class(0.24, 0.0, false),
+            melody_activity_class(0.30, 0.0, false),
             ActivityClass::Sustained
         );
         assert_eq!(
-            melody_activity_class(0.24, 0.05, false),
+            melody_activity_class(0.30, 0.05, false),
             ActivityClass::Oblique,
             "a foreground melody subdivides more readily — the cutoff shift reaches DOTTED"
         );

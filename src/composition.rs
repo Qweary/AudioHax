@@ -1767,6 +1767,15 @@ fn pick_archetype(u: &ImageUnderstanding) -> MotifArchetype {
 //   edge_activity <  CELL_EDGE_BROAD   → cell 1 (BROADER / augmented — the calmest gait)
 //   edge_activity <  CELL_EDGE_BUSY    → cell 0 (the S39 anchor — broad-but-moving)
 //   edge_activity >= CELL_EDGE_BUSY    → cell 2 (BUSIEST / even-subdivided — energetic)
+// CELL AXIS REVERTED to pre-S50 (pending fix-direction-2). The S50 cell-side re-range tried to
+// TIGHTEN these edges around the natural-photo cluster, but `pick_rhythm_cell` runs ONLY on the
+// theme path, and a theme exists only when complexity >= 0.4 (the `theme_behaviour` rule in
+// mappings.json). With the S50 PROFILED gate lowered to 0.20 — at/below that 0.4 theme gate —
+// EVERY themed image satisfied complexity >= PROFILED and force-pinned onto cell 3, killing the
+// cells 0/1/2 edge ramp entirely (zero benefit on the six bundled images: example/magic are
+// high-complexity → cell 3 under either value). So the cell axis is reverted to its pre-S50
+// values; the S50 spread is delivered by the band re-range (chord_engine.rs) + the character gate
+// (mappings.json), both UNTOUCHED. Invariant BROAD < BUSY holds (0.33 < 0.66).
 const CELL_EDGE_BROAD: f32 = 0.33;
 const CELL_EDGE_BUSY: f32 = 0.66;
 // SECONDARY axis = `complexity`. A high-complexity image is diverted onto cell 3 — the
@@ -1774,6 +1783,12 @@ const CELL_EDGE_BUSY: f32 = 0.66;
 // re-collapse onto the same density-picked cell: the busy/calm one keeps its density gait,
 // the visually-intricate one snaps to the character gait instead. This is the decorrelating
 // tiebreak (the clap-test win comes from two near-identical-energy images splitting gaits).
+// REVERTED to pre-S50 (0.66), pending fix-direction-2. The S50 lowering to 0.20 was a flawed-premise
+// regression: `pick_rhythm_cell` runs only on the theme path, and a theme requires complexity >= 0.4
+// (the `theme_behaviour` rule in mappings.json). Any PROFILED gate at or below that 0.4 theme gate is
+// therefore satisfied by EVERY themed image, force-pinning all of them onto cell 3 and killing the
+// edge ramp (cells 0/1/2). PROFILED must stay ABOVE 0.4 — 0.66 does — so that the edge ramp stays
+// reachable for themed images whose complexity falls in [0.4, 0.66).
 const CELL_COMPLEXITY_PROFILED: f32 = 0.66;
 
 /// Pick a rhythm-cell index (`0..cell_count-1`) for the chosen `archetype` from the image's
@@ -2445,7 +2460,13 @@ mod tests {
     }
 
     /// LOCKED slice-1 Section invariants: every section is home-key, base-tempo, home-mode,
-    /// variation ∈ {Identity, Fragmented}; the plan is Ballad / Four4.
+    /// variation ∈ {Identity, Fragmented}; the plan is Four4.
+    /// S50 re-bless: the character is no longer pinned to Ballad. The S50 rhythm-variety re-range
+    /// lowered the scherzo/march arousal gate (0.60→0.34) so mid-arousal images leave the ballad
+    /// default. For `u_with(0.5, 0.5)` (neutral sat 50 / colorfulness 0 / brightness 50) the
+    /// composite is arousal≈0.375, valence≈0.45 → arousal ≥ 0.34 AND valence < 0.55 → March
+    /// (the deadzone-closing split). Meter stays Four4 (its rules are still empty — deferred,
+    /// spec §2.D). The section-level home-key/tempo/mode invariants below are untouched by S50.
     #[test]
     fn slice1_section_invariants_hold() {
         let pm: PlanMappings = mappings()
@@ -2455,7 +2476,7 @@ mod tests {
             .into();
         let planner = CompositionPlanner::new(pm);
         let plan = planner.plan(&u_with(0.5, 0.5), &mappings());
-        assert_eq!(plan.character, Character::Ballad);
+        assert_eq!(plan.character, Character::March);
         assert_eq!(plan.meter, Meter::Four4);
         for s in &plan.sections {
             assert_eq!(s.key_offset_semitones, 0, "home key only in slice 1");

@@ -201,8 +201,8 @@
     "character": {
       "default": "ballad",
       "rules": [
-        { "when": [ {"knob":"arousal","op":"ge","lo":0.60,"hi":0.0}, {"knob":"valence","op":"ge","lo":0.55,"hi":0.0} ], "pick": "scherzo" },
-        { "when": [ {"knob":"arousal","op":"ge","lo":0.60,"hi":0.0}, {"knob":"valence","op":"lt","lo":0.45,"hi":0.0} ], "pick": "march" },
+        { "when": [ {"knob":"arousal","op":"ge","lo":0.34,"hi":0.0}, {"knob":"valence","op":"ge","lo":0.55,"hi":0.0} ], "pick": "scherzo" },
+        { "when": [ {"knob":"arousal","op":"ge","lo":0.34,"hi":0.0}, {"knob":"valence","op":"lt","lo":0.55,"hi":0.0} ], "pick": "march" },
         { "when": [ {"knob":"arousal","op":"le","lo":0.30,"hi":0.0}, {"knob":"valence","op":"lt","lo":0.35,"hi":0.0} ], "pick": "lament" },
         { "when": [ {"knob":"arousal","op":"le","lo":0.30,"hi":0.0}, {"knob":"valence","op":"ge","lo":0.55,"hi":0.0} ], "pick": "hymn" },
         { "when": [ {"knob":"arousal","op":"le","lo":0.35,"hi":0.0}, {"knob":"valence","op":"in_range","lo":0.35,"hi":0.47} ], "pick": "nocturne" }

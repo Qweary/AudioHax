@@ -112,44 +112,82 @@ fn calm_dark() -> ImageUnderstanding {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// AROUSAL monotonicity (saturation-led), observed downstream: holding every other feature
-/// fixed at the energetic profile, RAISING `avg_saturation` can only raise arousal, so the
-/// higher-saturation image must select a character at least as energetic and a BPM at least as
-/// fast as the lower-saturation one. Concretely: the low-saturation image stays Ballad
-/// (sub-threshold arousal) while the high-saturation image crosses into Scherzo with a strictly
-/// faster BPM. This is the affect bridge's load-bearing arousal driver (avg_saturation, weight
-/// 0.45) made observable. Replaces a direct `affect_composite(..).arousal` comparison (private).
+/// fixed at a CALM, low-brightness profile, RAISING `avg_saturation` can only raise arousal, so
+/// the higher-saturation image must select a more-energetic character and a STRICTLY faster BPM
+/// than the lower-saturation one. This is the affect bridge's load-bearing arousal driver
+/// (avg_saturation, weight 0.45) made observable. Replaces a direct
+/// `affect_composite(..).arousal` comparison (private).
+///
+/// S50 RE-BLESS (spec-s50 §3.3 / §6 step 5 — fixture re-calibration, NOT a production defect).
+/// The S50 character-gate move (scherzo/march arousal ge 0.60 → 0.34) un-pinned the OLD fixtures:
+/// at the original bright base (avg_brightness 62), both lo_sat (arousal 0.545) and hi_sat (0.927)
+/// now clear the 0.34 gate, so both leave ballad — lo_sat → March, hi_sat → Scherzo — and BOTH
+/// take the SAME brightness-derived raw BPM (121.7), which lands INSIDE both the March (96..132)
+/// and Scherzo (120..168) windows UNCLAMPED → a TIE that fails the strict `>` assert.
+///
+/// HONEST DIAGNOSIS (lead-flagged): this is a FIXTURE ARTIFACT, not a broken monotone property.
+/// Tempo is driven by BRIGHTNESS (the raw BPM), and the character window only CLAMPS it; so
+/// "more arousal → faster" is exercised ONLY where the higher-arousal character's window floor
+/// pulls the raw BPM UP (or the lower character's ceiling holds it DOWN). The old fixture sat at
+/// a brightness where the raw BPM was already inside BOTH windows, so going March→Scherzo changed
+/// nothing — a non-exercising fixture, not a property failure. RE-CALIBRATED here to a LOW-
+/// brightness, modest-energy base where the property is genuinely exercised: at avg_brightness 30
+/// the raw BPM is 87.2, BELOW March's 96 floor and ABOVE Lament's 66 ceiling, so:
+///   lo_sat (sat 20) → arousal 0.220 (below the 0.34 energetic gate, below the 0.30 lament gate
+///                     on a sub-0.35 valence) → Lament, window 44..66 → raw 87.2 clamped DOWN to 66.
+///   hi_sat (sat 80) → arousal 0.490 (clears the 0.34 gate; valence 0.427 < 0.55) → March, window
+///                     96..132 → raw 87.2 clamped UP to 96.
+/// → BPM rises 66 → 96 as saturation rises: the monotone-tempo property is REALLY exercised
+/// (a genuine character-window crossing), not trivially passed. The property HOLDS — the original
+/// red was the fixture's location, not the affect bridge.
 #[test]
 fn affect_arousal_monotone_in_saturation_downstream() {
     let m = mappings();
     let planner = CompositionPlanner::new(plan_mappings(&m));
 
-    // Base energetic profile, but low saturation: arousal stays under the 0.60 Scherzo gate.
-    let lo_sat = ImageUnderstanding {
-        avg_saturation: 10.0,
-        ..bright_energetic()
+    // A CALM, low-brightness base (so the raw BPM sits between the Lament ceiling and the March
+    // floor, where the character window genuinely moves the tempo). Vary ONLY saturation.
+    let calm_low_bright = ImageUnderstanding {
+        colorfulness: 0.20,
+        edge_activity: 0.25,
+        complexity: 0.30,
+        avg_brightness: 30.0,
+        fg_bg_contrast: 0.15,
+        ..ImageUnderstanding::neutral()
     };
-    // Same profile, high saturation: arousal crosses the gate.
+    // Low saturation → arousal 0.220 (below the 0.34 energetic gate): a calm character.
+    let lo_sat = ImageUnderstanding {
+        avg_saturation: 20.0,
+        ..calm_low_bright
+    };
+    // High saturation → arousal 0.490 (clears the 0.34 gate): the energetic March corner.
     let hi_sat = ImageUnderstanding {
-        avg_saturation: 95.0,
-        ..bright_energetic()
+        avg_saturation: 80.0,
+        ..calm_low_bright
     };
 
     let plo = planner.plan(&lo_sat, &m);
     let phi = planner.plan(&hi_sat, &m);
 
-    // Downstream witness of arousal↑: the high-saturation image selects the energetic corner,
-    // the low-saturation one does not (it lacks the arousal to fire the Scherzo rule).
+    // Downstream witness of arousal↑: the high-saturation image crosses INTO the energetic corner
+    // (March, arousal ≥ 0.34), the low-saturation one does NOT (it stays a calm character).
     assert_eq!(
         phi.character,
-        Character::Scherzo,
-        "high-saturation energetic image should reach Scherzo (arousal over 0.60 gate)"
+        Character::March,
+        "high-saturation image should reach the energetic March corner (arousal over the 0.34 gate)"
     );
-    assert_ne!(
-        plo.character,
-        Character::Scherzo,
-        "low-saturation image must NOT reach Scherzo (arousal below the gate)"
+    assert!(
+        matches!(
+            plo.character,
+            Character::Lament | Character::Nocturne | Character::Hymn
+        ),
+        "low-saturation image must stay a CALM character (arousal below the 0.34 energetic gate); \
+         got {:?}",
+        plo.character
     );
-    // …and the higher-arousal image is at least as fast (Scherzo window de-caps above Ballad).
+    // …and the higher-arousal image is STRICTLY faster: the March window floor (96) pulls the raw
+    // BPM UP, the lower character's window ceiling held it down. This is the real arousal→tempo
+    // crossing the OLD fixture failed to exercise.
     assert!(
         plan_bpm(&phi) > plan_bpm(&plo),
         "higher saturation (higher arousal) must yield a faster tempo: hi={:.2} lo={:.2}",
@@ -285,20 +323,34 @@ fn calm_dark_picks_slow_minor_leaning_character() {
 /// A vector that fires NO character rule falls through to the safe `ballad` catch-all default
 /// (first-match-wins, default last). Witnesses that the filled ladder preserves the Ballad
 /// default for the unclassified middle, and that Ballad clamps to its 56..96 window.
+///
+/// S50 RE-BLESS (spec-s50 §3.3 / §6 step 5 — fixture re-calibration, NOT a production defect).
+/// The OLD fixture (arousal ≈ 0.405) was built to sit in the pre-S50 (0.30, 0.60) ballad deadzone.
+/// S50 DELIBERATELY closed most of that deadzone (scherzo/march arousal gate 0.60 → 0.34), so the
+/// old vector now CLEARS the 0.34 gate and resolves Scherzo — the test was pinned to a region the
+/// re-range legitimately removed. The INTENDED property — "an unclassified/neutral vector falls
+/// through to ballad" — is still GUARDABLE because a narrow unclassified region survives: arousal
+/// in the (0.30, 0.34) gap (above the lament/hymn 0.30 gate, below the scherzo/march 0.34 gate)
+/// AND valence OUTSIDE nocturne's [0.35, 0.47] band. RE-CALIBRATED here to a vector that lands
+/// squarely in that surviving gap: arousal 0.3175 (mid of 0.30..0.34), valence 0.516 (above
+/// nocturne's 0.47 ceiling, below scherzo/hymn's 0.55 floor) → no rule fires → Ballad. The
+/// fall-through property is still genuinely tested.
 #[test]
 fn unclassified_vector_falls_through_to_ballad() {
     let m = mappings();
     let planner = CompositionPlanner::new(plan_mappings(&m));
 
-    // arousal ≈ 0.45*0.90 = 0.405 (in the (0.30, 0.60) gap — fails both ge-0.60 and le-0.30/0.35
-    // rows); valence ≈ 0.70*0.5 + 0.20*0.9 + 0.05 = 0.58 (also in no calm-rule band given the
-    // arousal gap). No rule fires → Ballad.
+    // arousal = 0.45*0.65 + 0.25*0.10 = 0.2925 + 0.025 = 0.3175 — in the SURVIVING (0.30, 0.34)
+    //   unclassified gap: above the lament/hymn `le 0.30` rows, below the scherzo/march `ge 0.34`
+    //   rows. valence = 0.70*0.48 + 0.20*0.65 + 0.10*(0.5) = 0.336 + 0.13 + 0.05 = 0.516 — above
+    //   nocturne's 0.47 `in_range` ceiling and below scherzo/hymn's 0.55 floor. No rule fires →
+    //   Ballad (the catch-all default).
     let unclassified = ImageUnderstanding {
-        avg_saturation: 90.0,
+        avg_saturation: 65.0,
         colorfulness: 0.10,
         edge_activity: 0.0,
         complexity: 0.0,
-        avg_brightness: 50.0,
+        avg_brightness: 48.0,
         fg_bg_contrast: 0.0,
         ..ImageUnderstanding::neutral()
     };
