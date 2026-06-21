@@ -33,6 +33,7 @@
 //!   3. BYTE-FREEZE GUARD — confirmed out-of-band: `engine_equivalence` stays
 //!      byte-green alongside this net (see the file footer + the returned run log).
 
+use audiohax::chord_engine::RhythmMotto;
 use audiohax::chord_engine::{
     realize_step, Chord, NoteEvent, PerfFeatures, PhrasePosition, StepPlan,
 };
@@ -386,6 +387,7 @@ fn pad_bed_counter() -> OrchestrationProfile {
         bass_pattern: None,
         bass_pattern_resolved: None,
         prominence: Vec::new(),
+        motto: RhythmMotto::neutral(),
     }
 }
 

@@ -2019,6 +2019,23 @@ const THEME_LONG_NOTE_SING: f32 = 1.15;
 /// The ritardando multiplier applied to a phrase-final note's hold. theory: as
 /// the phrase relaxes into its arrival the final note rings longer.
 const RITARDANDO_FACTOR: f32 = 1.30;
+/// S53 (D-CELL) — the per-piece MOTTO onset-bias depth: the MAXIMUM fraction of an interior onset's
+/// local inter-onset gap by which the per-piece rhythmic motto may DISPLACE that onset (cell 3 only
+/// uses the full depth; cell 1 a partial pull). theory & guard-rails: the motto biases WHERE the
+/// melody's already-chosen onsets sit, never HOW MANY (count-preserving — GR-1: it cannot promote a
+/// voice's ActivityClass because it changes no onset count and touches only the Melody/figure), and
+/// the displacement is a FRACTION of the GAP to the next onset so it can never cross the next onset
+/// or the step boundary. 0.18 is conservative: a perceptible lilt/steadying (≈ one-tenth-to-one-fifth
+/// of a beat's "and") that the ear reads as a different WALK without fragmenting the texture or
+/// muddying the downbeat. Ear-tune window [0.12, 0.25]; below 0.12 the gait is inaudible (GR-4),
+/// above 0.25 the syncopation starts to read as a metric error rather than a swung profile.
+const MOTTO_ONSET_BIAS_DEPTH: f32 = 0.18;
+/// S53 (D-CELL) — the pre-cadence attenuation of the motto onset bias (GR-2): the phrase RELAXES
+/// into its close, so the bias is HALVED on the pre-cadence approach step and ZEROED at the cadence
+/// itself (the cadence ring early-returns above, structurally unperturbed). theory: a gait that kept
+/// stamping its off-grid signature through the homecoming would rob the arrival of repose; the gait
+/// drives the phrase BODY and gets out of the way for the cadence.
+const MOTTO_PRECADENCE_ATTEN: f32 = 0.5;
 /// The NORMALIZED edge-activity floor below which an inner voice may rest-as-
 /// gesture on a weak interior beat. theory: rest-as-gesture is a deliberate
 /// silence that lets the outer voices speak — it must be RARE and intentional,
@@ -2765,8 +2782,109 @@ fn realize_rhythm(
                 }
             }
 
+            // S53 (D-CELL) — APPLY THE PER-PIECE RHYTHMIC MOTTO onset bias. theory: this is the
+            // deliverable — the per-piece gait that gives a short image-piece a hummable identity.
+            // The motto re-places WHERE the melody's onsets sit (its WALK) WITHOUT changing how many
+            // there are, so it composes UNDER the band ladder (the band already chose the onset
+            // COUNT; the motto only shapes the spacing). Guard-rail compliance:
+            //   • GR-1 (figure-ground): applied ONLY to the Melody (the figure) and ONLY by moving
+            //     existing onsets — it adds zero onsets, so it can never raise any voice's
+            //     ActivityClass; the bed roles are never touched, so `bed_onsets ≤ melody_onsets`
+            //     (spec-s46 F5b) is untouched by construction.
+            //   • GR-2 (homecoming): the cadence ring already early-returned above (bias = 0 at the
+            //     cadence, structurally); on the pre-cadence approach the bias is HALVED so the
+            //     phrase relaxes into its close.
+            //   • freeze hinge (I-4): `motto.is_neutral()` (cell_index == None on every legacy/
+            //     identity/single_section_default section) short-circuits → events are returned
+            //     byte-identical to pre-S53. The engine_equivalence goldens carry neutral() and
+            //     cannot move.
+            // Count-preserving and bounded WITHIN the step (each displaced onset stays strictly
+            // before the next onset / the step boundary), so it can never re-order onsets or ring
+            // across the kernel step (the same freeze-safety the comp push above relies on).
+            let motto = ctx.section.orchestration.motto;
+            if matches!(role, OrchestralRole::Melody) && !motto.is_neutral() && events.len() >= 2 {
+                let atten = if pre_cadence {
+                    MOTTO_PRECADENCE_ATTEN
+                } else {
+                    1.0
+                };
+                apply_motto_onset_bias(&mut events, motto, step_ms, atten);
+            }
+
             events
         }
+    }
+}
+
+/// S53 (D-CELL) — displace the melody's INTERIOR onsets to express the per-piece motto's gait.
+/// COUNT-PRESERVING: it moves WHERE onsets sit, never HOW MANY. Each interior onset (index ≥ 1) is
+/// nudged by a signed fraction of the GAP to its NEXT neighbour (or the step boundary for the last
+/// onset), so a displaced onset can never reach or pass the following onset — onset ORDER and COUNT
+/// are invariant, and nothing rings across the step boundary. The FIRST onset (the downbeat anchor)
+/// is left in place so the beat-one reference the ear locks onto is never blurred (GR-2 readability).
+///
+/// theory — the four gaits map to four signed displacement characters (read off the cell index,
+/// whose authored semantics are in `MotifArchetype::rhythm_cells`):
+///   * cell 0 (the S39 anchor): NEUTRAL — no displacement (the even reference walk).
+///   * cell 1 (broad/augmented): a small EARLIER pull — onsets settle a touch toward the grid, the
+///     calm, steady, "on-the-beat" reading (negative phase).
+///   * cell 2 (busy/even-subdivided): NEUTRAL even spacing — the moto-perpetuo walk is already even;
+///     biasing it would fight its defining evenness, so it keeps its grid.
+///   * cell 3 (profiled/syncopated): a LATER push — interior onsets lean off the grid toward the
+///     following weak phase, the characteristic lilting/swung lurch (positive phase, full depth).
+///
+/// The depth is `MOTTO_ONSET_BIAS_DEPTH` (× the per-cell character weight × the boundary `atten`),
+/// taken as a fraction of the local gap so a wide gap lilts more than a tight one (musically: a
+/// slow walk swings more audibly than a fast run). Pure; no RNG, no clock.
+fn apply_motto_onset_bias(events: &mut [NoteEvent], motto: RhythmMotto, step_ms: u64, atten: f32) {
+    // The signed character weight of the motto's cell (neutral cells contribute 0 → early return).
+    let cell = match motto.cell_index {
+        Some(c) => c,
+        None => return,
+    };
+    let character: f32 = match cell {
+        1 => -0.6, // broad → a gentle earlier pull toward the grid (steadier)
+        3 => 1.0,  // profiled → the full later lean (the syncopated lurch)
+        _ => 0.0,  // cell 0 (anchor) and cell 2 (even) keep their grid
+    };
+    if character == 0.0 || atten == 0.0 {
+        return;
+    }
+    let depth = MOTTO_ONSET_BIAS_DEPTH * character * atten;
+
+    let n = events.len();
+    // Walk interior onsets (skip index 0 — the downbeat anchor). For each, the available room is
+    // the gap to the NEXT onset (or the step boundary for the final onset); the displacement is a
+    // fraction of that gap, BOUNDED so the onset stays strictly inside (offset, next_offset).
+    for i in 1..n {
+        let here = events[i].offset_ms;
+        let next = if i + 1 < n {
+            events[i + 1].offset_ms
+        } else {
+            step_ms
+        };
+        // Margins to the neighbours so the bias can never reach an adjacent onset/boundary
+        // (preserve strict ordering): cap at just under the gap on the side we move toward.
+        let gap_after = next.saturating_sub(here);
+        let gap_before = here.saturating_sub(events[i - 1].offset_ms);
+        // The raw signed shift in ms; positive = later (toward `next`), negative = earlier.
+        let raw = (depth * gap_after.min(gap_before) as f32).round() as i64;
+        if raw == 0 {
+            continue;
+        }
+        // Keep at least 1 ms of separation from each neighbour so onsets never coincide/re-order.
+        let max_later = gap_after.saturating_sub(1) as i64;
+        let max_earlier = gap_before.saturating_sub(1) as i64;
+        let shift = raw.clamp(-max_earlier, max_later);
+        if shift == 0 {
+            continue;
+        }
+        let new_offset = (here as i64 + shift).max(0) as u64;
+        // Re-fit this onset's hold into the room remaining before the next onset / step boundary,
+        // preserving count and never ringing past the next event (the comp-push re-fit precedent).
+        let room = next.saturating_sub(new_offset).max(1);
+        events[i].offset_ms = new_offset;
+        events[i].hold_ms = events[i].hold_ms.max(1).min(room);
     }
 }
 
@@ -3331,6 +3449,156 @@ impl MotifArchetype {
     pub fn rhythm_cell_count(self) -> usize {
         self.rhythm_cells().len()
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// S53 / fix-direction-2 SLICE 1 (D-CELL) — THE PER-PIECE RHYTHMIC MOTTO + its un-gated selector.
+//
+// theory (the whole point of the slice): a short image-piece earns a hummable IDENTITY from ONE
+// recognizable rhythmic GAIT that recurs — "this is how this picture walks." Until now the cell
+// axis (the four idiomatic gaits authored per archetype in `rhythm_cells`) was reachable ONLY on
+// the synthetic THEME path (complexity >= 0.4), so every real photo got NO cell — the gait was
+// dead on the real path (design-s53-cell-seam §1). This slice lifts a per-piece `RhythmMotto` —
+// an (archetype, cell) IDENTITY, not a resolved subject motif — selected once per plan from
+// robust per-image features INDEPENDENT of the theme gate, stamped on every Section, and read by
+// `realize_rhythm` to BIAS onset placement within the band the band-ladder already chose. The
+// selection LOGIC lives here beside the cell vocabulary it indexes (so the cuts and the cells are
+// one source); the carrier (`Section.motto`) and the realizer read live downstream.
+// ════════════════════════════════════════════════════════════════════════════════════════════
+
+/// S53 D-CELL — the per-piece cell-1/0/2 density-ramp edges, applied to the `band_activity_spread`-
+/// re-expanded `edge_activity` (NOT raw edge — the natural-photo cluster compresses into ≈0.30–0.51
+/// and would pancake onto one cell without the spread, design-s53-cell-affect §2). These REUSE the
+/// pre-S50 themed-path values (CELL_EDGE_BROAD/BUSY in composition.rs) by VALUE — the cells 0/1/2 of
+/// every archetype are authored as exactly this BROAD→BUSY ramp (`rhythm_cells` doc) — but live here
+/// as their own consts so the per-piece path never reaches across the module boundary for them and
+/// the themed path's reverted consts stay independent. The spread genuinely straddles both cuts for
+/// the real cluster (affect §3.1: spread spans 0.000..0.847 across the six probes), so all three ramp
+/// cells {1,0,2} are reachable — the S50 trap (cuts behind a complexity>=0.4 pre-filter) does NOT
+/// recur because this path has no pre-filter. Invariant BROAD < BUSY holds (0.33 < 0.66).
+const PIECE_EDGE_BROAD: f32 = 0.33; // spread-edge < this → cell 1 (broadest/augmented — calmest gait)
+const PIECE_EDGE_BUSY: f32 = 0.66; // spread-edge >= this → cell 2 (busiest/even-subdivided)
+
+/// S53 D-CELL — the SECONDARY (cell-3 PROFILED/SYNCOPATED) divert cut, keyed on `complexity`,
+/// applied UN-GATED. This is the Affect specialist's adjudicated DRIVER decision (design-s53-cell-
+/// affect §1/§3, confirmed by the lead over the seam spec's original `affect_arousal` proposal):
+/// `affect_arousal` COLLAPSES the probe set (it ties the load-bearing Img3~Lena watch-pair within
+/// 0.016 and only ever clears a cut for the already-distinct `example`), whereas `complexity`
+/// cleanly separates it. complexity is the right CROSS-MODAL percept anyway: syncopation (onsets
+/// displaced off the grid) is the rhythmic analogue of spatial INTRICACY/detail, which `complexity`
+/// (a texture/shape scalar) measures and arousal (a saturation-dominant ENERGY composite) does not.
+/// It only failed in S50 because it was trapped BEHIND the complexity>=0.4 theme gate — the
+/// un-gating removes that trap, so the value the S50 author always intended (0.20) finally reaches
+/// the real-photo cluster.
+///
+/// Value 0.20 sits in the only window that both (a) reaches Img3 (cplx 0.229 — the lower-bound floor:
+/// the cut MUST be <= 0.229 or the Img3~Lena pair never splits) and (b) excludes Lena (cplx 0.164 —
+/// the selectivity ceiling: the cut MUST be > 0.164 or the cell-0 anchor empties). Valid window
+/// (0.164, 0.229]; ear-tune within [0.18, 0.23]. DISTINCT from the themed-path `CELL_COMPLEXITY_PROFILED`
+/// (composition.rs, still 0.66 — that governs the unchanged synthetic theme path and stays reverted).
+const PIECE_COMPLEXITY_PROFILED: f32 = 0.20;
+
+/// A per-piece RHYTHMIC MOTTO: the chosen melodic archetype and the index of its rhythm cell,
+/// selected ONCE per plan and stamped on every `Section`. Carries IDENTITY (archetype + cell),
+/// NOT a resolved `Vec<MotifNote>` — the no-theme path has no subject to replay; the motto only
+/// BIASES the band-ladder onset placement in `realize_rhythm`. `Copy` so it rides `Section` (which
+/// is `Clone`) and the per-section `orchestration.clone()` with zero allocation.
+///
+/// `RhythmMotto::neutral()` is the behaviour-neutral value `realize_rhythm` treats as "apply NO
+/// onset bias", so a section carrying it produces byte-identical output to pre-S53 (the freeze
+/// hinge — design-s53-cell-seam §I-4): the legacy/identity/`single_section_default` paths all carry
+/// it, so the engine_equivalence goldens cannot move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RhythmMotto {
+    pub archetype: MotifArchetype,
+    /// The index of the chosen rhythm cell, OR `None` for the behaviour-neutral motto (apply no
+    /// onset bias). `None` (not "cell 0") IS the freeze hinge: cell 0 is the S39 anchor gait and a
+    /// real per-piece motto MAY legitimately select it, so neutrality must be a value DISTINCT from
+    /// every real cell index — otherwise an image whose motto is genuinely cell 0 would be
+    /// indistinguishable from "no motto" and the realizer could not tell the freeze path from a
+    /// live cell-0 piece. `None` is that distinct sentinel.
+    pub cell_index: Option<usize>,
+}
+
+impl RhythmMotto {
+    /// The behaviour-neutral motto: `realize_rhythm` maps this to "apply NO onset bias", so a
+    /// section carrying it is byte-identical to pre-S53 (the freeze hinge — §I-4). Used by
+    /// `legacy_default_section`, `single_section_default` consumers, and the planner's fallback.
+    /// The archetype is a don't-care placeholder (`Arch`) — `cell_index == None` is what the read
+    /// short-circuits on, never the archetype.
+    pub fn neutral() -> RhythmMotto {
+        RhythmMotto {
+            archetype: MotifArchetype::Arch,
+            cell_index: None,
+        }
+    }
+
+    /// True iff this is the behaviour-neutral (no-bias) motto. The realizer's freeze short-circuit.
+    pub fn is_neutral(self) -> bool {
+        self.cell_index.is_none()
+    }
+}
+
+/// `Default` == `neutral()` — required so `OrchestrationProfile`'s `#[serde(skip)] motto` field
+/// deserializes to the byte-stable no-op (the `prominence`/`figuration_resolved` precedent), so
+/// every profile loaded from mappings.json carries the neutral motto until the planner seats the
+/// live per-piece value.
+impl Default for RhythmMotto {
+    fn default() -> Self {
+        RhythmMotto::neutral()
+    }
+}
+
+/// Select the PER-PIECE rhythmic-motto cell (`0..cell_count`) for `archetype` from robust per-image
+/// features, INDEPENDENT of the theme path. Pure; no RNG, no clock. The returned index is clamped
+/// to `cell_count` (and the realizer also clamps defensively in `rhythm_cell`), so it can never
+/// index out of an archetype's vocabulary.
+///
+/// PRIMARY axis = `band_activity_spread(edge_activity)` against `PIECE_EDGE_BROAD`/`PIECE_EDGE_BUSY`
+/// along the BROAD→BUSY density ramp (cells 1/0/2). Reusing the SAME spread the band ladder reads
+/// means the rhythmic motto and the realized onset density agree on one re-expanded activity.
+///
+/// SECONDARY divert = `complexity >= PIECE_COMPLEXITY_PROFILED` → the PROFILED/SYNCOPATED character
+/// cell (cell 3), GUARDED so it fires ONLY when the primary did not already land the BUSIEST cell 2
+/// (`primary_cell != 2`). theory (the cell-2 guard, affect §3.2): the genuine high-edge outlier
+/// (`example`) must keep its even-subdivided cell-2 gait and not be swept to cell 3 by its high
+/// complexity — cell 3 is reserved for the TEXTURED-but-not-busiest images, so a busy surface walks
+/// evenly while an intricate-but-calm surface lurches. Without the guard the distinct-cell count
+/// drops 4→3 (example would steal cell 3 from its own distinct cell-2 landing).
+///
+/// Takes the two driving features BY VALUE (not `&ImageUnderstanding`) so `chord_engine` imports no
+/// image type — the module boundary "chord engine has no image logic" is preserved; `composition.rs`
+/// reads `u.edge_activity`/`u.complexity` and passes scalars, exactly as it passes range/length to
+/// `resolve_motif_celled`.
+pub fn pick_piece_cell(
+    edge_activity: f32,
+    complexity: f32,
+    _archetype: MotifArchetype,
+    cell_count: usize,
+) -> usize {
+    // PRIMARY: the density ramp on the RE-EXPANDED edge (so the compressed real-photo cluster
+    // actually spans the cuts — without the spread, four of six probes pancake onto one cell).
+    let spread = band_activity_spread(edge_activity);
+    let primary = if spread < PIECE_EDGE_BROAD {
+        1 // calm → the broadest/augmented gait
+    } else if spread < PIECE_EDGE_BUSY {
+        0 // mid energy → the S39 anchor gait (broad-but-moving)
+    } else {
+        2 // busy → the busiest/even-subdivided gait
+    };
+
+    // SECONDARY divert (the decorrelating tiebreak): a visually-INTRICATE image takes the profiled/
+    // syncopated character gait (cell 3) — but GUARDED so the genuine busy outlier (primary == 2)
+    // keeps its even cell-2 gait. The vocabulary must actually HAVE a cell 3 (K >= 4 as authored)
+    // for the divert to be available; otherwise the primary stands and the final clamp keeps range.
+    let index = if complexity >= PIECE_COMPLEXITY_PROFILED && primary != 2 && cell_count > 3 {
+        3
+    } else {
+        primary
+    };
+
+    // Clamp into this archetype's vocabulary (`cell_count >= 1`); saturates to the last cell.
+    index.min(cell_count.saturating_sub(1))
 }
 
 /// Resolve a build-time `MotifArchetype` + image-derived range/length into the
@@ -6340,6 +6608,119 @@ mod tests {
     const REF_MIXOLYDIAN: [i8; 7] = [0, 2, 4, 5, 7, 9, 10];
     const REF_AEOLIAN: [i8; 7] = [0, 2, 3, 5, 7, 8, 10];
 
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // S53 / fix-direction-2 SLICE 1 (D-CELL) — `pick_piece_cell` PURE-SELECTOR UNIT NET.
+    //
+    // Tests the per-piece cell selector in ISOLATION (scalar inputs, no image type — the module
+    // boundary the signature preserves). Reproduces the Affect specialist's adjudicated target
+    // table on the six probe feature vectors, plus the cell-2 guard, the spread reachability, and
+    // the defensive clamp. The probe `(edge_activity, complexity)` pairs are the SAME literals
+    // `tests/cell_distinctness_s53.rs` captured from `understand_image_pure` at clean HEAD.
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    /// K=4 for every authored archetype, so the cell-3 divert is always available in these tests.
+    const K4: usize = 4;
+
+    /// PROPERTY: the six probes separate into the Affect target table {Img1:1, Lena:0, Img2:0,
+    /// example:2, magicstudio:3, Img3:3} — 4 distinct cells, exactly 2 on cell 3 (GR-3 selective).
+    /// Archetype is a don't-care here (the selector keys only on the two scalars), so a fixed
+    /// `Arch` exercises the path for all six.
+    #[test]
+    fn s53_pick_piece_cell_reproduces_affect_target_table() {
+        // (name, edge_activity, complexity, expected_cell) — the adjudicated acceptance set.
+        let probes: [(&str, f32, f32, usize); 6] = [
+            ("AudioHaxImg1", 0.300_852_45, 0.0055, 1),
+            ("Lena", 0.471_038_82, 0.1645, 0),
+            ("AudioHaxImg2", 0.509_440_1, 0.0155, 0),
+            ("example", 0.718_838_33, 0.905, 2),
+            ("magicstudio", 0.106_048_584, 1.0, 3),
+            ("AudioHaxImg3", 0.475_413_02, 0.229, 3),
+        ];
+        let mut distinct = std::collections::BTreeSet::new();
+        let mut on_cell_3 = 0;
+        for (name, edge, cplx, want) in probes {
+            let got = pick_piece_cell(edge, cplx, MotifArchetype::Arch, K4);
+            assert_eq!(
+                got, want,
+                "{name} (edge {edge}, cplx {cplx}) → cell {got}, expected {want} (Affect target)"
+            );
+            distinct.insert(got);
+            if got == 3 {
+                on_cell_3 += 1;
+            }
+        }
+        assert!(
+            distinct.len() >= 4,
+            "the six probes must occupy >= 4 distinct cells (got {distinct:?})"
+        );
+        assert_eq!(
+            on_cell_3, 2,
+            "exactly 2 probes on the syncopated cell 3 (GR-3 selectivity); got {on_cell_3}"
+        );
+    }
+
+    /// PROPERTY (the cell-2 GUARD): a high-edge, high-complexity image (`example`-like) keeps its
+    /// even-subdivided cell 2 and is NOT swept to cell 3 by its high complexity. Without the guard
+    /// it would divert and the distinct-cell count would drop 4→3.
+    #[test]
+    fn s53_pick_piece_cell_cell2_guard_keeps_busy_outlier_even() {
+        // example: spread(0.719) ≈ 0.847 ≥ BUSY → primary cell 2; complexity 0.905 ≥ 0.20 but the
+        // guard blocks the divert because primary == 2.
+        let cell = pick_piece_cell(0.718_838_33, 0.905, MotifArchetype::Descent, K4);
+        assert_eq!(
+            cell, 2,
+            "the busy outlier must keep cell 2 (the guard blocks the divert)"
+        );
+    }
+
+    /// PROPERTY: the complexity divert sits in the (0.164, 0.229] window — it splits the carried
+    /// Img3~Lena watch-pair (Img3 cplx 0.229 diverts to 3; Lena cplx 0.164 stays on the ramp).
+    #[test]
+    fn s53_pick_piece_cell_splits_img3_lena_watch_pair() {
+        // Near-identical edges (both land primary cell 0); only complexity separates them.
+        let img3 = pick_piece_cell(0.475_413_02, 0.229, MotifArchetype::Arch, K4);
+        let lena = pick_piece_cell(0.471_038_82, 0.1645, MotifArchetype::Arch, K4);
+        assert_eq!(
+            img3, 3,
+            "Img3 (cplx 0.229 ≥ 0.20) diverts to the profiled cell 3"
+        );
+        assert_eq!(
+            lena, 0,
+            "Lena (cplx 0.164 < 0.20) stays on the cell-0 anchor"
+        );
+        assert_ne!(img3, lena, "the watch-pair must split on the cell axis");
+    }
+
+    /// PROPERTY: the spread genuinely straddles both primary cuts for the real cluster, so all
+    /// three ramp cells {1,0,2} are reachable (the S50 trap — cuts behind a pre-filter — is gone).
+    #[test]
+    fn s53_pick_piece_cell_primary_ramp_spans_all_three_cells() {
+        // Low-complexity probes so the secondary never fires — isolate the PRIMARY ramp.
+        let calm = pick_piece_cell(0.106_048_584, 0.0, MotifArchetype::Arch, K4); // spread 0.000 → cell 1
+        let mid = pick_piece_cell(0.471_038_82, 0.0, MotifArchetype::Arch, K4); // spread 0.499 → cell 0
+        let busy = pick_piece_cell(0.718_838_33, 0.0, MotifArchetype::Arch, K4); // spread 0.847 → cell 2
+        assert_eq!(
+            (calm, mid, busy),
+            (1, 0, 2),
+            "the primary ramp reaches cells 1/0/2"
+        );
+    }
+
+    /// PROPERTY: the divert is unavailable (and never panics) when the vocabulary has < 4 cells;
+    /// the index is clamped into `0..cell_count`.
+    #[test]
+    fn s53_pick_piece_cell_clamps_to_vocabulary_size() {
+        // cell_count == 3: the cell-3 divert is suppressed (cell_count > 3 is false) → primary stands.
+        let three = pick_piece_cell(0.475_413_02, 0.9, MotifArchetype::Arch, 3);
+        assert!(
+            three < 3,
+            "with K=3 the divert is unavailable; primary cell stays in range"
+        );
+        // cell_count == 1: everything clamps to 0.
+        let one = pick_piece_cell(0.9, 0.9, MotifArchetype::Arch, 1);
+        assert_eq!(one, 0, "K=1 saturates every selection to cell 0");
+    }
+
     fn engine() -> ChordEngine {
         let mappings = crate::mapping_loader::load_mappings(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -8452,6 +8833,9 @@ mod tests {
             // every role's weight is PROMINENCE_NEUTRAL (0.5) and the three prominence
             // nudges are all 0.0 — this test stays byte-identical (additive freeze).
             prominence: Vec::new(),
+            // S53 — neutral motto: this counter net carries no per-piece gait, so the realizer's
+            // motto read short-circuits and the realized onsets are byte-unchanged (additive freeze).
+            motto: RhythmMotto::neutral(),
         }
     }
 
@@ -9191,6 +9575,7 @@ mod tests {
             bass_pattern: None,
             bass_pattern_resolved,
             prominence: Vec::new(),
+            motto: RhythmMotto::neutral(), // S53 — neutral gait; realizer short-circuits (freeze)
         }
     }
 

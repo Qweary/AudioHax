@@ -74,6 +74,7 @@
 //! FAILS LOUDLY (with a stderr advisory) the moment any progression regresses a dissonant leap.
 //! The earlier held-period/consonant-triad-scoped PT-1/PT-4 assertions are RETAINED.
 
+use audiohax::chord_engine::RhythmMotto;
 use audiohax::chord_engine::{
     realize_step, Chord, NoteEvent, PerfFeatures, PhrasePosition, StepPlan,
 };
@@ -162,6 +163,7 @@ fn pad_bed_counter() -> OrchestrationProfile {
         bass_pattern: None,
         bass_pattern_resolved: None,
         prominence: Vec::new(),
+        motto: RhythmMotto::neutral(),
     }
 }
 fn perf(edge: f32) -> PerfFeatures {
@@ -334,6 +336,7 @@ fn test_counter_off_is_byte_identical_baseline() {
         bass_pattern: None,
         bass_pattern_resolved: None,
         prominence: Vec::new(),
+        motto: RhythmMotto::neutral(),
     };
     let mk = |orch: OrchestrationProfile| Section {
         label: "A".to_string(),

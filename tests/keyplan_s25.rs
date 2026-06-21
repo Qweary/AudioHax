@@ -60,6 +60,7 @@
 //! valid in-menu offset under BOTH energy orderings — it deliberately does NOT assert the offset
 //! VALUE differs between orderings (it won't in v1, and asserting that would be a false test).
 
+use audiohax::chord_engine::RhythmMotto;
 use audiohax::chord_engine::{realize_step, Chord, NoteEvent, PhrasePosition, StepPlan};
 use audiohax::composition::{
     CadenceStrength, CompositionPlanner, ImageUnderstanding, KeyTempoPlan, LayerProminence,
@@ -826,6 +827,7 @@ fn trio(bed: LayerRole, prominence: Vec<LayerProminence>) -> OrchestrationProfil
         bass_pattern: None,
         bass_pattern_resolved: None,
         prominence,
+        motto: RhythmMotto::neutral(),
     }
 }
 

@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 
+use audiohax::chord_engine::RhythmMotto;
 use audiohax::chord_engine::{
     realize_step, Chord, MotifArchetype, MotifNote, NoteEvent, PerfFeatures, PhrasePosition,
     StepPlan,
@@ -328,6 +329,7 @@ fn melody_profile() -> OrchestrationProfile {
         bass_pattern: None,
         bass_pattern_resolved: None,
         prominence: Vec::new(),
+        motto: RhythmMotto::neutral(),
     }
 }
 

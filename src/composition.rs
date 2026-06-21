@@ -16,7 +16,7 @@
 //! planner never lets a non-zero / non-home value leak in; modulation / meter / the other
 //! characters ship as schema (default-pinned) and are realized in later stages.
 
-use crate::chord_engine::{self, ChordEngine, MotifArchetype, StepPlan};
+use crate::chord_engine::{self, ChordEngine, MotifArchetype, RhythmMotto, StepPlan};
 use crate::mapping_loader::{
     rebuild_mapping_table, CompositionMappings, HomeRootMap, MappingTable,
 };
@@ -528,6 +528,17 @@ pub struct OrchestrationProfile {
     /// byte-stable legacy path. The realizer reads THIS.
     #[serde(skip)]
     pub prominence: Vec<LayerProminence>,
+    /// NEW S53 (D-CELL) — the PER-PIECE rhythmic motto for this section, set ONCE per plan by the
+    /// planner (`pick_piece_cell` off `edge_activity`+`complexity`) and `.clone()`d onto every
+    /// section. NOT loaded from JSON (`#[serde(skip)]` → always [`RhythmMotto::neutral()`] at
+    /// deserialize, via `Default`); the planner sets the live value. `neutral()` == the byte-stable
+    /// no-op: `realize_rhythm` short-circuits, so every legacy/identity/`identity()` path is
+    /// byte-identical and the engine_equivalence goldens cannot move. The realizer reads THIS
+    /// (`ctx.section.orchestration.motto`) to bias the melody's onset placement. Carried HERE (not
+    /// as a bare `Section` field) so the byte-frozen `engine::legacy_default_section` `Section`
+    /// literal — which builds orchestration via `identity()` — compiles UNCHANGED (engine.rs frozen).
+    #[serde(skip)]
+    pub motto: RhythmMotto,
 }
 
 /// serde default for [`OrchestrationProfile::density`] — the no-op `0.5` midpoint.
@@ -550,6 +561,10 @@ impl OrchestrationProfile {
             bass_pattern: None,
             bass_pattern_resolved: None,
             prominence: Vec::new(),
+            // S53 (D-CELL) — the byte-freeze hinge: the identity profile carries the NEUTRAL motto
+            // (cell_index == None), so `realize_rhythm`'s motto read short-circuits and every
+            // identity/legacy/`single_section_default` path stays byte-identical to pre-S53.
+            motto: RhythmMotto::neutral(),
         }
     }
 
@@ -1220,6 +1235,21 @@ pub struct Section {
     pub steps: Vec<StepPlan>,
 }
 
+impl Section {
+    /// S53 (D-CELL) — the per-piece rhythmic MOTTO in effect for this section. theory/seam: the
+    /// motto rides on [`OrchestrationProfile`] (a per-section realization parameter, beside
+    /// `prominence`/`figuration_resolved`), NOT as a bare `Section` field — `OrchestrationProfile`
+    /// is the carrier whose every legacy/identity construction goes through `identity()`
+    /// (constructor, NOT an open-coded literal), so the byte-FROZEN `engine::legacy_default_section`
+    /// `Section {…}` literal compiles UNCHANGED and `src/engine.rs` stays sha-identical. This
+    /// accessor restores the design's `section.motto()` ergonomics over that carrier. The
+    /// legacy/identity/`single_section_default` paths return [`RhythmMotto::neutral()`] (the
+    /// byte-stable no-op), so `realize_rhythm` short-circuits and the equivalence goldens hold.
+    pub fn motto(&self) -> RhythmMotto {
+        self.orchestration.motto
+    }
+}
+
 /// The up-front architectural plan for one piece — computed ONCE by [`CompositionPlanner`]
 /// from an [`ImageUnderstanding`], then DRIVES per-step realization.
 #[derive(Debug, Clone, PartialEq)]
@@ -1545,6 +1575,38 @@ impl CompositionPlanner {
             lookup_prominence(&self.plan_mappings.prominence_catalogue, &prom_id)
                 .map(|p| p.layers.clone())
                 .unwrap_or_default();
+
+        // S53 (D-CELL) — the PER-PIECE rhythmic motto, computed ONCE here (alongside the other
+        // once-per-plan resolves) and STAMPED ONTO `orchestration`, which is `.clone()`d onto EVERY
+        // section in the loop below (uniform-per-piece grain — the SAME motto on every section; the
+        // `prominence`/`bass_pattern_resolved` precedent for a planner-set, per-section-cloned
+        // orchestration field). INDEPENDENT of the theme gate — the whole point of fix-direction-2:
+        // every real image gets a gait, not just the synthetic complexity>=0.4 themed ones. The
+        // driver is (edge_activity, complexity) — the Affect-adjudicated axes — fed to the un-gated
+        // `chord_engine::pick_piece_cell` (which applies `band_activity_spread` internally and the
+        // cell-2 guard). The archetype is `pick_archetype(u)` so the motto's gait is read from the
+        // SAME contour family the themed path would pick (one coherent rhythmic identity per piece);
+        // on a no-theme image the archetype is otherwise unused, but it names which archetype's cell
+        // vocabulary the realizer's gait belongs to. `realize_rhythm` short-circuits to the frozen
+        // path whenever this is `neutral()`, which it never is on the real path (cell_index is always
+        // Some here) — but the legacy/identity orchestration profiles (built via `identity()`, which
+        // bypass the planner) DO carry neutral(), so the engine_equivalence freeze holds.
+        //
+        // CARRIER NOTE: the motto rides `OrchestrationProfile` (not a bare `Section` field) so the
+        // byte-FROZEN `engine::legacy_default_section` literal compiles UNCHANGED — that literal sets
+        // `orchestration: OrchestrationProfile::identity()` (a constructor call), and `identity()`
+        // seats `neutral()`, so `src/engine.rs` stays sha-identical. `Section::motto()` reads it back.
+        let piece_archetype = pick_archetype(u);
+        let piece_cell = chord_engine::pick_piece_cell(
+            u.edge_activity,
+            u.complexity,
+            piece_archetype,
+            piece_archetype.rhythm_cell_count(),
+        );
+        orchestration.motto = RhythmMotto {
+            archetype: piece_archetype,
+            cell_index: Some(piece_cell),
+        };
 
         let mut sections: Vec<Section> = Vec::with_capacity(form_spec.sections.len());
         let mut assigned = 0usize;

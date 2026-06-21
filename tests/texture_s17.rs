@@ -31,6 +31,7 @@
 //!   7. The CounterMelody stub is byte-equal to the (rest-fixed) HarmonicFill figure
 //!      on the same step — pinning the stub so a later counter-line is a clean diff.
 
+use audiohax::chord_engine::RhythmMotto;
 use audiohax::chord_engine::{
     assign_role, instrument_role, realize_step, Chord, NoteEvent, OrchestralRole, PerfFeatures,
     PhrasePosition, StepPlan,
@@ -130,6 +131,7 @@ fn pad_bed() -> OrchestrationProfile {
         bass_pattern: None,
         bass_pattern_resolved: None,
         prominence: Vec::new(),
+        motto: RhythmMotto::neutral(),
     }
 }
 
@@ -420,6 +422,7 @@ fn test_countermelody_is_no_longer_harmonicfill_delegate() {
         bass_pattern: None,
         bass_pattern_resolved: None,
         prominence: Vec::new(),
+        motto: RhythmMotto::neutral(),
     };
     // A strong (even) interior beat with real edge so the HarmonicFill SOUNDS (a single
     // onset at 0). The single-step fixture has no prior step (step_in_section == 0), so

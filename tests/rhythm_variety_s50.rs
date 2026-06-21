@@ -50,10 +50,7 @@
 
 use std::collections::BTreeSet;
 
-use audiohax::chord_engine::{
-    realize_step, resolve_motif_celled, Chord, MotifArchetype, MotifNote, PerfFeatures,
-    PhrasePosition, StepPlan,
-};
+use audiohax::chord_engine::{realize_step, Chord, PerfFeatures, PhrasePosition, StepPlan};
 use audiohax::composition::{
     CadenceStrength, CompositionPlan, CompositionPlanner, ImageUnderstanding, KeyTempoPlan,
     OrchestrationProfile, PlanMappings, ResolutionPolicy, Section, StepContext, ThematicRole,
@@ -208,45 +205,15 @@ fn band_for(u: &ImageUnderstanding) -> Band {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The CELL observable (planner-realized): identify the (archetype, cell) of the
-// stored theme motif by matching the FULL (degree, dur_steps) line against the
-// vocabulary at the planner's own range/length formulas (the motif_s41 trick). A
-// usize::MAX sentinel means "no theme realized" (complexity < 0.4 ⇒ theme absent;
-// composition.rs:1478) — an HONEST cell value, not a guess.
+// The CELL observable (planner-realized). fix-direction-2 SLICE 1 (D-CELL) un-gated the cell axis
+// to run PER-PIECE, so the honest observable moved from the (always-empty on real photos)
+// `themes[0]` motif to `section.motto().cell_index` — see `realized_cell` below. The old
+// theme-matching machinery (ALL_ARCHETYPES / range_for / length_for / identify_cell) is therefore
+// gone; the cell now reads directly off the per-piece motto the engine actually consumes.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const ALL_ARCHETYPES: [MotifArchetype; 8] = [
-    MotifArchetype::Arch,
-    MotifArchetype::InvertedArch,
-    MotifArchetype::Descent,
-    MotifArchetype::Ascent,
-    MotifArchetype::NeighborTurn,
-    MotifArchetype::LeapStep,
-    MotifArchetype::Pendulum,
-    MotifArchetype::RisingSequence,
-];
-
-/// The planner's own pure range/length formulas (composition.rs:1484/1485; mirrored from
-/// motif_s41::range_for/length_for).
-fn range_for(u: &ImageUnderstanding) -> u8 {
-    (2.0 + u.edge_activity * 5.0).round() as u8
-}
-fn length_for(u: &ImageUnderstanding) -> usize {
-    (3.0 + u.complexity * 5.0).round() as usize
-}
-
-fn identify_cell(stored: &[MotifNote], range: u8, len: usize) -> Option<usize> {
-    for &a in &ALL_ARCHETYPES {
-        for cell in 0..a.rhythm_cell_count() {
-            if resolve_motif_celled(a, range, len, cell) == *stored {
-                return Some(cell);
-            }
-        }
-    }
-    None
-}
-
-/// Sentinel for "no theme realized" — distinct from any real 0..=3 cell index.
+/// Sentinel for "no per-piece cell" — distinct from any real 0..=3 cell index. After slice 1 every
+/// real image carries a live motto cell, so this is now only the defensive `unwrap_or` fallback.
 const NO_THEME_CELL: usize = usize::MAX;
 
 /// A stable, Ord-able key for a [`Character`] (the enum is `Eq` but not `Ord`, so it cannot key a
@@ -267,16 +234,19 @@ fn char_key(c: audiohax::composition::Character) -> &'static str {
     }
 }
 
-/// The planner-realized rhythm cell for an image: the matched cell index, or NO_THEME_CELL when
-/// the image bears no theme (complexity < 0.4). RNG-independent (the cell is chosen by
-/// `pick_rhythm_cell`, not the harmony draw).
-fn realized_cell(plan: &CompositionPlan, u: &ImageUnderstanding) -> usize {
-    if plan.themes.is_empty() {
-        return NO_THEME_CELL;
-    }
-    let stored = &plan.themes[0].motif;
-    identify_cell(stored, range_for(u), length_for(u))
-        .expect("a realized theme motif must match some (archetype, cell) of the S41 vocabulary")
+/// The planner-realized PER-PIECE rhythm cell for an image. RE-POINTED for fix-direction-2 SLICE 1
+/// (D-CELL, design-s53 §5.2-B): the cell axis is now un-gated and runs per-piece — the honest
+/// rhythmic observable is `section.motto().cell_index` (the cell `realize_rhythm` ACTUALLY reads to
+/// bias onset placement), NOT the (always-empty on real photos) `themes[0]`. The motto is uniform
+/// across sections (slice-1 grain), so section 0 is canonical. RNG-independent (a pure function of
+/// the two scalar features). The S52 honesty invariant is PRESERVED — the engine now reads this cell.
+fn realized_cell(plan: &CompositionPlan, _u: &ImageUnderstanding) -> usize {
+    plan.sections
+        .first()
+        .expect("a plan has at least one section")
+        .motto()
+        .cell_index
+        .unwrap_or(NO_THEME_CELL)
 }
 
 /// The full per-image rhythmic signature, RNG-independent.

@@ -33,6 +33,7 @@
 //! (Scherzo bright register + a bright-image bright_octaves lift + the saliency foreground
 //! lift, all at once). The `Character`-named brightness anchors below document that mapping.
 
+use audiohax::chord_engine::RhythmMotto;
 use audiohax::chord_engine::{realize_step, Chord, NoteEvent, PhrasePosition, StepPlan};
 use audiohax::composition::{
     CadenceStrength, Character, KeyTempoPlan, LayerProminence, LayerRole, OrchestrationProfile,
@@ -156,6 +157,7 @@ fn trio(bed: LayerRole, prominence: Vec<LayerProminence>) -> OrchestrationProfil
         bass_pattern: None,
         bass_pattern_resolved: None,
         prominence,
+        motto: RhythmMotto::neutral(),
     }
 }
 
@@ -253,6 +255,7 @@ fn prominence_neutral_is_byte_identical() {
         bass_pattern: None,
         bass_pattern_resolved: None,
         prominence: all_neutral(),
+        motto: RhythmMotto::neutral(),
     };
 
     // Sweep both a non-cadence interior step AND a cadence step (covers the velocity nudge,

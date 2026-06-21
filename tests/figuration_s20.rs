@@ -14,6 +14,7 @@
 //! Run under DEFAULT features (the as-built quirk: `--no-default-features` drags in a
 //! feature-gated bin):  cargo test --test figuration_s20
 
+use audiohax::chord_engine::RhythmMotto;
 use audiohax::chord_engine::{
     realize_step, Chord, NoteEvent, PerfFeatures, PhrasePosition, StepPlan,
 };
@@ -107,6 +108,7 @@ fn pad_figured() -> OrchestrationProfile {
         bass_pattern: None,
         bass_pattern_resolved: None,
         prominence: Vec::new(),
+        motto: RhythmMotto::neutral(),
     }
 }
 
@@ -128,6 +130,7 @@ fn pad_bed() -> OrchestrationProfile {
         bass_pattern: None,
         bass_pattern_resolved: None,
         prominence: Vec::new(),
+        motto: RhythmMotto::neutral(),
     }
 }
 
@@ -149,6 +152,7 @@ fn pad_figured_unresolved() -> OrchestrationProfile {
         bass_pattern: None,
         bass_pattern_resolved: None,
         prominence: Vec::new(),
+        motto: RhythmMotto::neutral(),
     }
 }
 

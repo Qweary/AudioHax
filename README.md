@@ -1,245 +1,131 @@
 # AudioHax
 
-AudioHax is a proof-of-concept project that converts images into music by scanning and mapping pixel data to musical parameters, applying music theory logic, and outputting MIDI to a software synthesizer in real time.
+**Turn an image into music with one command.** AudioHax is a Rust command-line tool that scans an image, maps its colour, brightness, texture and shape to musical parameters (mode, harmony, tempo, rhythm), and plays the result through a built-in pure-Rust synthesizer — no MIDI cabling, no external synth, nothing to wire up. It also ships an MFSK acoustic data modem (encode a file to sound and back).
 
 ---
 
-## Features
-- Image-to-MIDI mapping using OpenCV.
-- Multi-instrument concurrent playback.
-- Configurable SoundFonts with FluidSynth.
-- Basic music theory–driven chord mapping.
+## Quick Start (Linux)
 
----
-
-## Requirements
-- **Rust** (Cargo) – [Install Rust](https://rustup.rs)
-- **OpenCV**  
-  - Windows: Use prebuilt binaries from [OpenCV Releases](https://github.com/opencv/opencv/releases)  
-  - macOS: Install via Homebrew (`brew install opencv`)  
-  - Linux: Install via package manager (e.g., `sudo apt install libopencv-dev`)
-- **loopMIDI** (Windows only) – [Download loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html)
-- **Virtual MIDI Driver**  
-  - macOS: [Built-in IAC Driver](https://support.apple.com/en-us/guide/audio-midi-setup/ams7cadc6d1/mac)  
-  - Linux: ALSA MIDI (`sudo modprobe snd_virmidi`)
-- **FluidSynth** – [FluidSynth Downloads](https://github.com/FluidSynth/fluidsynth/releases) or `brew install fluidsynth` / `sudo apt install fluidsynth`
-- A General MIDI–compatible `.sf2` SoundFont file  
-  Example: [GeneralUser GS](https://schristiancollins.com/generaluser.php)
-
----
-
-## Project Structure
-
-AudioHax/
-│ Cargo.toml
-│ .gitignore
-├───assets
-│  └───images
-|    └───example.jpg
-├───src
-│ └───main.rs
-│ └───image_analysis.rs
-│ └───image_source.rs
-│ └───chord_engine.rs
-│ └───mapping_loader.rs
-│ └───midi_output.rs
-
----
-
-## Installation
-
-### Windows
-1. Install Rust & Cargo:
-   ```powershell
-   rustup-init.exe
-2. Install OpenCV:
-
-    Extract to C:\opencv
-
-    Set environment variables:
-
-        setx OPENCV_DIR "C:\opencv\build"
-        setx PATH "$($Env:PATH);C:\opencv\build\x64\vc15\bin"
-
-3. Install loopMIDI and create a port named AudioHaxOut.
-
-4. Install FluidSynth (ensure fluidsynth.exe is in PATH).
-
----
-
-### macOS
-
-1. Install Rust:
-
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-2. Install OpenCV:
-
-    brew install opencv
-
-3. Enable IAC Driver:
-
-    Open Audio MIDI Setup → Window > Show MIDI Studio → Double-click IAC Driver → Enable device.
-
-4. Install FluidSynth:
-
-    brew install fluidsynth
-
----
-
-### Linux (Debian/Ubuntu example)
-
-1. Install Rust:
-
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-2. Install OpenCV:
-
-    sudo apt install libopencv-dev
-
-3. Enable Virtual MIDI:
-
-    sudo modprobe snd_virmidi
-
-4. Install FluidSynth:
-
-    sudo apt install fluidsynth
-
-5. Install libclang:
-
-   sudo apt install llvm-dev libclang-dev clang
-
-6. Install ALSA:
-
-   sudo apt install libasound2-dev
-
----
-
-## Building
-
-   cargo clean
-   cargo update
-   cargo build --release
-
----
-
-## Running it (the easy way)
-
-On Linux, the fastest path is the bundled `./play` wrapper — it builds the latest
-source and plays through the **in-process pure-Rust synth with zero MIDI routing**
-(no loopMIDI / FluidSynth / virtual port to set up — it just makes sound):
+From an image to music in three steps.
 
 ```sh
-export PATH="$HOME/.cargo/bin:$PATH"   # once per shell, if cargo isn't already on PATH
-./play                                 # play the bundled sample image
-./play path/to/your-image.jpg          # play your own image
-./play my.png --instruments 6          # extra flags pass straight through to `play`
-./play --help                          # short help, incl. the optional MIDI route
+# 1. Clone
+git clone https://github.com/Qweary/AudioHax.git
+cd AudioHax
+
+# 2. Fetch the default SoundFont (REQUIRED — it is embedded into the binary at build
+#    time, and is not stored in git). One-time, ~31 MB.
+curl -L -o assets/soundfonts/default.sf2 \
+  https://raw.githubusercontent.com/mrbumpy409/GeneralUser-GS/main/GeneralUser-GS.sf2
+
+# 3. Play a bundled example image (builds on first run, then plays)
+./play
 ```
 
-`./play` always runs the current source via `cargo run --release` (rebuilding if
-stale), so you never play a stale binary. `just play` / `just play-image <path>`
-wrap the same script if you have [`just`](https://github.com/casey/just) installed.
+That's it — `./play` builds the latest source and plays the bundled sample image
+through the in-process synth. To play your own image:
 
-For the **max-quality external-MIDI route** (route into Qsynth/FluidSynth/a DAW for
-reverb + effects), use `--output midi` / `--midi-virtual` and follow
-[`docs/midi-routing.md`](docs/midi-routing.md). That is output plumbing only — you do
-not need it to hear sound.
+```sh
+./play path/to/your-image.jpg
+```
 
----
+> **`cargo: not found`?** Cargo is installed in your home dir. Run this once per shell:
+> `export PATH="$HOME/.cargo/bin:$PATH"`
 
-## Running
+### The same thing without the wrapper
 
----
+`./play` just drives `cargo run --release -- play`. The explicit form:
 
-### Start loopMIDI
+```sh
+cargo run --release -- play assets/images/example.jpg
+```
 
-Set "New port-name:" as "AudioHaxOut"
+### Render to a WAV file (no audio device needed)
 
-Click + to add port
+Great for a laptop with no/temperamental audio at a conference, or for sharing a file:
 
-Leave running
+```sh
+cargo run --release -- render assets/images/example.jpg --wav out.wav
+```
 
----
+This writes `out.wav` (44.1 kHz stereo) offline. Add `--seed <number>` for an
+**exactly reproducible** result — the same image + seed always yields a byte-identical
+WAV and the identical composition:
 
-### Start FluidSynth
-
-Replace PATH_TO_SF2 with your .sf2 file:
-
-Windows:
-
-   fluidsynth -a dsound -p AudioHaxOut -m winmidi "PATH_TO_SF2"
-
-macOS:
-
-  fluidsynth -a coreaudio -o midi.driver=coremidi -o midi.coremidi.id="AudioHaxOut" "PATH_TO_SF2"
-
-Linux:
-
-   fluidsynth -a alsa -o midi.driver=alsa_seq -o midi.alsa_seq.device=AudioHaxOut "PATH_TO_SF2"
+```sh
+cargo run --release -- render assets/images/example.jpg --wav out.wav --seed 42
+./play assets/images/example.jpg --seed 42          # ...and the same seed when playing live
+```
 
 ---
 
-### Run AudioHax
+## Prerequisites
 
-cargo run --release -- play
+| Need | Why | Install (Debian/Ubuntu/Kali) |
+|---|---|---|
+| **Rust + Cargo** | builds the tool | [rustup.rs](https://rustup.rs) |
+| **`libasound2-dev`** | the only Linux *build* dep — the audio (cpal) + MIDI (midir) backends link ALSA | `sudo apt install libasound2-dev` |
+| **`default.sf2`** | the SoundFont is embedded into the binary at build time; **the build fails without it** | see Quick Start step 2 |
 
----
+That is the whole list for the default build. It is **pure Rust** — you do **not** need
+OpenCV, libclang, FluidSynth, loopMIDI, or any virtual-MIDI driver to build or to hear
+sound. (Those are only relevant to the optional routes below.)
 
-## How It Works
-
-1. Image Loading – The image is read from assets/images/example.jpg.
-
-2. Analysis – Pixel data is scanned and mapped to note/chord information.
-
-3. Chord Engine – Music theory logic decides what notes/chords to play.
-
-4. MIDI Output – Notes are sent to the virtual MIDI port.
-
-5. Audio Rendering – FluidSynth plays the notes using your SoundFont.
+- **macOS / Windows:** install Rust + fetch `default.sf2`, then `./play` / `cargo run --release -- play <image>`. No system audio dev package is needed (CoreAudio / WASAPI are built in).
 
 ---
 
-## Data Flow Diagram
+## What you can do
 
-        ┌───────────────────────┐
-        │   Input Image (.jpg)  │
-        └───────────┬───────────┘
-                    │
-                    ▼
-        ┌───────────────────────┐
-        │ image_source.rs        │
-        │ - Loads image          │
-        │ - Prepares scan        │
-        └───────────┬───────────┘
-                    │
-                    ▼
-        ┌───────────────────────┐
-        │ image_analysis.rs      │
-        │ - Scans regions        │
-        │ - Maps pixels → notes  │
-        └───────────┬───────────┘
-                    │
-                    ▼
-        ┌───────────────────────┐
-        │ chord_engine.rs        │
-        │ - Music theory logic   │
-        └───────────┬───────────┘
-                    │
-                    ▼
-        ┌───────────────────────┐
-        │ midi_output.rs         │
-        │ - Sends to MIDI port   │
-        └───────────┬───────────┘
-                    │
-                    ▼
-   loopMIDI / IAC / ALSA Virtual MIDI
-                    │
-                    ▼
-         FluidSynth → Audio Output
+- **Image → live music** — `./play <image>` (or `cargo run --release -- play <image>`).
+  Plays through the built-in synth, zero routing.
+- **Image → WAV (offline render)** — `cargo run --release -- render <image> --wav out.wav`.
+  Deterministic with `--seed`; honours `--soundfont` / `--reverb` / `--gain`.
+- **Swap the instrument sound (no rebuild)** — `--soundfont <path/to/font.sf2>`.
+  rustysynth is SF2-only (no SF3/compressed). A few fonts are staged under
+  `assets/soundfonts/` — see that directory's `README.md`.
+- **Shape the performance** — `--instruments <n>` (default 4), `--ms-per-step <ms>`
+  (scan tempo, default 250), `--steps <n>` (default 40), `--reverb on|off`,
+  `--gain <f32>`. Run `./play --help` or `cargo run --release -- play --help` for the full list.
+- **Acoustic data modem** — encode a file to a WAV of MFSK tones and decode it back,
+  with FEC and channel-simulation options, via the dedicated bins:
+  ```sh
+  cargo run --release --bin modem_encode -- out.wav secret.txt --compress
+  cargo run --release --bin modem_decode -- out.wav recovered
+  ```
+
+### Optional: route into an external synth/DAW for studio-grade effects
+
+The built-in synth is General-MIDI sample playback with reverb/chorus on by default.
+For your own sampled instruments + effects, route AudioHax's note events into Qsynth /
+FluidSynth / a DAW with `--output midi` (or `--midi-virtual` on Linux/macOS). This is
+output plumbing only — you do **not** need it to hear sound. Full guide:
+[`docs/midi-routing.md`](docs/midi-routing.md).
+
+---
+
+## Tweaking the music
+
+The image→music mapping lives in [`assets/mappings.json`](assets/mappings.json) and is
+plain JSON you can edit: hue → musical mode (Phrygian/Lydian/Ionian/…), saturation →
+harmonic complexity, brightness → tempo, and more. Change a value, re-run `./play`, and
+the same image speaks differently.
+
+---
+
+## More usage
+
+`docs/USAGE.md` has the full subcommand and flag reference. Quick pointers:
+
+```sh
+./play --help                              # the friendly wrapper's help
+cargo run --release -- play --help         # every play flag
+cargo run --release -- render --help       # every render flag
+```
 
 ---
 
 ## License
 
-### MIT License – See LICENSE file for details.
+MIT — see [LICENSE](LICENSE). Default SoundFont: *GeneralUser GS* by S. Christian
+Collins (schristiancollins.com), used under the GeneralUser GS License.

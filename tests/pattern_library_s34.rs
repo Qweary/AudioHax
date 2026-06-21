@@ -20,6 +20,7 @@
 //! DETERMINISTIC + HEADLESS — no `thread_rng`, no disk. The Bass/Pad arms are pure
 //! functions of the fixture. Run under DEFAULT features:  cargo test --test pattern_library_s34
 
+use audiohax::chord_engine::RhythmMotto;
 use audiohax::chord_engine::{
     realize_step, Chord, NoteEvent, PerfFeatures, PhrasePosition, StepPlan,
 };
@@ -125,6 +126,7 @@ fn profile(
         bass_pattern: None,
         bass_pattern_resolved,
         prominence: Vec::new(),
+        motto: RhythmMotto::neutral(),
     }
 }
 

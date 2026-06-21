@@ -51,6 +51,7 @@
 //! footer). A single belt-and-suspenders sha re-confirmation is included as the
 //! natural, non-duplicative forward guard.
 
+use audiohax::chord_engine::RhythmMotto;
 use audiohax::chord_engine::{
     realize_step, Chord, NoteEvent, PerfFeatures, PhrasePosition, StepPlan,
 };
@@ -237,6 +238,7 @@ fn ensemble(prominence: Vec<LayerProminence>) -> OrchestrationProfile {
         bass_pattern: None,
         bass_pattern_resolved: None,
         prominence,
+        motto: RhythmMotto::neutral(),
     }
 }
 
