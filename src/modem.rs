@@ -1292,18 +1292,18 @@ pub fn simulate_channel_bytes(
 /* ============================================================================
  * S7 — REAL-AIR ROBUSTNESS
  *
- * Pass A deliverables (this block):
- *   1. AcousticChannelParams + simulate_acoustic_channel — REAL working code,
- *      a seeded acoustic-channel model used as unit-test scaffolding. It injects
- *      the four textbook speaker->mic impairments (start offset, clock drift,
- *      frequency offset, multipath echo) plus optional timing jitter, all driven
- *      by a deterministic ChaCha8Rng.
- *   2. The sync / timing-recovery API and the rate-selectable-coding API as
- *      COMPILING STUBS — `///`-documented signatures with minimal bodies that
- *      compile and keep the existing tests green, but do NOT yet implement real
- *      offset tolerance. Each stub body is tagged `// TODO(s7-passC): real impl`.
+ * This block holds the speaker->mic robustness layer, all shipped and tested:
+ *   1. AcousticChannelParams + simulate_acoustic_channel — a seeded acoustic-
+ *      channel model used as unit-test scaffolding. It injects the four textbook
+ *      speaker->mic impairments (start offset, clock drift, frequency offset,
+ *      multipath echo) plus optional timing jitter, all driven by a deterministic
+ *      ChaCha8Rng.
+ *   2. The sync / timing-recovery API (chirp preamble render + cross-correlation
+ *      burst detection + per-burst stride timing recovery) and the rate-selectable
+ *      Reed-Solomon coding API (RsRate). Both are fully implemented and exercised
+ *      by the modem_realair tests for offset/drift tolerance.
  *
- * See docs/design-s7-realair.md for the full design and the 3-pass migration.
+ * See docs/design-s7-realair.md for the full design.
  * ============================================================================ */
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1494,20 +1494,20 @@ pub fn simulate_acoustic_channel(samples: &[i16], params: &AcousticChannelParams
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// 2a. SYNC / TIMING-RECOVERY API (COMPILING STUBS — TODO Pass C)
+// 2a. SYNC / TIMING-RECOVERY API (chirp preamble, burst detection, stride recovery)
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Start-of-burst synchronization mode.
 ///
 /// `PilotOnly` is the **default** and is byte-for-byte the current behavior: the
 /// repeated-pilot preamble is the only sync, and decode windows start at sample 0.
-/// `Chirp` (Pass C) prepends a linear-chirp preamble located by cross-correlation,
+/// `Chirp` prepends a linear-chirp preamble located by cross-correlation,
 /// giving sample-accurate start detection robust to offset and frequency shift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
-    /// Current behavior: repeated-pilot preamble, windows from sample 0.
+    /// Repeated-pilot preamble, windows from sample 0 (legacy default).
     PilotOnly,
-    /// Linear-chirp preamble located by cross-correlation (Pass C).
+    /// Linear-chirp preamble located by cross-correlation.
     Chirp,
 }
 
@@ -1793,14 +1793,15 @@ fn estimate_freq_offset(region: &[i16], params: &ModemParams, sync: &SyncParams)
 /// Produce drift-corrected symbol-window start boundaries for the burst.
 ///
 /// Lays symbol windows from the located start (`sync.start_sample`, the chirp's first
-/// sample in `Chirp` mode) to the end of the buffer, with an **early-late timing-
-/// recovery loop** that tracks slow clock drift instead of advancing by a fixed
-/// stride. For each window it evaluates the dominant-tone Goertzel energy at three
-/// sub-window read positions (early / on-time / late) and steers the running window
-/// position and the fractional stride estimate toward the energy peak. Under a
-/// positive `clock_ppm` the true symbol length grows, so the estimated stride creeps
-/// up and the window starts slide cumulatively LATE across the burst — which is
-/// exactly what `decode_with_boundaries`'s pilot search then re-aligns to the data.
+/// sample in `Chirp` mode) to the end of the buffer using a single drift-corrected
+/// stride recovered by a **per-burst stride grid search**. A constant clock offset
+/// makes the true symbol length a constant `sps·(1+ppm)` for the whole burst (not
+/// per-symbol jitter), so the estimator searches a tight sub-sample grid of candidate
+/// strides around nominal and selects the one whose laid-down windows maximize the
+/// MEAN per-window dominant-tone Goertzel alignment energy. Windows are then placed at
+/// `start + i·sps_est`, so under drift the chosen stride differs from nominal and the
+/// boundaries slide CUMULATIVELY across the burst — which is exactly what
+/// `decode_with_boundaries`'s pilot search then re-aligns to the data.
 ///
 /// The chirp/pilot prefix windows are included in the returned boundaries; the
 /// decode-side pilot-pattern search trims everything up to and including the pilot,
@@ -2001,7 +2002,7 @@ pub fn recover_symbol_timing(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// 2b. RATE-SELECTABLE CODING API (COMPILING STUBS — TODO Pass C)
+// 2b. RATE-SELECTABLE CODING API (interleaved Reed-Solomon rate ladder)
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Named interleaved-Reed-Solomon redundancy points (the coding *rate*), plus a

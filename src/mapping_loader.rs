@@ -79,23 +79,6 @@ pub struct GlobalMapping {
     pub progression_families: HashMap<String, Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct InstrumentSectionMapping {
-    pub edge_density_to_rhythm: HashMap<String, String>,
-    pub line_orientation_to_interval: HashMap<String, String>,
-    pub contrast_to_articulation: HashMap<String, String>,
-    pub color_shift_to_chord_extension: HashMap<String, Vec<String>>,
-    pub texture_to_modal_color: HashMap<String, String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct FineDetailMapping {
-    pub pixel_y_position_to_pitch: String,
-    pub pixel_brightness_to_velocity: String,
-    pub local_jaggedness_to_chromaticism: HashMap<String, i32>,
-    pub shape_to_ostinato: HashMap<String, String>,
-}
-
 /// S15 Slice 1: the loader's deserialize target for the optional `composition` block.
 ///
 /// Shape mirrors `composition::PlanMappings` exactly; it deserializes here (the loader owns
@@ -200,8 +183,6 @@ pub struct HomeBand {
 #[derive(Debug, Deserialize)]
 pub struct MappingTable {
     pub global: GlobalMapping,
-    pub instrument_section: InstrumentSectionMapping,
-    pub fine_detail: FineDetailMapping,
     /// S15 Slice 1: the optional `composition` block (form catalogue + selection tables).
     /// Absent in the legacy `mappings.json` → `None` (back-compat floor). When present, the
     /// engine's compose path builds a `CompositionPlanner` from it.
@@ -252,25 +233,6 @@ pub fn rebuild_mapping_table(t: &MappingTable) -> MappingTable {
                 low_motion_cadence: t.global.cadence_trigger.low_motion_cadence.clone(),
             },
             progression_families: t.global.progression_families.clone(),
-        },
-        instrument_section: InstrumentSectionMapping {
-            edge_density_to_rhythm: t.instrument_section.edge_density_to_rhythm.clone(),
-            line_orientation_to_interval: t.instrument_section.line_orientation_to_interval.clone(),
-            contrast_to_articulation: t.instrument_section.contrast_to_articulation.clone(),
-            color_shift_to_chord_extension: t
-                .instrument_section
-                .color_shift_to_chord_extension
-                .clone(),
-            texture_to_modal_color: t.instrument_section.texture_to_modal_color.clone(),
-        },
-        fine_detail: FineDetailMapping {
-            pixel_y_position_to_pitch: t.fine_detail.pixel_y_position_to_pitch.clone(),
-            pixel_brightness_to_velocity: t.fine_detail.pixel_brightness_to_velocity.clone(),
-            local_jaggedness_to_chromaticism: t
-                .fine_detail
-                .local_jaggedness_to_chromaticism
-                .clone(),
-            shape_to_ostinato: t.fine_detail.shape_to_ostinato.clone(),
         },
         // S15: the optional composition block derives Clone, so copy it directly.
         composition: t.composition.clone(),
@@ -340,10 +302,6 @@ mod tests {
               "modal_interchange_trigger": { "brightness_drop_threshold": 0.5, "borrowed_chords": [] },
               "cadence_trigger": { "stillness_threshold": 0.5, "high_motion_cadence": "x", "low_motion_cadence": "y" },
               "progression_families": {} },
-            "instrument_section": { "edge_density_to_rhythm": {}, "line_orientation_to_interval": {},
-              "contrast_to_articulation": {}, "color_shift_to_chord_extension": {}, "texture_to_modal_color": {} },
-            "fine_detail": { "pixel_y_position_to_pitch": "p", "pixel_brightness_to_velocity": "v",
-              "local_jaggedness_to_chromaticism": {}, "shape_to_ostinato": {} },
             "composition": {
               "form": { "default": "f", "rules": [] }, "character": { "default": "ballad", "rules": [] },
               "meter": { "default": "four4", "rules": [] }, "key_scheme": { "default": "home_only", "rules": [] },

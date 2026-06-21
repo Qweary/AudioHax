@@ -58,47 +58,6 @@
       ]
     }
   },
-  "instrument_section": {
-    "edge_density_to_rhythm": {
-      "low": "HalfNotes",
-      "medium": "QuarterNotes",
-      "high": "EighthNotes"
-    },
-    "line_orientation_to_interval": {
-      "horizontal": "Stepwise",
-      "vertical": "Leaps",
-      "diagonal": "Mixed"
-    },
-    "contrast_to_articulation": {
-      "low": "Legato",
-      "medium": "Portato",
-      "high": "Staccato"
-    },
-    "color_shift_to_chord_extension": {
-      "small": ["add9", "6"],
-      "medium": ["maj9", "min9"],
-      "large": ["13", "b13", "#11"]
-    },
-    "texture_to_modal_color": {
-      "smooth": "StayInMode",
-      "medium": "BorrowFromParallel",
-      "rough": "SecondaryDominant"
-    }
-  },
-  "fine_detail": {
-    "pixel_y_position_to_pitch": "MapTopToHighPitch",
-    "pixel_brightness_to_velocity": "DirectMapping",
-    "local_jaggedness_to_chromaticism": {
-      "smooth": 0,
-      "medium": 1,
-      "jagged": 2
-    },
-    "shape_to_ostinato": {
-      "circle": "PedalPoint",
-      "triangle": "AscendingOstinato",
-      "square": "DescendingOstinato"
-    }
-  },
   "composition": {
     "home_root": {
       "_note": "S40 Slice-2 Finding #1 (per-image HOME). dominant_hue (deg, 0..360) -> chromatic pitch class -> seated into the [57,68] register band by the planner. ABSENT block => home_root_midi = 60 (C4) byte-for-byte (serde default None). The [lo,hi] band is the Theory-owned register-safety guard (design-s38-theory.md 2.2): hi MUST NOT exceed 68 without re-deriving the 81<<96 / 103<<108 headroom margins, because melody floor 67 + bright-lift + a degree-+7 motif already sits near the top-end clamp; the band spans exactly 12 semitones [57=A3 .. 68=G#4] so every pitch class has exactly one in-band representative (seating is total). hue->pc rationale: UNIFORM 30-deg-per-pc synesthetic color-wheel -> chromatic-wheel identity (red=hue 0 -> C/pc 0, ascending clockwise around both 12-fold circles). Chosen over a non-uniform perceptual spacing because the uniform 1:1 spreads natural-image hues most EVENLY across all 12 homes -- directly serving cross-image differentiation (the 'by ~4th image, motifs sound familiar' observation): a 30-deg hue rotation always lands a new chromatic home, and no large hue range collapses onto one pc. Coherent with global.hue_to_mode (same hue-domain 'lo-hi' convention over 0..360): warm reds/oranges (Phrygian/Lydian) take the low chromatic homes C..D#, greens (Ionian) the central E..F, cyans/blues (Dorian/Aeolian) F#..G#, violets/magentas (Mixolydian) A..A#, wrapping back toward B at the red boundary -- color heat tracks rising chromatic center without contradicting the mode the same hue picks.",
@@ -153,7 +112,7 @@
       "rules": [
         { "when": [ {"knob":"complexity","op":"ge","lo":0.66,"hi":0.0}, {"knob":"edge_activity","op":"ge","lo":0.6,"hi":0.0} ], "pick": "theme_and_variations" },
         { "when": [ {"knob":"quadrant_contrast","op":"ge","lo":0.6,"hi":0.0} ], "pick": "ternary_aba" },
-        { "when": [ {"knob":"aspect_ratio","op":"ge","lo":1.6,"hi":0.0}, {"knob":"palette_bimodality","op":"le","lo":0.3,"hi":0.0} ], "pick": "aaba" },
+        { "when": [ {"knob":"aspect_ratio","op":"ge","lo":1.6,"hi":0.0} ], "pick": "aaba" },
         { "when": [ {"knob":"vertical_emphasis","op":"ge","lo":0.6,"hi":0.0} ], "pick": "abac" },
         { "when": [ {"knob":"edge_activity","op":"ge","lo":0.7,"hi":0.0}, {"knob":"value_key","op":"ge","lo":0.6,"hi":0.0} ], "pick": "abbac" }
       ]
@@ -253,7 +212,7 @@
       "rules": [
         { "when": [ {"knob":"complexity","op":"ge","lo":0.66,"hi":0.0}, {"knob":"edge_activity","op":"ge","lo":0.6,"hi":0.0}, {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ], "pick": "theme_and_variations_resolve" },
         { "when": [ {"knob":"quadrant_contrast","op":"ge","lo":0.6,"hi":0.0}, {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ], "pick": "ternary_aba_excursion" },
-        { "when": [ {"knob":"aspect_ratio","op":"ge","lo":1.6,"hi":0.0}, {"knob":"palette_bimodality","op":"le","lo":0.3,"hi":0.0}, {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ], "pick": "aaba_excursion" },
+        { "when": [ {"knob":"aspect_ratio","op":"ge","lo":1.6,"hi":0.0}, {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ], "pick": "aaba_excursion" },
         { "when": [ {"knob":"vertical_emphasis","op":"ge","lo":0.6,"hi":0.0}, {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ], "pick": "abac_rondo" },
         { "when": [ {"knob":"edge_activity","op":"ge","lo":0.7,"hi":0.0}, {"knob":"value_key","op":"ge","lo":0.6,"hi":0.0}, {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ], "pick": "abbac_excursion" },
         { "when": [ {"knob":"fg_bg_contrast","op":"ge","lo":0.25,"hi":0.0} ], "pick": "rounded_binary_excursion" }

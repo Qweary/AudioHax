@@ -24,7 +24,6 @@ struct TileEntry {
     offset: u64,
     len: u64,
     avg_color: [u8; 3],
-    encoding: String,
 }
 
 fn print_usage(name: &str) {

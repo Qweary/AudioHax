@@ -178,14 +178,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pkt_payload = pkt_size;
             let repeats_used = repeats;
             let mut enc_bytes = 0usize;
-            let mut seq = 0usize;
             let mut offset = 0usize;
             while offset < frame.len() {
                 let end = std::cmp::min(offset + pkt_payload, frame.len());
                 let payload_len = end - offset;
                 let hdr = 4 + 4 + 2 + 4; // PKT1 header
                 enc_bytes += (hdr + payload_len) * repeats_used;
-                seq += 1;
                 offset = end;
             }
             let bps = modem::bits_per_symbol(params.m_tones);
