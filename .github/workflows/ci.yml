@@ -1,0 +1,83 @@
+name: CI
+
+# Proves the DEFAULT (pure-Rust) target BUILDS and the headless test suite PASSES
+# on ubuntu-latest / windows-latest / macos-latest, with no operator hardware and
+# no audio device. See docs/design-s55-ci-portability.md for the full rationale.
+#
+# What this CANNOT prove (by design, acceptable): any AUDIBLE property. GitHub
+# runners have no audio device, so the cpal `play` path is never exercised. The
+# device-free `render --wav` path and all headless logic tests ARE proven here.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# Cancel superseded runs on the same ref (nice-to-have).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: build+test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Linux-only: cpal (ALSA backend) + midir (ALSA-seq backend) link ALSA at
+      # build. Windows (WASAPI/WinMM) and macOS (CoreAudio/CoreMIDI) need nothing.
+      - name: Install Linux audio build deps (ALSA)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      # CRITICAL: src/synth_sink.rs embeds assets/soundfonts/default.sf2 at compile
+      # time via include_bytes!, and that file is git-ignored (~31 MB), so a fresh
+      # checkout has no SoundFont and `cargo build` fails on ALL THREE OSes. Fetch it
+      # BEFORE any build/test/clippy. `shell: bash` makes the one curl work on the
+      # windows runner too (git-bash + curl are present). This is the single highest
+      # -risk CI detail — omitting it red-lines every job at compile.
+      - name: Cache default SoundFont (31 MB)
+        id: sf2-cache
+        uses: actions/cache@v4
+        with:
+          path: assets/soundfonts/default.sf2
+          key: soundfont-generaluser-gs-v2-raw.githubusercontent.com-mrbumpy409-GeneralUser-GS-main
+
+      - name: Fetch default SoundFont (embedded via include_bytes! at build time)
+        if: steps.sf2-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          curl -fL -o assets/soundfonts/default.sf2 \
+            https://raw.githubusercontent.com/mrbumpy409/GeneralUser-GS/main/GeneralUser-GS.sf2
+          # sanity: non-empty file so the build never fails on a truncated fetch
+          test -s assets/soundfonts/default.sf2
+
+      - name: Install Rust toolchain (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + target (per-OS, keyed on Cargo.lock)
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build all bins (default features)
+        run: cargo build --bins
+
+      - name: Test (default features — the green headless path)
+        run: cargo test
+
+      # Gate-with-teeth: fails a PR that introduces a genuine correctness regression
+      # while staying honest about the ~41 pre-existing style/pedantic warnings.
+      # `-D warnings` is NOT viable (it would red-line the existing debt); the
+      # correctness lint class passes green today. See design §1.2 / §2.5.
+      - name: Clippy correctness gate
+        run: cargo clippy --all-targets -- -D clippy::correctness
