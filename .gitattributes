@@ -1,0 +1,10 @@
+# Normalize all text files to LF on checkout, every platform (fixes CRLF drift on Windows CI).
+* text=auto eol=lf
+
+# Binary assets — never normalize (protects them from text conversion/corruption).
+*.sf2  binary
+*.jpg  binary
+*.jpeg binary
+*.png  binary
+*.wav  binary
+*.ico  binary
