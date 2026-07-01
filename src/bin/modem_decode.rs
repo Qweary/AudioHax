@@ -5,9 +5,24 @@
 use std::fs::File;
 use std::io::Write;
 
-use audiohax::cli::parse_modem_decode;
-use audiohax::modem::{self, ModemParams};
+use audiohax::cli::{parse_modem_decode, SyncModeArg};
+use audiohax::modem::{self, ModemParams, SyncMode, SyncParams};
 use hound;
+
+/// Map the CLI `--sync-mode` enum to a decode-side `SyncParams` (chirp geometry from
+/// `SyncParams::default()`, matching the encoder's defaults).
+fn build_sync_params(mode: SyncModeArg) -> SyncParams {
+    match mode {
+        SyncModeArg::Pilot => SyncParams {
+            mode: SyncMode::PilotOnly,
+            ..SyncParams::default()
+        },
+        SyncModeArg::Chirp => SyncParams {
+            mode: SyncMode::Chirp,
+            ..SyncParams::default()
+        },
+    }
+}
 
 /// helper: write recovered file to disk and pick extension
 fn detect_and_write_file(bytes: &[u8], out_basename: &str) -> std::io::Result<()> {
@@ -98,12 +113,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(" Ch {}: {:?}", ch, freqs);
     }
 
+    // S7 symbol-window boundaries. In `pilot` mode (default) these are the legacy
+    // fixed-stride windows from sample 0. In `chirp` mode they come from
+    // detect_burst_start → recover_symbol_timing (drift-tracking): the returned
+    // boundaries START at the located chirp/pilot prefix and slide cumulatively under
+    // clock drift; the per-channel pilot-pattern trim below then discards everything up
+    // to and including the pilot, so we do not need to know the chirp length here. In
+    // BOTH modes each window is `samples_per_symbol` long and the SAME per-channel
+    // max-energy Goertzel detection runs at each boundary.
+    let sync = build_sync_params(cli.sync_mode);
+    let boundaries: Vec<usize> = match sync.mode {
+        SyncMode::PilotOnly => (0..samples_i16.len())
+            .step_by(samples_per_symbol)
+            .take_while(|&w| w + samples_per_symbol <= samples_i16.len())
+            .collect(),
+        SyncMode::Chirp => {
+            let sr = modem::detect_burst_start(&samples_i16, &params, &sync)?;
+            println!(
+                "Chirp sync: start_sample={}, sps={:.2}, freq_offset={:.1} Hz, confidence={:.3}",
+                sr.start_sample, sr.samples_per_symbol, sr.freq_offset_hz, sr.confidence
+            );
+            modem::recover_symbol_timing(&samples_i16, &params, &sr)?
+        }
+    };
+
     // detection
     let mut detected_by_channel: Vec<Vec<u8>> = vec![Vec::new(); params.channels];
 
-    for window_start in (0..samples_i16.len()).step_by(samples_per_symbol) {
+    for &window_start in &boundaries {
         if window_start + samples_per_symbol > samples_i16.len() {
-            break;
+            continue;
         }
         let slice = &samples_i16[window_start..window_start + samples_per_symbol];
         for ch in 0..params.channels {
@@ -188,8 +227,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // If RS options were provided, attempt RS depacketize, otherwise use repeat-based depacketize, then fallback to raw frame parse.
-    let packetized_result = if rs_data_shards.is_some() && rs_parity_shards.is_some() {
+    // HEADER-AWARE DEPACKETIZE (S7): a stream carrying a triplicated `CDG1` in-band
+    // rate header MUST decode via depacketize_with_profile regardless of flags — the
+    // receiver learns the rate in-band. parse_coding_header returns consumed>0 only
+    // when a CDG1 prefix is present; a header-LESS legacy stream returns consumed=0 and
+    // falls through to the EXISTING flag-driven legacy branch unchanged (so a legacy
+    // WAV decoded with no new flags is byte-identical to today). CDG1 cannot collide
+    // with the legacy RS01/PKT1 packet magics, so this detection is safe.
+    let header_hit = match modem::parse_coding_header(&bytes) {
+        Ok((profile, consumed)) if consumed > 0 => Some(profile),
+        _ => None,
+    };
+
+    let packetized_result = if let Some(profile) = header_hit {
+        println!(
+            "In-band CDG1 coding header detected: {:?}. Using profile-aware depacketize.",
+            profile
+        );
+        match modem::depacketize_with_profile(&bytes) {
+            Ok(v) => {
+                println!("Depacketize (profile) succeeded: {} bytes", v.len());
+                Some(v)
+            }
+            Err(e) => {
+                eprintln!(
+                    "Profile depacketize failed: {}. Falling back to raw frame parse.",
+                    e
+                );
+                None
+            }
+        }
+    } else if rs_data_shards.is_some() && rs_parity_shards.is_some() {
         println!("Attempting Reed-Solomon depacketize on straightforward bytes...");
         match modem::depacketize_stream_rs(&bytes) {
             Ok(v) => {

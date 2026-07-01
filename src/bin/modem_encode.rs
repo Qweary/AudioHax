@@ -8,9 +8,44 @@
 use std::fs::{self, File};
 use std::io::Write;
 
-use audiohax::cli::{parse_modem_encode, ModemPreset};
-use audiohax::modem::{self, ModemParams};
+use audiohax::cli::{parse_modem_encode, CodingProfileArg, ModemPreset, SyncModeArg};
+use audiohax::modem::{self, CodingProfile, ModemParams, RsRate, SyncMode, SyncParams};
 use hound;
+
+/// Map the CLI `--sync-mode` enum to a `SyncParams` (chirp defaults come from
+/// `SyncParams::default()`; only the mode is operator-selectable here).
+fn build_sync_params(mode: SyncModeArg) -> SyncParams {
+    match mode {
+        SyncModeArg::Pilot => SyncParams {
+            mode: SyncMode::PilotOnly,
+            ..SyncParams::default()
+        },
+        SyncModeArg::Chirp => SyncParams {
+            mode: SyncMode::Chirp,
+            ..SyncParams::default()
+        },
+    }
+}
+
+/// Resolve the CLI `--coding-profile` enum into a concrete [`CodingProfile`] for the
+/// header-bearing packetization path. `Legacy` returns `None` (the caller keeps the
+/// legacy header-less branch). `Rep` uses the already-resolved `pkt_size`/`repeats`;
+/// `Auto` selects the RS rate from `snr_db` via `select_rate`.
+fn resolve_coding_profile(
+    profile: CodingProfileArg,
+    pkt_size: usize,
+    repeats: usize,
+    snr_db: f32,
+) -> Option<CodingProfile> {
+    match profile {
+        CodingProfileArg::Legacy => None,
+        CodingProfileArg::Rep => Some(CodingProfile::Repetition { repeats, pkt_size }),
+        CodingProfileArg::RsHigh => Some(CodingProfile::RsRate(RsRate::High)),
+        CodingProfileArg::RsMedium => Some(CodingProfile::RsRate(RsRate::Medium)),
+        CodingProfileArg::RsLow => Some(CodingProfile::RsRate(RsRate::Low)),
+        CodingProfileArg::Auto => Some(CodingProfile::RsRate(modem::select_rate(snr_db))),
+    }
+}
 
 fn apply_preset(p: &mut ModemParams, preset: &str, chosen: &mut PresetParams) {
     match preset {
@@ -207,10 +242,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // choose packetization: RS if options provided, otherwise repeats
-    let mut packetized_bytes: Vec<u8> = if let (Some(d), Some(p), Some(s)) =
-        (rs_data_shards, rs_parity_shards, rs_shard_size)
-    {
+    // S7 in-band coding profile. When a non-legacy profile is selected we emit a
+    // triplicated CDG1 rate header via packetize_with_profile (the receiver learns the
+    // rate in-band). `legacy` (DEFAULT) resolves to None and keeps the exact legacy
+    // header-less branch below, so default output is byte-identical to pre-S8.
+    let coding_profile = resolve_coding_profile(cli.coding_profile, pkt_size, repeats, cli.snr_db);
+
+    // choose packetization: profile-aware (CDG1 header) if a non-legacy profile is
+    // chosen, else legacy (RS if options provided, otherwise repeats).
+    let mut packetized_bytes: Vec<u8> = if let Some(profile) = coding_profile {
+        println!(
+            "Using in-band coding profile: {:?} (CDG1 header emitted)",
+            profile
+        );
+        modem::packetize_with_profile(&frame, &profile)?
+    } else if let (Some(d), Some(p), Some(s)) = (rs_data_shards, rs_parity_shards, rs_shard_size) {
         if interleave_enabled {
             println!("Using Reed-Solomon FEC (interleaved): data_shards={} parity_shards={} shard_size={}", d, p, s);
             modem::packetize_stream_rs_interleaved(&frame, d, p, s)
@@ -275,7 +321,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // render to samples
-    let samples_i16 = modem::render_symbols_to_samples(&channels_syms, &params);
+    let body_i16 = modem::render_symbols_to_samples(&channels_syms, &params);
+
+    // S7 sync preamble: in `chirp` mode prepend the linear-chirp preamble to the FULL
+    // rendered stream (orthogonal to the symbol/tone counts; the per-channel pilot
+    // preamble already rendered into `body_i16` is RETAINED after the chirp). In
+    // `pilot` mode render_sync_preamble returns an empty buffer, so the output is
+    // byte-identical to the legacy path (no reallocation, no prepend).
+    let sync = build_sync_params(cli.sync_mode);
+    let preamble = modem::render_sync_preamble(&params, &sync);
+    let samples_i16 = if preamble.is_empty() {
+        body_i16
+    } else {
+        println!("Prepended chirp sync preamble ({} samples)", preamble.len());
+        let mut out = Vec::with_capacity(preamble.len() + body_i16.len());
+        out.extend_from_slice(&preamble);
+        out.extend_from_slice(&body_i16);
+        out
+    };
 
     // write wav
     let spec = hound::WavSpec {

@@ -290,6 +290,42 @@ pub enum ChannelMode {
     Acoustic,
 }
 
+/// Start-of-burst sync mode (S7). CLI-side mirror of [`audiohax::modem::SyncMode`].
+///
+/// `Pilot` (default) reproduces the legacy repeated-pilot-only preamble with decode
+/// windows from sample 0 — byte-identical output. `Chirp` prepends a linear-chirp
+/// preamble located by cross-correlation and drives the drift-tracking timing
+/// recovery on decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SyncModeArg {
+    /// Repeated-pilot preamble, windows from sample 0 (legacy default).
+    Pilot,
+    /// Linear-chirp preamble located by cross-correlation.
+    Chirp,
+}
+
+/// In-band coding profile (S7 rate-selectable FEC). Maps to the encoder's
+/// packetization path. `Legacy` (default) keeps today's header-less packetization
+/// (RS if `--rs-*`/preset provide shards, else repetition) byte-identical; the other
+/// variants emit a triplicated `CDG1` in-band rate header via
+/// [`audiohax::modem::packetize_with_profile`] so the decoder learns the rate with no
+/// out-of-band flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CodingProfileArg {
+    /// Legacy header-less packetization (DEFAULT, byte-identical to pre-S8 output).
+    Legacy,
+    /// Repetition FEC with a `CDG1` header (uses the resolved `--pkt-size`/`--repeats`).
+    Rep,
+    /// Interleaved RS, High rate (d=4,p=1) with a `CDG1` header.
+    RsHigh,
+    /// Interleaved RS, Medium rate (d=4,p=2) with a `CDG1` header.
+    RsMedium,
+    /// Interleaved RS, Low rate (d=4,p=4) with a `CDG1` header.
+    RsLow,
+    /// Auto-select the RS rate from `--snr-db` via `select_rate`, with a `CDG1` header.
+    Auto,
+}
+
 /// Args for `audiohax modem encode` / legacy `modem_encode`.
 ///
 /// Legacy invocation: `modem_encode <out.wav> <input_file> [options]`.
@@ -357,6 +393,16 @@ pub struct ModemEncodeArgs {
     /// RS shard size in bytes (legacy `--rs-shard-size`).
     #[arg(long = "rs-shard-size")]
     pub rs_shard_size: Option<usize>,
+    /// S7 start-of-burst sync mode (default `pilot` = legacy, byte-identical output).
+    #[arg(long = "sync-mode", value_enum, default_value_t = SyncModeArg::Pilot)]
+    pub sync_mode: SyncModeArg,
+    /// S7 in-band coding profile (default `legacy` = header-less, byte-identical output).
+    #[arg(long = "coding-profile", value_enum, default_value_t = CodingProfileArg::Legacy)]
+    pub coding_profile: CodingProfileArg,
+    /// Assumed link SNR in dB, consumed ONLY by `--coding-profile auto` (default 15.0
+    /// → RS Medium via `select_rate`). Ignored for every other profile.
+    #[arg(long = "snr-db", default_value_t = 15.0)]
+    pub snr_db: f32,
 }
 
 /// Args for `audiohax modem decode` / legacy `modem_decode`.
@@ -389,6 +435,10 @@ pub struct ModemDecodeArgs {
     /// RS parity-shard count.
     #[arg(long = "rs-parity")]
     pub rs_parity: Option<usize>,
+    /// S7 start-of-burst sync mode (default `pilot` = legacy fixed-stride/sample-0
+    /// decode). `chirp` runs `detect_burst_start` + `recover_symbol_timing`.
+    #[arg(long = "sync-mode", value_enum, default_value_t = SyncModeArg::Pilot)]
+    pub sync_mode: SyncModeArg,
 }
 
 /// Args for `audiohax modem channel-sim` / legacy `channel_sim`.
