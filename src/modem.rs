@@ -558,49 +558,72 @@ pub fn build_tone_frequencies(params: &ModemParams) -> Vec<Vec<f32>> {
     out
 }
 
-/// Single-frequency generalized Goertzel power at an EXACT (fractional) frequency.
+/// Recurrence coefficient of the generalized Goertzel for a target frequency:
+/// `coeff = 2·cos(2π·target_freq/sr)`. `omega` is set directly and NOT rounded to an
+/// integer DFT bin, so the response is faithful for off-bin (frequency-offset) tones;
+/// for a tone on a bin center the fractional `omega` equals the legacy integer-`k`
+/// `omega`, so on-bin behaviour is unchanged.
+#[inline]
+fn goertzel_coeff(target_freq: f32, sample_rate: usize) -> f32 {
+    let omega = 2.0 * PI * target_freq / (sample_rate as f32);
+    2.0 * omega.cos()
+}
+
+/// Generalized Goertzel power on a PRE-CONVERTED f32 window using a PRE-COMPUTED
+/// recurrence coefficient.
 ///
-/// `omega = 2π·target_freq/sr` is set directly and NOT rounded to an integer DFT bin,
-/// so the response is faithful for off-bin (frequency-offset) tones. For a tone on a
-/// bin center the fractional `omega` equals the legacy integer-`k` `omega`, so on-bin
-/// behaviour is unchanged. This is the narrowband primitive used by the band-energy
-/// detector [`goertzel_mag_squared`].
-fn goertzel_point(samples: &[i16], target_freq: f32, sample_rate: usize) -> f32 {
-    let n = samples.len();
-    if n == 0 {
-        return 0.0;
-    }
-    let sr = sample_rate as f32;
-    let omega = 2.0 * PI * target_freq / sr;
-    let coeff = 2.0 * omega.cos();
+/// This is the narrowband primitive. It takes the window already as `f32` and the
+/// `coeff` already computed so a hot loop that probes ONE window at many frequencies —
+/// or a FIXED set of frequencies across many windows — can hoist both out of its inner
+/// passes: the i16→f32 conversion is done ONCE per window (not once per probe, inside
+/// every probe's sample loop) and each frequency's `2·cos(ω)` is computed ONCE (not once
+/// per window). Both hoists are exact: `f32_window[i]` IS `i16_window[i] as f32`, and
+/// `coeff` is a deterministic f32, so the recurrence — and therefore the returned power —
+/// is bit-for-bit identical to the previous per-probe-converted / per-call-cos version.
+fn goertzel_point_coeff_f32(samples: &[f32], coeff: f32) -> f32 {
     let mut s_prev = 0.0f32;
     let mut s_prev2 = 0.0f32;
     for &x in samples {
-        let s = (x as f32) + coeff * s_prev - s_prev2;
+        let s = x + coeff * s_prev - s_prev2;
         s_prev2 = s_prev;
         s_prev = s;
     }
     s_prev2 * s_prev2 + s_prev * s_prev - coeff * s_prev * s_prev2
 }
 
-/// Goertzel tone-energy detector for `target_freq` on a slice of i16 samples.
+/// Single-frequency generalized Goertzel power at an EXACT (fractional) frequency,
+/// evaluated on a PRE-CONVERTED f32 window. Thin wrapper over
+/// [`goertzel_point_coeff_f32`] that computes the coefficient for `target_freq`; use the
+/// `_coeff` form directly when the same frequency is probed across many windows.
+fn goertzel_point_f32(samples: &[f32], target_freq: f32, sample_rate: usize) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    goertzel_point_coeff_f32(samples, goertzel_coeff(target_freq, sample_rate))
+}
+
+/// Goertzel tone-energy detector for `target_freq` on a PRE-CONVERTED f32 window.
 ///
-/// Returns the energy in a NARROW BAND centered on `target_freq` — the sum of three
-/// generalized-Goertzel probes at `target_freq` and `target_freq ± ½·bin`, where
-/// `bin = sample_rate / N` is the DFT bin resolution of this slice. Integrating over
-/// ±½ bin (rather than a single point) is what makes the detector tolerant of a
-/// **carrier frequency offset**: under an S7 `freq_offset_hz` the channel's real-cosine
-/// mix splits a tone's energy into sidebands a few Hz off the nominal bin center
-/// (and a point probe at the nominal frequency then scallops down far enough that an
-/// *adjacent* tone's point probe can win the arg-max — the exact failure the real-air
-/// freq-offset test exercises). The ±½-bin band recaptures that displaced energy for
-/// the *true* tone while staying well inside the tone spacing (the modem's tones are a
-/// full bin or more apart), so it does not blur neighbouring tones and preserves the
-/// per-tone / per-band selectivity the existing isolation tests assert. For a clean
-/// on-bin tone the center probe dominates and the band sum is monotone in the true
-/// tone energy, so on-bin arg-max decisions (and every existing on-bin test) are
-/// unchanged.
-pub fn goertzel_mag_squared(samples: &[i16], target_freq: f32, sample_rate: usize) -> f32 {
+/// Returns the energy in a NARROW BAND centered on `target_freq` — the sum of five
+/// generalized-Goertzel probes at `target_freq` and `target_freq ± 0.375·bin`,
+/// `± 0.75·bin`, where `bin = sample_rate / N` is the DFT bin resolution of this slice.
+/// Integrating over the band (rather than a single point) is what makes the detector
+/// tolerant of a **carrier frequency offset**: under an S7 `freq_offset_hz` the channel's
+/// real-cosine mix splits a tone's energy into sidebands a few Hz off the nominal bin
+/// center (and a point probe at the nominal frequency then scallops down far enough that
+/// an *adjacent* tone's point probe can win the arg-max — the exact failure the real-air
+/// freq-offset test exercises). The ±0.75-bin band recaptures that displaced energy for
+/// the *true* tone while staying well inside the tone spacing (the modem's tones are ≥ 2
+/// bins apart), so it does not blur neighbouring tones and preserves the per-tone /
+/// per-band selectivity the existing isolation tests assert. For a clean on-bin tone the
+/// center probe dominates and the band sum is monotone in the true tone energy, so on-bin
+/// arg-max decisions (and every existing on-bin test) are unchanged.
+///
+/// Taking the window as `f32` lets a caller that probes the same window at many tones
+/// (the decode arg-max) convert it to `f32` ONCE and share it across all probes. The
+/// i16 entry point [`goertzel_mag_squared`] converts once and delegates here, so its
+/// result is unchanged.
+pub fn goertzel_mag_squared_f32(samples: &[f32], target_freq: f32, sample_rate: usize) -> f32 {
     let n = samples.len();
     if n == 0 {
         return 0.0;
@@ -616,11 +639,25 @@ pub fn goertzel_mag_squared(samples: &[i16], target_freq: f32, sample_rate: usiz
     let bin = (sample_rate as f32) / (n as f32);
     let q = 0.375 * bin;
     let h = 0.75 * bin;
-    goertzel_point(samples, target_freq - h, sample_rate)
-        + goertzel_point(samples, target_freq - q, sample_rate)
-        + goertzel_point(samples, target_freq, sample_rate)
-        + goertzel_point(samples, target_freq + q, sample_rate)
-        + goertzel_point(samples, target_freq + h, sample_rate)
+    goertzel_point_f32(samples, target_freq - h, sample_rate)
+        + goertzel_point_f32(samples, target_freq - q, sample_rate)
+        + goertzel_point_f32(samples, target_freq, sample_rate)
+        + goertzel_point_f32(samples, target_freq + q, sample_rate)
+        + goertzel_point_f32(samples, target_freq + h, sample_rate)
+}
+
+/// Goertzel tone-energy detector for `target_freq` on a slice of i16 samples.
+///
+/// Converts the window to `f32` ONCE and delegates to [`goertzel_mag_squared_f32`]; the
+/// band-energy semantics live there. The single conversion is value-identical to the
+/// old five-per-probe conversions, so this returns the same power as before for every
+/// caller and test.
+pub fn goertzel_mag_squared(samples: &[i16], target_freq: f32, sample_rate: usize) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let f32_window: Vec<f32> = samples.iter().map(|&x| x as f32).collect();
+    goertzel_mag_squared_f32(&f32_window, target_freq, sample_rate)
 }
 
 /* -----------------------------
@@ -1858,18 +1895,30 @@ pub fn recover_symbol_timing(
     // single-point Goertzel (not the ±½-bin band sum) here: a small carrier offset
     // shifts every tone's energy together and does not move the *alignment* peak across
     // stride, so the point metric is enough to time-align and is 3× cheaper.
+    // Hoist each tone's Goertzel recurrence coefficient (2·cos(ω)) out of the per-window
+    // loop: the tone set is FIXED for the whole stride search, so its cosines are computed
+    // ONCE here instead of once per window inside every probe. Flattening channel×tone
+    // into one coefficient list makes the per-window arg-max a single pass. Both are exact
+    // — `coeff` is a deterministic f32 — so the per-tone value (and the max) are unchanged.
+    let tone_coeffs: Vec<f32> = tone_freqs
+        .iter()
+        .flatten()
+        .map(|&f| goertzel_coeff(f, params.sample_rate))
+        .collect();
     let win_energy = |s: usize| -> f32 {
         if s + sps_int > samples.len() {
             return 0.0;
         }
-        let slice = &samples[s..s + sps_int];
+        // Convert the i16 window to f32 ONCE and share it across every tone probe. Before
+        // this the same window was re-converted (`x as f32`) inside each of the
+        // channels×tones probes' sample loops. The conversion is value-identical, so the
+        // dominant-tone energy is bit-for-bit what the old per-probe path returned.
+        let win_f32: Vec<f32> = samples[s..s + sps_int].iter().map(|&x| x as f32).collect();
         let mut best = 0.0f32;
-        for ch_freqs in &tone_freqs {
-            for &f in ch_freqs {
-                let mag = goertzel_point(slice, f, params.sample_rate);
-                if mag > best {
-                    best = mag;
-                }
+        for &coeff in &tone_coeffs {
+            let mag = goertzel_point_coeff_f32(&win_f32, coeff);
+            if mag > best {
+                best = mag;
             }
         }
         best

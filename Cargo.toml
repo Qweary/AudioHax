@@ -215,3 +215,19 @@ crossterm = "0.28"                                 # terminal backend / event lo
 
 [dev-dependencies]
 rand_chacha = "0.3"
+
+# ── Build-profile guidance for the modem decode path ─────────────────────────
+# The chirp-sync decoder is Goertzel-heavy: per symbol window it runs a per-channel
+# per-tone arg-max, and `recover_symbol_timing` sweeps a sub-sample stride grid whose
+# per-window alignment metric is itself a per-channel per-tone Goertzel max. That inner
+# Goertzel recurrence is a serial (data-dependent) FP chain, so it is latency-bound: an
+# UNOPTIMIZED (`cargo build`, dev) `modem_decode` runs it roughly 2x slower than a
+# release binary, and a large payload takes tens of seconds either way. Operators
+# measuring or running the decoder should prefer `cargo build --release` /
+# `cargo run --release` — that is the primary throughput lever. (opt-level never changes
+# numeric behavior: Rust does not enable fast-math / FP reassociation at any level, so
+# every byte-exact round-trip and freq-offset golden is identical across dev/release.)
+
+# Explicit release settings (documents the throughput path; opt-level 3 is the default).
+[profile.release]
+opt-level = 3

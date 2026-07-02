@@ -145,12 +145,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         let slice = &samples_i16[window_start..window_start + samples_per_symbol];
+        // Convert this symbol window to f32 ONCE and share it across every channel/tone
+        // Goertzel probe. Previously each `goertzel_mag_squared(&[i16], ..)` call re-ran
+        // `x as f32` over the whole window inside all five of its band probes, so the same
+        // window was re-converted channels×m_tones×5 (= 640 at default S5 params) times.
+        // `x as f32` is value-identical wherever it runs, so the arg-max tone decision for
+        // every window is byte-for-byte unchanged.
+        let slice_f32: Vec<f32> = slice.iter().map(|&x| x as f32).collect();
         for ch in 0..params.channels {
             let freqs = &tone_freqs[ch];
             let mut max_idx = 0usize;
             let mut max_val = 0f32;
             for (i, &f) in freqs.iter().enumerate() {
-                let mag = modem::goertzel_mag_squared(slice, f, params.sample_rate);
+                let mag = modem::goertzel_mag_squared_f32(&slice_f32, f, params.sample_rate);
                 if mag > max_val {
                     max_val = mag;
                     max_idx = i;
