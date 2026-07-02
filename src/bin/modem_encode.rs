@@ -185,6 +185,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rs_shard_size = Some(s);
     }
 
+    // ── S57 (Lane G): Reed-Solomon flag ergonomics ─────────────────────────────
+    // INVARIANT established here: an explicit `--rs-data`/`--rs-parity` request must
+    // NEVER silently fall through to the non-RS PKT1 path — it either produces an
+    // `RS01` stream or fails loudly. `rs_flags_present` keys off the RAW CLI flags
+    // (not the preset-derived values above), so a preset that supplies RS geometry
+    // with NO explicit RS flags is untouched and its output stays byte-identical.
+    let rs_flags_present = cli.rs_data.is_some() || cli.rs_parity.is_some();
+
+    // (B) Conflict guard: the bare `--rs-*` flags select a header-less `RS01` stream
+    // while a non-legacy `--coding-profile` selects an in-band `CDG1` stream. Honoring
+    // both is ambiguous (previously the profile silently won and the RS flags were
+    // ignored), so refuse loudly and tell the operator to pick one FEC path.
+    if rs_flags_present && cli.coding_profile != CodingProfileArg::Legacy {
+        return Err(format!(
+            "conflicting FEC selection: the --rs-data/--rs-parity flags request a \
+             header-less RS01 stream, but --coding-profile {:?} requests an in-band \
+             CDG1 stream. Specify exactly one FEC path (drop the --rs-* flags, or use \
+             --coding-profile legacy).",
+            cli.coding_profile
+        )
+        .into());
+    }
+
+    // (B) Incomplete-spec guard: Reed-Solomon needs BOTH a data-shard and a
+    // parity-shard count (parity = 0 is meaningless). A lone `--rs-data` or
+    // `--rs-parity` used to silently emit a non-RS PKT1 stream; refuse instead.
+    if rs_flags_present && (rs_data_shards.is_none() || rs_parity_shards.is_none()) {
+        return Err(format!(
+            "incomplete Reed-Solomon spec: --rs-data and --rs-parity must be supplied \
+             together (got --rs-data={:?}, --rs-parity={:?}). Supply both, or select a \
+             preset RS rate with --coding-profile {{rs-high|rs-medium|rs-low|auto}}.",
+            cli.rs_data, cli.rs_parity
+        )
+        .into());
+    }
+
+    // (A) Honor the flags: when RS is requested with data+parity but no explicit
+    // `--rs-shard-size`, supply the established default shard size (128 bytes — the
+    // same value the balanced/robust presets use) so the flags actually switch the
+    // encoder to an `RS01` stream instead of being silently dropped.
+    if rs_flags_present && rs_shard_size.is_none() {
+        rs_shard_size = Some(128);
+        println!(
+            "Reed-Solomon requested without --rs-shard-size; defaulting shard size to 128 bytes"
+        );
+    }
+
     // If estimate-only requested, compute estimate and exit
     if estimate_only {
         if let (Some(d), Some(p), Some(s)) = (rs_data_shards, rs_parity_shards, rs_shard_size) {

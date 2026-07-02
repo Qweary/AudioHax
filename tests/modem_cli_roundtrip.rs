@@ -77,6 +77,22 @@ fn run(bin: &str, args: &[&str]) -> Output {
     out
 }
 
+/// Run a bin with args EXPECTING a non-zero exit (a loud, actionable refusal).
+/// Returns the captured `Output` so the caller can assert on the error message; on
+/// an unexpected success it panics with the captured stdout for debuggability.
+fn run_expect_fail(bin: &str, args: &[&str]) -> Output {
+    let out = Command::new(bin)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"));
+    assert!(
+        !out.status.success(),
+        "process unexpectedly SUCCEEDED (expected a non-zero exit): {bin} {args:?}\n--- stdout ---\n{}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+    out
+}
+
 /// Path a `modem_decode` recovered-file lands at for a given output basename, given
 /// a non-magic payload (always the `.bin` extension).
 fn recovered_bin(base: &Path) -> PathBuf {
@@ -538,5 +554,157 @@ fn cli_default_stream_with_explicit_repeats_still_decodes() {
 
     let got = std::fs::read(recovered_bin(&base)).expect("recovered .bin must exist");
     assert_bytes_eq(&data, &got, "default stream + explicit --repeats 3");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ============================================================================
+// TEST 10 (S57 Lane G) — bare `--rs-data`/`--rs-parity` produce an RS01 stream and
+// round-trip byte-exact with a flagless decode.
+//
+// This locks the S57 fix. BEFORE the fix, `modem_encode --rs-data 4 --rs-parity 2`
+// (no `--rs-shard-size`) SILENTLY dropped the RS request and emitted a non-RS PKT1
+// stream (the RS packetization guard `if let (Some(d),Some(p),Some(s))` failed on the
+// missing shard size), AND `modem_decode` had no RS01 auto-detect. This test:
+//   1. captures the emitted packet stream via `--simulate --sim-flip 0 --sim-out` and
+//      asserts its magic is `RS01` (NOT `PKT1`) — proving the encoder honored the
+//      flags. This assertion FAILS on pre-fix code (magic would be `PKT1`).
+//   2. decodes the WAV with NO RS flags and asserts the decode log announces the
+//      auto-detected `RS01` stream — proving the S57 decode-side RS01 auto-detect
+//      (mirroring the S56 PKT1 auto-detect). Also FAILS pre-fix (no such branch).
+//   3. asserts byte-exact recovery of the payload.
+// `--sim-flip 0` (+ default 0 burst) is a deterministic no-op pass-through, so the
+// WAV encodes the same RS01 bytes that were captured.
+// ============================================================================
+#[test]
+fn cli_bare_rs_flags_emit_rs01_and_roundtrip_byte_exact() {
+    let dir = work_dir("bare_rs");
+    let inp = dir.join("in.bin");
+    let wav = dir.join("out.wav");
+    let pkts = dir.join("pkts.bin");
+    let base = dir.join("rec");
+    let data = payload(320);
+    std::fs::write(&inp, &data).unwrap();
+
+    // Encode with ONLY --rs-data/--rs-parity (no shard size), capturing the packet
+    // stream bytes via the no-op channel simulator.
+    run(
+        BIN_ENCODE,
+        &[
+            wav.to_str().unwrap(),
+            inp.to_str().unwrap(),
+            "--rs-data",
+            "4",
+            "--rs-parity",
+            "2",
+            "--simulate",
+            "--sim-flip",
+            "0",
+            "--sim-out",
+            pkts.to_str().unwrap(),
+        ],
+    );
+
+    // (1) The emitted stream MUST be an RS01 (Reed-Solomon) stream, not PKT1.
+    let stream = std::fs::read(&pkts).expect("captured packet stream must exist");
+    assert!(
+        stream.len() >= 4,
+        "captured packet stream is too short: {} bytes",
+        stream.len()
+    );
+    assert_eq!(
+        &stream[0..4],
+        b"RS01",
+        "bare --rs-data/--rs-parity MUST emit an RS01 stream (got magic {:?}); pre-fix \
+         this was silently a PKT1 stream",
+        String::from_utf8_lossy(&stream[0..4])
+    );
+
+    // (2) Decode with NO RS flags; the S57 RS01 auto-detect must fire.
+    let dec = run(BIN_DECODE, &[wav.to_str().unwrap(), base.to_str().unwrap()]);
+    let log = String::from_utf8_lossy(&dec.stdout);
+    assert!(
+        log.contains("RS01") && log.contains("auto"),
+        "expected decode to auto-detect the RS01 stream (no --rs-data/--rs-parity); \
+         decode stdout was:\n{log}"
+    );
+
+    // (3) Byte-exact recovery.
+    let got = std::fs::read(recovered_bin(&base)).expect("recovered .bin must exist");
+    assert_bytes_eq(&data, &got, "bare --rs-data/--rs-parity CLI round-trip");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ============================================================================
+// TEST 11 (S57 Lane G) — hard-error on conflicting FEC selection.
+// Property: giving BOTH the bare `--rs-*` flags AND a non-legacy `--coding-profile`
+// exits non-zero with an actionable "conflicting FEC selection" message, instead of
+// silently letting the coding profile win (the pre-fix behavior).
+// ============================================================================
+#[test]
+fn cli_rs_flags_plus_coding_profile_hard_errors() {
+    let dir = work_dir("rs_conflict");
+    let inp = dir.join("in.bin");
+    let wav = dir.join("out.wav");
+    let data = payload(200);
+    std::fs::write(&inp, &data).unwrap();
+
+    let out = run_expect_fail(
+        BIN_ENCODE,
+        &[
+            wav.to_str().unwrap(),
+            inp.to_str().unwrap(),
+            "--rs-data",
+            "4",
+            "--rs-parity",
+            "2",
+            "--coding-profile",
+            "rs-high",
+        ],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("conflicting FEC selection"),
+        "expected a 'conflicting FEC selection' error; stderr was:\n{err}"
+    );
+    // No WAV should have been produced.
+    assert!(
+        !wav.exists(),
+        "encoder must not write a WAV when it refuses a conflicting FEC selection"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ============================================================================
+// TEST 12 (S57 Lane G) — hard-error on an incomplete RS spec (only --rs-data).
+// Property: a lone `--rs-data` (no `--rs-parity`) exits non-zero with an actionable
+// "incomplete Reed-Solomon spec" message, instead of silently emitting a non-RS PKT1
+// stream (the pre-fix behavior).
+// ============================================================================
+#[test]
+fn cli_partial_rs_flags_hard_error() {
+    let dir = work_dir("rs_partial");
+    let inp = dir.join("in.bin");
+    let wav = dir.join("out.wav");
+    let data = payload(200);
+    std::fs::write(&inp, &data).unwrap();
+
+    let out = run_expect_fail(
+        BIN_ENCODE,
+        &[
+            wav.to_str().unwrap(),
+            inp.to_str().unwrap(),
+            "--rs-data",
+            "4",
+        ],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("incomplete Reed-Solomon spec"),
+        "expected an 'incomplete Reed-Solomon spec' error; stderr was:\n{err}"
+    );
+    assert!(
+        !wav.exists(),
+        "encoder must not write a WAV when it refuses an incomplete RS spec"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

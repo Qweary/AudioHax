@@ -313,6 +313,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             }
         }
+    } else if modem::stream_is_rs01(&bytes) {
+        // RS01 AUTO-DETECT (S57, mirrors the PKT1 auto-detect above): the bare
+        // `--rs-data`/`--rs-parity` encode flags now emit a header-less RS01 stream,
+        // which begins with the `RS01` magic. Each RS01 packet header self-describes
+        // its data/parity/shard geometry, so depacketize_stream_rs reconstructs the
+        // stream (interleaved or not) with NO `--rs-data`/`--rs-parity` flags on the
+        // decode side — exactly as the S56 PKT1 branch removed the need for `--repeats`.
+        // A legacy AHX1 frame or a PKT1/CDG1 stream does NOT start with RS01, so this
+        // branch cannot displace those paths.
+        println!(
+            "Detected RS01 Reed-Solomon packet stream; auto-depacketizing (no --rs-data/--rs-parity needed)."
+        );
+        match modem::depacketize_stream_rs(&bytes) {
+            Ok(v) => {
+                println!("Depacketize (RS01 auto) succeeded: {} bytes", v.len());
+                Some(v)
+            }
+            Err(e) => {
+                eprintln!(
+                    "RS01 auto-depacketize failed: {}. Falling back to raw frame parse.",
+                    e
+                );
+                None
+            }
+        }
     } else {
         None
     };

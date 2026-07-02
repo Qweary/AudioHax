@@ -782,6 +782,22 @@ pub fn stream_is_pkt1(buf: &[u8]) -> bool {
     buf.len() >= 4 && &buf[0..4] == b"PKT1"
 }
 
+/// Returns `true` when `buf` looks like a Reed-Solomon-packetized (`RS01`) stream,
+/// i.e. it begins with the `RS01` packet magic emitted by [`packetize_stream_rs`]
+/// and [`packetize_stream_rs_interleaved`] (both serialize the SAME 28-byte header
+/// whose first four bytes are `RS01`).
+///
+/// Mirrors [`stream_is_pkt1`]: it lets decode auto-select the RS depacketizer
+/// without explicit `--rs-data`/`--rs-parity` flags. Each `RS01` packet header
+/// self-describes its `data_shards`/`parity_shards`/`shard_size` geometry, so
+/// [`depacketize_stream_rs`] reconstructs the stream (interleaved or not) from the
+/// headers alone. The prefix check (not a whole-buffer scan) cleanly distinguishes
+/// an `RS01` stream from a legacy header-less `AHX1` frame and from `PKT1`/`CDG1`
+/// streams, so it cannot mis-fire on those paths.
+pub fn stream_is_rs01(buf: &[u8]) -> bool {
+    buf.len() >= 4 && &buf[0..4] == b"RS01"
+}
+
 /* -----------------------------
 Reed-Solomon Packetization (RS)
 -----------------------------
