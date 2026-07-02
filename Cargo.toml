@@ -17,9 +17,21 @@ default-run = "audiohax"
 [[bin]]
 name = "audiohax"          # src/main.rs — the image-to-music app
 path = "src/main.rs"
-# WS-4 Phase 2 (S11) Lane C: required-features DROPPED. The DEFAULT feature set
-# (`pure-analysis` + `synth`) builds this bin pure-Rust; every `opencv::` /
-# `midi-out` reference in main.rs is `#[cfg(feature=…)]`-gated (design §3.C/§5.2).
+# S58 Lane B: required-features RESTORED. The S11 note below dropped them on the
+# premise that main.rs was pure-Rust-buildable, but the app has since grown
+# UNCONDITIONAL references to `audiohax::pure_analysis` and `audiohax::synth_sink`
+# (e.g. the `build_step_event_timeline` return type, the stream loop's `MidiCmd`
+# use) plus a `#[cfg(not(feature="opencv"))]`-guarded `pure_analysis` block whose
+# predicate does not match `pure-analysis` — so under `--no-default-features` the
+# bin fails to compile (E0432/E0433), which broke `cargo test --no-default-features`
+# for the whole workspace. `midi_output::MidiOut` (line 68) also pulls `midir`
+# unconditionally. The app's true minimal feature set is therefore the full default
+# set; declaring it lets `--no-default-features` SKIP the app bin (mirroring the
+# image `[[bin]]` targets) while the pure-Rust music+modem core still builds+tests.
+# The default feature set turns all three ON, so `cargo run`/`cargo build` are
+# unaffected. (Was, S11: "required-features DROPPED — DEFAULT set builds this bin
+# pure-Rust; every opencv/midi-out reference is #[cfg]-gated, design §3.C/§5.2".)
+required-features = ["pure-analysis", "synth", "midi-out"]
 
 [[bin]]
 name = "make_tiled_payload"
@@ -30,6 +42,66 @@ required-features = ["image"]
 name = "unpack_tiled_payload"
 path = "src/bin/unpack_tiled_payload.rs"
 required-features = ["image"]
+
+# ── Explicit test tables for FEATURE-DEPENDENT integration tests ─────────────
+# Same mechanism as the image `[[bin]]` targets above (S5). Cargo auto-discovers
+# every file in tests/, so a test that imports a feature-gated item
+# UNCONDITIONALLY fails to compile under `--no-default-features` (E0432). Naming
+# the test with its true minimal `required-features` lets cargo SKIP it when the
+# feature is off, so `cargo test --no-default-features` compiles only the
+# music+modem (pure-Rust, dependency-free) tests and runs them green. A `[[test]]`
+# table with a matching name+path does NOT drop the test from default-feature
+# runs — it is still discovered and run when its features are on.
+#
+# Two feature-gated tests are NOT listed here because each already carries a
+# file-level `#![cfg(all(feature = "synth", feature = "pure-analysis"))]` guard
+# (tests/ab_harness_s31.rs, tests/render_cli_determinism_s55.rs) — they compile
+# to an empty binary under --no-default-features on their own.
+#
+# `pure-analysis` pulls the `image` crate and gates `audiohax::pure_analysis`;
+# `synth` gates `audiohax::synth_sink` and pulls `rustysynth`/`cpal`.
+
+# Import `audiohax::pure_analysis` (and/or the `image` crate) → need `pure-analysis`.
+[[test]]
+name = "prominence_s43"
+path = "tests/prominence_s43.rs"
+required-features = ["pure-analysis"]
+
+[[test]]
+name = "qg_s53_review"
+path = "tests/qg_s53_review.rs"
+required-features = ["pure-analysis"]
+
+[[test]]
+name = "rhythm_variety_s50"
+path = "tests/rhythm_variety_s50.rs"
+required-features = ["pure-analysis"]
+
+[[test]]
+name = "runtime_reachability_s37"
+path = "tests/runtime_reachability_s37.rs"
+required-features = ["pure-analysis"]
+
+[[test]]
+name = "s52_probe_identity"
+path = "tests/s52_probe_identity.rs"
+required-features = ["pure-analysis"]
+
+[[test]]
+name = "saliency_s18"
+path = "tests/saliency_s18.rs"
+required-features = ["pure-analysis"]
+
+[[test]]
+name = "variety_scorecard_s45"
+path = "tests/variety_scorecard_s45.rs"
+required-features = ["pure-analysis"]
+
+# Also imports `audiohax::synth_sink` / `rustysynth` → need `pure-analysis` AND `synth`.
+[[test]]
+name = "phase2_pure_pipeline"
+path = "tests/phase2_pure_pipeline.rs"
+required-features = ["pure-analysis", "synth"]
 
 [features]
 # ── WS-4 Phase 2 (S11) Lane C — DEFAULT flipped to PURE RUST (design §5.1). ──
