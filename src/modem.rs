@@ -768,6 +768,20 @@ pub fn depacketize_stream(buf: &[u8], _expected_repeats: usize) -> Result<Vec<u8
     Ok(out)
 }
 
+/// Returns `true` when `buf` looks like a repetition-packetized (`PKT1`) stream,
+/// i.e. it begins with the `PKT1` packet magic emitted by [`packetize_stream`].
+///
+/// Used by decode to auto-select the repetition depacketizer without an explicit
+/// `--repeats` flag: the `PKT1` header self-describes each packet's `seq`/`len`,
+/// and [`depacketize_stream`] ignores its `expected_repeats` argument entirely —
+/// it reconstructs from `seq` grouping plus per-copy CRC voting. The prefix check
+/// (not a whole-buffer scan) cleanly distinguishes a `PKT1` stream from a legacy
+/// header-less `AHX1` frame (which begins with `AHX1`) and from `RS01`/`CDG1`
+/// streams, so it cannot mis-fire on those paths.
+pub fn stream_is_pkt1(buf: &[u8]) -> bool {
+    buf.len() >= 4 && &buf[0..4] == b"PKT1"
+}
+
 /* -----------------------------
 Reed-Solomon Packetization (RS)
 -----------------------------
@@ -2426,6 +2440,37 @@ mod tests {
             Ok(_) => {}
             other => panic!("expected Depacketize Err or Ok, got {:?}", other),
         }
+    }
+
+    /// Property: `stream_is_pkt1` recognizes a real repetition-packetized stream by
+    /// its `PKT1` prefix, and does NOT mis-classify a legacy header-less `AHX1` frame
+    /// nor random junk. This is the gate the decode auto-detect path relies on to
+    /// depacketize without an explicit `--repeats` flag.
+    #[test]
+    fn test_stream_is_pkt1_prefix_detection() {
+        let frame =
+            build_frame("p.bin", &seeded_payload(21, 64), false, None).expect("build_frame");
+        // A packetized stream is detected...
+        let pkt = packetize_stream(&frame, 200, 3);
+        assert!(
+            stream_is_pkt1(&pkt),
+            "PKT1 stream must be detected by prefix"
+        );
+        // ...and, because depacketize_stream ignores the repeat count, it reconstructs
+        // the frame byte-exactly regardless of the (wrong) count passed in.
+        let recovered = depacketize_stream(&pkt, 0).expect("auto-depacketize");
+        assert_eq!(
+            recovered, frame,
+            "auto-depacketize must reconstruct the frame"
+        );
+        // A legacy header-less AHX1 frame is NOT mistaken for a PKT1 stream.
+        assert!(
+            !stream_is_pkt1(&frame),
+            "AHX1 frame must not be seen as PKT1"
+        );
+        // Random junk and too-short buffers are rejected.
+        assert!(!stream_is_pkt1(&seeded_payload(22, 200)));
+        assert!(!stream_is_pkt1(b"PKT"));
     }
 
     /// Property: depacketize_stream_rs on a buffer with no RS01 magic returns a

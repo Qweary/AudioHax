@@ -272,26 +272,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             }
         }
-    } else {
-        // try repetition-based
-        if let Some(r) = expected_repeats {
-            println!(
-                "Attempting repetition depacketize (expected repeats = {})",
-                r
-            );
-            match modem::depacketize_stream(&bytes, r) {
-                Ok(v) => {
-                    println!("Depacketize succeeded: {} bytes", v.len());
-                    Some(v)
-                }
-                Err(e) => {
-                    eprintln!("Depacketize failed or no packets found: {}. Falling back to trying raw frame parsing.", e);
-                    None
-                }
+    } else if let Some(r) = expected_repeats {
+        // Explicit operator override: repetition depacketize with the supplied count.
+        // (depacketize_stream ignores the count internally, but honoring the flag keeps
+        // legacy `--repeats N` invocations behaving exactly as before.)
+        println!(
+            "Attempting repetition depacketize (expected repeats = {})",
+            r
+        );
+        match modem::depacketize_stream(&bytes, r) {
+            Ok(v) => {
+                println!("Depacketize succeeded: {} bytes", v.len());
+                Some(v)
             }
-        } else {
-            None
+            Err(e) => {
+                eprintln!("Depacketize failed or no packets found: {}. Falling back to trying raw frame parsing.", e);
+                None
+            }
         }
+    } else if modem::stream_is_pkt1(&bytes) {
+        // PKT1 AUTO-DETECT (mirrors the RS01/CDG1 in-band auto-detection above): the
+        // DEFAULT encoder packetizes with PKT1 repetition, so a default-encoded stream
+        // begins with the `PKT1` magic. The PKT1 header self-describes each packet's
+        // seq/len and depacketize_stream reconstructs from seq grouping + per-copy CRC
+        // voting, so no `--repeats` flag is needed. A legacy header-less AHX1 frame does
+        // NOT start with PKT1 and falls through to the raw-frame parse unchanged.
+        println!(
+            "Detected PKT1 repetition packet stream; auto-depacketizing (no --repeats needed)."
+        );
+        match modem::depacketize_stream(&bytes, 0) {
+            Ok(v) => {
+                println!("Depacketize (PKT1 auto) succeeded: {} bytes", v.len());
+                Some(v)
+            }
+            Err(e) => {
+                eprintln!(
+                    "PKT1 auto-depacketize failed: {}. Falling back to raw frame parse.",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
     };
 
     // Decide what to parse as frame bytes: prefer depacketized result if available, else raw bytes

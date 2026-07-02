@@ -440,3 +440,103 @@ fn cli_acoustic_channel_chirp_rs_e2e_byte_exact() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ============================================================================
+// TEST 7 (S54 regression) — DEFAULT plain round-trip with NO flags either side.
+//
+// Property: `modem_encode out.wav in` (no flags) then `modem_decode out.wav rec`
+// (no flags) recovers the input BYTE-FOR-BYTE. The default encoder packetizes with
+// PKT1 repetition (pkt_size=200 repeats=3); before the PKT1 auto-detect branch was
+// added to modem_decode, the default decoder never stripped the PKT1 wrapper (it
+// only depacketized under an explicit `--repeats N`), so parse_frame_header saw the
+// PKT1 magic instead of AHX1 and the recovered `.bin` was the raw packet stream,
+// not the payload. This test FAILS pre-fix (length + first-byte mismatch) and
+// passes once decode auto-detects PKT1. Confirmed red pre-fix by reverting the
+// `stream_is_pkt1` branch.
+// ============================================================================
+#[test]
+fn cli_default_plain_roundtrip_byte_exact() {
+    let dir = work_dir("default_plain");
+    let inp = dir.join("in.bin");
+    let wav = dir.join("out.wav");
+    let base = dir.join("rec");
+    let data = payload(300);
+    std::fs::write(&inp, &data).unwrap();
+
+    run(BIN_ENCODE, &[wav.to_str().unwrap(), inp.to_str().unwrap()]);
+    let dec = run(BIN_DECODE, &[wav.to_str().unwrap(), base.to_str().unwrap()]);
+
+    // The decode log should announce the auto-detected PKT1 stream (no --repeats).
+    let log = String::from_utf8_lossy(&dec.stdout);
+    assert!(
+        log.contains("PKT1") && log.contains("auto"),
+        "expected decode to auto-detect the PKT1 repetition stream; decode stdout was:\n{log}"
+    );
+
+    let got = std::fs::read(recovered_bin(&base)).expect("recovered .bin must exist");
+    assert_bytes_eq(&data, &got, "default plain CLI round-trip (no flags)");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ============================================================================
+// TEST 8 (S54 regression) — DEFAULT `--compress` round-trip with default decode.
+//
+// Property: `modem_encode out.wav in --compress` then `modem_decode out.wav rec`
+// (no flags) recovers the input BYTE-FOR-BYTE. Mirrors the orchestrator's finding
+// that the failure was NOT compress-specific: the gzip frame is still wrapped in
+// PKT1 by default, so the same auto-detect fix carries it. Byte-exact means the
+// decoder both stripped PKT1 AND decompressed. FAILS pre-fix.
+// ============================================================================
+#[test]
+fn cli_default_compress_roundtrip_byte_exact() {
+    let dir = work_dir("default_compress");
+    let inp = dir.join("in.bin");
+    let wav = dir.join("out.wav");
+    let base = dir.join("rec");
+    let data = payload(300);
+    std::fs::write(&inp, &data).unwrap();
+
+    run(
+        BIN_ENCODE,
+        &[wav.to_str().unwrap(), inp.to_str().unwrap(), "--compress"],
+    );
+    run(BIN_DECODE, &[wav.to_str().unwrap(), base.to_str().unwrap()]);
+
+    let got = std::fs::read(recovered_bin(&base)).expect("recovered .bin must exist");
+    assert_bytes_eq(&data, &got, "default --compress CLI round-trip (no flags)");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ============================================================================
+// TEST 9 (S54 regression) — explicit `--repeats` override still decodes a DEFAULT
+// (PKT1) stream, proving the auto-detect branch did not displace the legacy flag.
+//
+// Property: default `modem_encode` then `modem_decode --repeats 3` recovers byte-
+// exact. This is distinct from TEST 2 (which encodes `--coding-profile legacy
+// --repeats 3`): here the encode is a bare default, and the decode still honors the
+// operator-supplied `--repeats` (the explicit branch is tried BEFORE the auto one).
+// ============================================================================
+#[test]
+fn cli_default_stream_with_explicit_repeats_still_decodes() {
+    let dir = work_dir("default_explicit_rep");
+    let inp = dir.join("in.bin");
+    let wav = dir.join("out.wav");
+    let base = dir.join("rec");
+    let data = payload(240);
+    std::fs::write(&inp, &data).unwrap();
+
+    run(BIN_ENCODE, &[wav.to_str().unwrap(), inp.to_str().unwrap()]);
+    run(
+        BIN_DECODE,
+        &[
+            wav.to_str().unwrap(),
+            base.to_str().unwrap(),
+            "--repeats",
+            "3",
+        ],
+    );
+
+    let got = std::fs::read(recovered_bin(&base)).expect("recovered .bin must exist");
+    assert_bytes_eq(&data, &got, "default stream + explicit --repeats 3");
+    let _ = std::fs::remove_dir_all(&dir);
+}
