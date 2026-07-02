@@ -17,21 +17,34 @@ default-run = "audiohax"
 [[bin]]
 name = "audiohax"          # src/main.rs — the image-to-music app
 path = "src/main.rs"
-# S58 Lane B: required-features RESTORED. The S11 note below dropped them on the
-# premise that main.rs was pure-Rust-buildable, but the app has since grown
-# UNCONDITIONAL references to `audiohax::pure_analysis` and `audiohax::synth_sink`
-# (e.g. the `build_step_event_timeline` return type, the stream loop's `MidiCmd`
-# use) plus a `#[cfg(not(feature="opencv"))]`-guarded `pure_analysis` block whose
-# predicate does not match `pure-analysis` — so under `--no-default-features` the
-# bin fails to compile (E0432/E0433), which broke `cargo test --no-default-features`
-# for the whole workspace. `midi_output::MidiOut` (line 68) also pulls `midir`
-# unconditionally. The app's true minimal feature set is therefore the full default
-# set; declaring it lets `--no-default-features` SKIP the app bin (mirroring the
-# image `[[bin]]` targets) while the pure-Rust music+modem core still builds+tests.
-# The default feature set turns all three ON, so `cargo run`/`cargo build` are
-# unaffected. (Was, S11: "required-features DROPPED — DEFAULT set builds this bin
-# pure-Rust; every opencv/midi-out reference is #[cfg]-gated, design §3.C/§5.2".)
-required-features = ["pure-analysis", "synth", "midi-out"]
+# S59 Lane H: required-features LOWERED to the TRUE minimum after fixing the ROOT
+# source defect in main.rs. S58 (below) set the full default set because main.rs's
+# feature-gating was internally inconsistent — a `#[cfg(not(feature="opencv"))]`-guarded
+# `pure_analysis` block (predicate keyed on the ABSENCE of opencv, not the PRESENCE of
+# pure-analysis) plus an UNCONDITIONAL `midi_output::MidiOut`/`midir` reference — so the
+# bin could not compile under a pure-Rust set and had to be SKIPPED wholesale. S59 makes
+# the gating honest: every `pure_analysis` ref is now gated on `all(not(opencv),
+# feature="pure-analysis")` (opencv-preferred, else pure), and every `MidiOut`/`midir`
+# ref (the module, the imports, the `impl AudioSink for MidiOut`, the `--list-midi-ports`
+# query, and the MIDI arm of runtime sink selection) is gated on `feature="midi-out"`.
+# The app therefore GENUINELY compiles under `--no-default-features --features
+# pure-analysis,synth` (the reduced pure-Rust headless set), so the minimum is exactly
+# `["pure-analysis", "synth"]`:
+#   * `synth` stays REQUIRED — it is a hard dependency of the app's event model, not an
+#     optional output: `build_step_event_timeline` returns `synth_sink::TimedMidiEvent`
+#     and the stream loop dispatches `synth_sink::MidiCmd` on EVERY sink (MIDI included),
+#     so there is no build of this bin without `synth`.
+#   * `pure-analysis` stays REQUIRED as the DEFAULT image provider (default has no
+#     opencv) — it also guarantees a defined feature `source` so `--features synth`
+#     alone can't compile to a missing-source error. opencv is normally ADDITIVE over
+#     the default set (`cargo build --features opencv` keeps pure-analysis+synth), so
+#     the opencv escape hatch still builds.
+#   * `midi-out` is now TRULY OPTIONAL. It is in the DEFAULT set, so `cargo run`/`cargo
+#     build` compile it and select the sink at runtime exactly as before (default
+#     behavior byte-preserved); a pure-Rust build drops it and uses the synth only.
+# Under `--no-default-features` (nothing on) the bin is still cleanly SKIPPED
+# (pure-analysis absent), so `cargo test --no-default-features` stays green.
+required-features = ["pure-analysis", "synth"]
 
 [[bin]]
 name = "make_tiled_payload"

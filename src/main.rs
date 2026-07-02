@@ -38,9 +38,13 @@
 mod image_analysis;
 #[cfg(feature = "opencv")]
 mod image_source;
-// External MIDI-out adapter module. WS-4 S12: `midi-out` is now in the DEFAULT
-// feature set, so this module + the `MidiOut` sink are always compiled and the sink
-// is chosen at RUNTIME (see the `--output`/`--midi-virtual` branch below), not by cfg.
+// External MIDI-out adapter module. S59 Lane H: this module pulls `midir` (via
+// `midi_output.rs`), so it is compiled ONLY under the `midi-out` feature. `midi-out`
+// is in the DEFAULT set, so the shipped binary still compiles it and selects the sink
+// at RUNTIME (see the `--output`/`--midi-virtual` branch below); a pure-Rust build with
+// `--no-default-features --features pure-analysis,synth` drops it (no `midir`, no MIDI
+// sink) and uses the in-process synth exclusively.
+#[cfg(feature = "midi-out")]
 mod midi_output;
 
 use audiohax::cli::{pipeline_to_engine_config, Cli, Command, OutputSink, PlayArgs, RenderArgs};
@@ -60,11 +64,15 @@ use opencv::core;
 #[cfg(feature = "opencv")]
 use opencv::prelude::MatTraitConst; // needed for .cols()/.rows()
 
-// ── External MIDI-out sink import ────────────────────────────────────────────
-// WS-4 S12: `MidiOut` (and its `AudioSinkError` use) are always compiled now — the
-// sink is selected at runtime. `AudioSinkError` is imported once here regardless of
-// the `opencv` flag (the `impl AudioSink for MidiOut` below always needs it).
+// ── External MIDI-out sink import (gated by `midi-out`) ──────────────────────
+// S59 Lane H: `MidiOut` and its `AudioSinkError` use are compiled ONLY when the
+// `midi-out` feature is on (it pulls `midir`). `midi-out` is in the DEFAULT set, so
+// the shipped binary still compiles both and selects the sink at runtime; a
+// `--no-default-features --features pure-analysis,synth` build omits them entirely and
+// the in-process synth is the sole sink.
+#[cfg(feature = "midi-out")]
 use audiohax::engine::AudioSinkError;
+#[cfg(feature = "midi-out")]
 use midi_output::MidiOut;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,8 +83,9 @@ use std::time::{Duration, Instant};
 /// bin-private `MidiOut`, and even a re-export would be an orphan violation. Each
 /// method maps `MidiOut`'s `Box<dyn Error>` (NOT `Send + Sync`) into an
 /// `AudioSinkError` by stringifying it — keeping `midi_output.rs` untouched.
-/// WS-4 S12: unconditional — `midi-out` is in `default`, so `MidiOut` is always
-/// compiled and selected at runtime; the in-process `SynthSink` remains the default.
+/// S59 Lane H: gated on `midi-out` (the feature that compiles `MidiOut`). Under the
+/// default set the sink is still selected at runtime; a pure-Rust build omits it.
+#[cfg(feature = "midi-out")]
 impl AudioSink for MidiOut {
     fn note_on(&mut self, channel: u8, note: u8, velocity: u8) -> Result<(), AudioSinkError> {
         MidiOut::note_on(self, channel, note, velocity)
@@ -366,7 +375,7 @@ fn run_render_wav(
         let steps = scan_image(&img, instrument_count, bar_thickness_frac, num_steps, None)?;
         PrecomputedSource::new(&global_features, &steps)
     };
-    #[cfg(not(feature = "opencv"))]
+    #[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
     let (source, understanding) = {
         use audiohax::pure_analysis::{
             load_pure_image, understand_image_pure, PureAnalysisSource, PureImageSource,
@@ -404,9 +413,9 @@ fn run_render_wav(
     //    is the audible path; the S13 flat path is the fallback when mappings.json has no
     //    `composition` block (compose_from_image -> false). The OpenCV arm stays on the legacy
     //    set_features_global path (spec §4 Option A). ──
-    #[cfg(not(feature = "opencv"))]
+    #[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
     let composed: bool = engine.compose_from_image(&understanding);
-    #[cfg(not(feature = "opencv"))]
+    #[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
     if !composed {
         // No `composition` block in mappings.json -> keep the S13 flat path, byte-identical
         // to the pre-S37 binary.
@@ -476,6 +485,45 @@ fn run_render_wav(
     Ok(())
 }
 
+/// Build the in-process synth sink (rustysynth + cpal), honoring the `--soundfont` /
+/// `--reverb` / `--gain` A/B controls. This is the DEFAULT sink and — on a build
+/// WITHOUT the `midi-out` feature — the ONLY sink. Extracted (S59 Lane H) so the two
+/// `midi-out`-gated sink-selection arms below share one construction site instead of
+/// duplicating it; no flags ⇒ `SynthConfig::default()` + bundled font ⇒ byte-identical
+/// to the pre-extraction inline path.
+fn build_synth_sink(
+    play_args: &PlayArgs,
+) -> Result<Box<dyn AudioSink>, Box<dyn std::error::Error>> {
+    use audiohax::synth_sink::{SoundFontSource, SynthConfig, SynthSink};
+    let synth_config = SynthConfig {
+        enable_reverb_and_chorus: play_args.audio.reverb.is_on(),
+        gain: play_args.audio.gain,
+    };
+    let font_src = match &play_args.audio.soundfont {
+        Some(p) => SoundFontSource::Path(p.as_path()),
+        None => SoundFontSource::Bundled,
+    };
+    match &play_args.audio.soundfont {
+        Some(p) => println!(
+            "Starting in-process synth (rustysynth + cpal, SoundFont {})...",
+            p.display()
+        ),
+        None => println!("Starting in-process synth (rustysynth + cpal, bundled SoundFont)..."),
+    }
+    println!(
+        "  reverb/chorus = {}, master gain = {}",
+        if synth_config.enable_reverb_and_chorus {
+            "on"
+        } else {
+            "off"
+        },
+        synth_config.gain
+    );
+    let synth = SynthSink::new_with_config(font_src, synth_config)?;
+    println!("Synth audio stream started @ {} Hz.", synth.sample_rate());
+    Ok(Box::new(synth))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── CLI (shared clap grammar) ───────────────────────────────────────────────
     let cli = Cli::parse();
@@ -515,7 +563,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── `--list-midi-ports` query short-circuit (WS-4 S12) ──────────────────────
     // This is a query, not playback: enumerate the available MIDI output ports and
     // exit BEFORE any mapping/image work. The printed index is the selector accepted
-    // by `--midi-port <index>`.
+    // by `--midi-port <index>`. S59 Lane H: MIDI enumeration exists only when `midi-out`
+    // is compiled in; a pure-Rust build answers the query with a clear "not compiled in".
+    #[cfg(feature = "midi-out")]
     if play_args.list_midi_ports {
         match MidiOut::list_ports() {
             Ok(ports) if !ports.is_empty() => {
@@ -530,6 +580,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
             Err(e) => eprintln!("Could not enumerate MIDI ports: {e}"),
         }
+        return Ok(());
+    }
+    #[cfg(not(feature = "midi-out"))]
+    if play_args.list_midi_ports {
+        println!(
+            "This build has no `midi-out` feature, so there are no external MIDI output \
+             ports to list. Rebuild with `--features midi-out` to enable external MIDI."
+        );
         return Ok(());
     }
 
@@ -598,7 +656,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // DEFAULT (pure) path: acquire + analyze with the pure-Rust `pure_analysis` module.
-    #[cfg(not(feature = "opencv"))]
+    #[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
     let (source, understanding) = {
         use audiohax::pure_analysis::{
             load_pure_image, understand_image_pure, PureAnalysisSource, PureImageSource,
@@ -646,9 +704,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // mappings.json has no `composition` block (compose_from_image -> false). The OpenCV arm
     // stays on the legacy set_features_global path (spec §4 Option A).
     let mut engine = PipelineEngine::new(mappings, engine_config);
-    #[cfg(not(feature = "opencv"))]
+    #[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
     let composed: bool = engine.compose_from_image(&understanding);
-    #[cfg(not(feature = "opencv"))]
+    #[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
     if !composed {
         engine.set_features_global(&source.global_features());
     }
@@ -669,61 +727,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // ── Sink selection at RUNTIME (WS-4 S12) ────────────────────────────────────
-    // Both sinks are compiled in; the concrete one is chosen here, not by cfg.
-    // `--midi-virtual` forces the MIDI sink; otherwise `--output` decides (default
-    // `synth`). The engine driver below speaks only `Box<dyn AudioSink>` — the seam.
-    let want_midi =
-        matches!(play_args.output, OutputSink::Midi) || play_args.midi_virtual.is_some();
-
-    let mut sink: Box<dyn AudioSink> = if want_midi {
-        let midi = if let Some(vname) = play_args.midi_virtual.as_deref() {
-            println!(
-                "Creating virtual MIDI output port '{vname}' (subscribe to it from your DAW/Qsynth)..."
-            );
-            MidiOut::open_virtual(vname)?
-        } else {
-            let env_port = std::env::var("AUDIOHAX_MIDI_PORT").ok();
-            let selector = play_args.midi_port.as_deref().or(env_port.as_deref());
-            println!("Connecting to external MIDI port (selector = {selector:?})...");
-            MidiOut::open_selector(selector)?
-        };
-        println!("MIDI output ready.");
-        Box::new(midi)
-    } else {
-        // S31: honor the A/B controls. No flags ⇒ SynthConfig::default() + Bundled font
-        // ⇒ byte-identical to the pre-S31 path. `--soundfont` swaps the font (loaded by
-        // path; a bad path fails loudly); `--reverb`/`--gain` set the config.
-        use audiohax::synth_sink::{SoundFontSource, SynthConfig, SynthSink};
-        let synth_config = SynthConfig {
-            enable_reverb_and_chorus: play_args.audio.reverb.is_on(),
-            gain: play_args.audio.gain,
-        };
-        let font_src = match &play_args.audio.soundfont {
-            Some(p) => SoundFontSource::Path(p.as_path()),
-            None => SoundFontSource::Bundled,
-        };
-        match &play_args.audio.soundfont {
-            Some(p) => println!(
-                "Starting in-process synth (rustysynth + cpal, SoundFont {})...",
-                p.display()
-            ),
-            None => {
-                println!("Starting in-process synth (rustysynth + cpal, bundled SoundFont)...")
-            }
-        }
-        println!(
-            "  reverb/chorus = {}, master gain = {}",
-            if synth_config.enable_reverb_and_chorus {
-                "on"
+    // ── Sink selection at RUNTIME ───────────────────────────────────────────────
+    // The in-process synth is the default and — on a build without the `midi-out`
+    // feature — the ONLY sink. When `midi-out` is compiled in (it is, in the DEFAULT
+    // set), `--midi-virtual` forces the external MIDI sink and otherwise `--output`
+    // decides (default `synth`). The engine driver below speaks only `Box<dyn
+    // AudioSink>` — the seam — so the reduced pure-Rust build differs only in which
+    // concrete sink can be constructed. S59 Lane H: the MIDI arm is cfg-gated so the
+    // pure-Rust build carries no `MidiOut`/`midir` reference.
+    #[cfg(feature = "midi-out")]
+    let mut sink: Box<dyn AudioSink> = {
+        let want_midi =
+            matches!(play_args.output, OutputSink::Midi) || play_args.midi_virtual.is_some();
+        if want_midi {
+            let midi = if let Some(vname) = play_args.midi_virtual.as_deref() {
+                println!(
+                    "Creating virtual MIDI output port '{vname}' (subscribe to it from your DAW/Qsynth)..."
+                );
+                MidiOut::open_virtual(vname)?
             } else {
-                "off"
-            },
-            synth_config.gain
-        );
-        let synth = SynthSink::new_with_config(font_src, synth_config)?;
-        println!("Synth audio stream started @ {} Hz.", synth.sample_rate());
-        Box::new(synth)
+                let env_port = std::env::var("AUDIOHAX_MIDI_PORT").ok();
+                let selector = play_args.midi_port.as_deref().or(env_port.as_deref());
+                println!("Connecting to external MIDI port (selector = {selector:?})...");
+                MidiOut::open_selector(selector)?
+            };
+            println!("MIDI output ready.");
+            Box::new(midi) as Box<dyn AudioSink>
+        } else {
+            // S31: honor the A/B controls. No flags ⇒ SynthConfig::default() + Bundled
+            // font ⇒ byte-identical to the pre-S31 path (see `build_synth_sink`).
+            build_synth_sink(&play_args)?
+        }
+    };
+
+    // Pure-Rust build (no `midi-out`): the synth is the only sink. If the operator
+    // still asked for MIDI, say so plainly and fall back rather than silently ignoring.
+    #[cfg(not(feature = "midi-out"))]
+    let mut sink: Box<dyn AudioSink> = {
+        if matches!(play_args.output, OutputSink::Midi) || play_args.midi_virtual.is_some() {
+            eprintln!(
+                "Note: this build has no `midi-out` feature; `--output midi` / `--midi-virtual` \
+                 are ignored — using the in-process synth. Rebuild with `--features midi-out` \
+                 for external MIDI."
+            );
+        }
+        build_synth_sink(&play_args)?
     };
 
     // ── Graceful-shutdown wiring (BUG-01) ───────────────────────────────────────
