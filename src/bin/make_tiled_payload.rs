@@ -87,8 +87,8 @@ fn tile_and_encode_level(
     quality: u8,
 ) -> (Vec<TileEntry>, Vec<Vec<u8>>) {
     let (w, h) = level_img.dimensions();
-    let tx_count = ((w + tile_size - 1) / tile_size) as u32;
-    let ty_count = ((h + tile_size - 1) / tile_size) as u32;
+    let tx_count = w.div_ceil(tile_size);
+    let ty_count = h.div_ceil(tile_size);
 
     let mut entries: Vec<TileEntry> = Vec::new();
     let mut blobs: Vec<Vec<u8>> = Vec::new();

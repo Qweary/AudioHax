@@ -14,13 +14,13 @@ use rand::prelude::*;
 
 fn detect_and_write_file(bytes: &[u8], out_basename: &str) -> std::io::Result<()> {
     let mut ext = "bin";
-    if bytes.len() >= 8 && &bytes[0..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+    if bytes.len() >= 8 && bytes[0..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
         ext = "png";
     } else if bytes.len() >= 3 && bytes[0..3] == [0xFF, 0xD8, 0xFF] {
         ext = "jpg";
     } else if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
         ext = "gif";
-    } else if bytes.len() >= 2 && &bytes[0..2] == [0x42, 0x4D] {
+    } else if bytes.len() >= 2 && bytes[0..2] == [0x42, 0x4D] {
         ext = "bmp";
     }
     let out_path = format!("{}_sim_recovered.{}", out_basename, ext);
@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // exercises the SAME library function the integration tests use, so behavior
     // is identical across the bin and the test crate.
     if mode == "acoustic" {
-        if bytes.len() % 2 != 0 {
+        if !bytes.len().is_multiple_of(2) {
             eprintln!("acoustic mode: input length must be even (raw i16 LE samples)");
             std::process::exit(1);
         }
@@ -147,8 +147,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if rng.gen_bool(burst_prob) {
                     let len = burst_len; // fixed length; could be randomized
                     let end = std::cmp::min(i + len, sim.len());
-                    for j in i..end {
-                        sim[j] = 0u8;
+                    for slot in &mut sim[i..end] {
+                        *slot = 0u8;
                     } // erase -> zeros
                     i = end;
                 } else {
@@ -166,8 +166,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let end = std::cmp::min(idx + packet_size, sim.len());
                 if rng.gen_bool(burst_prob) {
                     // drop whole packet -> zero it
-                    for j in idx..end {
-                        sim[j] = 0u8;
+                    for slot in &mut sim[idx..end] {
+                        *slot = 0u8;
                     }
                 } else {
                     // surviving packet: optionally flip bits inside

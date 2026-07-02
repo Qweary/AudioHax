@@ -245,6 +245,7 @@ fn step_rect(
 ///     clamp, so a note whose `hold_ms` exceeds one grid step (the common pad/cadence/
 ///     legato `1.10–1.20×step_ms` overlap, `chord_engine.rs`) RINGS THROUGH into the next
 ///     step exactly as render's offline synth honors it.
+///
 /// Plus the initial per-channel `ProgramChange`s at `at_ms = 0` (prog `(i*7)%128`), the
 /// same scheme both paths used inline before.
 ///

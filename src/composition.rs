@@ -256,9 +256,9 @@ impl Default for AffectMappings {
 /// - Within-family projection (brightness-rank slots — preserves the S2 six-mode diversity rather
 ///   than collapsing to plain Ionian/Aeolian): when valence forces a family but the hue mode is in
 ///   the OTHER family, remap to the SAME-brightness-slot mode in the forced family:
-///     Lydian(brightest major) ↔ Dorian(brightest minor)
-///     Ionian(mid major)       ↔ Aeolian(mid minor)
-///     Mixolydian(darkest major, b7) ↔ Phrygian(darkest minor)
+///   Lydian(brightest major) ↔ Dorian(brightest minor)
+///   Ionian(mid major)       ↔ Aeolian(mid minor)
+///   Mixolydian(darkest major, b7) ↔ Phrygian(darkest minor)
 ///   If the hue mode is already in the forced family, keep it. An UNRECOGNISED mode string (not
 ///   one of the six) is left untouched — the projection only ever moves a known mode.
 ///
@@ -1753,6 +1753,7 @@ impl CompositionPlanner {
 ///   * low arousal + high valence (calm, pleasant) → ARCHED (Arch / InvertedArch).
 ///   * low arousal + low valence (calm, dark) → FALLING (Descent / LeapStep).
 ///   * high arousal + low valence (tense, agitated) → OSCILLATING (Pendulum / NeighborTurn).
+///
 /// theory: arousal=energy and valence=mood are the two empirically-validated
 /// affect axes (Russell's circumplex); a rising line reads as lifting/positive
 /// and a falling line as settling/resolving, so this is a musically-meaningful

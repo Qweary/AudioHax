@@ -10,7 +10,6 @@ use std::io::Write;
 
 use audiohax::cli::{parse_modem_encode, CodingProfileArg, ModemPreset, SyncModeArg};
 use audiohax::modem::{self, CodingProfile, ModemParams, RsRate, SyncMode, SyncParams};
-use hound;
 
 /// Map the CLI `--sync-mode` enum to a `SyncParams` (chirp defaults come from
 /// `SyncParams::default()`; only the mode is operator-selectable here).
@@ -178,11 +177,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if rs_shard_size.is_none() {
         rs_shard_size = preset_params.rs.map(|t| t.2);
     }
-    if rs_data_shards.is_none() && preset_params.rs.is_some() {
-        let (d, p, s) = preset_params.rs.unwrap();
-        rs_data_shards = Some(d);
-        rs_parity_shards = Some(p);
-        rs_shard_size = Some(s);
+    if rs_data_shards.is_none() {
+        if let Some((d, p, s)) = preset_params.rs {
+            rs_data_shards = Some(d);
+            rs_parity_shards = Some(p);
+            rs_shard_size = Some(s);
+        }
     }
 
     // ── S57 (Lane G): Reed-Solomon flag ergonomics ─────────────────────────────
@@ -270,7 +270,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let bps = modem::bits_per_symbol(params.m_tones);
             let bits_per_symbol = if bps == 0 { 1 } else { bps };
-            let symbols_payload = (enc_bytes * 8 + bits_per_symbol - 1) / bits_per_symbol;
+            let symbols_payload = (enc_bytes * 8).div_ceil(bits_per_symbol);
             let symbols_total = symbols_payload
                 + params.preamble_symbols.len() * params.preamble_repeats * params.channels;
             let samples_per_symbol = (params.sample_rate * params.symbol_ms as usize) / 1000;
@@ -350,7 +350,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut channels_syms = modem::split_round_robin(&symbols, params.channels);
 
     // --- PREAMBLE: prepend per-channel preamble symbols to each channel's stream
-    if params.preamble_symbols.len() > 0 && params.preamble_repeats > 0 {
+    if !params.preamble_symbols.is_empty() && params.preamble_repeats > 0 {
         let mut pre_vec: Vec<u8> =
             Vec::with_capacity(params.preamble_symbols.len() * params.preamble_repeats);
         for _ in 0..params.preamble_repeats {

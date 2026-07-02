@@ -120,8 +120,8 @@ impl ChordEngine {
 
     /// Choose a progression family based on mode (simple heuristic)
     pub fn pick_progression(&self, mode: &str) -> Vec<String> {
-        let warm = vec!["Ionian", "Lydian", "Mixolydian"];
-        let cool = vec!["Dorian", "Aeolian", "Phrygian"];
+        let warm = ["Ionian", "Lydian", "Mixolydian"];
+        let cool = ["Dorian", "Aeolian", "Phrygian"];
 
         let family_key = if warm.contains(&mode) {
             "warm"
@@ -890,6 +890,7 @@ pub enum OrchestralRole {
 ///   * `saturation` (0..=100) → overall dynamic LEVEL (vivid color = bold tone),
 ///   * `brightness` (0..=100) → REGISTER (bright image = higher octave),
 ///   * `edge_density` (0..=1)  → RHYTHMIC ACTIVITY (busy texture = more onsets).
+///
 /// `realize_step` consumes these as the expressive inputs the phrase plan is
 /// shaped against; main.rs builds one from each `ScanBarFeatures` (see the
 /// wiring spec) and never passes the raw feature struct in.
@@ -4221,7 +4222,7 @@ fn land_home_pitch(
     ctx: &crate::composition::StepContext,
     chord: &Chord,
 ) -> u8 {
-    let home_root_pc = (ctx.key_tempo.home_root_midi % 12) as u8;
+    let home_root_pc = ctx.key_tempo.home_root_midi % 12;
     match role {
         OrchestralRole::Bass => {
             // Home tonic root in the bass → root-position I (the PAC requires it).
@@ -4287,13 +4288,15 @@ fn pivot_resolution_is_armed(ctx: &crate::composition::StepContext) -> bool {
 ///   * any chordal 7th resolves DOWN by step to the I's THIRD — realized literally: the inner
 ///     voice's pivot 7th (destination 5th degree + a minor 7th = dest_root + 5) steps DOWN to
 ///     the destination tonic's diatonic third in the active mode.
+///
 /// Per role, in the destination key (`dest_root_pc = home_root + this section's offset`):
 ///   * Bass    → destination tonic ROOT (root-position I; dom-root → tonic-root is the
-///               idiomatic authentic-cadence bass leap).
+///     idiomatic authentic-cadence bass leap).
 ///   * Melody  → destination tonic ROOT on top (the pivot's melody dom-5th = dest 2nd degree
-///               descends a STEP to the tonic — soprano-on-tonic, a strong arrival, and the
-///               step-down/leap-up split is the contrary motion that voids parallel octaves).
+///     descends a STEP to the tonic — soprano-on-tonic, a strong arrival, and the
+///     step-down/leap-up split is the contrary motion that voids parallel octaves).
 ///   * Fill    → destination tonic diatonic THIRD (the pivot 7th's down-by-step target).
+///
 /// Every pitch is seated via `seat_pc_in_register` at the role's existing floor, so
 /// bass < fill < melody holds by construction and `no_inversion_invariant` cannot break.
 fn pivot_resolution_pitch(role: OrchestralRole, ctx: &crate::composition::StepContext) -> u8 {

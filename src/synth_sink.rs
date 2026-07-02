@@ -513,11 +513,7 @@ fn build_f32_stream(
             }
 
             // Number of audio frames this callback must fill.
-            let frames = if channels == 0 {
-                0
-            } else {
-                output.len() / channels
-            };
+            let frames = output.len().checked_div(channels).unwrap_or(0);
             if frames == 0 {
                 // Defensive: nothing to render (mono-less / zero-frame buffer).
                 for s in output.iter_mut() {

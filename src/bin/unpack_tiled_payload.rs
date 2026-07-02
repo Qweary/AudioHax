@@ -162,8 +162,8 @@ fn paint_avg_on_canvas(
     let scale = 2u32.pow(lvl_idx as u32);
     let full_x = entry.tx * tile_size * scale;
     let full_y = entry.ty * tile_size * scale;
-    let full_w = (entry.w * scale) as u32;
-    let full_h = (entry.h * scale) as u32;
+    let full_w = entry.w * scale;
+    let full_h = entry.h * scale;
     for yy in 0..full_h {
         for xx in 0..full_w {
             let cx = full_x + xx;

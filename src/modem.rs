@@ -254,10 +254,7 @@ pub fn build_frame(
         let cipher_text = cipher
             .encrypt(nonce, compressed_bytes.as_ref())
             .map_err(|e| {
-                Box::<dyn Error>::from(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("encrypt error: {}", e),
-                ))
+                Box::<dyn Error>::from(std::io::Error::other(format!("encrypt error: {}", e)))
             })?;
 
         // final payload = nonce || ciphertext
@@ -451,7 +448,7 @@ pub fn bytes_to_symbols(payload: &[u8], m_tones: usize) -> Vec<u8> {
 pub fn symbols_to_bytes(symbols: &[u8], m_tones: usize) -> Vec<u8> {
     let bps = bits_per_symbol(m_tones);
     if bps == 0 {
-        return symbols.iter().map(|s| *s).collect();
+        return symbols.to_vec();
     }
     let mut bitbuf: u64 = 0;
     let mut bits_in_buf: usize = 0;
@@ -482,10 +479,7 @@ pub fn split_round_robin(symbols: &[u8], channels: usize) -> Vec<Vec<u8>> {
 
 /// Render channels' symbol streams into mono i16 samples.
 /// Each channel contributes a single sine per-symbol. Tones are placed in separated bands.
-pub fn render_symbols_to_samples(
-    channels_symbols: &Vec<Vec<u8>>,
-    params: &ModemParams,
-) -> Vec<i16> {
+pub fn render_symbols_to_samples(channels_symbols: &[Vec<u8>], params: &ModemParams) -> Vec<i16> {
     let sample_rate = params.sample_rate as f32;
     let samples_per_symbol =
         ((params.sample_rate as f32) * (params.symbol_ms / 1000.0)).round() as usize;
@@ -496,12 +490,16 @@ pub fn render_symbols_to_samples(
 
     // Hann window
     let mut hann: Vec<f32> = vec![0.0; samples_per_symbol];
-    for n in 0..samples_per_symbol {
+    for (n, h) in hann.iter_mut().enumerate() {
         let x = (n as f32) / (samples_per_symbol as f32);
-        hann[n] = 0.5 * (1.0 - (2.0 * PI * x).cos());
+        *h = 0.5 * (1.0 - (2.0 * PI * x).cos());
     }
 
     for symbol_index in 0..max_len {
+        // clippy: index retained — n offset-indexes the signal buffer (`start + n`)
+        // alongside `hann[n]` and drives FP tone synthesis; must not become a
+        // bare iterator (needless_range_loop).
+        #[allow(clippy::needless_range_loop)]
         for n in 0..samples_per_symbol {
             let t = n as f32 / sample_rate;
             let mut s = 0f32;
@@ -724,9 +722,7 @@ pub fn depacketize_stream(buf: &[u8], _expected_repeats: usize) -> Result<Vec<u8
             h.update(payload);
             let crc_ok = h.finalize() == hdr_crc;
             // store the payload (copy) with its CRC-validity tag
-            map.entry(seq)
-                .or_insert_with(Vec::new)
-                .push((payload.to_vec(), crc_ok));
+            map.entry(seq).or_default().push((payload.to_vec(), crc_ok));
             if (seq as i64) > max_seq {
                 max_seq = seq as i64;
             }
@@ -897,6 +893,9 @@ pub fn packetize_stream_rs(
         rs.encode(&mut shard_refs)?;
 
         // emit per-shard packets with header (include orig_len so decoder can trim)
+        // clippy: index retained — shard_idx is written into the packet header as a
+        // value (`shard_idx as u16`), not merely used to index `shards`.
+        #[allow(clippy::needless_range_loop)]
         for shard_idx in 0..total_shards {
             let payload = &shards[shard_idx];
             let mut hdr = Vec::with_capacity(4 + 8 + 4 + 2 + 2 + 2 + 2 + 4);
@@ -1066,8 +1065,8 @@ pub fn depacketize_stream_rs(buf: &[u8]) -> Result<Vec<u8>, ModemError> {
         rs.reconstruct(&mut shards_opt)?;
 
         // append first data_shards to assembled bytes
-        for d in 0..data_shards {
-            if let Some(sh) = &shards_opt[d] {
+        for sh_opt in shards_opt.iter().take(data_shards) {
+            if let Some(sh) = sh_opt {
                 assembled.extend_from_slice(sh);
             } else {
                 // shouldn't happen
@@ -1099,7 +1098,7 @@ pub struct ShardPacket {
 }
 
 /// Interleave order: 0..total_shards across all blocks, then next shard index, etc.
-fn interleave_packets(blocks: &Vec<Vec<ShardPacket>>) -> Vec<u8> {
+fn interleave_packets(blocks: &[Vec<ShardPacket>]) -> Vec<u8> {
     if blocks.is_empty() {
         return Vec::new();
     }
@@ -1111,9 +1110,9 @@ fn interleave_packets(blocks: &Vec<Vec<ShardPacket>>) -> Vec<u8> {
             .sum(),
     );
     for s in 0..total_shards {
-        for b in 0..blocks.len() {
-            if s < blocks[b].len() {
-                out.extend_from_slice(&blocks[b][s].bytes);
+        for block in blocks {
+            if s < block.len() {
+                out.extend_from_slice(&block[s].bytes);
             }
         }
     }
@@ -1170,6 +1169,9 @@ pub fn packetize_stream_rs_interleaved(
         let mut shards: Vec<Vec<u8>> = (0..t).map(|_| vec![0u8; shard_size]).collect();
 
         // fill data shards from block payload
+        // clippy: index retained — s computes an offset into `block_payload`
+        // (`start = s * shard_size`) in parallel with indexing `shards`.
+        #[allow(clippy::needless_range_loop)]
         for s in 0..d {
             let start = s * shard_size;
             let end = start + shard_size;
@@ -1187,6 +1189,9 @@ pub fn packetize_stream_rs_interleaved(
 
         // serialize shards with matching header
         let mut shard_packets: Vec<ShardPacket> = Vec::with_capacity(t);
+        // clippy: index retained — shard_idx is written into the packet header as a
+        // value (`shard_idx as u16`), not merely used to index `shards`.
+        #[allow(clippy::needless_range_loop)]
         for shard_idx in 0..t {
             let payload_bytes = &shards[shard_idx];
 
@@ -1200,7 +1205,7 @@ pub fn packetize_stream_rs_interleaved(
             hdr.extend_from_slice(&(shard_idx as u16).to_be_bytes());
             hdr.extend_from_slice(&(shard_size as u16).to_be_bytes());
             let mut hcrc = Crc32::new();
-            hcrc.update(&payload_bytes);
+            hcrc.update(payload_bytes);
             hdr.extend_from_slice(&hcrc.finalize().to_be_bytes());
 
             let mut pkt_bytes = hdr;
@@ -1231,6 +1236,7 @@ pub struct DurationEstimate {
     pub seconds: f64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn estimate_duration_seconds(
     payload_len: usize,
     rs_data: usize,
@@ -1248,7 +1254,7 @@ pub fn estimate_duration_seconds(
 
     // number of blocks
     let mut blocks = payload_len / block_bytes;
-    if payload_len % block_bytes != 0 {
+    if !payload_len.is_multiple_of(block_bytes) {
         blocks += 1;
     }
 
@@ -1263,7 +1269,7 @@ pub fn estimate_duration_seconds(
     let bits_per_symbol = if bps == 0 { 1 } else { bps };
 
     // symbols for payload
-    let symbols_payload = (encoded_bytes * 8 + bits_per_symbol - 1) / bits_per_symbol;
+    let symbols_payload = (encoded_bytes * 8).div_ceil(bits_per_symbol);
 
     // add preamble (per channel; encoder adds the same count on each)
     let symbols_total = symbols_payload + preamble_symbols_per_channel * channels;
@@ -1295,20 +1301,8 @@ pub fn simulate_channel_bytes(
     avg_burst_len: usize,
 ) -> Vec<u8> {
     // Safety clamp params
-    let rf = if random_flip_prob < 0.0 {
-        0.0
-    } else if random_flip_prob > 1.0 {
-        1.0
-    } else {
-        random_flip_prob
-    };
-    let bp = if burst_erase_prob < 0.0 {
-        0.0
-    } else if burst_erase_prob > 1.0 {
-        1.0
-    } else {
-        burst_erase_prob
-    };
+    let rf = random_flip_prob.clamp(0.0, 1.0);
+    let bp = burst_erase_prob.clamp(0.0, 1.0);
     let avg_burst = if avg_burst_len == 0 {
         1usize
     } else {
@@ -1322,18 +1316,18 @@ pub fn simulate_channel_bytes(
     if rf > 0.0 {
         let mut rng = OsRng;
         let thresh = ((u64::MAX as f64) * rf) as u64;
-        for i in 0..out.len() {
+        for byte in out.iter_mut() {
             let r = rng.next_u64();
             if r <= thresh {
                 // flip a single random bit in this byte
                 let bit = (rng.next_u32() % 8) as u8;
-                out[i] ^= 1u8 << bit;
+                *byte ^= 1u8 << bit;
             }
         }
     }
 
     // Burst erasures: iterate with index; when a burst starts, remove a random length around avg_burst
-    if bp > 0.0 && out.len() > 0 {
+    if bp > 0.0 && !out.is_empty() {
         let mut rng = OsRng;
         let thresh = ((u64::MAX as f64) * bp) as u64;
         let mut i = 0usize;

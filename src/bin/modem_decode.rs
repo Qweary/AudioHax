@@ -7,7 +7,6 @@ use std::io::Write;
 
 use audiohax::cli::{parse_modem_decode, SyncModeArg};
 use audiohax::modem::{self, ModemParams, SyncMode, SyncParams};
-use hound;
 
 /// Map the CLI `--sync-mode` enum to a decode-side `SyncParams` (chirp geometry from
 /// `SyncParams::default()`, matching the encoder's defaults).
@@ -27,13 +26,13 @@ fn build_sync_params(mode: SyncModeArg) -> SyncParams {
 /// helper: write recovered file to disk and pick extension
 fn detect_and_write_file(bytes: &[u8], out_basename: &str) -> std::io::Result<()> {
     let mut ext = "bin";
-    if bytes.len() >= 8 && &bytes[0..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+    if bytes.len() >= 8 && bytes[0..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
         ext = "png";
     } else if bytes.len() >= 3 && bytes[0..3] == [0xFF, 0xD8, 0xFF] {
         ext = "jpg";
     } else if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
         ext = "gif";
-    } else if bytes.len() >= 2 && &bytes[0..2] == [0x42, 0x4D] {
+    } else if bytes.len() >= 2 && bytes[0..2] == [0x42, 0x4D] {
         ext = "bmp";
     }
     let out_path = format!("{}_recovered.{}", out_basename, ext);
@@ -179,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- PREAMBLE DETECTION & ALIGNMENT ---
     // If encoder used params.preamble_symbols repeated params.preamble_repeats per channel,
     // detect per-channel and trim each channel's vector so it starts after the preamble.
-    if params.preamble_symbols.len() > 0 && params.preamble_repeats > 0 {
+    if !params.preamble_symbols.is_empty() && params.preamble_repeats > 0 {
         let mut pattern: Vec<u8> = Vec::new();
         for _ in 0..params.preamble_repeats {
             pattern.extend_from_slice(&params.preamble_symbols);
@@ -189,6 +188,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Looking for per-channel preamble pattern ({} symbols)",
             pat_len
         );
+        // clippy: index retained — the loop is bounded by params.channels (the
+        // configured channel count), and ch is also printed as a value; converting
+        // to an iterator over detected_by_channel would change the channel-count
+        // semantics of the decode.
+        #[allow(clippy::needless_range_loop)]
         for ch in 0..params.channels {
             let chvec = &mut detected_by_channel[ch];
             if let Some(idx) = find_subslice(chvec, &pattern) {
@@ -215,6 +219,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max()
         .unwrap_or(0);
     for i in 0..max_len {
+        // clippy: index retained — round-robin reinterleave bounded by
+        // params.channels with parallel index i; the (i, ch) ordering is the
+        // S60 decode invariant and must not be reshaped into an iterator.
+        #[allow(clippy::needless_range_loop)]
         for ch in 0..params.channels {
             if i < detected_by_channel[ch].len() {
                 symbols.push(detected_by_channel[ch][i]);
