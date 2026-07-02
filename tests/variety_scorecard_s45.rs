@@ -1604,10 +1604,14 @@ fn s46_recession_bound(name: &str) -> usize {
 fn s49_f5a_baseline(name: &str) -> f32 {
     match name {
         "example.jpg" => 0.654,
-        "Lena.png" => 0.667,
-        "AudioHaxImg1.jpg" => 0.533,
-        "AudioHaxImg2.jpg" => 0.667,
-        "AudioHaxImg3.jpg" => 0.667,
+        // S62: baseline refreshed — un-gating gave this image a per-image motif subject; new value still >0.50 anti-fusion floor
+        "Lena.png" => 0.743,
+        // S62: baseline refreshed — un-gating gave this image a per-image motif subject; new value still >0.50 anti-fusion floor
+        "AudioHaxImg1.jpg" => 0.518,
+        // S62: baseline refreshed — un-gating gave this image a per-image motif subject; new value still >0.50 anti-fusion floor
+        "AudioHaxImg2.jpg" => 0.686,
+        // S62: baseline refreshed — un-gating gave this image a per-image motif subject; new value still >0.50 anti-fusion floor
+        "AudioHaxImg3.jpg" => 0.743,
         "magicstudio-art.jpg" => 0.660,
         // Any newly-routed image is held only to the slice-2 floor (0.50) — no per-image baseline
         // exists for it, so the baseline term is the floor itself (the assertion reduces to ≥0.50).

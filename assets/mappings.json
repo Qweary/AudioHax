@@ -118,8 +118,9 @@
       ]
     },
     "theme_behaviour": {
-      "default": "absent",
-      "rules": [ { "when": [ {"knob":"complexity","op":"ge","lo":0.4,"hi":0.0} ], "pick": "fragment" } ]
+      "_note": "S62 fix-direction-1 (UN-GATE THE PITCHED MOTIF): default flipped 'absent' -> 'fragment' so EVERY real image carries a per-image melodic subject. Previously default was 'absent' with a single rule complexity>=0.4 -> 'fragment', which left 4 of 6 bundled photos (complexity 0.005-0.229) theme-LESS: they fell back to the realizer's generic melodization and sounded like 'the same tune everywhere' (docs/diagnostic-s62-motivic-derivation.md). This is a ROUTING change only — the subject is still one of the authored 8 archetype contours (chord_engine::MotifArchetype); no new melodic vocabulary. A real image now always has a subject (the diagnostic found no image that is legitimately better off theme-less); rules is empty because the default applies to all. The rhythm gait remains complexity-gated (pick_rhythm_cell, unchanged) and the per-piece motto (S53) is independent of this seam.",
+      "default": "fragment",
+      "rules": []
     },
     "motif_rhythm": {
       "_note": "DATA MIRROR (S41 DP-6 discipline retained): a tunable copy of the per-archetype rhythm-cell VOCABULARIES authored inline in chord_engine.rs::MotifArchetype::rhythm_cells(). The inline Rust cells are AUTHORITATIVE — resolve_motif_celled does NOT read this block (no loader wiring this slice; QG confirms inert). Each cell is a list of dur_steps weights (steps, >= 1) cycled across the sampled contour until Σ dur_steps fills length_steps; Σ is then capped at length_steps so the motif never over-runs its section. cell 0 of every archetype MUST equal the S39 single profile (freeze anchor) — the first row of every list below is the pre-S41 profile, byte-for-byte. Cell ordering is BROAD(1) -> BUSY(2) -> PROFILED/SYNCOPATED(3) (see the rhythm_cells doc). Keep in sync with the inline cells if either is edited.",

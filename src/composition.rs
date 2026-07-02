@@ -1386,6 +1386,19 @@ impl<'a> StepContext<'a> {
 /// near the legacy single-image scan length, deterministic and modest.
 const BASE_STEPS_PER_SECTION: usize = 8;
 
+/// S62 fix-direction-2 — the MINIMUM motif duration in steps (Σ dur_steps), a musical floor.
+/// theory: a subject needs to read as a SHAPE, not an interval. The pre-S62 length formula
+/// `(3 + complexity*5)` collapsed calm/low-complexity photos (the majority) to 3-4 steps — a
+/// 2-3-note tonic/leap stub the ear cannot tell apart from any other stub (diagnostic §4.2). A
+/// ~5-6-step floor is the smallest statement that carries a hummable contour. 5 is chosen (not 6)
+/// deliberately: every complexity>=0.4 image already yields `round(3+complexity*5) >= 5`, so the
+/// floor is a pure NO-OP for the themed fixtures the existing motif goldens exercise
+/// (motif_s39/motif_s41/composition_s15 reconstruct against `round(3+complexity*5)`) — it lifts
+/// ONLY the sub-0.4-complexity photos that this session's un-gate (fix-direction-1) newly themes.
+/// (True DECORRELATION of length from `complexity` — driving it off an independent feature — is
+/// deferred: it would move the length of those same goldens, which are locked this session.)
+const MOTIF_LENGTH_FLOOR: usize = 5;
+
 /// S29/MX-4 (Lever 2) — the modest energy→density map and its byte-stable neutral. A
 /// home/fallback section carries `HOME_ENERGY_NEUTRAL`, and `f(HOME_ENERGY_NEUTRAL)` is
 /// the algebraic identity (== `DENSITY_NEUTRAL` == 0.5) so every home / home_only / identity
@@ -1512,10 +1525,14 @@ impl CompositionPlanner {
             // Range in scale degrees from edge_activity (calm = narrow, busy = wider), length
             // in steps from complexity (richer image = a slightly longer subject).
             let range_degrees = (2.0 + u.edge_activity * 5.0).round() as u8; // 2..=7
-            let length_steps = (3.0 + u.complexity * 5.0).round() as usize; // 3..=8
-                                                                            // S41 Finding B (lever A): the gait is no longer welded to the contour — the image
-                                                                            // selects one of the archetype's rhythm cells, so two images on the same archetype
-                                                                            // can still be clapped apart.
+                                                                             // S62 fix-direction-2: floor the length at MOTIF_LENGTH_FLOOR so newly-themed calm
+                                                                             // photos (fix-direction-1) get a readable ~4-5-note subject instead of a 2-3-note
+                                                                             // stub. NO-OP for complexity>=0.4 (already >= 5); lifts only the low-complexity images.
+            let length_steps =
+                ((3.0 + u.complexity * 5.0).round() as usize).max(MOTIF_LENGTH_FLOOR); // 5..=8
+                                                                                       // S41 Finding B (lever A): the gait is no longer welded to the contour — the image
+                                                                                       // selects one of the archetype's rhythm cells, so two images on the same archetype
+                                                                                       // can still be clapped apart.
             let cell_count = archetype.rhythm_cell_count();
             let cell_index = pick_rhythm_cell(u, archetype, cell_count);
             let motif = chord_engine::resolve_motif_celled(
