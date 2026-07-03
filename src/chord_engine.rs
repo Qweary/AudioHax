@@ -2424,6 +2424,16 @@ fn realize_rhythm(
             // bed. Each tone is seated into its own register slot and de-duplicated
             // so no two bed voices collapse onto the same pitch (the spirit of
             // upper_voices_well_spaced — a bed of unisons is not a bed).
+            //
+            // S63 INTEGRATION (move b) — the melody's activity CLASS this step, computed ONCE
+            // here and reused by BOTH the figuration-complement (below, to thin the comp
+            // inversely to the melody's local activity) and the pad recession governor (further
+            // below). Identical value/formula to the governor's original in-place computation
+            // (the S49 §7 "governor sees the same melody class the arm renders" discipline) —
+            // hoisting it up does not change it.
+            let melody_prom_shift =
+                melody_total_rhythm_shift(prominence_weight(ctx, OrchestralRole::Melody));
+            let m_class = melody_activity_class(edge_activity, melody_prom_shift, pre_cadence);
             let notes = &step.chord.notes;
             let pad_events = if notes.is_empty() || pad_voices == 0 {
                 // Defensive: a chord with no tones (or a profile that named a Pad
@@ -2468,7 +2478,30 @@ fn realize_rhythm(
                 // so a cadence step is never figured.
                 match ctx.section.orchestration.figuration_resolved.as_ref() {
                     Some(spec) if !spec.onsets.is_empty() => {
-                        figured_bed(spec, &seated, velocity, step_ms)
+                        // S63 INTEGRATION (move b) — the accompaniment expresses the per-piece
+                        // motto as the COMPLEMENT of the melody's gait: it VACATES the melody's
+                        // downbeat (answers in the gaps) and THINS inversely to the melody's
+                        // local activity (`m_class`). Gated on a NON-NEUTRAL motto: the identity/
+                        // legacy path carries `neutral()` (cell_index == None) and takes the
+                        // byte-identical static figure below — so every engine_equivalence golden
+                        // (neutral, and no Pad instrument) and the figuration_s20 fixtures
+                        // (neutral) are unperturbed. The transform is COUNT-NON-INCREASING, so the
+                        // F1/F5b `bed_onsets ≤ melody_onsets` invariants and the recede governor
+                        // below can only be helped. Deterministic — feature-seeded via the motto,
+                        // no RNG/hash (the operator's structure-vs-randomness balance law).
+                        match ctx.section.orchestration.motto.cell_index {
+                            Some(cell) => {
+                                let comp = motto_complement_onsets(&spec.onsets, cell, m_class);
+                                // Degenerate guard: if the phase/density filter emptied the set,
+                                // keep the static figure so the bed is never silenced.
+                                if comp.is_empty() {
+                                    figured_bed(&spec.onsets, &seated, velocity, step_ms)
+                                } else {
+                                    figured_bed(&comp, &seated, velocity, step_ms)
+                                }
+                            }
+                            None => figured_bed(&spec.onsets, &seated, velocity, step_ms),
+                        }
                     }
                     _ => seated
                         .into_iter()
@@ -2501,10 +2534,8 @@ fn realize_rhythm(
             // synthetic bars, so this is doubly inert there).
             let pad_w = prominence_weight(ctx, OrchestralRole::Pad);
             // S49 SLICE 2 (L1): the governor's view of the MELODY class MUST match the melody arm's
-            // (spec §7) — read the SAME `melody_total_rhythm_shift` (prominence + gated L1 bias).
-            let melody_prom_shift =
-                melody_total_rhythm_shift(prominence_weight(ctx, OrchestralRole::Melody));
-            let m_class = melody_activity_class(edge_activity, melody_prom_shift, pre_cadence);
+            // (spec §7) — the SAME `melody_total_rhythm_shift`/`m_class` computed at the TOP of this
+            // Pad arm (S63 hoist; identical value) is reused here.
             match pad_onset_cap(pad_w, m_class) {
                 Some(cap) => recede_pad_onsets(pad_events, cap, step_ms),
                 None => pad_events,
@@ -3141,6 +3172,76 @@ fn pedal_bass(
     }]
 }
 
+/// S63 INTEGRATION (move b) — derive the accompaniment's onset plan as the deterministic
+/// COMPLEMENT of the melody's per-piece motto gait, so the comp INTERLOCKS with the tune
+/// instead of stacking under it. Pure; no RNG/clock — the whole result is a function of the
+/// (per-image) motto `cell`, the melody's activity `melody_class`, and the curated `base`
+/// figure. THE ONE integration transform the Pad realizer reads the motto through.
+///
+/// The two coordinated moves (design-s63-holistic-distinctness-aesthetics.md I2/I3):
+///   • PHASE — the melody always attacks the DOWNBEAT (offset 0). For every cell EXCEPT the
+///     syncopated one (cell 3), the comp VACATES the downbeat (drop any onset at `at ≈ 0`) so
+///     it answers in the melody's gap. For cell 3 the melody LEAVES the downbeat (its onsets
+///     lean late/off-grid), so the comp KEEPS the downbeat to ANCHOR the pulse the melody
+///     leans off. If dropping the downbeat empties the set (a figure that is ONLY a downbeat
+///     onset), the earliest onset is RE-PHASED to the mid-step off-beat (`at = 0.5`) — a
+///     re-placement of a CURATED onset, never a synthesized/new cell.
+///   • DENSITY — thin the comp INVERSELY to the melody's local activity: a busy (Subdividing)
+///     melody gets a single comp stab (recede), a mid (Oblique) melody ≤2, a holding
+///     (Sustained) melody keeps the full curated figure (the comp animates the held space).
+///     Keeps the FIRST k survivors in time order.
+///
+/// COUNT-NON-INCREASING: `result.len() ≤ base.len()` for every (cell, class). This is the
+/// freeze/asserted-metric safety: it can only LOWER the Pad onset count, so the F1/F5b
+/// `bed_onsets ≤ melody_onsets` invariants (and the `recede_pad_onsets` governor that still
+/// runs after) can only be helped; each kept onset carries its `tone`/`hold_frac`/
+/// `register_octaves` verbatim so the bed stays chord-tones-only and in-band by construction.
+fn motto_complement_onsets(
+    base: &[crate::composition::FigurationOnset],
+    cell: usize,
+    melody_class: ActivityClass,
+) -> Vec<crate::composition::FigurationOnset> {
+    if base.is_empty() {
+        return Vec::new();
+    }
+    // The syncopated cell (3) leaves the downbeat to the comp to ANCHOR; every other cell keeps
+    // the melody on the beat, so the comp vacates it and answers in the gap.
+    let anchor_downbeat = cell == 3;
+    // Onsets within ~2% of a step of the downbeat count as "on the downbeat" (the melody's seat).
+    const DOWNBEAT_EPS: f32 = 0.02;
+
+    // PHASE: vacate (or keep) the downbeat.
+    let mut phased: Vec<crate::composition::FigurationOnset> = if anchor_downbeat {
+        base.to_vec()
+    } else {
+        let off: Vec<crate::composition::FigurationOnset> = base
+            .iter()
+            .copied()
+            .filter(|o| o.at.clamp(0.0, 1.0) > DOWNBEAT_EPS)
+            .collect();
+        if off.is_empty() {
+            // The figure was only a downbeat onset — re-phase the earliest curated onset to the
+            // mid-step off-beat so the comp still speaks in the melody's gap (no new material).
+            let mut o = base[0];
+            o.at = 0.5;
+            vec![o]
+        } else {
+            off
+        }
+    };
+
+    // DENSITY: inverse to the melody's local activity (the comp recedes as the melody moves).
+    let keep = match melody_class {
+        ActivityClass::Subdividing => 1, // busy melody → a single comp stab
+        ActivityClass::Oblique => 2,     // mid melody → up to two
+        ActivityClass::Sustained => phased.len(), // holding melody → the full curated figure
+    };
+    if phased.len() > keep {
+        phased.truncate(keep.max(1));
+    }
+    phased
+}
+
 /// Expand ONE held chord into the figure's bounded multi-onset burst within a SINGLE
 /// step — the S20 Slice-3a accompaniment-figuration mapper (Music Theory Specialist
 /// owns). Animates the held Pad bed with an in-beat broken-chord / Alberti cell so the
@@ -3170,7 +3271,12 @@ fn pedal_bass(
 /// mid-high Alberti shape [3rd, 7th, 5th, 7th]. The catalogue's Alberti row is authored for
 /// the 3-voice case; the modulo is what makes it cycle correctly on any seated voice count.
 fn figured_bed(
-    spec: &crate::composition::FigurationSpec,
+    // S63 (move b) — takes the onset SLICE directly (was `&FigurationSpec`) so the caller can
+    // pass EITHER the static `&spec.onsets` (the neutral/frozen path, byte-identical) OR the
+    // motto-complement onset plan from `motto_complement_onsets`. Private fn (no external
+    // caller / no test calls it directly), so the signature change is contained; the body is
+    // otherwise UNCHANGED (same offset/hold/tone mapping) → byte-identical on `&spec.onsets`.
+    onsets_in: &[crate::composition::FigurationOnset],
     seated: &[u8],
     velocity: u8,
     step_ms: u64,
@@ -3186,7 +3292,7 @@ fn figured_bed(
 
     // Bound the burst to 4 (the catalogue guarantees 2..=4; truncate defensively so the
     // helper can never emit an unbounded count even on a malformed row).
-    let onsets = &spec.onsets[..spec.onsets.len().min(4)];
+    let onsets = &onsets_in[..onsets_in.len().min(4)];
 
     onsets
         .iter()
@@ -9779,12 +9885,12 @@ mod tests {
         };
         let seated = [55u8, 59, 62];
         assert_eq!(
-            figured_bed(&with_zero, &seated, 80, 1000),
-            figured_bed(&without, &seated, 80, 1000),
+            figured_bed(&with_zero.onsets, &seated, 80, 1000),
+            figured_bed(&without.onsets, &seated, 80, 1000),
             "register_octaves==0 on every onset realizes byte-identically (the freeze default)"
         );
         // And every event's note is exactly the seated tone (no shift at all).
-        let evs = figured_bed(&with_zero, &seated, 80, 1000);
+        let evs = figured_bed(&with_zero.onsets, &seated, 80, 1000);
         assert_eq!(evs[0].note, seated[0]);
         assert_eq!(evs[1].note, seated[2 % 3]);
     }
@@ -9813,7 +9919,7 @@ mod tests {
             ],
         };
         let seated = [55u8, 59, 62]; // fill-band inner tones
-        let evs = figured_bed(&oom_pah, &seated, 80, 1000);
+        let evs = figured_bed(&oom_pah.onsets, &seated, 80, 1000);
         assert_eq!(evs.len(), 2);
         // The oom == apply_register_octaves(seated[0], -1) == an octave below seated[0].
         assert_eq!(evs[0].note, apply_register_octaves(seated[0], -1));
@@ -9862,7 +9968,7 @@ mod tests {
         };
         let seated = [55u8, 59, 62];
         let bed_pcs: Vec<u8> = seated.iter().map(|n| n % 12).collect();
-        for e in figured_bed(&stride, &seated, 80, 1000) {
+        for e in figured_bed(&stride.onsets, &seated, 80, 1000) {
             assert!(
                 bed_pcs.contains(&(e.note % 12)),
                 "shifted note {} (pc {}) must keep a seated pitch class",
@@ -9907,7 +10013,7 @@ mod tests {
             ],
         };
         let seated = [55u8, 59, 62];
-        let evs = figured_bed(&stride, &seated, 80, 1000);
+        let evs = figured_bed(&stride.onsets, &seated, 80, 1000);
         // The two stride-bass onsets (indices 0, 2) are below both stab onsets (1, 3).
         let bass_max = evs[0].note.max(evs[2].note);
         let stab_min = evs[1].note.min(evs[3].note);
@@ -10704,5 +10810,146 @@ mod tests {
             counter >= 1,
             "S45: the counter recedes in LEVEL but is never muted to silence"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // S63 INTEGRATION (move b) — motto-COMPLEMENT figuration invariants. All assertions
+    // are EXACT-INTEGER STRUCTURAL facts (which onset survives, offset==0-or-not, counts) —
+    // no fractional audio metric is pinned (the S62.1 cross-platform test discipline).
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// A base figure carrying an explicit downbeat onset + off-beats (broken_chord: 0/.25/.5/.75).
+    fn base_with_downbeat() -> Vec<crate::composition::FigurationOnset> {
+        [0.0f32, 0.25, 0.5, 0.75]
+            .iter()
+            .map(|&at| crate::composition::FigurationOnset {
+                at,
+                tone: 0,
+                hold_frac: 1.0,
+                register_octaves: 0,
+            })
+            .collect()
+    }
+
+    /// PHASE — for every cell EXCEPT the syncopated one (cell 3) the comp VACATES the melody's
+    /// downbeat (no surviving onset at offset ~0); for cell 3 it KEEPS the downbeat to anchor.
+    /// This is the interlock property (the comp reads the motto): the melody owns beat one, the
+    /// comp answers off it — except when the melody itself leaves the downbeat (cell 3).
+    #[test]
+    fn s63_motto_complement_phase_reads_motto() {
+        let base = base_with_downbeat();
+        // Sustained melody so density keeps the full set — the phase face is isolated.
+        for cell in [0usize, 1, 2] {
+            let comp = motto_complement_onsets(&base, cell, ActivityClass::Sustained);
+            assert!(
+                comp.iter().all(|o| o.at > 0.02),
+                "cell {cell}: comp must vacate the melody's downbeat (all at>0), got {:?}",
+                comp.iter().map(|o| o.at).collect::<Vec<_>>()
+            );
+        }
+        let comp3 = motto_complement_onsets(&base, 3, ActivityClass::Sustained);
+        assert!(
+            comp3.iter().any(|o| o.at <= 0.02),
+            "cell 3 (syncopated): comp must KEEP a downbeat onset to anchor the pulse, got {:?}",
+            comp3.iter().map(|o| o.at).collect::<Vec<_>>()
+        );
+    }
+
+    /// COUNT-NON-INCREASING — the freeze/asserted-metric safety: the transform can only LOWER
+    /// the Pad onset count, never raise it, for every (cell, melody class).
+    #[test]
+    fn s63_motto_complement_never_adds_onsets() {
+        let base = base_with_downbeat();
+        for cell in 0..4usize {
+            for class in [
+                ActivityClass::Sustained,
+                ActivityClass::Oblique,
+                ActivityClass::Subdividing,
+            ] {
+                let comp = motto_complement_onsets(&base, cell, class);
+                assert!(
+                    comp.len() <= base.len(),
+                    "cell {cell} class {class:?}: comp {} must not exceed base {}",
+                    comp.len(),
+                    base.len()
+                );
+                assert!(
+                    !comp.is_empty(),
+                    "cell {cell} class {class:?}: comp must never be silenced to empty"
+                );
+            }
+        }
+    }
+
+    /// DENSITY — the comp thins INVERSELY to the melody's local activity: a busy (Subdividing)
+    /// melody yields no MORE comp onsets than a holding (Sustained) melody. Structural counts.
+    #[test]
+    fn s63_motto_complement_thins_under_busy_melody() {
+        let base = base_with_downbeat();
+        for cell in 0..4usize {
+            let busy = motto_complement_onsets(&base, cell, ActivityClass::Subdividing).len();
+            let mid = motto_complement_onsets(&base, cell, ActivityClass::Oblique).len();
+            let calm = motto_complement_onsets(&base, cell, ActivityClass::Sustained).len();
+            assert!(
+                busy <= mid && mid <= calm,
+                "cell {cell}: comp density must be inverse to melody activity \
+                 (busy {busy} ≤ mid {mid} ≤ calm {calm})"
+            );
+            assert_eq!(
+                busy, 1,
+                "cell {cell}: a busy melody leaves a single comp stab"
+            );
+        }
+    }
+
+    /// A figure that is ONLY a downbeat onset re-phases to the mid-step off-beat (0.5) on a
+    /// non-anchor cell — a re-placement of the CURATED onset, never silence, never a new cell.
+    #[test]
+    fn s63_motto_complement_downbeat_only_rephases_to_offbeat() {
+        let base = vec![crate::composition::FigurationOnset {
+            at: 0.0,
+            tone: 1,
+            hold_frac: 1.0,
+            register_octaves: 0,
+        }];
+        let comp = motto_complement_onsets(&base, 0, ActivityClass::Sustained);
+        assert_eq!(comp.len(), 1, "one curated onset in, one out (re-phased)");
+        assert!(
+            (comp[0].at - 0.5).abs() < 1e-6,
+            "the lone downbeat onset must re-phase to the 0.5 off-beat, got at={}",
+            comp[0].at
+        );
+        assert_eq!(
+            comp[0].tone, 1,
+            "the re-phased onset keeps its curated tone (no new material)"
+        );
+    }
+
+    /// FREEZE WITNESS — `figured_bed` on the FULL static onset set (the neutral path the identity/
+    /// golden route takes) is byte-identical to mapping the raw figure: exactly `onsets.len()`
+    /// events (≤4), each within the step, offsets on the figure's fractional grid.
+    #[test]
+    fn s63_figured_bed_static_path_bytes_stable() {
+        let base = base_with_downbeat(); // 0/.25/.5/.75
+        let seated = [55u8, 59, 62]; // three inner tones
+        let step_ms = 200u64;
+        let evs = figured_bed(&base, &seated, 70, step_ms);
+        assert_eq!(
+            evs.len(),
+            4,
+            "static broken-chord bed emits exactly its 4 onsets"
+        );
+        let offs: Vec<u64> = evs.iter().map(|e| e.offset_ms).collect();
+        assert_eq!(
+            offs,
+            vec![0, 50, 100, 150],
+            "offsets land on the figure's fractional grid"
+        );
+        for e in &evs {
+            assert!(
+                e.offset_ms + e.hold_ms <= ((step_ms as f32) * PAD_OVERLAP_FRAC).round() as u64,
+                "every figured onset stays within the step (+≤10% overlap cap)"
+            );
+        }
     }
 }

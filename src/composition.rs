@@ -1625,6 +1625,38 @@ impl CompositionPlanner {
             cell_index: Some(piece_cell),
         };
 
+        // S63 INTEGRATION (move c) — PROPAGATE THE MOTTO TO THE BASS. The per-piece motto is the
+        // shared rhythmic DNA; here it also drives the bass PATTERN so the bass ANCHORS the strong
+        // pulse (walking opens on the chord root at the downbeat, which the comp — move b — now
+        // vacates) and VARIES per piece, opening the walking/pedal library that was 100% dead
+        // (`bass_pattern_catalogue` fired `sustained` on every image — diagnostic-s63 offender #4).
+        // The bass KIND is a deterministic function of the motto cell (no RNG/hash — the balance
+        // law), matched to the piece's energy (I4): a broad/calm gait (cell 1) grounds on a tonic
+        // pedal; a moving mid gait (cell 0) walks to carry the motion; a busy/even gait (cell 2)
+        // holds a dominant pedal so the bass does not crowd an already-dense surface; a syncopated
+        // gait (cell 3) walks to lay down the grid the melody leans off. GATED so it only arms on a
+        // real texture profile (NOT the identity/legacy profile): `!is_identity()` keeps every
+        // identity-profile section carrying `bass_pattern == None` → the realizer's byte-stable
+        // Sustained bass arm → the engine_equivalence bass-36 golden is unmoved. Only sets the
+        // pattern when the profile did not already carry an explicit one (a hand-authored
+        // `pad_walking`/`pad_pedal` handle still wins). Re-runs the SAME `lookup_bass_pattern`
+        // resolve the once-per-plan pass (above) uses, so the realizer reads the resolved spec.
+        if orchestration.bass_pattern.is_none() && !orchestration.is_identity() {
+            let bass_id = match piece_cell {
+                1 => "pedal",     // broad/calm → grounding tonic pedal
+                0 => "walking",   // mid, moving → half-note walking carries the motion
+                2 => "pedal_dom", // busy/even → dominant pedal, do not crowd the surface
+                3 => "walking",   // syncopated → walking lays down the grid the melody leans off
+                _ => "sustained",
+            };
+            orchestration.bass_pattern = Some(bass_id.to_string());
+            orchestration.bass_pattern_resolved = orchestration
+                .bass_pattern
+                .as_deref()
+                .and_then(|id| lookup_bass_pattern(&self.plan_mappings.bass_pattern_catalogue, id))
+                .cloned();
+        }
+
         let mut sections: Vec<Section> = Vec::with_capacity(form_spec.sections.len());
         let mut assigned = 0usize;
         for (i, tpl) in form_spec.sections.iter().enumerate() {
@@ -3308,19 +3340,30 @@ mod tests {
             assert_eq!(resolved.id, "walking");
         }
 
-        // Control: a profile with no bass_pattern leaves bass_pattern_resolved == None.
+        // Control (S63-UPDATED): the byte-stable Bass path (bass_pattern_resolved == None) is now
+        // the IDENTITY-profile path, not `pad_bed`. S63 move (c) propagates the per-piece motto to
+        // the bass on every REAL (non-identity) texture profile — so `pad_bed` (pad_voices 3,
+        // populated layers) now resolves a motto-derived bass and is NO LONGER None. The freeze
+        // path this control guards is the identity profile (`!is_identity()` gates the S63 bass
+        // assignment), which the engine_equivalence bass-36 golden rides. Force it by routing the
+        // texture axis to an UNMATCHED id → `lookup_orchestration` falls back to `identity()`.
         let mt2 = mappings();
         let mut cm2 = mt2.composition.clone().expect("composition block present");
         cm2.texture = SelectTable {
-            default: "pad_bed".to_string(),
+            default: "__identity_fallback__".to_string(),
             rules: Vec::new(),
         };
         let pm2: PlanMappings = cm2.into();
         let plan2 = CompositionPlanner::new(pm2).plan(&ImageUnderstanding::neutral(), &mt2);
         for s in &plan2.sections {
             assert!(
+                s.orchestration.is_identity(),
+                "the unmatched texture id falls back to the identity profile (the freeze path)"
+            );
+            assert!(
                 s.orchestration.bass_pattern_resolved.is_none(),
-                "pad_bed (no bass_pattern) → bass_pattern_resolved None (byte-stable Bass path)"
+                "identity profile → bass_pattern_resolved None (byte-stable Bass path; the S63 \
+                 motto→bass assignment is gated off the identity profile)"
             );
         }
     }
@@ -3401,6 +3444,130 @@ mod tests {
         assert!(
             !texture.rules.iter().any(|r| r.pick == "pad_oom_pah_pah"),
             "pad_oom_pah_pah must be inert (un-selected) until a triple-meter knob exists"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // S63 INTEGRATION (move c + move a) — planner-level invariants over the REAL 6-image
+    // corpus. All assertions are EXACT-INTEGER STRUCTURAL facts (which bass id/kind fired,
+    // distinct-kind COUNT, how many images animate) — no fractional audio metric is pinned
+    // (the S62.1 cross-platform test discipline; these are RNG-independent selector facts).
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    const S63_CORPUS: [&str; 6] = [
+        "AudioHaxImg1.jpg",
+        "AudioHaxImg2.jpg",
+        "AudioHaxImg3.jpg",
+        "example.jpg",
+        "Lena.png",
+        "magicstudio-art.jpg",
+    ];
+
+    fn s63_understand(name: &str) -> ImageUnderstanding {
+        let img = crate::pure_analysis::load_pure_image(
+            &crate::pure_analysis::PureImageSource::Preselected(name.to_string()),
+        )
+        .unwrap_or_else(|e| panic!("load {name}: {e}"));
+        crate::pure_analysis::understand_image_pure(img.as_rgb())
+            .unwrap_or_else(|e| panic!("understand {name}: {e}"))
+    }
+
+    /// THE BASS READS THE MOTTO (move c). For each corpus image the planner selects the bass
+    /// pattern id as a deterministic function of the piece's motto cell — cell 1→pedal,
+    /// 0→walking, 2→pedal_dom, 3→walking. Reads the resolved bass id + the motto cell off the
+    /// real plan and asserts the mapping holds for every image (this is the literal "motto is
+    /// now read by the bass, not just the melody" invariant).
+    #[test]
+    fn s63_motto_drives_bass_pattern() {
+        let m = mappings();
+        let pm: PlanMappings = m.composition.clone().expect("composition present").into();
+        let planner = CompositionPlanner::new(pm);
+        for name in S63_CORPUS {
+            let u = s63_understand(name);
+            let plan = planner.plan(&u, &m);
+            let sec0 = plan.sections.first().expect("plan has sections");
+            let cell = sec0
+                .orchestration
+                .motto
+                .cell_index
+                .unwrap_or_else(|| panic!("{name}: a real image carries a motto cell"));
+            let bass_id = sec0
+                .orchestration
+                .bass_pattern_resolved
+                .as_ref()
+                .map(|b| b.id.as_str())
+                .unwrap_or_else(|| {
+                    panic!("{name}: a figured/real profile resolves a bass pattern")
+                });
+            let expect = match cell {
+                1 => "pedal",
+                0 => "walking",
+                2 => "pedal_dom",
+                3 => "walking",
+                other => panic!("{name}: unexpected motto cell {other}"),
+            };
+            assert_eq!(
+                bass_id, expect,
+                "{name}: motto cell {cell} must drive bass pattern {expect}, got {bass_id}"
+            );
+        }
+    }
+
+    /// THE BASS VARIES PER PIECE (move c) — the 100%-dead bass library (sustained on 6/6, the
+    /// S63 diagnostic offender #4) now fires ≥ 3 DISTINCT kinds across the corpus. Structural
+    /// id-set count, not a metric.
+    #[test]
+    fn s63_bass_varies_across_corpus() {
+        let m = mappings();
+        let pm: PlanMappings = m.composition.clone().expect("composition present").into();
+        let planner = CompositionPlanner::new(pm);
+        let mut ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for name in S63_CORPUS {
+            let u = s63_understand(name);
+            let plan = planner.plan(&u, &m);
+            if let Some(b) = plan
+                .sections
+                .first()
+                .and_then(|s| s.orchestration.bass_pattern_resolved.as_ref())
+            {
+                ids.insert(b.id.clone());
+            }
+        }
+        assert!(
+            ids.len() >= 3,
+            "the bass must vary per piece: expected ≥3 distinct bass kinds across the corpus, \
+             got {} ({:?})",
+            ids.len(),
+            ids
+        );
+    }
+
+    /// THE ACCOMPANIMENT ANIMATES ON ≥ MOST IMAGES (move a) — the figuration library fired on
+    /// 1/6 before (only `example`); the re-tuned texture routing + the pad_bed_counter default
+    /// figuration now animate ≥ 5 of the 6. "Animates" = at least one section resolves a
+    /// figuration with a NON-EMPTY onset table (a block/None bed does not count). Structural.
+    #[test]
+    fn s63_figuration_animates_most_corpus() {
+        let m = mappings();
+        let pm: PlanMappings = m.composition.clone().expect("composition present").into();
+        let planner = CompositionPlanner::new(pm);
+        let animated = S63_CORPUS
+            .iter()
+            .filter(|name| {
+                let u = s63_understand(name);
+                let plan = planner.plan(&u, &m);
+                plan.sections.iter().any(|s| {
+                    s.orchestration
+                        .figuration_resolved
+                        .as_ref()
+                        .is_some_and(|f| !f.onsets.is_empty())
+                })
+            })
+            .count();
+        assert!(
+            animated >= 5,
+            "≥5 of 6 corpus images must have an animated accompaniment (non-empty figuration); \
+             only {animated} did"
         );
     }
 }
