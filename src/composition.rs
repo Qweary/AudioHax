@@ -997,6 +997,13 @@ pub struct PlanMappings {
     /// across by the `From<CompositionMappings>` impl below.
     #[serde(default)]
     pub home_root: Option<HomeRootMap>,
+    /// NEW S64 — selects a [`crate::chord_engine::PhraseScheme`] id from an image feature
+    /// (complexity / edge_activity — the same knobs the `form` gate reads). `#[serde(default)]`
+    /// empty `SelectTable` → `""` → `PhraseScheme::from_id("")` → the LEGACY `Period4`, so an OLD
+    /// `mappings.json` (no `phrase_scheme` axis) and the neutral/identity path stay byte-for-byte
+    /// frozen. Carried onto `PlanMappings` by the `From<CompositionMappings>` impl below.
+    #[serde(default)]
+    pub phrase_scheme: SelectTable,
 }
 
 impl From<CompositionMappings> for PlanMappings {
@@ -1020,6 +1027,7 @@ impl From<CompositionMappings> for PlanMappings {
             prominence_catalogue: c.prominence_catalogue,
             key_scheme_catalogue: c.key_scheme_catalogue,
             home_root: c.home_root,
+            phrase_scheme: c.phrase_scheme, // S64 — per-image phrase/cadence scheme selector
         }
     }
 }
@@ -1452,6 +1460,20 @@ impl CompositionPlanner {
         let meter = parse_meter(&self.plan_mappings.meter.select(u));
         let key_scheme_id = self.plan_mappings.key_scheme.select(u); // S24: image-selected scheme id
         let theme_behaviour = self.plan_mappings.theme_behaviour.select(u);
+        // S64 — PHRASE-PERIOD SPREAD. Resolve the per-piece phrase/cadence SCHEME ONCE from an
+        // image feature (the `phrase_scheme` SelectTable reads complexity / edge_activity — the
+        // SAME knobs the `form` gate reads), against the curated menu. This is the single deepest
+        // lever against the S64 "Wizard of Oz" cross-piece sameness: it breaks the universal
+        // 4-step period so the CADENCE PERIODICITY the ear locks onto varies across pieces
+        // (`sentence_8` → 8, `asymmetric_3` → 3, `group_6` → 6, `period_4` → the legacy 4). It is
+        // uniform-per-piece (mirrors the S53 motto grain), threaded into `plan_phrases_scheme`
+        // below. FREEZE: an absent/unmatched id → `""` → `PhraseScheme::from_id` → `Period4`, the
+        // byte-stable legacy period, so the neutral/identity path (`neutral()` → complexity 0 →
+        // the SelectTable `default`) and every `engine_equivalence` witness are unmoved; the
+        // frozen `src/engine.rs` keeps calling the legacy `plan_phrases` delegate. BALANCE LAW:
+        // curated authored menu + real feature seed, deterministic, NO RNG.
+        let phrase_scheme =
+            crate::chord_engine::PhraseScheme::from_id(&self.plan_mappings.phrase_scheme.select(u));
 
         // 3) lookup the chosen form; fall back to the default id, then to a minimal 1-section
         //    form so the planner is total (never panics on a malformed catalogue).
@@ -1708,7 +1730,11 @@ impl CompositionPlanner {
                     *first = chord_engine.tonic_triad(section_root_midi, &home_mode);
                 }
             }
-            let steps = chord_engine.plan_phrases(&chords);
+            // S64 — plan this section's phrases under the per-piece phrase scheme (resolved once,
+            // above). `Period4` reproduces the legacy `plan_phrases` output byte-for-byte; the
+            // non-legacy schemes move where the cadences (and the downstream pre-cadence lift /
+            // cadence ring) fall, so the cadence periodicity varies across pieces.
+            let steps = chord_engine.plan_phrases_scheme(&chords, phrase_scheme);
 
             // S29/MX-4 Lever 2(i): SET Section.density from the source-region energy ONCE, HERE.
             // f(e) = clamp(DENSITY_NEUTRAL + DENSITY_ENERGY_SPAN * (e - 0.5), FLOOR, CEIL).

@@ -578,6 +578,151 @@ pub const MAX_UPPER_VOICE_MOTION: u8 = 7;
 /// periodic structure; cadences land at their boundaries.
 pub const PHRASE_LENGTHS: [usize; 2] = [4, 8];
 
+/// A curated phrase-length / cadence-layout scheme (S64 — PHRASE-PERIOD SPREAD).
+///
+/// theory: common-practice music does NOT phrase everything in symmetrical 4-bar
+/// periods. Each variant below is a REAL formal archetype with a DIFFERENT cadence
+/// spacing, so two pieces built on two different schemes cannot share the recurring
+/// `S..h S..P` double-period the ear transcribes as "the same piece" (the S64
+/// diagnostic's fixed cross-piece skeleton). The scheme is resolved ONCE per image
+/// from an image feature (the `phrase_scheme` SelectTable in `mappings.json`, over
+/// complexity / edge_activity — the same knobs the form gate reads), so the *cadence
+/// periodicity* varies across pieces deterministically (BALANCE LAW: curated menu +
+/// feature seed, never RNG).
+///
+/// FREEZE ANCHOR: [`PhraseScheme::Period4`] is the LEGACY default and MUST reproduce
+/// the pre-S64 behavior byte-for-byte. It is what [`ChordEngine::plan_phrases`] (the
+/// signature `src/engine.rs` calls, frozen) delegates to, and what the neutral/identity
+/// path (`ImageUnderstanding::neutral()` → complexity 0 → the SelectTable `default`)
+/// resolves to. So the `engine_equivalence` goldens and every identity witness are
+/// untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PhraseScheme {
+    /// LEGACY — 4/8-step antecedent–consequent PERIODS: the largest of `PHRASE_LENGTHS`
+    /// `[4,8]` that divides the section evenly AND yields >= 2 phrases, else the largest
+    /// evenly-dividing length, else 4. Cadence periodicity 4 (`S..h S..P`). The default
+    /// and the byte-freeze anchor.
+    #[default]
+    Period4,
+    /// SENTENCE (Schoenberg/Caplin) — one 8-step SENTENCE closing on a SINGLE terminal
+    /// cadence. Cadence periodicity 8: the `S..h S..P` double-period collapses to one long
+    /// `S......P` drive, and the pre-cadence acceleration lands ONCE (the second-to-last
+    /// step, position 6) instead of on every 3rd step — the continuation's single push to
+    /// the terminal cadence. For a busy, high-energy image whose surface legitimately drives
+    /// to one goal.
+    ///
+    /// NOTE (no overclaim): what this variant realizes is the sentence's CADENCE PLACEMENT
+    /// (one terminal cadence, no interior cadence). It does NOT encode the sentence's internal
+    /// 2+2+4 basic-idea / repetition / continuation-with-fragmentation grouping at the StepPlan
+    /// level — interior steps are one undifferentiated `Interior` run, not a 2/2/4 sub-grouping
+    /// with accelerating harmonic rhythm. The "2+2+4 Schoenberg sentence" is the NAME of the
+    /// archetype the single-terminal-cadence layout is drawn from (S65 could model the internal
+    /// grouping).
+    Sentence8,
+    /// ASYMMETRIC PERIOD — a 5 + 3 antecedent/consequent period (a 5-step antecedent answered
+    /// by a compressed 3-step consequent) over an 8-step section. Cadence positions {4, 7}
+    /// instead of the symmetric {3, 7}: the interior half cadence (and its pre-cadence lift and
+    /// ring) walk one step LATER, and the two phrases are UNEQUAL in length — an asymmetric period,
+    /// a real common-practice structure. Crucially the cadence COUNT is 2 (identical to the legacy
+    /// period), so this scheme is CADENCE-DENSITY-NEUTRAL: it does NOT add cadence rings, so it
+    /// cannot fuse role pairs at extra homophonic ring steps (the S49 F5a within-piece anti-fusion
+    /// floor). For a mid-detail image that wants an off-square phrase without a denser cadence rate.
+    ///
+    /// (An earlier design used symmetric 3-step GROUPS (cadence periodicity 3); it was rejected
+    /// because tripling the section's cadence rate collapsed a role pair's onset grids onto the
+    /// shared cadence ring and REGRESSED the S49 F5a baseline ratchet on the tight-baseline images —
+    /// see docs/design-s64-phrase-period-spread.md §"cadence-density and F5a".)
+    Phrase5,
+    /// BROAD — a 6-step phrase GROUP (an asymmetric LONG phrase) with a short 2-step tail
+    /// (6 + 2 over an 8-step section). Cadence periodicity 6: the arrival is pushed LATER
+    /// and irregularly, and the pre-cadence lift lands at step 5. For a dense-but-calm image
+    /// whose broad surface wants a long, unhurried phrase rather than quick periods.
+    Group6,
+}
+
+impl PhraseScheme {
+    /// Parse a scheme id (the `pick` of the `phrase_scheme` SelectTable in `mappings.json`)
+    /// into a scheme. An unknown / empty id resolves to the LEGACY [`PhraseScheme::Period4`] —
+    /// the byte-stable fallback, so a missing/typo'd catalogue row (or an old `mappings.json`
+    /// with no `phrase_scheme` axis → `""`) degrades to today's behavior rather than panicking.
+    pub fn from_id(id: &str) -> Self {
+        match id {
+            "sentence_8" => PhraseScheme::Sentence8,
+            "phrase_5" => PhraseScheme::Phrase5,
+            "group_6" => PhraseScheme::Group6,
+            // "period_4" and everything else → the legacy period (freeze-safe default).
+            _ => PhraseScheme::Period4,
+        }
+    }
+
+    /// Choose the NOMINAL phrase length (in steps) for a section of `n` steps under this scheme.
+    ///
+    /// The section is then partitioned into phrases of this length by [`ChordEngine::plan_phrases_scheme`],
+    /// with the LAST phrase absorbing any remainder (its `this_len` < nominal) — so a scheme's
+    /// non-dividing length still yields a musically honest "long phrase + short tail" (e.g. a
+    /// 6-group over 8 steps = one 6-phrase + a 2-step codetta). Below a scheme's minimum viable
+    /// span the scheme cannot form (there is no room for its constituent ideas), so it FALLS BACK
+    /// to the legacy period rule — which keeps the very short sections (the rounded-binary "A" of
+    /// ~3 steps) identical across schemes and confines the audible spread to the longer sections
+    /// where periodicity is actually perceptible.
+    fn phrase_len_for(self, n: usize) -> usize {
+        match self {
+            PhraseScheme::Period4 => legacy_period_len(n),
+            // A sentence needs its full 8-step arc (2 + 2 + 4); below that there is no room for
+            // the basic-idea / repetition / continuation shape → legacy period.
+            PhraseScheme::Sentence8 => {
+                if n >= 8 {
+                    8
+                } else {
+                    legacy_period_len(n)
+                }
+            }
+            // The 5-step antecedent needs its full span (a 5+3 period presumes n >= 8 so the
+            // consequent has >= 3 steps); a shorter section cannot carry an asymmetric period and
+            // falls back to the legacy rule. (Between 5 and 7 the remainder would be a 1..2-step
+            // stub consequent, too short to cadence honestly, so we also require n >= 8.)
+            PhraseScheme::Phrase5 => {
+                if n >= 8 {
+                    5
+                } else {
+                    legacy_period_len(n)
+                }
+            }
+            // A broad 6-group needs at least its 6-step span; shorter → legacy period.
+            PhraseScheme::Group6 => {
+                if n >= 6 {
+                    6
+                } else {
+                    legacy_period_len(n)
+                }
+            }
+        }
+    }
+}
+
+/// The LEGACY phrase-length rule, extracted VERBATIM so [`PhraseScheme::Period4`] reproduces the
+/// pre-S64 `plan_phrases` behavior byte-for-byte.
+///
+/// theory: prefer the LARGEST allowed length in `PHRASE_LENGTHS` `[4,8]` that (a) divides the
+/// sequence evenly AND (b) still yields at least TWO phrases so a period can form; else the
+/// largest evenly-dividing length; else the normative 4. (See `plan_phrases` for the full
+/// period/antecedent-consequent rationale.) Callers guarantee `n >= 1`.
+fn legacy_period_len(n: usize) -> usize {
+    PHRASE_LENGTHS
+        .iter()
+        .rev()
+        .copied()
+        .find(|&len| len <= n && n.is_multiple_of(len) && n / len >= 2)
+        .or_else(|| {
+            PHRASE_LENGTHS
+                .iter()
+                .rev()
+                .copied()
+                .find(|&len| len <= n && n.is_multiple_of(len))
+        })
+        .unwrap_or(PHRASE_LENGTHS[0])
+}
+
 impl ChordEngine {
     /// Re-voice a chord sequence for smooth voice leading.
     ///
@@ -690,6 +835,27 @@ impl ChordEngine {
     /// velocity floor (76/88/96 for interior/start/cadence) that marks phrase
     /// shape without expressive contour.
     pub fn plan_phrases(&self, chords: &[Chord]) -> Vec<StepPlan> {
+        // FREEZE DELEGATE: the legacy signature (`src/engine.rs`'s frozen caller uses THIS one)
+        // routes through the LEGACY [`PhraseScheme::Period4`], so its output is byte-identical to
+        // the pre-S64 implementation. The scheme-aware planner below carries the real logic.
+        self.plan_phrases_scheme(chords, PhraseScheme::Period4)
+    }
+
+    /// Phrase-aware plan over a chord sequence UNDER A CURATED PHRASE SCHEME (S64 —
+    /// PHRASE-PERIOD SPREAD). Identical to [`ChordEngine::plan_phrases`] except the phrase
+    /// LENGTH — and therefore the cadence periodicity and the pre-cadence-acceleration
+    /// placement — is chosen by `scheme` (see [`PhraseScheme`]) rather than always by the
+    /// legacy 4/8-period rule.
+    ///
+    /// theory: the ONLY thing the scheme changes is the nominal phrase length fed to the SAME
+    /// partition/cadence-stamping logic below; a longer or shorter period moves WHERE the half-
+    /// and perfect-authentic cadences fall (and, downstream in `realize_rhythm`, where the
+    /// pre-cadence lift and cadence ring land, since those gates read `phrase_len` /
+    /// `position_in_phrase` off the `StepPlan`). So a `sentence_8` piece cadences once every 8
+    /// steps, an `asymmetric_3` piece every 3, a `group_6` piece every 6 — the recurring
+    /// `S..h S..P` skeleton is no longer universal. `PhraseScheme::Period4` reproduces the
+    /// legacy behavior byte-for-byte (freeze anchor).
+    pub fn plan_phrases_scheme(&self, chords: &[Chord], scheme: PhraseScheme) -> Vec<StepPlan> {
         // Voice-lead first so the plan carries the smoothly connected chords, not
         // the raw root-position triads — the structural plan rides on top of the
         // re-voiced surface.
@@ -698,30 +864,19 @@ impl ChordEngine {
             return Vec::new();
         }
 
-        // ---- Choose a phrase length from PHRASE_LENGTHS ------------------
-        // theory: common-practice periodic structure parses into 4- or 8-step
-        // units, and the smallest complete unit is the PERIOD — an antecedent
-        // phrase resting on a half cadence answered by a consequent closing with
-        // a PAC. So we prefer the LARGEST allowed length that (a) divides the
-        // sequence evenly AND (b) still yields at least TWO phrases, so a period
-        // can form. An 8-step input therefore parses as two 4-step phrases
-        // (antecedent + consequent), not one undifferentiated 8-step phrase.
-        // If no length yields a period (sequences of 4 or fewer), we fall back to
-        // the largest evenly-dividing length, or to 4 as the normative default.
+        // ---- Choose a phrase length from the SCHEME ---------------------
+        // theory: common-practice periodic structure parses into phrase units and the smallest
+        // complete unit is the PERIOD — an antecedent phrase resting on a half cadence answered
+        // by a consequent closing with a PAC. The LEGACY scheme (`Period4`) prefers the LARGEST
+        // of `PHRASE_LENGTHS` that divides evenly AND yields >= 2 phrases (so an 8-step input
+        // parses as two 4-step phrases, not one undifferentiated 8-step phrase), falling back to
+        // the largest evenly-dividing length, else 4. The NON-legacy schemes select a different
+        // nominal length (8 / 3 / 6) so the cadence PERIODICITY varies across pieces; the
+        // partition logic below is shared and unchanged. `PhraseScheme::phrase_len_for` folds in
+        // each scheme's own minimum-span fallback to the legacy rule (so very short sections stay
+        // identical across schemes). See [`PhraseScheme`].
         let n = led.len();
-        let phrase_len = PHRASE_LENGTHS
-            .iter()
-            .rev()
-            .copied()
-            .find(|&len| len <= n && n.is_multiple_of(len) && n / len >= 2)
-            .or_else(|| {
-                PHRASE_LENGTHS
-                    .iter()
-                    .rev()
-                    .copied()
-                    .find(|&len| len <= n && n.is_multiple_of(len))
-            })
-            .unwrap_or(PHRASE_LENGTHS[0]);
+        let phrase_len = scheme.phrase_len_for(n);
 
         let phrase_count = n.div_ceil(phrase_len);
 

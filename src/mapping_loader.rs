@@ -150,6 +150,12 @@ pub struct CompositionMappings {
     /// `From<CompositionMappings>` impl in composition.rs.
     #[serde(default)]
     pub home_root: Option<HomeRootMap>,
+    /// S64 — the per-image phrase/cadence scheme selector (→ a `PhraseScheme` id). `#[serde(default)]`
+    /// back-compat floor: absent → empty `SelectTable` → `""` → the LEGACY `PhraseScheme::Period4`
+    /// (byte-stable). Carried onto `PlanMappings` by the `From<CompositionMappings>` impl in
+    /// composition.rs.
+    #[serde(default)]
+    pub phrase_scheme: crate::composition::SelectTable,
 }
 
 /// S40 / Slice-2 (Finding #1) — the per-image home block (schema Option S1, range-map shape).
