@@ -1930,18 +1930,41 @@ fn variety_scorecard_sweep() {
         // THE ASSERTION (sign/direction, NOT a tuned magnitude — spec §5 / the build's "assert
         // the DIRECTION not a specific number" instruction): per image, the measured F5a must
         //   (1) clear the slice-2 FLOOR (≥ 0.50 — the hard anti-fusion floor on every image), AND
-        //   (2) NOT FALL BELOW its pre-slice-2 baseline (a small float epsilon tolerated) — the
-        //       per-role grids slice 2 introduced must not REGRESS distinctness on any image, and
-        //       must HOLD the rise on the images where L2 fired (Lena +0.083, Img3 +0.083).
+        //   (2) NOT FALL BELOW its pre-slice-2 baseline minus a CROSS-PLATFORM matrix tolerance
+        //       (`eps`, see below) — the per-role grids slice 2 introduced must not REGRESS
+        //       distinctness on any image, and must HOLD the rise on the images where L2 fired
+        //       (Lena +0.083, Img3 +0.083).
+        // The `baseline` here is a cross-platform regression FLOOR, NOT a single-platform exact
+        // value: `rhythm_distinct_frac` jitters by up to ~0.03 across the 3-OS CI matrix (Linux
+        // baselines; macOS drifts on a handful of the ~210 role-pairs), so `eps` is sized to
+        // absorb that FP spread with margin while staying far below a fusion-scale drop.
+        // WHY THIS STILL CATCHES A REAL FUSION REGRESSION: if two co-sounding roles FUSE onto an
+        // identical onset grid, distinctness does not jitter by a few pairs — it collapses toward
+        // (and through) the 0.50 floor: a single fused pair among ~210 is a ~0.005 drop, but a
+        // genuine fusion regression means a WHOLE ROLE'S grid coincides with another across many
+        // co-sounding pairs, a drop of many tenths that trips BOTH this baseline-relative guard
+        // (>> eps = 0.05) and the hard 0.50 floor. The 0.05 tolerance is thus > the observed 0.029
+        // cross-platform spread yet << a fusion drop — platform-robust and fusion-sensitive.
         // The magnitude (how MUCH each role's grid differs) stays REPORTED in the F5a scorecard
         // row above for the taste gate to size. A future change that FUSES two roles' onset grids
-        // (re-introducing the S42 fusion) drops F5a below baseline and RED-BARS here — the honesty
-        // guard. (F5a measures the OFFSET-GRID face of slice 2 — L2's phase-separation; L1's
+        // (re-introducing the S42 fusion) drops F5a well below baseline and RED-BARS here — the
+        // honesty guard. (F5a measures the OFFSET-GRID face of slice 2 — L2's phase-separation; L1's
         // onset-COUNT face shows in F1's margin, which the S47 F1 gate above already asserts.)
         if v.figure_ground != Verdict::Crash {
             let f5a_floor = 0.50_f32;
             let baseline = s49_f5a_baseline(name);
-            let eps = 0.005_f32; // float-jitter tolerance on the baseline-relative sign
+            // CROSS-PLATFORM REGRESSION-FLOOR TOLERANCE (S62 CI-matrix hardening).
+            // `baseline` is NOT a single-platform exact value: `rhythm_distinct_frac` (fraction of
+            // co-sounding role-pairs whose onset grids differ) is FP-sensitive across the 3-OS CI
+            // matrix. The S62 baselines were measured on Linux; macOS drifts on a few of the ~210
+            // role-pairs (observed max Δ = 0.029 on AudioHaxImg2: Linux 0.686 vs macOS 0.657 ≈ 6
+            // pairs) while windows == Linux within old jitter. The old eps = 0.005 was calibrated
+            // for SAME-platform jitter only and red-barred macOS spuriously. Widen to a
+            // matrix-calibrated tolerance that treats `baseline` as a cross-platform REGRESSION
+            // FLOOR: comfortably ABOVE the observed 0.029 spread (with margin for Img3 and others,
+            // whose macOS values are unmeasured-but-nearby), yet comfortably BELOW a real fusion
+            // drop. This keeps the partial-fusion guard automated AND platform-robust.
+            let eps = 0.05_f32;
             assert!(
                 v.rhythm_distinct_frac >= f5a_floor,
                 "[{name}] S49 F5a anti-fusion FLOOR REGRESSED: per-role onset-grid distinctness \
@@ -1953,7 +1976,8 @@ fn variety_scorecard_sweep() {
             assert!(
                 v.rhythm_distinct_frac >= baseline - eps,
                 "[{name}] S49 F5a per-role rhythm-distinctness REGRESSED below the pre-slice-2 \
-                 baseline: measured {:.3} < baseline {baseline:.3} (−{eps:.3} eps) — slice 2's \
+                 baseline FLOOR: measured {:.3} < baseline {baseline:.3} (−{eps:.3} cross-platform \
+                 matrix tolerance) — a drop this far past the CI-matrix FP spread means slice 2's \
                  per-role onset grids (L1 melody-subdivides + L2 HarmonicFill phase-separation + L3 \
                  articulation contrast) FUSED a role pair that was distinct before, a figure-ground \
                  regression (the gate brackets the slice-2 grid gain, never lets it walk back)",
