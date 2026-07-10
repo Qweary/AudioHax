@@ -414,6 +414,23 @@ fn run_render_wav(
     // engine.rs is never touched — the register is read inside chord_engine::pick_progression.
     audiohax::seed::set_composition_seed(render_args.seed);
 
+    // ── S79 cadence-figure differentiation: ARMED S80 (production default). ──
+    // Per-image + within-piece-developing cadential figure, grounded on LIVE `understanding.*`
+    // extraction — NOT the hardcoded test fixture the QG flagged. Set here BEFORE compose, the
+    // `set_composition_seed` discipline, freeze-safe (engine.rs untouched; the register is read
+    // inside chord_engine::realize_rhythm + composition::plan). Only the not(opencv)+pure-analysis
+    // arm binds a live `understanding`; the opencv/bare arm has none → it keeps the neutral()
+    // legacy figure (do NOT fabricate features), exactly as the S74b `programs` floor does.
+    // A/B evidence: examples/poc_s79_rhythm_diff.rs + renders/s79-rhythm-diff/LISTEN-S79.md.
+    #[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
+    audiohax::chord_engine::set_cadence_development(audiohax::chord_engine::CadenceFigure {
+        shape: Some(audiohax::chord_engine::select_cadence_shape(
+            understanding.complexity,
+            understanding.aspect_ratio,
+        )),
+        drive: audiohax::chord_engine::edge_to_drive(understanding.edge_activity),
+    });
+
     // ── S74b/B5: per-voice GM program vector (image-feature → ensemble). Computed ONCE, BEFORE
     //    `PipelineEngine::new` consumes `mappings`. Freeze-safe: reads DATA + the live
     //    `understanding`; touches neither the engine nor the plan. Absent/empty `instrumentation`
@@ -727,6 +744,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // composer/planner runs. engine.rs is never touched — the register is read inside
     // chord_engine::pick_progression.
     audiohax::seed::set_composition_seed(play_args.seed);
+
+    // ── S79 cadence-figure differentiation: ARMED S80 (production default). ──
+    // Per-image + within-piece-developing cadential figure, grounded on LIVE `understanding.*`
+    // extraction — NOT the hardcoded test fixture the QG flagged. Set here BEFORE compose, the
+    // `set_composition_seed` discipline, freeze-safe (engine.rs untouched). Only the
+    // not(opencv)+pure-analysis arm binds a live `understanding`; the opencv/bare arm has none →
+    // it keeps the neutral() legacy figure, exactly as the S74b `programs` floor does.
+    // A/B evidence: examples/poc_s79_rhythm_diff.rs + renders/s79-rhythm-diff/LISTEN-S79.md.
+    #[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
+    audiohax::chord_engine::set_cadence_development(audiohax::chord_engine::CadenceFigure {
+        shape: Some(audiohax::chord_engine::select_cadence_shape(
+            understanding.complexity,
+            understanding.aspect_ratio,
+        )),
+        drive: audiohax::chord_engine::edge_to_drive(understanding.edge_activity),
+    });
 
     // ── S74b/B5: per-voice GM program vector (image-feature → ensemble). Computed ONCE, BEFORE
     //    `PipelineEngine::new` consumes `mappings`; a piece-level constant read by both the eager

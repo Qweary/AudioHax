@@ -546,6 +546,28 @@ fn half_f32() -> f32 {
     0.5
 }
 
+/// One named ENSEMBLE = a voice-indexed GM-program palette (B5, S74b differential
+/// instrumentation). Parallel to [`FormSpec`]/[`OrchestrationProfile`] — the musical vocabulary
+/// lives in `mappings.json` (`composition.ensemble_catalogue`), so adding an ensemble or
+/// re-voicing a family is a JSON row, not a Rust edit. Selected by the `instrumentation`
+/// [`SelectTable`]; resolved to per-voice programs by [`crate::instrumentation::select_programs`].
+///
+/// serde is NOT `deny_unknown_fields`, so a row may carry a documentation `label`/comment key that
+/// parses harmlessly (mirrors the shipped `texture` table's `_comment` rows).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct EnsembleSpec {
+    /// Stable handle the `instrumentation` [`SelectTable`] picks, e.g. `"dark_reeds"`.
+    pub id: String,
+    /// Human label; documentation only. `#[serde(default)]` so a row may omit it.
+    #[serde(default)]
+    pub label: String,
+    /// Voice-indexed GM programs (0..=127): v0 Bass, v1 Pad, v2 Fill|Counter, v3 Melody. Authored
+    /// for the canonical 4-voice stack; longer voice counts fall to `legacy_program(i)` for the
+    /// tail (guarded in [`crate::instrumentation::select_programs`]). `Vec<u8>` (not `[u8;4]`)
+    /// keeps it N-agnostic and back-compat-lenient.
+    pub programs: Vec<u8>,
+}
+
 impl OrchestrationProfile {
     /// The behaviour-neutral profile: today's role split (the realizer's `assign_role`
     /// delegates to `instrument_role` under it), no pad. The byte-freeze anchor — every
@@ -1004,6 +1026,19 @@ pub struct PlanMappings {
     /// frozen. Carried onto `PlanMappings` by the `From<CompositionMappings>` impl below.
     #[serde(default)]
     pub phrase_scheme: SelectTable,
+    /// NEW S74b/B5 — selects an [`EnsembleSpec`] id from the spread image features (hue zone +
+    /// brightness×edge×texture). `#[serde(default)]` empty `SelectTable` → `""` → no ensemble →
+    /// every voice falls to `legacy_program(i)` in the adapter (byte-identical to pre-B5). The
+    /// planner does NOT itself consume this (the `main.rs` adapter does); it is declared on both
+    /// mirrors so their shape stays identical and a future planner-side use needs no schema change.
+    /// Carried onto `PlanMappings` by the `From<CompositionMappings>` impl below.
+    #[serde(default)]
+    pub instrumentation: SelectTable,
+    /// NEW S74b/B5 — the ensemble palette vocabulary (id → voice-indexed GM programs). Parallel to
+    /// `texture_catalogue`. `#[serde(default)]` empty Vec (back-compat floor): absent → an
+    /// unresolved ensemble id → per-voice `legacy_program(i)` floor.
+    #[serde(default)]
+    pub ensemble_catalogue: Vec<EnsembleSpec>,
 }
 
 impl From<CompositionMappings> for PlanMappings {
@@ -1028,6 +1063,8 @@ impl From<CompositionMappings> for PlanMappings {
             key_scheme_catalogue: c.key_scheme_catalogue,
             home_root: c.home_root,
             phrase_scheme: c.phrase_scheme, // S64 — per-image phrase/cadence scheme selector
+            instrumentation: c.instrumentation, // S74b/B5 — per-image ensemble selector
+            ensemble_catalogue: c.ensemble_catalogue, // S74b/B5 — ensemble palette vocabulary
         }
     }
 }
@@ -1647,6 +1684,16 @@ impl CompositionPlanner {
             cell_index: Some(piece_cell),
         };
 
+        // S79 (L2) — WITHIN-PIECE DEVELOPMENT GATE. When a live cadential figure is armed for this
+        // thread (the L1 render/test entry set it), also develop the INTERIOR across the piece: a
+        // per-image density ARC (so the melody's interior gait shifts section-to-section instead of
+        // one texture wall-to-wall) and a per-SECTION motto rotation (so the `.clone()`-onto-every-
+        // section no longer forces identical rhythmic DNA). `neutral()` (the freeze / unset default)
+        // ⇒ NEITHER fires ⇒ `section_density`/`motto` are byte-identical to legacy ⇒ every existing
+        // composition test and the A control render are unmoved. Pure function of image stats.
+        let develop = !crate::chord_engine::cadence_development().is_neutral();
+        let piece_cell_count = piece_archetype.rhythm_cell_count();
+
         // S63 INTEGRATION (move c) — PROPAGATE THE MOTTO TO THE BASS. The per-piece motto is the
         // shared rhythmic DNA; here it also drives the bass PATTERN so the bass ANCHORS the strong
         // pulse (walking opens on the chord root at the downbeat, which the comp — move b — now
@@ -1740,8 +1787,29 @@ impl CompositionPlanner {
             // f(e) = clamp(DENSITY_NEUTRAL + DENSITY_ENERGY_SPAN * (e - 0.5), FLOOR, CEIL).
             // Home/home_only/identity sections carry HOME_ENERGY_NEUTRAL == 0.5, and f(0.5) ==
             // DENSITY_NEUTRAL == 0.5 exactly, so those sections keep density == 0.5 byte-for-byte.
-            let section_density = (DENSITY_NEUTRAL + DENSITY_ENERGY_SPAN * (energy_i - 0.5))
+            let mut section_density = (DENSITY_NEUTRAL + DENSITY_ENERGY_SPAN * (energy_i - 0.5))
                 .clamp(DENSITY_FLOOR, DENSITY_CEIL);
+
+            // S79 (L2a) — INTERIOR-BAND DEVELOPMENT ARC. Legacy `section_density` is 0.5 on every
+            // home_only section (energy_i == 0.5) → the melody reads the SAME interior band on every
+            // step of every section (the "one texture wall-to-wall" half of the complaint). Under a
+            // live figure, override it with a PER-IMAGE ramp across the sections so the interior gait
+            // DEVELOPS: a calm image builds (rising), a busy image relaxes (falling); aspect_ratio
+            // tilts the arc so images tying on complexity still differ. Bounded to the same
+            // [FLOOR, CEIL] the energy formula uses, so the realizer's edge-activity nudge stays in
+            // range. (`edge_activity = base + (density-0.5)*GAIN`, chord_engine — the reader.)
+            if develop && form_spec.sections.len() > 1 {
+                let n_sec = form_spec.sections.len();
+                let stage = i as f32 / (n_sec - 1) as f32; // 0 at the opening → 1 at the close
+                let rising = u.complexity < 0.4; // calm images build; busy images relax into the close
+                let arc = if rising {
+                    DENSITY_FLOOR + (DENSITY_CEIL - DENSITY_FLOOR) * stage
+                } else {
+                    DENSITY_CEIL - (DENSITY_CEIL - DENSITY_FLOOR) * stage
+                };
+                let tilt = ((u.aspect_ratio - 1.0) * 0.05).clamp(-0.05, 0.05);
+                section_density = (arc + tilt).clamp(DENSITY_FLOOR, DENSITY_CEIL);
+            }
 
             // S45/Slice-1: PER-SECTION Pad figuration variation. The plan resolves ONE figuration
             // once (above, :1524) and `.clone()`s it onto every section, so a figured comp runs the
@@ -1770,6 +1838,16 @@ impl CompositionPlanner {
                 {
                     section_orch.figuration_resolved = Some(spec.clone());
                 }
+            }
+
+            // S79 (L2b) — STOP THE MOTTO `.clone()`-ONTO-EVERY-SECTION. Legacy stamps the ONE
+            // per-piece motto cell on every section, so the melody's micro-timing DNA is uniform
+            // wall-to-wall. Under a live figure, ROTATE the cell per section index so sections carry
+            // distinct (but same-archetype, so still one coherent identity) gaits — the interior no
+            // longer repeats identically. FREEZE: gated on `develop`; unset ⇒ the byte-identical
+            // cloned per-piece motto. Deterministic (index arithmetic, no RNG).
+            if develop && piece_cell_count > 1 {
+                section_orch.motto.cell_index = Some((piece_cell + i) % piece_cell_count);
             }
 
             sections.push(Section {
@@ -3480,6 +3558,12 @@ mod tests {
     // (the S62.1 cross-platform test discipline; these are RNG-independent selector facts).
     // ═══════════════════════════════════════════════════════════════════════════
 
+    // S63/B5 FIX — these three corpus tests load REAL images via `crate::pure_analysis`, which is
+    // `#[cfg(feature = "pure-analysis")]`-gated. Without the guard the `--no-default-features`
+    // headless `cargo test --lib` gate fails to COMPILE (three unresolved `crate::pure_analysis`
+    // refs). Gate the corpus const + loader helper + the three tests that use them on the same
+    // feature so the pure-Rust headless gate compiles green; they still run in the default build.
+    #[cfg(feature = "pure-analysis")]
     const S63_CORPUS: [&str; 6] = [
         "AudioHaxImg1.jpg",
         "AudioHaxImg2.jpg",
@@ -3489,6 +3573,7 @@ mod tests {
         "magicstudio-art.jpg",
     ];
 
+    #[cfg(feature = "pure-analysis")]
     fn s63_understand(name: &str) -> ImageUnderstanding {
         let img = crate::pure_analysis::load_pure_image(
             &crate::pure_analysis::PureImageSource::Preselected(name.to_string()),
@@ -3503,6 +3588,7 @@ mod tests {
     /// 0→walking, 2→pedal_dom, 3→walking. Reads the resolved bass id + the motto cell off the
     /// real plan and asserts the mapping holds for every image (this is the literal "motto is
     /// now read by the bass, not just the melody" invariant).
+    #[cfg(feature = "pure-analysis")]
     #[test]
     fn s63_motto_drives_bass_pattern() {
         let m = mappings();
@@ -3542,6 +3628,7 @@ mod tests {
     /// THE BASS VARIES PER PIECE (move c) — the 100%-dead bass library (sustained on 6/6, the
     /// S63 diagnostic offender #4) now fires ≥ 3 DISTINCT kinds across the corpus. Structural
     /// id-set count, not a metric.
+    #[cfg(feature = "pure-analysis")]
     #[test]
     fn s63_bass_varies_across_corpus() {
         let m = mappings();
@@ -3572,6 +3659,7 @@ mod tests {
     /// 1/6 before (only `example`); the re-tuned texture routing + the pad_bed_counter default
     /// figuration now animate ≥ 5 of the 6. "Animates" = at least one section resolves a
     /// figuration with a NON-EMPTY onset table (a block/None bed does not count). Structural.
+    #[cfg(feature = "pure-analysis")]
     #[test]
     fn s63_figuration_animates_most_corpus() {
         let m = mappings();
@@ -3594,6 +3682,103 @@ mod tests {
             animated >= 5,
             "≥5 of 6 corpus images must have an animated accompaniment (non-empty figuration); \
              only {animated} did"
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// S79 (L2) — WITHIN-PIECE DEVELOPMENT tests: the interior-band density ARC and the per-section
+// motto rotation fire ONLY when a live cadential figure is armed, and are byte-legacy otherwise.
+// ────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod develop_s79_tests {
+    use super::*;
+    use crate::chord_engine::{
+        clear_cadence_development, set_cadence_development, ApproachShape, CadenceFigure,
+    };
+
+    fn mappings() -> MappingTable {
+        crate::mapping_loader::load_mappings("assets/mappings.json").expect("mappings load")
+    }
+    fn u_with(complexity: f32, edge: f32) -> ImageUnderstanding {
+        ImageUnderstanding {
+            complexity,
+            edge_activity: edge,
+            ..ImageUnderstanding::neutral()
+        }
+    }
+
+    fn plan_for(cx: f32, edge: f32) -> CompositionPlan {
+        let pm: PlanMappings = mappings()
+            .composition
+            .clone()
+            .expect("composition block")
+            .into();
+        CompositionPlanner::new(pm).plan(&u_with(cx, edge), &mappings())
+    }
+
+    /// Find a complexity that yields a MULTI-section plan, so the cross-section develop asserts are
+    /// non-vacuous (a single-section piece develops only via the L1 per-phrase figure, not L2).
+    fn multi_section_cx() -> Option<f32> {
+        clear_cadence_development();
+        [0.2f32, 0.5, 0.7, 0.9, 0.95]
+            .into_iter()
+            .find(|&cx| plan_for(cx, 0.5).sections.len() > 1)
+    }
+
+    /// LEGACY (unset): every home_only section keeps density == 0.5 and the SAME motto cell — the
+    /// byte-stable pre-S79 behavior. Guarantees the A control render and existing tests are unmoved.
+    #[test]
+    fn legacy_density_and_motto_uniform_when_unset() {
+        clear_cadence_development();
+        let plan = plan_for(0.9, 0.6);
+        for s in &plan.sections {
+            assert!(
+                (s.density - 0.5).abs() < 1e-6,
+                "unset: home_only density must stay 0.5, got {}",
+                s.density
+            );
+        }
+        let cells: Vec<_> = plan.sections.iter().map(|s| s.motto().cell_index).collect();
+        assert!(
+            cells.windows(2).all(|w| w[0] == w[1]),
+            "unset: motto must be cloned identically onto every section"
+        );
+    }
+
+    /// DEVELOPED (armed): a multi-section piece's interior densities DEVELOP across sections (not a
+    /// flat wall) and the motto rotates section-to-section — the L2 within-piece fixes.
+    #[test]
+    fn density_arc_and_motto_rotate_when_armed() {
+        let Some(cx) = multi_section_cx() else {
+            // No multi-section form reachable from the plain-feature planner — surface it rather
+            // than pass vacuously. (L1 per-phrase development still covers single-section pieces.)
+            panic!("no multi-section plan reachable; L2 cross-section test cannot run");
+        };
+        set_cadence_development(CadenceFigure {
+            shape: Some(ApproachShape::Anacrusis),
+            drive: 0.5,
+        });
+        let plan = plan_for(cx, 0.5);
+        clear_cadence_development();
+
+        let dens: Vec<f32> = plan.sections.iter().map(|s| s.density).collect();
+        assert!(
+            dens.windows(2).any(|w| (w[0] - w[1]).abs() > 1e-3),
+            "armed: interior density must develop across sections, got {dens:?}"
+        );
+        for d in &dens {
+            assert!(
+                (0.35..=0.65).contains(d),
+                "armed: density {d} must stay inside [FLOOR, CEIL]"
+            );
+        }
+        let cells: Vec<_> = plan.sections.iter().map(|s| s.motto().cell_index).collect();
+        // At least two sections must differ IF the archetype has >1 cell (rotation is real).
+        let distinct: std::collections::HashSet<_> = cells.iter().collect();
+        assert!(
+            distinct.len() >= 2 || plan.sections.len() == 1,
+            "armed: motto must rotate across sections, got {cells:?}"
         );
     }
 }

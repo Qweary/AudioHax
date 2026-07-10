@@ -1259,6 +1259,257 @@ fn band_activity_spread(edge_activity: f32) -> f32 {
     (BAND_SPREAD_CENTER + (edge_activity - BAND_SPREAD_CENTER) * slope).clamp(0.0, 1.0)
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// S79 — CADENCE-FIGURE DIFFERENTIATION + DEVELOPMENT (the "Wizard-of-Oz line" fix).
+//
+// The persistent "sameness" the ear names — *triplet-eighth, quarter-rest, four-
+// sixteenths, quarter, and variations of that* — is the phrase-TAIL skeleton: the
+// pre-cadence step is FORCED to four even sixteenths (`realize_rhythm`, the melody
+// ARPEGGIO arm `n = if pre_cadence { 4 }`) and the cadence rings one sustained note.
+// Because `pre_cadence`/`is_cadence` are pure phrase-POSITION functions, that figure
+// closes EVERY phrase of EVERY image identically — an image-independent fingerprint
+// (diagnosis §1-2). S64 varied only the cadence SPACING, never the FIGURE, so the ear
+// still hears it. The binding constraint (S74 §10 screen): a UNIFORM new figure
+// HOMOGENIZES cross-piece sameness — only PER-IMAGE DIFFERENTIATION helps.
+//
+// THIS LAYER replaces the single fixed pre-cadence figure with:
+//   (a) a per-IMAGE cadential-approach VOCABULARY, keyed to `complexity × aspect_ratio`
+//       (the pair the diagnosis found genuinely spreads the six corpus images; aspect
+//       is the orthogonal decorrelator that splits the energy-clustered mid three), with
+//       `edge_activity` as a fine drive-tiebreak so two images that tie on the grid
+//       (Img1/Img2 — same complexity band AND aspect) still close differently; and
+//   (b) WITHIN-PIECE DEVELOPMENT: an antecedent HALF cadence gets a lighter, open
+//       "comma"; a consequent PERFECT-AUTHENTIC cadence gets the full figure, and later
+//       phrases FRAGMENT/accelerate into the close — textbook cadential intensification.
+// Everything stays diatonic + voice-led: this arm only chooses ONSET PLACEMENT +
+// ARTICULATION (exactly what the legacy n=4 arm already did); the PITCHES are the seat's,
+// so the figure can never leave the key.
+//
+// FREEZE SEAM: the four candidate carrier structs on the realizer's path
+// (`OrchestrationProfile`/`Section`/`PerfFeatures`/`StepPlan`) each have fully-enumerated
+// literals in the byte-FROZEN `engine.rs` and/or ~18 non-owned integration-test files, so
+// a new struct FIELD is impossible without editing frozen/foreign code. This mirrors the
+// established `src/seed.rs::set_composition_seed` seam instead: a thread-local injected at
+// the freeze-safe entry (the render/test harness, or a `main.rs` one-liner). Its default
+// is `neutral()` → `realize_rhythm` takes the byte-identical LEGACY path, so every
+// `engine_equivalence` golden and every existing test is unmoved. The value is a pure
+// function of image stats (no RNG/hash), so the balance law holds.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The characteristic pre-cadence APPROACH contour of one piece — the onset-skeleton
+/// family the melody drives into its cadences with. Selected per-image from
+/// `complexity × aspect_ratio` ([`select_cadence_shape`]). Each variant is a distinct
+/// rhythmic gesture; NONE emits a pitch (the seat supplies pitch), so all stay diatonic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApproachShape {
+    /// Gentle even approach (2 or 3 held onsets, drive-gated) — calm, low-complexity images.
+    Plain,
+    /// Lilting dotted drive: one long onset then two quick ones (long-short-short).
+    Dotted,
+    /// Scotch snap: a short accented onset, a held tone, then a crisp pickup pair.
+    Snap,
+    /// Anacrustic run: a held tone then accelerating bunched pickups into the downbeat.
+    Anacrusis,
+    /// Four even sixteenths (the legacy figure) — kept as ONE image's choice, not universal.
+    Even4,
+    /// Six-onset fragmenting rush — the busiest/most-intricate images.
+    Rush,
+}
+
+/// The per-piece cadential-figure directive read by [`realize_rhythm`]. `shape == None` is
+/// the behaviour-neutral figure (the LEGACY four-sixteenths pre-cadence + bare sustained
+/// ring) — the freeze hinge, DISTINCT from every real shape so the realizer can tell the
+/// frozen path from a live piece. `drive` (0..1, from `edge_activity`) sets onset density
+/// within a shape and articulation crispness — it is the tiebreak that differentiates two
+/// images sharing a grid cell. `Copy` so it rides a `Cell` like the composition seed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CadenceFigure {
+    pub shape: Option<ApproachShape>,
+    pub drive: f32,
+}
+
+impl CadenceFigure {
+    /// The behaviour-neutral figure: `realize_rhythm` maps this to the byte-identical legacy
+    /// pre-cadence/cadence path. Every frozen/identity/unset caller sees this.
+    pub fn neutral() -> CadenceFigure {
+        CadenceFigure {
+            shape: None,
+            drive: 0.0,
+        }
+    }
+    /// True iff this is the neutral (legacy) figure — the realizer's freeze short-circuit.
+    pub fn is_neutral(self) -> bool {
+        self.shape.is_none()
+    }
+}
+
+impl Default for CadenceFigure {
+    fn default() -> Self {
+        CadenceFigure::neutral()
+    }
+}
+
+thread_local! {
+    /// Active per-piece cadential figure for this thread. `neutral()` ⇒ the LEGACY figure
+    /// (freeze default). Set at the freeze-safe entry (render/test harness or `main.rs`),
+    /// BEFORE `compose_from_image`/planning, and cleared after — the `set_composition_seed`
+    /// discipline. Read by `realize_rhythm` (per-image figure) and by `composition::plan`
+    /// (the L2 interior-band + motto development gate).
+    static CADENCE_DEV: std::cell::Cell<CadenceFigure> = const { std::cell::Cell::new(CadenceFigure { shape: None, drive: 0.0 }) };
+}
+
+/// Enable per-image cadence differentiation for this thread with the piece's figure.
+/// Call ONCE before planning/rendering; pair with [`clear_cadence_development`].
+pub fn set_cadence_development(figure: CadenceFigure) {
+    CADENCE_DEV.with(|c| c.set(figure));
+}
+
+/// Restore the neutral (legacy) figure — always call after a render/test that set one, so
+/// no state leaks into a subsequent composition on the same thread.
+pub fn clear_cadence_development() {
+    CADENCE_DEV.with(|c| c.set(CadenceFigure::neutral()));
+}
+
+/// Read the active per-piece cadential figure for this thread.
+pub fn cadence_development() -> CadenceFigure {
+    CADENCE_DEV.with(|c| c.get())
+}
+
+/// Map `edge_activity` (0..1) onto a cadence DRIVE (0..1): the crispness/onset-density knob
+/// that separates images tying on the `complexity × aspect_ratio` grid (Img1 vs Img2, both
+/// low-complexity tall portraits). Centered so the corpus low pair lands on opposite sides
+/// of the Plain 2-vs-3-onset split. Pure, RNG-free.
+pub fn edge_to_drive(edge_activity: f32) -> f32 {
+    ((edge_activity - 0.20) / 0.45).clamp(0.0, 1.0)
+}
+
+/// Choose the per-image cadential-approach SHAPE from `complexity × aspect_ratio` — the
+/// decorrelated pair (diagnosis §3): complexity is the character axis, aspect_ratio the
+/// orthogonal tiebreak that splits the energy-clustered mid images. A 3×3 grid; every cell
+/// is a genuinely distinct gesture, so distinct images close their phrases distinctly. Pure.
+pub fn select_cadence_shape(complexity: f32, aspect_ratio: f32) -> ApproachShape {
+    // complexity band: LOW (<0.10) / MID (<0.50) / HIGH (>=0.50).
+    // aspect band: TALL (<0.90) / SQUARE (<1.20) / WIDE (>=1.20).
+    let tall = aspect_ratio < 0.90;
+    let square = aspect_ratio < 1.20;
+    if complexity < 0.10 {
+        if tall {
+            ApproachShape::Plain
+        } else if square {
+            ApproachShape::Dotted
+        } else {
+            ApproachShape::Snap
+        }
+    } else if complexity < 0.50 {
+        if tall {
+            ApproachShape::Snap
+        } else if square {
+            ApproachShape::Dotted
+        } else {
+            ApproachShape::Anacrusis
+        }
+    } else if square {
+        // HIGH complexity, TALL or SQUARE (tall ⇒ square): the busy legacy four-sixteenths drive.
+        ApproachShape::Even4
+    } else {
+        // HIGH complexity, WIDE: the six-onset fragmenting rush (the busiest/widest image).
+        ApproachShape::Rush
+    }
+}
+
+/// Articulation at the OPEN (less-settled) end of a half-cadence ring, as a fraction of the
+/// step: an antecedent phrase breathes rather than fully closing, so its arrival reads as a
+/// "comma" against the consequent PAC's full ring — the within-piece cadential contrast.
+const HALF_CADENCE_RING_FRAC: f32 = 0.72;
+
+/// Build the pre-cadence APPROACH as a list of `(slot_fraction, articulation_fraction)` onsets
+/// (the fractions of the step each onset occupies; they tile the step, summing to 1). This is
+/// the whole L1 figure vocabulary — pure and directly unit-testable, so the "per-image
+/// differentiation" and "within-piece development" property tests assert on it without rendering.
+///
+/// * `figure` — the per-piece shape + drive (from the image).
+/// * `approaching_pac` — is the cadence this step drives INTO a Perfect Authentic Cadence
+///   (consequent/close) or a Half cadence (antecedent/open)? An antecedent gets the LIGHT
+///   two-onset "comma"; a consequent gets the full figure.
+/// * `phrase_index` — later phrases FRAGMENT the final onset (acceleration into the close).
+///
+/// Never emits a pitch — the caller maps each slot onto the seat's `note`, so the figure is
+/// always diatonic (design constraint: RHYTHM/contour vary, harmony never does).
+pub fn cadence_approach_slots(
+    figure: CadenceFigure,
+    approaching_pac: bool,
+    phrase_index: usize,
+) -> Vec<(f32, f32)> {
+    let shape = match figure.shape {
+        Some(s) => s,
+        None => {
+            // Neutral: the legacy four even sixteenths at STACCATO — byte-identical fallback.
+            return vec![(0.25, STACCATO_FRAC); 4];
+        }
+    };
+    // Base (consequent/PAC) pattern per shape: (slot_fraction, articulation).
+    let base: Vec<(f32, f32)> = match shape {
+        ApproachShape::Plain => {
+            if figure.drive < 0.45 {
+                // calm, low-drive image (Img1): a gentle two-onset approach.
+                vec![(0.5, PORTATO_FRAC), (0.5, PORTATO_FRAC)]
+            } else {
+                // a touch more driven (Img2): three even held onsets — audibly distinct from n=2.
+                vec![
+                    (1.0 / 3.0, PORTATO_FRAC),
+                    (1.0 / 3.0, PORTATO_FRAC),
+                    (1.0 / 3.0, PORTATO_FRAC),
+                ]
+            }
+        }
+        ApproachShape::Dotted => vec![
+            (2.0 / 3.0, PORTATO_FRAC),
+            (1.0 / 6.0, STACCATO_FRAC),
+            (1.0 / 6.0, STACCATO_FRAC),
+        ],
+        ApproachShape::Snap => vec![
+            (1.0 / 8.0, STACCATO_FRAC),
+            (3.0 / 8.0, PORTATO_FRAC),
+            (1.0 / 4.0, STACCATO_FRAC),
+            (1.0 / 4.0, STACCATO_FRAC),
+        ],
+        ApproachShape::Anacrusis => vec![
+            (1.0 / 2.0, PORTATO_FRAC),
+            (1.0 / 4.0, STACCATO_FRAC),
+            (1.0 / 8.0, STACCATO_FRAC),
+            (1.0 / 8.0, STACCATO_FRAC),
+        ],
+        ApproachShape::Even4 => vec![(0.25, STACCATO_FRAC); 4],
+        ApproachShape::Rush => vec![(1.0 / 6.0, STACCATO_FRAC); 6],
+    };
+
+    if !approaching_pac {
+        // ANTECEDENT (half cadence): the LIGHT, OPEN "comma". A busy shape (>2 onsets) relaxes to
+        // its opening onset then a single held tone — keeping a hint of the per-image gesture while
+        // reading gentler than the consequent. An already-calm shape (<=2 onsets) relaxes ALL the
+        // way to ONE held tone (the most open antecedent). Either way it is strictly lighter than
+        // the consequent PAC, so the phrase-pair DEVELOPS (antecedent → consequent) instead of
+        // stamping the identical figure at both cadences.
+        if base.len() <= 2 {
+            return vec![(1.0, PORTATO_FRAC)];
+        }
+        let f0 = base.first().map(|s| s.0).unwrap_or(0.5).clamp(0.1, 0.9);
+        return vec![(f0, PORTATO_FRAC), ((1.0 - f0).max(0.05), PORTATO_FRAC)];
+    }
+
+    // CONSEQUENT (PAC): the full figure. Later phrases (phrase_index >= 1) FRAGMENT the final
+    // onset into two crisp halves — cadential acceleration that intensifies toward the close.
+    let mut pat = base;
+    if phrase_index >= 1 && pat.len() >= 2 {
+        if let Some((s, _)) = pat.pop() {
+            let half = s / 2.0;
+            pat.push((half, STACCATO_FRAC));
+            pat.push((half, STACCATO_FRAC));
+        }
+    }
+    pat
+}
+
 /// The realized rhythmic-activity CLASS of a voice on a step — coarse, RNG-free, and
 /// structural (a function of `edge_activity` + the arm's band, never of absolute pitch).
 /// Ordering IS the figure-ground rank: Sustained < Oblique < Subdividing. The Counter arm
@@ -2279,6 +2530,10 @@ fn realize_rhythm(
         && step.position_in_phrase + 2 >= step.phrase_len
         && step.phrase_len >= 2;
 
+    // S79 — the per-piece cadential-figure directive (thread-local; `neutral()` on the frozen /
+    // unset path → every cadence/pre-cadence read below takes the byte-identical legacy branch).
+    let dev = cadence_development();
+
     // S13 CONTINUOUS articulation curve (S15 §4.4 re-scaled the output window).
     // theory: note length varies SMOOTHLY with the normalized edge activity, now
     // re-scaled into the bounded non-cadence window (§4.4):
@@ -2431,6 +2686,21 @@ fn realize_rhythm(
                 ..sustained(0, step_ms, LEGATO_FRAC)
             };
             return vec![ring];
+        }
+        // S79 — WITHIN-PIECE CADENCE DEVELOPMENT (the generic ring). Under a live figure, an
+        // antecedent HALF cadence rings SHORTER/opener — a "comma" — while the consequent
+        // Perfect-Authentic cadence keeps the full legato ring (the point of repose). This
+        // develops the "…quarter note" tail of the named line so it is not the identical
+        // sustained arrival at every cadence. FREEZE: `dev.is_neutral()` on the frozen/unset
+        // path → the byte-identical legacy ring below (and PAC always rings legato even live).
+        if !dev.is_neutral() && step.position == PhrasePosition::HalfCadence {
+            let hold = ((step_ms as f32) * HALF_CADENCE_RING_FRAC).round().max(1.0) as u64;
+            return vec![NoteEvent {
+                note,
+                velocity,
+                hold_ms: hold,
+                offset_ms: 0,
+            }];
         }
         return vec![sustained(0, step_ms, LEGATO_FRAC)];
     }
@@ -2879,63 +3149,104 @@ fn realize_rhythm(
             // spec §3.3). Composes WITH `prom_shift` exactly as before: spread the activity, THEN
             // compare against `CUTOFF - prom_shift` (the per-role L1 bias + prominence are untouched).
             let band_edge = band_activity_spread(edge_activity);
-            let (mut events, pushable): (Vec<NoteEvent>, bool) =
-                if pre_cadence || band_edge > (MELODY_ARP_CUTOFF - prom_shift) {
-                    // ARPEGGIO / acceleration: spread chord-tone onsets evenly across
-                    // the step (more onsets, shorter values) — the active, driving
-                    // figure. theory: subdividing the beat is the melody's way of
-                    // generating forward motion, intensified into a cadence.
-                    let n = if pre_cadence { 4 } else { 3 };
-                    let slot = step_ms / n as u64;
+            let (mut events, pushable): (Vec<NoteEvent>, bool) = if pre_cadence {
+                // S79 — THE PRE-CADENCE APPROACH (the named "four sixteenths" slot). Legacy
+                // forced n=4 even sixteenths on EVERY image's every phrase-tail — the
+                // image-independent fingerprint the ear names. Under a live figure this becomes
+                // a PER-IMAGE, WITHIN-PIECE-DEVELOPING approach.
+                if dev.is_neutral() {
+                    // FREEZE / unset path: the byte-identical legacy four even sixteenths.
+                    let n = 4u64;
+                    let slot = step_ms / n;
                     let ev = (0..n)
-                        .map(|k| {
-                            let offset = (k as u64) * slot;
-                            sustained(offset, slot, STACCATO_FRAC)
-                        })
+                        .map(|k| sustained(k * slot, slot, STACCATO_FRAC))
                         .collect();
-                    (ev, false) // already spread off the downbeat — NOT pushable
-                } else if band_edge > (MELODY_SYNC_CUTOFF - prom_shift) {
-                    // SYNCOPATED: delay the onset off the downbeat by 1/4 step, then
-                    // a second onset, pushing against the meter. theory: syncopation
-                    // displaces the accent to energize an active-but-not-busy melody.
-                    let quarter = step_ms / 4;
-                    let ev = vec![
-                        sustained(quarter, step_ms / 2, PORTATO_FRAC),
-                        sustained(step_ms * 3 / 4, step_ms / 4, STACCATO_FRAC),
-                    ];
-                    (ev, false) // first onset already at step_ms/4 — NOT pushable
-                } else if floor_to_dotted || band_edge > (MELODY_DOTTED_CUTOFF - prom_shift) {
-                    // DOTTED: a long-short pair (onsets at 0 and 2/3; holds 2/3 and
-                    // 1/3) — the lilting mid-activity figure. theory: the dotted
-                    // rhythm is the default expressive subdivision of a singing line.
-                    // S47: `floor_to_dotted` ALSO routes a calm FOREGROUND melody here
-                    // (the activity floor — a foreground figure gets the minimum real
-                    // motion rather than holding under a moving bed).
-                    let two_thirds = step_ms * 2 / 3;
-                    let ev = vec![
-                        sustained(0, two_thirds, PORTATO_FRAC),
-                        sustained(two_thirds, step_ms - two_thirds, STACCATO_FRAC),
-                    ];
-                    (ev, true) // first onset at 0 (low-seat case) — PUSHABLE for the comp
+                    (ev, false)
                 } else {
-                    // SUSTAINED (low edge_activity): one long tone whose length rides the
-                    // CONTINUOUS articulation curve (S13). At low activity base_frac ≈ 1.05,
-                    // so the calm melody OVERLAPS across the step boundary and truly sings —
-                    // the fix for "uniformly short" notes that the old hard 0.95 cap blocked.
-                    //
-                    // S39 — a multi-step THEME note (dur_steps>1) gets a longer within-step
-                    // hold so it SINGS toward the overlap ceiling (its continuation step is a
-                    // theme-driven rest, so the onset+gap reads as the note's full length). The
-                    // `sustained` closure's `.min(1.20)` cap keeps it inside the overlap ceiling
-                    // — it NEVER rings across the next kernel step (no freeze break). A dur==1
-                    // onset (every pre-S39 note), a non-onset step, and a free-select melody all
-                    // see `theme_onset_dur_steps == None`/`Some(1)` → factor 1.0 → byte-identical.
-                    let sing_frac = match theme_onset_dur_steps(ctx, step, features) {
-                        Some(d) if d > 1 => base_frac * THEME_LONG_NOTE_SING,
-                        _ => base_frac,
-                    };
-                    (vec![sustained(0, step_ms, sing_frac)], true) // single onset at 0 — PUSHABLE
+                    // Look ahead within the section for the cadence this step drives INTO, so an
+                    // antecedent (Half) and a consequent (PAC) approach develop differently.
+                    let si = ctx.step_in_section;
+                    let approaching_pac = ctx
+                        .section
+                        .steps
+                        .get(si + 1..)
+                        .into_iter()
+                        .flatten()
+                        .take(3)
+                        .find(|s| {
+                            matches!(
+                                s.position,
+                                PhrasePosition::HalfCadence
+                                    | PhrasePosition::PerfectAuthenticCadence
+                            )
+                        })
+                        .map(|s| s.position == PhrasePosition::PerfectAuthenticCadence)
+                        .unwrap_or(true);
+                    let slots = cadence_approach_slots(dev, approaching_pac, step.phrase_index);
+                    // Tile the step: cumulative fractions → exact offset/slot in ms (no gaps).
+                    let mut ev: Vec<NoteEvent> = Vec::with_capacity(slots.len());
+                    let mut cum = 0.0f32;
+                    for (slot_frac, artic) in slots {
+                        let off = (cum * step_ms as f32).round() as u64;
+                        cum += slot_frac;
+                        let end = (cum * step_ms as f32).round() as u64;
+                        let slot = end.saturating_sub(off).max(1);
+                        ev.push(sustained(off, slot, artic));
+                    }
+                    (ev, false) // spread off the downbeat by construction — NOT pushable
+                }
+            } else if band_edge > (MELODY_ARP_CUTOFF - prom_shift) {
+                // INTERIOR ARPEGGIO (unchanged): three chord-tone onsets across the step — the
+                // active, driving interior figure. theory: subdividing the beat generates
+                // forward motion. (The pre-cadence case above owns the phrase-TAIL figure.)
+                let n = 3u64;
+                let slot = step_ms / n;
+                let ev = (0..n)
+                    .map(|k| sustained(k * slot, slot, STACCATO_FRAC))
+                    .collect();
+                (ev, false) // already spread off the downbeat — NOT pushable
+            } else if band_edge > (MELODY_SYNC_CUTOFF - prom_shift) {
+                // SYNCOPATED: delay the onset off the downbeat by 1/4 step, then
+                // a second onset, pushing against the meter. theory: syncopation
+                // displaces the accent to energize an active-but-not-busy melody.
+                let quarter = step_ms / 4;
+                let ev = vec![
+                    sustained(quarter, step_ms / 2, PORTATO_FRAC),
+                    sustained(step_ms * 3 / 4, step_ms / 4, STACCATO_FRAC),
+                ];
+                (ev, false) // first onset already at step_ms/4 — NOT pushable
+            } else if floor_to_dotted || band_edge > (MELODY_DOTTED_CUTOFF - prom_shift) {
+                // DOTTED: a long-short pair (onsets at 0 and 2/3; holds 2/3 and
+                // 1/3) — the lilting mid-activity figure. theory: the dotted
+                // rhythm is the default expressive subdivision of a singing line.
+                // S47: `floor_to_dotted` ALSO routes a calm FOREGROUND melody here
+                // (the activity floor — a foreground figure gets the minimum real
+                // motion rather than holding under a moving bed).
+                let two_thirds = step_ms * 2 / 3;
+                let ev = vec![
+                    sustained(0, two_thirds, PORTATO_FRAC),
+                    sustained(two_thirds, step_ms - two_thirds, STACCATO_FRAC),
+                ];
+                (ev, true) // first onset at 0 (low-seat case) — PUSHABLE for the comp
+            } else {
+                // SUSTAINED (low edge_activity): one long tone whose length rides the
+                // CONTINUOUS articulation curve (S13). At low activity base_frac ≈ 1.05,
+                // so the calm melody OVERLAPS across the step boundary and truly sings —
+                // the fix for "uniformly short" notes that the old hard 0.95 cap blocked.
+                //
+                // S39 — a multi-step THEME note (dur_steps>1) gets a longer within-step
+                // hold so it SINGS toward the overlap ceiling (its continuation step is a
+                // theme-driven rest, so the onset+gap reads as the note's full length). The
+                // `sustained` closure's `.min(1.20)` cap keeps it inside the overlap ceiling
+                // — it NEVER rings across the next kernel step (no freeze break). A dur==1
+                // onset (every pre-S39 note), a non-onset step, and a free-select melody all
+                // see `theme_onset_dur_steps == None`/`Some(1)` → factor 1.0 → byte-identical.
+                let sing_frac = match theme_onset_dur_steps(ctx, step, features) {
+                    Some(d) if d > 1 => base_frac * THEME_LONG_NOTE_SING,
+                    _ => base_frac,
                 };
+                (vec![sustained(0, step_ms, sing_frac)], true) // single onset at 0 — PUSHABLE
+            };
 
             // S48 SLICE 3 (2b.2) — THE PRIMARY (rhythmic-separation) comp tool: push the melody's
             // FIRST onset OFF the bed's downbeat, scaled by the inverse-register comp. theory
@@ -11106,5 +11417,168 @@ mod tests {
                 "every figured onset stays within the step (+≤10% overlap cap)"
             );
         }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// S79 — CADENCE-FIGURE DIFFERENTIATION + DEVELOPMENT property tests. These assert the
+// ACTUAL musical claims (per-image differentiation; within-piece development; musicality
+// preserved; the neutral path reproduces the legacy figure), directly over the pure figure
+// vocabulary — no render, no RNG. The real-corpus feature tuples are the live values dumped
+// from `understand_image_pure` on the six bundled images (S79 feature dump).
+// ────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod cadence_figure_s79_tests {
+    use super::*;
+
+    /// (name, complexity, aspect_ratio, edge_activity) — the six corpus images, live values.
+    const CORPUS: [(&str, f32, f32, f32); 6] = [
+        ("Img1", 0.0055, 0.6667, 0.3009),
+        ("Img2", 0.0155, 0.6667, 0.5094),
+        ("Img3", 0.2290, 1.5000, 0.4754),
+        ("example", 0.9050, 2.0455, 0.7188),
+        ("Lena", 0.1645, 1.0000, 0.4710),
+        ("magic", 1.0000, 1.0000, 0.1060),
+    ];
+
+    fn figure_for(cx: f32, ar: f32, edge: f32) -> CadenceFigure {
+        CadenceFigure {
+            shape: Some(select_cadence_shape(cx, ar)),
+            drive: edge_to_drive(edge),
+        }
+    }
+
+    /// A comparable signature of a realized approach: the onset count + each onset's rounded
+    /// (start‰, articulation‰) across the step. Two images "close the same" iff these match.
+    fn signature(slots: &[(f32, f32)]) -> Vec<(u32, u32)> {
+        let mut cum = 0.0f32;
+        let mut sig = Vec::with_capacity(slots.len());
+        for (slot_frac, artic) in slots {
+            sig.push((
+                (cum * 1000.0).round() as u32,
+                (artic * 1000.0).round() as u32,
+            ));
+            cum += slot_frac;
+        }
+        sig
+    }
+
+    /// CORE ANTI-SAMENESS PROPERTY: the six corpus images do NOT all close their phrases with the
+    /// same figure. Legacy forced the identical four-sixteenths→quarter tail on all six; here the
+    /// consequent (PAC) approach must be genuinely distinct across the corpus.
+    #[test]
+    fn per_image_cadential_figure_differs_across_corpus() {
+        let sigs: Vec<(&str, Vec<(u32, u32)>)> = CORPUS
+            .iter()
+            .map(|(n, cx, ar, e)| {
+                let fig = figure_for(*cx, *ar, *e);
+                (*n, signature(&cadence_approach_slots(fig, true, 0)))
+            })
+            .collect();
+        let distinct: std::collections::HashSet<_> = sigs.iter().map(|(_, s)| s.clone()).collect();
+        assert!(
+            distinct.len() >= 5,
+            "expected >=5 distinct cadential figures across the 6 corpus images, got {}: {:#?}",
+            distinct.len(),
+            sigs
+        );
+        // The diagnosed collision pair (same complexity band AND aspect) MUST still differ — the
+        // edge_activity drive tiebreak is what splits them (n=2 vs n=3 approach).
+        let img1 = &sigs.iter().find(|(n, _)| *n == "Img1").unwrap().1;
+        let img2 = &sigs.iter().find(|(n, _)| *n == "Img2").unwrap().1;
+        assert_ne!(
+            img1, img2,
+            "Img1/Img2 (grid-collision pair) must close differently via drive"
+        );
+    }
+
+    /// WITHIN-PIECE DEVELOPMENT: for every corpus image, an antecedent (Half-cadence) approach
+    /// differs from a consequent (PAC) approach, and a LATER-phrase PAC fragments (>= as many
+    /// onsets as an early PAC, strictly more when the shape can fragment) — cadential intensification,
+    /// not the identical figure at every cadence.
+    #[test]
+    fn within_piece_development_antecedent_vs_consequent_and_fragmentation() {
+        for (n, cx, ar, e) in CORPUS {
+            let fig = figure_for(cx, ar, e);
+            let half = cadence_approach_slots(fig, false, 0);
+            let pac_early = cadence_approach_slots(fig, true, 0);
+            let pac_late = cadence_approach_slots(fig, true, 1);
+            assert_ne!(
+                signature(&half),
+                signature(&pac_early),
+                "{n}: antecedent (half) and consequent (PAC) must develop, not clone"
+            );
+            assert!(
+                pac_late.len() >= pac_early.len(),
+                "{n}: a later-phrase PAC must not lose onsets (fragmentation is additive)"
+            );
+        }
+        // On a fragmentable multi-onset shape (Even4 = magic), the later PAC is STRICTLY busier.
+        let magic = figure_for(1.0000, 1.0000, 0.1060);
+        assert!(
+            cadence_approach_slots(magic, true, 1).len()
+                > cadence_approach_slots(magic, true, 0).len(),
+            "a later PAC on a fragmentable shape must add an onset (acceleration into the close)"
+        );
+    }
+
+    /// MUSICALITY PRESERVED: every generated approach tiles the step exactly (onsets sum to the
+    /// whole step, no gaps/overhang), every onset has positive duration and a real articulation,
+    /// and the onset count stays in a musical range (never a click-storm). This is what keeps the
+    /// figure phrased and in-tempo rather than a random drum machine.
+    #[test]
+    fn approach_slots_tile_the_step_and_stay_musical() {
+        for (n, cx, ar, e) in CORPUS {
+            let fig = figure_for(cx, ar, e);
+            for approaching_pac in [false, true] {
+                for phrase_index in [0usize, 1, 2] {
+                    let slots = cadence_approach_slots(fig, approaching_pac, phrase_index);
+                    assert!(
+                        (1..=8).contains(&slots.len()),
+                        "{n}: onset count {} out of musical range",
+                        slots.len()
+                    );
+                    let sum: f32 = slots.iter().map(|(s, _)| *s).sum();
+                    assert!(
+                        (sum - 1.0).abs() < 1e-3,
+                        "{n}: slots must tile the step (sum {sum}, want 1.0)"
+                    );
+                    for (slot, artic) in &slots {
+                        assert!(*slot > 0.0, "{n}: every onset needs positive duration");
+                        assert!(
+                            *artic >= STACCATO_FRAC,
+                            "{n}: articulation below staccato floor"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// FREEZE HINGE: the neutral (unset / identity) figure reproduces the LEGACY pre-cadence figure
+    /// EXACTLY — four even sixteenths at STACCATO. This is what keeps every `engine_equivalence`
+    /// golden byte-identical when no development is armed.
+    #[test]
+    fn neutral_figure_is_the_legacy_four_sixteenths() {
+        let legacy = cadence_approach_slots(CadenceFigure::neutral(), true, 0);
+        assert_eq!(legacy, vec![(0.25, STACCATO_FRAC); 4]);
+        assert!(CadenceFigure::neutral().is_neutral());
+        assert!(CadenceFigure::default().is_neutral());
+    }
+
+    /// The thread-local development directive round-trips and clears (the `set_composition_seed`
+    /// discipline) so no armed figure leaks into a later composition on the same thread.
+    #[test]
+    fn development_directive_sets_and_clears() {
+        clear_cadence_development();
+        assert!(cadence_development().is_neutral());
+        set_cadence_development(CadenceFigure {
+            shape: Some(ApproachShape::Snap),
+            drive: 0.5,
+        });
+        assert!(!cadence_development().is_neutral());
+        assert_eq!(cadence_development().shape, Some(ApproachShape::Snap));
+        clear_cadence_development();
+        assert!(cadence_development().is_neutral());
     }
 }
