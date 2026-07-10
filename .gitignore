@@ -1,1 +1,17 @@
 /target
+
+# S69/S70/S72/S74 throwaway PoC render harnesses + local-only renders (never commit)
+/examples/poc_s72_render.rs
+/examples/poc_s73_featdump.rs
+/examples/poc_s73_a5_output.rs
+/examples/poc_s73_rhythmdump.rs
+/examples/poc_s74_rhythm.rs
+/examples/poc_s74b_instr.rs
+/examples/poc_s77_falsify.rs
+/examples/poc_s77_image_score.rs
+/renders/
+/examples/poc_s79_featdump.rs
+/examples/poc_s79_rhythm_diff.rs
+
+# Catch-all: every throwaway PoC harness (covers s67/s69/s70 + any future) — never commit
+/examples/poc_*.rs
