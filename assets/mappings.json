@@ -384,6 +384,34 @@
         { "_comment": "LOW-MID detail → an ASYMMETRIC 5+3 PERIOD (cadences {4,7}): an off-square period that walks the interior cadence one step later than the legacy {3,7}. Lena.png (0.164). Floor 0.1 keeps the near-zero-complexity images (Img1 0.005, Img2 0.015) on the legacy period_4 default (also F5a-protective for Img1). Density-neutral (2 cadences), so F5a is unregressed.",
           "when": [ {"knob":"complexity","op":"ge","lo":0.1,"hi":0.0} ], "pick": "phrase_5" }
       ]
+    },
+    "ensemble_catalogue": [
+      { "id": "dark_reeds",      "label": "Dark warm reeds",         "programs": [70, 60, 69, 71] },
+      { "id": "bright_brass",    "label": "Bright brass",            "programs": [58, 61, 57, 56] },
+      { "id": "warm_plucked",    "label": "Warm plucked",            "programs": [32, 46,  6, 24] },
+      { "id": "cool_mallets",    "label": "Bright cool mallets",     "programs": [12, 11, 13,  9] },
+      { "id": "lush_strings",    "label": "Lush warm strings",       "programs": [42, 48, 41, 40] },
+      { "id": "ethereal_violet", "label": "Ethereal pad/bell/choir", "programs": [89, 52,  8, 10] }
+    ],
+    "instrumentation": {
+      "_note": "S74b/B5 DIFFERENTIAL INSTRUMENTATION — per-image GM ensemble keyed off SPREAD raw image features (NOT the compressed affect projection). Generalizes the 6-image ear-approved lookup into a feature->ensemble RULE for arbitrary images (Perceptual/Cross-Modal S74b, arch b5-instrumentation-build-arch.md). Two-stage: hue picks a temperature ZONE (cool->mallets, violet->ethereal), then the crowded WARM zone splits by brightness x edge x texture. Order is load-bearing (first-match-wins): hue zones first, then warm splitters (reeds BEFORE brass), then default. Selects a voice-indexed programs array from ensemble_catalogue; the emission is per-voice-index at t=0 in the main.rs adapter (NOT role-keyed — voice-indexed is freeze-critical: role-keying collapses v1/v2 HarmonicFill and breaks the approved golden). Grounding: brightness->register HIGH, edge->attack HIGH, hue->family MEDIUM (garnish). FREEZE: absent axis / empty catalogue -> every voice falls to legacy_program(i)=(i*7)%128 (byte-identical to pre-B5). Corpus trace: example(hue198.7)->cool_mallets, magic(hue278.3)->ethereal_violet, Img1(bri29)->dark_reeds, Img2(bri81,edge0.51,cfl0.08)->bright_brass, Img3(cfl0.42)->warm_plucked, Lena(tex0.19,sat52)->lush_strings.",
+      "default": "warm_plucked",
+      "rules": [
+        { "_c": "COOL-STRUCK: cyan/teal hue -> metallic mallets. example.jpg (hue 198.7).",
+          "when": [ {"knob":"dominant_hue","op":"in_range","lo":150,"hi":239.999} ], "pick": "cool_mallets" },
+        { "_c": "MYSTERY/VIOLET hue -> ethereal pad/bell/choir. magicstudio-art.jpg (hue 278.3).",
+          "when": [ {"knob":"dominant_hue","op":"in_range","lo":240,"hi":299.999} ], "pick": "ethereal_violet" },
+        { "_c": "WARM . dark -> dark low reeds. AudioHaxImg1.jpg (bri 29.3). MUST precede brass.",
+          "when": [ {"knob":"avg_brightness","op":"lt","lo":40,"hi":0.0} ], "pick": "dark_reeds" },
+        { "_c": "WARM . bright + energetic + low-colorfulness -> bright brass. AudioHaxImg2.jpg (bri 81, edge 0.51, cfl 0.08).",
+          "when": [ {"knob":"avg_brightness","op":"ge","lo":55,"hi":0.0}, {"knob":"edge_activity","op":"ge","lo":0.50,"hi":0.0}, {"knob":"colorfulness","op":"lt","lo":0.15,"hi":0.0} ], "pick": "bright_brass" },
+        { "_c": "WARM . colorful -> warm plucked (OR-arm 1 of 2: colorfulness). AudioHaxImg3.jpg (cfl 0.42).",
+          "when": [ {"knob":"colorfulness","op":"ge","lo":0.30,"hi":0.0} ], "pick": "warm_plucked" },
+        { "_c": "WARM . very-red hue -> warm plucked (OR-arm 2 of 2: hue<20). SelectRule is AND-only, so the spec OR is two rows.",
+          "when": [ {"knob":"dominant_hue","op":"lt","lo":20,"hi":0.0} ], "pick": "warm_plucked" },
+        { "_c": "WARM . smooth + saturated -> lush strings. Lena.png (tex 0.19, sat 51.9).",
+          "when": [ {"knob":"texture","op":"lt","lo":0.30,"hi":0.0}, {"knob":"avg_saturation","op":"ge","lo":45,"hi":0.0} ], "pick": "lush_strings" }
+      ]
     }
   }
 }

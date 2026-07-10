@@ -17,6 +17,11 @@ pub mod seed;
 // `--no-default-features`-clean: NO image type, NO OpenCV. Builds & unit-tests headlessly.
 pub mod composition;
 
+// S74b/B5 — the pure-Rust image-feature → per-voice GM program selector. Freeze-safe: depends
+// only on `composition::{CompositionMappings, ImageUnderstanding}` — NO engine (frozen), NO
+// OpenCV, NO audio stack. Builds & unit-tests headlessly under `--no-default-features`.
+pub mod instrumentation;
+
 // WS-4 Phase 1 (S9) — pure-Rust shared core + CLI. Both build & unit-test under
 // `cargo test --lib --no-default-features` (no system libs). The engine holds NO
 // OpenCV/image/midir type; the CLI is the headless-testable clap grammar.

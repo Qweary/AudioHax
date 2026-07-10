@@ -266,15 +266,21 @@ fn build_step_event_timeline<S: FeatureSource>(
     total_steps: usize,
     grid_ms_per_step: u64,
     instrument_count: usize,
+    programs: &[u8],
 ) -> Vec<audiohax::synth_sink::TimedMidiEvent> {
     use audiohax::synth_sink::{MidiCmd, TimedMidiEvent};
 
     let mut events: Vec<TimedMidiEvent> = Vec::new();
 
-    // Initial per-channel programs (same scheme both paths used: prog = (i*7)%128).
+    // Initial per-channel programs (S74b/B5): voice `i` gets the resolved ensemble program
+    // `programs[i]`. An empty/short `programs` (or the pre-B5 control) falls to the byte-identical
+    // legacy floor `legacy_program(i) == (i*7)%128`, so an absent instrumentation axis is a no-op.
     for i in 0..instrument_count {
         let ch = (i % 16) as u8;
-        let prog = ((i * 7) % 128) as u8;
+        let prog = programs
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| audiohax::instrumentation::legacy_program(i));
         events.push(TimedMidiEvent {
             at_ms: 0,
             cmd: MidiCmd::ProgramChange {
@@ -408,6 +414,27 @@ fn run_render_wav(
     // engine.rs is never touched — the register is read inside chord_engine::pick_progression.
     audiohax::seed::set_composition_seed(render_args.seed);
 
+    // ── S74b/B5: per-voice GM program vector (image-feature → ensemble). Computed ONCE, BEFORE
+    //    `PipelineEngine::new` consumes `mappings`. Freeze-safe: reads DATA + the live
+    //    `understanding`; touches neither the engine nor the plan. Absent/empty `instrumentation`
+    //    axis ⇒ every voice == legacy `(i*7)%128` (byte-identical to pre-B5). It is a piece-level
+    //    constant (matches the per-channel-at-t=0 emission model). ──
+    #[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
+    let programs: Vec<u8> = match mappings.composition.as_ref() {
+        Some(comp) => {
+            audiohax::instrumentation::select_programs(&understanding, comp, instrument_count)
+        }
+        None => (0..instrument_count)
+            .map(audiohax::instrumentation::legacy_program)
+            .collect(),
+    };
+    // opencv-cfg / bare arm: no `understanding` is bound here → per-voice legacy floor.
+    // (opencv render arm inspection-validated only — not compiled on this box; B5 §4.3.)
+    #[cfg(not(all(not(feature = "opencv"), feature = "pure-analysis")))]
+    let programs: Vec<u8> = (0..instrument_count)
+        .map(audiohax::instrumentation::legacy_program)
+        .collect();
+
     let mut engine = PipelineEngine::new(mappings, engine_config);
 
     // ── S37: install the COMPOSER plan (pure-Rust / default path). The plan-first composer
@@ -449,6 +476,7 @@ fn run_render_wav(
         total_steps,
         grid_ms_per_step,
         instrument_count,
+        &programs,
     );
 
     // ── Synthesize offline + write the WAV, honoring the A/B controls. ──
@@ -700,6 +728,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // chord_engine::pick_progression.
     audiohax::seed::set_composition_seed(play_args.seed);
 
+    // ── S74b/B5: per-voice GM program vector (image-feature → ensemble). Computed ONCE, BEFORE
+    //    `PipelineEngine::new` consumes `mappings`; a piece-level constant read by both the eager
+    //    program-change init below and the shared `build_step_event_timeline`. Freeze-safe: DATA +
+    //    live `understanding` only. Absent/empty axis ⇒ every voice == legacy `(i*7)%128`. ──
+    #[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
+    let programs: Vec<u8> = match mappings.composition.as_ref() {
+        Some(comp) => {
+            audiohax::instrumentation::select_programs(&understanding, comp, instrument_count)
+        }
+        None => (0..instrument_count)
+            .map(audiohax::instrumentation::legacy_program)
+            .collect(),
+    };
+    // opencv-cfg / bare arm: no `understanding` bound here → per-voice legacy floor (B5 §4.3).
+    #[cfg(not(all(not(feature = "opencv"), feature = "pure-analysis")))]
+    let programs: Vec<u8> = (0..instrument_count)
+        .map(audiohax::instrumentation::legacy_program)
+        .collect();
+
     // ── Build the engine + install the COMPOSER plan (S37) ──
     // The plan-first composer is the audible path; the S13 flat path is the fallback when
     // mappings.json has no `composition` block (compose_from_image -> false). The OpenCV arm
@@ -797,10 +844,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Initial per-channel programs (same scheme as before: prog = (i*7)%128).
+    // Initial per-channel programs (S74b/B5): voice `i` gets `programs[i]` (the resolved ensemble);
+    // empty/short ⇒ legacy `(i*7)%128` floor. This eager init is redundant with the ProgramChange
+    // events already carried in the shared timeline (at_ms=0) — kept for the MIDI-port "ready"
+    // handshake — so it MUST read the same `programs` the timeline does or the two would disagree.
     for i in 0..instrument_count {
         let ch = (i % 16) as u8;
-        let prog = ((i * 7) % 128) as u8;
+        let prog = programs
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| audiohax::instrumentation::legacy_program(i));
         // via the AudioSink trait so the adapter speaks one vocabulary to the engine's sink.
         let _ = sink.program_change(ch, prog);
     }
@@ -848,6 +901,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_steps,
         grid_ms_per_step,
         instrument_count,
+        &programs,
     );
 
     // The absolute grid epoch — captured ONCE. Every event fires at `epoch + at_ms`, so the
@@ -1081,7 +1135,7 @@ mod tests {
     #[test]
     fn timeline_is_sorted_by_at_ms() {
         let (engine, source, total_steps, grid, instruments) = fixture();
-        let tl = build_step_event_timeline(&engine, &source, total_steps, grid, instruments);
+        let tl = build_step_event_timeline(&engine, &source, total_steps, grid, instruments, &[]);
         assert!(!tl.is_empty(), "synthetic source should realize events");
         for w in tl.windows(2) {
             assert!(
@@ -1101,7 +1155,7 @@ mod tests {
         // the release was inserted in an EARLIER step, so the stable sort keeps it BEFORE the
         // retrigger (off-before-on), freeing the voice. Assert that invariant directly.
         let (engine, source, total_steps, grid, instruments) = fixture();
-        let tl = build_step_event_timeline(&engine, &source, total_steps, grid, instruments);
+        let tl = build_step_event_timeline(&engine, &source, total_steps, grid, instruments, &[]);
         for i in 0..tl.len() {
             if let MidiCmd::NoteOn {
                 channel: c1,
@@ -1135,7 +1189,7 @@ mod tests {
         // The whole point of the fix: a note's NoteOff may land PAST the next step's grid
         // base (no clamp), so the deliberate pad/cadence/legato ring-through is honored.
         let (engine, source, total_steps, grid, instruments) = fixture();
-        let tl = build_step_event_timeline(&engine, &source, total_steps, grid, instruments);
+        let tl = build_step_event_timeline(&engine, &source, total_steps, grid, instruments, &[]);
 
         // Map each (channel, note) NoteOn to the step it belongs to, then check at least one
         // NoteOff fires at an at_ms >= (its step + 1) * grid — i.e. it rings into the next step.
@@ -1168,8 +1222,8 @@ mod tests {
         // This is the load-bearing invariant: render and play both call this fn, so identical
         // output here == they consume the same timeline == play == render by construction.
         let (engine, source, total_steps, grid, instruments) = fixture();
-        let a = build_step_event_timeline(&engine, &source, total_steps, grid, instruments);
-        let b = build_step_event_timeline(&engine, &source, total_steps, grid, instruments);
+        let a = build_step_event_timeline(&engine, &source, total_steps, grid, instruments, &[]);
+        let b = build_step_event_timeline(&engine, &source, total_steps, grid, instruments, &[]);
         assert_eq!(
             a, b,
             "the shared timeline must be deterministic (jitter-free) so play == render"
@@ -1180,7 +1234,7 @@ mod tests {
     fn timeline_has_program_change_init_at_zero() {
         // Each channel gets its ProgramChange at at_ms = 0, sorted ahead of the first onsets.
         let (engine, source, total_steps, grid, instruments) = fixture();
-        let tl = build_step_event_timeline(&engine, &source, total_steps, grid, instruments);
+        let tl = build_step_event_timeline(&engine, &source, total_steps, grid, instruments, &[]);
         let pc_count = tl
             .iter()
             .filter(|e| matches!(e.cmd, MidiCmd::ProgramChange { .. }))

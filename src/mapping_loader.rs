@@ -156,6 +156,17 @@ pub struct CompositionMappings {
     /// composition.rs.
     #[serde(default)]
     pub phrase_scheme: crate::composition::SelectTable,
+    /// S74b/B5 — the per-image ENSEMBLE selector (→ an `EnsembleSpec` id from `ensemble_catalogue`).
+    /// `#[serde(default)]` back-compat floor: absent → empty `SelectTable` → `""` → no ensemble →
+    /// the adapter falls every voice to `legacy_program(i)=(i*7)%128` (byte-identical to pre-B5).
+    /// Carried onto `PlanMappings` by the `From<CompositionMappings>` impl in composition.rs.
+    #[serde(default)]
+    pub instrumentation: crate::composition::SelectTable,
+    /// S74b/B5 — the ensemble palette vocabulary (id → voice-indexed GM programs). `#[serde(default)]`
+    /// back-compat floor: absent → empty catalogue → an unresolved ensemble id → per-voice floor.
+    /// Carried onto `PlanMappings` by the `From<CompositionMappings>` impl in composition.rs.
+    #[serde(default)]
+    pub ensemble_catalogue: Vec<crate::composition::EnsembleSpec>,
 }
 
 /// S40 / Slice-2 (Finding #1) — the per-image home block (schema Option S1, range-map shape).
