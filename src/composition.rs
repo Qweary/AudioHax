@@ -215,6 +215,49 @@ pub struct AffectMappings {
     /// `valence_family_mode` projection is a NO-OP (hue-only derivation, byte-for-byte legacy).
     #[serde(default)]
     pub mode_valence_cuts: Option<ModeValenceCuts>,
+    /// S91-S3. Weight per `ImageUnderstanding` field name for the TEMPO-ENERGY blend — the knob
+    /// that positions a piece on the global tempo curve. Deliberately a SEPARATE blend from
+    /// `arousal_weights`: arousal is a *gating* coordinate (it sorts the character ladder), and
+    /// re-weighting it would move `character`/`home_mode` and change the music outside this
+    /// build's sealed scope. This blend feeds tempo and NOTHING else.
+    ///
+    /// EMPTY (the legacy floor, and any old mappings.json) → the energy tempo path is disabled and
+    /// tempo falls back to the byte-for-byte legacy `brightness_to_tempo_bpm` surface.
+    #[serde(default)]
+    pub tempo_energy_weights: std::collections::HashMap<String, f32>,
+    /// S91-S3. The global energy→BPM curve. ABSENT → `None` → legacy brightness tempo path.
+    #[serde(default)]
+    pub energy_tempo: Option<EnergyTempo>,
+    /// S91-S3. Per-character MULTIPLICATIVE tempo factor, keyed by lowercase character name.
+    /// A missing character → factor `1.0` (no shift), never a clamp. See `character_tempo_bpm`
+    /// for why this is a multiplier and not a window.
+    #[serde(default)]
+    pub character_tempo_factor: std::collections::HashMap<String, f32>,
+}
+
+/// S91-S3. The global energy→BPM curve: a straight line through the two named endpoints.
+///
+/// `bpm = bpm_at_zero + energy * (bpm_at_one - bpm_at_zero)`, with `energy ∈ [0,1]`.
+///
+/// WHY A LINE AND NOT THE LEGACY ANCHOR MAP: `interp_tempo_bpm` interpolates between the
+/// MIDPOINTS of its JSON bands and CLAMPS FLAT outside the outermost midpoints. That flat tail is
+/// the original sin of the tempo surface — it is what made `raw_bpm >= 72` unconditional and so
+/// pinned every `lament` to its window edge (a sub-66 BPM piece was unreachable for ANY image that
+/// could ever exist). A two-point line has no flat region: every distinct energy maps to a
+/// distinct BPM, monotonically, across the whole domain. Reusing the anchor map here would
+/// reintroduce the exact defect this criterion exists to remove.
+///
+/// The endpoints are absolute musical statements, NOT corpus statistics: a wholly inert image
+/// (no edges, no texture, no complexity, no colour variety) is `bpm_at_zero`; a maximally busy one
+/// is `bpm_at_one`. Real artworks occupy the lower half of the domain, and the upper half is
+/// deliberately left as headroom for the busier image classes (photographs, screenshots, synthetic
+/// frames) that this nine-artwork corpus does not contain.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+pub struct EnergyTempo {
+    /// BPM at `energy == 0.0` — a completely static image.
+    pub bpm_at_zero: f32,
+    /// BPM at `energy == 1.0` — a maximally active image.
+    pub bpm_at_one: f32,
 }
 
 impl Default for AffectMappings {
@@ -238,6 +281,11 @@ impl Default for AffectMappings {
             // C6.6: no cuts in the floor → `valence_family_mode` is a NO-OP, so the default
             // (no-affect-block) plan keeps the pure hue→mode derivation byte-for-byte.
             mode_valence_cuts: None,
+            // S91-S3: the floor leaves the energy tempo surface DISABLED, so the no-affect-block
+            // path (and every pre-S91 mappings.json) keeps the legacy brightness tempo byte-for-byte.
+            tempo_energy_weights: std::collections::HashMap::new(),
+            energy_tempo: None,
+            character_tempo_factor: std::collections::HashMap::new(),
         }
     }
 }
@@ -334,35 +382,178 @@ pub fn valence_family_mode(hue_mode: &str, valence: f32, cuts: &Option<ModeValen
 /// fluency transform (`0.5 + 0.5*x`), all others→identity. Sum, then clamp 0..1. When a weight
 /// map is EMPTY (the default floor / no-affect-block path) the corresponding axis returns the
 /// neutral 0.5 (an empty blend has no terms; seed it to 0.5 so a `Ge`/`Le` rule reads "neutral").
-fn affect_composite(u: &ImageUnderstanding, weights: &AffectMappings) -> Affect {
-    /// Normalize one knob field for the affect blend (mirrors the §3.2 field-name table).
-    fn normalized_field(name: &str, u: &ImageUnderstanding) -> f32 {
-        match name {
-            "avg_saturation" => u.avg_saturation / 100.0,
-            "avg_brightness" => u.avg_brightness / 100.0,
-            "fg_bg_contrast" => 0.5 + 0.5 * u.fg_bg_contrast,
-            "colorfulness" => u.colorfulness,
-            "edge_activity" => u.edge_activity,
-            "complexity" => u.complexity,
-            // Any other field falls back to its raw value (no §4 weight row uses these).
-            _ => 0.0,
-        }
+/// Normalize one `ImageUnderstanding` knob to 0..1 for a weighted blend (the §3.2 field-name table).
+///
+/// The two HSV scalars are 0..100 and divided by 100; `fg_bg_contrast` goes through the fluency
+/// transform; the rest are already 0..1. An unlisted name contributes 0.0.
+///
+/// S91: hoisted out of `affect_composite` so the affect blend and the S91 tempo-energy blend read
+/// the SAME table. Two copies of a field-name table are two copies that can silently drift, and a
+/// tempo knob that disagreed with the affect knob about what `edge_activity` means would be a very
+/// expensive bug to find. `texture` was added for the tempo blend; no affect weight row names it,
+/// so adding it is a no-op for `arousal`/`valence` (proved by C3(b) and C6, which re-run the whole
+/// corpus and require byte-identical affect bits and byte-identical discrete plans).
+fn normalized_knob(name: &str, u: &ImageUnderstanding) -> f32 {
+    match name {
+        "avg_saturation" => u.avg_saturation / 100.0,
+        "avg_brightness" => u.avg_brightness / 100.0,
+        "fg_bg_contrast" => 0.5 + 0.5 * u.fg_bg_contrast,
+        "colorfulness" => u.colorfulness,
+        "edge_activity" => u.edge_activity,
+        "complexity" => u.complexity,
+        "texture" => u.texture,
+        // Any other field contributes nothing (no weight row uses these).
+        _ => 0.0,
     }
-    /// Sum `weight * normalized_field` over a weight map; an EMPTY map → neutral 0.5.
+}
+
+/// Order-stable weighted blend over a knob-weight map; an EMPTY map → the caller's degenerate case.
+///
+/// See `affect_composite`'s S91-S1 note for why the reduction order is pinned: `HashMap` iteration
+/// order is randomized per process and f32 addition is not associative, so an unordered reduction
+/// makes the composite non-reproducible across processes. Keys are sorted and the accumulation is
+/// done in f64 with a single f32 rounding at the end.
+fn stable_blend(map: &std::collections::HashMap<String, f32>, u: &ImageUnderstanding) -> f32 {
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort_unstable();
+    let mut acc: f64 = 0.0;
+    for name in keys {
+        acc += (map[name] as f64) * (normalized_knob(name, u) as f64);
+    }
+    (acc as f32).clamp(0.0, 1.0)
+}
+
+/// S91-S3. The TEMPO-ENERGY knob: how much MOTION the image has, 0..1.
+///
+/// THE DEFECT THIS REPLACES: tempo was `f(avg_brightness)` and nothing else — an *energy*
+/// parameter driven by an *exposure meter*. The four `lament` images have brightness within 3.6
+/// points of each other, so no re-anchoring of any brightness→BPM curve could ever separate them;
+/// they all interpolated below the curve's floor and clamped to the identical window edge. Their
+/// *motion*, meanwhile, differs by more than an order of magnitude (`edge_activity` 0.550 / 0.059 /
+/// 0.031 / 0.000). The information needed to separate them was already in the feature vector; the
+/// tempo surface was throwing it away.
+///
+/// WHAT COUNTS AS ENERGY (the musical claim, stated so it can be argued with):
+/// - `edge_activity` — visual busyness. The strongest tempo signal: a densely-incident image wants
+///   rhythmic incident. Highest weight.
+/// - `texture` — surface agitation. Roughness reads as restlessness.
+/// - `complexity` — compositional density. More to say ⇒ more motion to say it in.
+/// - `colorfulness` — chromatic variety. Liveliness, but weakly; lowest weight.
+///
+/// WHAT IS DELIBERATELY EXCLUDED, and why:
+/// - `avg_brightness` — EXPOSURE IS NOT ENERGY. This is the entire bug. A dark image is not
+///   necessarily a slow one, and a bright one is not necessarily fast.
+/// - `avg_saturation` — VIVIDNESS IS NOT MOTION. A saturated but perfectly still image (the
+///   Cameron portrait: saturation 40.8, and edge/texture/complexity all ≈ 0) should be SLOW.
+///   Saturation belongs to timbre and colour, which read it elsewhere; it has no business setting
+///   a tempo.
+///
+/// Weights live in `mappings.json` (`composition.affect.tempo_energy_weights`), so the musical
+/// claim above is operator-tunable rather than welded into the binary. Order-stable by
+/// construction. Pure. An empty weight map returns 0.0 and the caller falls back to legacy tempo.
+pub fn tempo_energy(u: &ImageUnderstanding, weights: &AffectMappings) -> f32 {
+    if weights.tempo_energy_weights.is_empty() {
+        return 0.0;
+    }
+    stable_blend(&weights.tempo_energy_weights, u)
+}
+
+fn affect_composite(u: &ImageUnderstanding, weights: &AffectMappings) -> Affect {
+    /// Sum `weight * normalized_knob` over a weight map; an EMPTY map → neutral 0.5.
+    ///
+    /// S91-S1 (ORDER-STABILITY, blocking): this sum used to reduce straight over
+    /// `HashMap::iter()`. `HashMap` iteration order is randomized PER PROCESS by `RandomState`,
+    /// and f32 addition is NOT associative — so the same weights over the same image summed to a
+    /// different float depending on which order they happened to iterate in. Measured: 7 distinct
+    /// affect bit-patterns for the same 9 images across 10 separate processes (3 images jittered
+    /// by ±1 ULP). It flipped no decision only because the mapping layer's cut-points sat ~74,000×
+    /// further from the data than the jitter — a margin that is an ARTIFACT of the cuts being far
+    /// above where the features live, not a design property, and one this build spends by moving
+    /// the tempo surface onto the data. A latent nondeterminism you are in the act of arming is
+    /// not deferrable: the affect composite feeds `character`/`home_mode`/`texture` gates, and a
+    /// 0.008 arousal perturbation against the `lament`/`hymn` `le 0.30` gate has ALREADY been
+    /// observed (in an offline replica) to flip a character.
+    ///
+    /// The fix is order-independence by construction, belt AND braces:
+    ///   1. iterate the keys in **sorted** order — a fixed, declared reduction order, so the same
+    ///      map always accumulates the same way in every process;
+    ///   2. accumulate in **f64** and round to f32 exactly once at the end — the partial sums then
+    ///      carry ~29 more bits than any f32 rounding error the term order could introduce, so the
+    ///      result is not merely *stable* but *correctly rounded*.
+    ///
+    /// Either alone would satisfy C3; together the property survives someone later swapping the
+    /// map type or the key set. Pure; no allocation beyond the key vector.
     fn blend(map: &std::collections::HashMap<String, f32>, u: &ImageUnderstanding) -> f32 {
         if map.is_empty() {
             return 0.5;
         }
-        let sum: f32 = map
-            .iter()
-            .map(|(name, w)| w * normalized_field(name, u))
-            .sum();
-        sum.clamp(0.0, 1.0)
+        stable_blend(map, u)
     }
     Affect {
         arousal: blend(&weights.arousal_weights, u),
         valence: blend(&weights.valence_weights, u),
     }
+}
+
+/// S91-S2. A stable 64-bit seed DERIVED FROM THE IMAGE'S OWN FEATURES.
+///
+/// `pick_progression`'s production default was `thread_rng`, so every section of every piece drew a
+/// fresh random progression on every run: the same image rendered to different harmony each time,
+/// while two different images were no more likely to differ than one image was from itself. That is
+/// an ANTI-differentiator — it makes a piece differ from *itself* run-to-run and does nothing
+/// whatsoever to separate pieces *by image*, and it fogs any listening test or cross-piece distance
+/// taken without `--seed`.
+///
+/// Seeding from the image's feature vector costs exactly what seeding from a constant costs, and it
+/// is at least not image-BLIND. **It earns no differentiation credit and none is claimed:** a
+/// hash-seeded draw over a progression catalogue is a pseudo-random differentiator, not a musical
+/// one — two similar images get unrelated progressions and two different images may get the same
+/// one. This is a REPRODUCIBILITY and MEASURABILITY fix. Progressions stay excluded from the
+/// acceptance metric.
+///
+/// FNV-1a over the raw bit patterns of the whole-image feature vector, in a FIXED declared order.
+/// Not `DefaultHasher`: `RandomState` is per-process randomized (which is the very bug being fixed
+/// three functions up), and `DefaultHasher`'s algorithm is explicitly unspecified across Rust
+/// releases — neither is acceptable for a value that must be stable across processes AND across
+/// rebuilds. Affect is NOT hashed: it is seated later in planning, so it is not yet meaningful at
+/// the `main.rs` call site. Pure.
+pub fn image_seed(u: &ImageUnderstanding) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    let fields: [f32; 11] = [
+        u.avg_brightness,
+        u.avg_saturation,
+        u.colorfulness,
+        u.edge_activity,
+        u.complexity,
+        u.texture,
+        u.aspect_ratio,
+        u.fg_bg_contrast,
+        u.dominant_hue,
+        u.subject_size,
+        u.value_key,
+    ];
+    for f in fields {
+        // Normalize the two zero encodings so -0.0 and +0.0 cannot seed different harmony.
+        let bits = if f == 0.0 { 0u32 } else { f.to_bits() };
+        for byte in bits.to_le_bytes() {
+            h ^= byte as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    }
+    h
+}
+
+/// Read-only view of the planner's OWN affect composite (S91 instrumentation; zero behaviour).
+///
+/// `affect_composite` is private and `Affect` is not retained on `CompositionPlan`, so the affect
+/// the planner actually decided on was previously unobservable from outside — every prior report
+/// had to MIRROR the function and argue the mirror was faithful. A mirror cannot certify the
+/// order-stability of the thing it mirrors (that is exactly the bug S91-S1 fixes), so the gate
+/// gets a direct accessor instead of an argument. Delegates; adds no logic of its own.
+pub fn affect_of(u: &ImageUnderstanding, weights: &AffectMappings) -> Affect {
+    affect_composite(u, weights)
 }
 
 /// Clamp the raw brightness→BPM into the selected character's window from
@@ -377,6 +568,62 @@ fn character_tempo_bpm(raw_bpm: f32, character: Character, affect: &AffectMappin
         Some(w) => raw_bpm.clamp(w.bpm_min, w.bpm_max),
         None => raw_bpm,
     }
+}
+
+/// S91-S3. THE TEMPO SURFACE: `bpm = (energy curve) × (character factor)`, then a safety rail.
+///
+/// Returns `None` when the energy surface is not configured (empty `tempo_energy_weights` or an
+/// absent `energy_tempo` block), so the caller falls back to the legacy brightness path
+/// byte-for-byte. Pure.
+///
+/// ── WHY A MULTIPLIER AND NOT A WINDOW ────────────────────────────────────────────────────────
+/// The rule the old surface broke: **a categorical selector may SHIFT a continuum; it must never
+/// SATURATE one.** `character` used to select a `[bpm_min, bpm_max]` window and CLAMP the tempo
+/// into it. A clamp is not a shift — it is a projection onto a boundary, and it is lossy exactly
+/// where a whole group of images lands outside the window together. Every `lament` interpolated
+/// below its window's floor, so all four clamped to the identical `66.0`: four images entered with
+/// different tempi and left with the same one. The clamp *destroyed* the differentiation it was
+/// meant to characterize.
+///
+/// The natural repair is not a wider window and it is not a blend toward the window's centre — a
+/// convex blend is a CONTRACTION MAP, which pulls every image of a given character toward a common
+/// attractor and compresses within-character spread by exactly the blend weight. It scores well on
+/// a distinct-value count while making the audible outcome slightly *worse*; it is the window bug
+/// wearing a softer mask.
+///
+/// A MULTIPLIER is the transformation that shifts without saturating, and it is the right one for
+/// a specific and checkable reason: **perceived tempo difference is a RATIO, not a difference**
+/// (the ~8% JND is scale-free — 60→65 BPM and 120→130 BPM are the same musical step). Multiplying
+/// a whole character class by a constant leaves every within-class RATIO exactly invariant. So the
+/// character can say "a lament is slower than a march" as strongly as it likes, and it is
+/// arithmetically incapable of collapsing two laments onto each other while doing so. Separation is
+/// then carried entirely by the energy curve, which is where the image's own information lives.
+///
+/// `character_tempo` is RETAINED, but demoted from shaper to **safety rail**: a wide, absolute
+/// per-character bound that protects against a pathological image, not a window that positions
+/// ordinary ones. If a rail is ever observed to bind on a real image it is too tight and should be
+/// widened — a tempo produced by a rail is a tempo not produced by the image, which is the defect
+/// this function exists to remove.
+fn energy_tempo_bpm(
+    u: &ImageUnderstanding,
+    character: Character,
+    affect: &AffectMappings,
+) -> Option<f32> {
+    let curve = affect.energy_tempo?;
+    if affect.tempo_energy_weights.is_empty() {
+        return None;
+    }
+    let energy = tempo_energy(u, affect);
+    // The global energy→BPM line. No flat tail: every distinct energy → a distinct base tempo.
+    let base = curve.bpm_at_zero + energy * (curve.bpm_at_one - curve.bpm_at_zero);
+    // The character's multiplicative shift. Absent character → 1.0 (no shift), never a clamp.
+    let factor = affect
+        .character_tempo_factor
+        .get(character_tempo_key(character))
+        .copied()
+        .unwrap_or(1.0);
+    // The safety rail (see above): expected NOT to bind on any real image.
+    Some(character_tempo_bpm(base * factor, character, affect))
 }
 
 /// The lowercase JSON key for a [`Character`] in `affect.character_tempo` (matches the §4(b)
@@ -1560,10 +1807,19 @@ impl CompositionPlanner {
         let scheme_pivot = key_scheme_handle.map(|s| s.pivot).unwrap_or(false);
         let scheme_resolution = key_scheme_handle.map(|s| s.resolution).unwrap_or_default();
         let offsets = resolve_key_scheme(key_scheme_handle, &form_spec.sections, u, &home_mode);
-        let raw_bpm = interp_tempo_bpm(&mappings.global.brightness_to_tempo_bpm, u.avg_brightness);
-        // Per-character tempo window (de-caps the legacy Ballad 56..96 clamp): the chosen
-        // character selects the window; brightness positions BPM within it. Absent window → no clamp.
-        let bpm = character_tempo_bpm(raw_bpm, character, &self.plan_mappings.affect);
+        // S91-S3: THE TEMPO INPUT KNOB. Tempo is an ENERGY parameter and it was being driven by an
+        // EXPOSURE METER — `interp_tempo_bpm(brightness_to_tempo_bpm, u.avg_brightness)`, i.e.
+        // `f(avg_brightness)` and nothing else. See `energy_tempo_bpm` / `tempo_energy` for the
+        // full argument. When the energy surface is configured it OWNS the tempo; when it is
+        // absent (any pre-S91 mappings.json, or the no-affect-block floor) we fall back to the
+        // legacy brightness path byte-for-byte, so old configs and the existing tests are unmoved.
+        let bpm = energy_tempo_bpm(u, character, &self.plan_mappings.affect).unwrap_or_else(|| {
+            let raw_bpm =
+                interp_tempo_bpm(&mappings.global.brightness_to_tempo_bpm, u.avg_brightness);
+            // Legacy: the character selects a window and brightness positions BPM within it —
+            // which saturates, and is the defect. Retained only as the unconfigured fallback.
+            character_tempo_bpm(raw_bpm, character, &self.plan_mappings.affect)
+        });
         let base_ms_per_step = (60_000.0 / bpm.max(1.0)).round() as u64;
 
         // 5) total_steps from a base budget × section count, image-influenced (edge_activity
@@ -2503,6 +2759,281 @@ mod tests {
 
     fn mappings() -> MappingTable {
         crate::mapping_loader::load_mappings("assets/mappings.json").expect("mappings load")
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // S91-S1 — ORDER-STABILITY OF THE AFFECT SUM
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// The affect composite must be BIT-identical regardless of the weight map's iteration order.
+    ///
+    /// This is the regression guard for the S91-S1 defect: `blend` reduced f32 over a `HashMap`,
+    /// whose iteration order is randomized per process, and f32 addition is not associative — so
+    /// the same image summed to a different affect in different processes (measured: 7 distinct
+    /// bit-patterns across 10 runs). A same-process test cannot vary `RandomState`, so we vary the
+    /// thing that actually perturbs bucket layout and iteration order: INSERTION ORDER and
+    /// CAPACITY. With the unsorted reduction these produced differing low bits; with the sorted /
+    /// f64 reduction they must be bit-identical.
+    #[test]
+    fn affect_composite_is_bit_identical_under_weight_map_reordering() {
+        let u = ImageUnderstanding {
+            avg_brightness: 29.34,
+            avg_saturation: 16.67,
+            colorfulness: 0.205,
+            edge_activity: 0.550,
+            complexity: 0.473,
+            fg_bg_contrast: 0.363,
+            ..ImageUnderstanding::neutral()
+        };
+        let rows: [(&str, f32); 4] = [
+            ("avg_saturation", 0.45),
+            ("colorfulness", 0.25),
+            ("edge_activity", 0.20),
+            ("complexity", 0.10),
+        ];
+        // Every rotation of the insertion order, at several capacities.
+        let mut seen: std::collections::BTreeSet<(u32, u32)> = std::collections::BTreeSet::new();
+        for rot in 0..rows.len() {
+            for cap in [0usize, 1, 4, 17, 64] {
+                let mut w = AffectMappings::default();
+                let mut arousal = std::collections::HashMap::with_capacity(cap);
+                for k in 0..rows.len() {
+                    let (name, weight) = rows[(k + rot) % rows.len()];
+                    arousal.insert(name.to_string(), weight);
+                }
+                w.arousal_weights = arousal;
+                // valence, inserted in the opposite order for good measure
+                let mut valence = std::collections::HashMap::with_capacity(cap);
+                for (name, weight) in [
+                    ("fg_bg_contrast", 0.10f32),
+                    ("avg_saturation", 0.20),
+                    ("avg_brightness", 0.70),
+                ] {
+                    valence.insert(name.to_string(), weight);
+                }
+                w.valence_weights = valence;
+
+                let a = affect_of(&u, &w);
+                seen.insert((a.arousal.to_bits(), a.valence.to_bits()));
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            1,
+            "affect must be ONE bit-pattern across every weight-map ordering/capacity, got {seen:?}"
+        );
+    }
+
+    /// The stabilized sum must still compute the DOCUMENTED value, not merely a stable one.
+    /// (A blend that always returned 0.0 would be perfectly order-stable and perfectly wrong.)
+    #[test]
+    fn affect_composite_still_computes_the_documented_weighted_sum() {
+        let u = ImageUnderstanding {
+            avg_saturation: 20.0,
+            colorfulness: 0.40,
+            edge_activity: 0.50,
+            complexity: 0.60,
+            ..ImageUnderstanding::neutral()
+        };
+        let mut w = AffectMappings::default();
+        for (name, weight) in [
+            ("avg_saturation", 0.45f32),
+            ("colorfulness", 0.25),
+            ("edge_activity", 0.20),
+            ("complexity", 0.10),
+        ] {
+            w.arousal_weights.insert(name.to_string(), weight);
+        }
+        // 0.45*0.20 + 0.25*0.40 + 0.20*0.50 + 0.10*0.60 = 0.09 + 0.10 + 0.10 + 0.06 = 0.35
+        let a = affect_of(&u, &w);
+        assert!(
+            (a.arousal - 0.35).abs() < 1e-6,
+            "arousal must be the documented weighted sum, got {}",
+            a.arousal
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // S91-S2 — IMAGE-DERIVED SEED
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Same features → same seed; different features → different seed. (Determinism is the point;
+    /// image-dependence is what distinguishes this from a constant seed.)
+    #[test]
+    fn image_seed_is_deterministic_and_image_dependent() {
+        let a = u_with(0.4, 0.5);
+        let b = u_with(0.4, 0.5);
+        let c = u_with(0.4, 0.6);
+        assert_eq!(image_seed(&a), image_seed(&b), "same features → same seed");
+        assert_ne!(
+            image_seed(&a),
+            image_seed(&c),
+            "a different edge_activity must change the seed"
+        );
+        // Stable across repeated calls (no interior mutable state, no RandomState).
+        assert_eq!(image_seed(&a), image_seed(&a));
+    }
+
+    /// `-0.0` and `+0.0` are distinct bit patterns but the SAME number; they must not seed
+    /// different harmony. (A feature extractor is free to hand us either.)
+    #[test]
+    fn image_seed_normalizes_negative_zero() {
+        let mut pos = ImageUnderstanding::neutral();
+        pos.edge_activity = 0.0;
+        let mut neg = ImageUnderstanding::neutral();
+        neg.edge_activity = -0.0;
+        assert_ne!(
+            (0.0f32).to_bits(),
+            (-0.0f32).to_bits(),
+            "precondition: the two zeros differ in bits"
+        );
+        assert_eq!(
+            image_seed(&pos),
+            image_seed(&neg),
+            "-0.0 and +0.0 must produce the same seed"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // S91-S3 — THE TEMPO SURFACE
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// TEMPO IS AN ENERGY PARAMETER, NOT AN EXPOSURE METER. The defect being fixed was that tempo
+    /// read `avg_brightness` and nothing else. The energy knob must be INVARIANT to brightness and
+    /// saturation, and must MOVE with motion.
+    #[test]
+    fn tempo_energy_ignores_exposure_and_tracks_motion() {
+        let m = mappings();
+        let affect = &m.composition.as_ref().expect("composition").affect;
+        assert!(
+            !affect.tempo_energy_weights.is_empty(),
+            "mappings.json must configure the energy tempo surface"
+        );
+
+        let base = ImageUnderstanding {
+            edge_activity: 0.30,
+            texture: 0.20,
+            complexity: 0.25,
+            colorfulness: 0.20,
+            avg_brightness: 20.0,
+            avg_saturation: 10.0,
+            ..ImageUnderstanding::neutral()
+        };
+        // Same motion, wildly different exposure/vividness → IDENTICAL energy.
+        let mut bright = base.clone();
+        bright.avg_brightness = 95.0;
+        bright.avg_saturation = 90.0;
+        assert_eq!(
+            tempo_energy(&base, affect).to_bits(),
+            tempo_energy(&bright, affect).to_bits(),
+            "brightness/saturation must not move the tempo energy — exposure is not energy"
+        );
+
+        // More motion → strictly more energy.
+        let mut busier = base.clone();
+        busier.edge_activity = 0.80;
+        assert!(
+            tempo_energy(&busier, affect) > tempo_energy(&base, affect),
+            "more edge_activity must raise the tempo energy"
+        );
+    }
+
+    /// THE CENTRAL MUSICAL CLAIM, ASSERTED: the character is a MULTIPLIER, so it can never collapse
+    /// two pieces of the same character onto the same tempo. Perceived tempo difference is a RATIO,
+    /// and a multiplier leaves every within-character ratio EXACTLY invariant.
+    ///
+    /// This is the direct regression guard for the S91 defect: under the old window-CLAMP, four
+    /// `lament` images with different energies all landed on the identical 66.0 BPM window edge.
+    #[test]
+    fn character_shift_is_multiplicative_and_preserves_within_character_ratios() {
+        let m = mappings();
+        let affect = &m.composition.as_ref().expect("composition").affect;
+
+        // Two laments with genuinely different motion (mirrors the corpus's s6 vs s1).
+        let calm = ImageUnderstanding {
+            edge_activity: 0.00,
+            texture: 0.02,
+            complexity: 0.04,
+            colorfulness: 0.03,
+            ..ImageUnderstanding::neutral()
+        };
+        let busy = ImageUnderstanding {
+            edge_activity: 0.55,
+            texture: 0.35,
+            complexity: 0.47,
+            colorfulness: 0.21,
+            ..ImageUnderstanding::neutral()
+        };
+
+        let lam_calm = energy_tempo_bpm(&calm, Character::Lament, affect).expect("configured");
+        let lam_busy = energy_tempo_bpm(&busy, Character::Lament, affect).expect("configured");
+        let mar_calm = energy_tempo_bpm(&calm, Character::March, affect).expect("configured");
+        let mar_busy = energy_tempo_bpm(&busy, Character::March, affect).expect("configured");
+
+        // (1) The character SHIFTS: a march is faster than a lament at identical energy.
+        assert!(
+            mar_busy > lam_busy && mar_calm > lam_calm,
+            "march must be faster than lament at equal energy"
+        );
+        // (2) The character does NOT SATURATE: two laments of different energy get different tempi,
+        //     separated well beyond the ~8% JND.
+        assert!(
+            lam_busy / lam_calm > 1.08,
+            "two laments of different energy must differ audibly in tempo, got {lam_calm:.2} vs {lam_busy:.2}"
+        );
+        // (3) RATIO INVARIANCE — the whole point. The busy/calm tempo ratio is the SAME for lament
+        //     and march, because the character is a multiplier. A clamp or a blend would break this.
+        let lam_ratio = lam_busy / lam_calm;
+        let mar_ratio = mar_busy / mar_calm;
+        assert!(
+            (lam_ratio - mar_ratio).abs() < 1e-4,
+            "a multiplicative character must leave within-character ratios invariant: \
+             lament {lam_ratio:.6} vs march {mar_ratio:.6}"
+        );
+    }
+
+    /// The engine must be able to render BELOW the old global floor. Pre-S91 `interp_tempo_bpm`
+    /// returned >= 72 unconditionally and the lament window capped at 66, so EVERY lament pinned to
+    /// exactly 66.0 and a sub-66 BPM piece was impossible for ANY image that could ever exist.
+    #[test]
+    fn a_still_dark_lament_can_now_render_below_the_old_66_floor() {
+        let m = mappings();
+        let affect = &m.composition.as_ref().expect("composition").affect;
+        let still = ImageUnderstanding {
+            edge_activity: 0.0,
+            texture: 0.015,
+            complexity: 0.042,
+            colorfulness: 0.025,
+            ..ImageUnderstanding::neutral()
+        };
+        let bpm = energy_tempo_bpm(&still, Character::Lament, affect).expect("configured");
+        assert!(
+            bpm < 66.0,
+            "a motionless lament must now be able to render below the old 66.0 floor, got {bpm:.2}"
+        );
+        let rail = &affect.character_tempo["lament"];
+        assert!(
+            bpm > rail.bpm_min && bpm < rail.bpm_max,
+            "and it must sit INTERIOR to its safety rail, not on it (got {bpm:.2}, rail [{}, {}])",
+            rail.bpm_min,
+            rail.bpm_max
+        );
+    }
+
+    /// An unconfigured `affect` block (any pre-S91 mappings.json) must fall back to the legacy
+    /// brightness tempo path byte-for-byte, so old configs keep working.
+    #[test]
+    fn energy_tempo_is_disabled_when_unconfigured() {
+        let floor = AffectMappings::default();
+        assert!(
+            energy_tempo_bpm(&u_with(0.5, 0.5), Character::Ballad, &floor).is_none(),
+            "with no energy_tempo block the energy surface must be OFF (legacy fallback)"
+        );
+        assert_eq!(
+            tempo_energy(&u_with(0.5, 0.5), &floor),
+            0.0,
+            "an empty tempo_energy_weights map contributes no energy"
+        );
     }
 
     /// SelectTable first-match-wins: a rule that holds beats the default; none holding →

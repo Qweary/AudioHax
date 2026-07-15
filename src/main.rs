@@ -408,11 +408,20 @@ fn run_render_wav(
         (src, understanding)
     };
 
-    // ── S41: set the composition-seed register BEFORE composing (freeze-safe entry). ──
-    // `--seed N` ⇒ Some(N) makes pick_progression deterministic (reproducible WAV); absent
-    // ⇒ None = today's exact `thread_rng()` path. Set once, before the composer/planner runs.
+    // ── S41/S91-S2: set the composition-seed register BEFORE composing (freeze-safe entry). ──
+    // `--seed N` ⇒ Some(N), the operator's explicit override, unchanged.
+    // ABSENT ⇒ was `None` = `thread_rng()`: every section drew a fresh random progression on every
+    // run, so the same image rendered to different harmony each time while doing NOTHING to
+    // separate one image from another. S91 replaces that default with a seed DERIVED FROM THE
+    // IMAGE's own feature vector: the same image now yields the same plan, in every process, every
+    // run. This is a REPRODUCIBILITY fix and is claimed as nothing more — a hash-seeded draw over a
+    // progression catalogue is a pseudo-random differentiator, not a musical one.
     // engine.rs is never touched — the register is read inside chord_engine::pick_progression.
-    audiohax::seed::set_composition_seed(render_args.seed);
+    audiohax::seed::set_composition_seed(Some(
+        render_args
+            .seed
+            .unwrap_or_else(|| audiohax::composition::image_seed(&understanding)),
+    ));
 
     // ── S79 cadence-figure differentiation: ARMED S80 (production default). ──
     // Per-image + within-piece-developing cadential figure, grounded on LIVE `understanding.*`
@@ -738,12 +747,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (src, understanding)
     };
 
-    // ── S41: set the composition-seed register BEFORE composing (freeze-safe entry). ──
-    // `--seed N` ⇒ Some(N) makes pick_progression deterministic (same image+seed ⇒ same
-    // composition); absent ⇒ None = today's exact `thread_rng()` path. Set once, before the
-    // composer/planner runs. engine.rs is never touched — the register is read inside
+    // ── S41/S91-S2: set the composition-seed register BEFORE composing (freeze-safe entry). ──
+    // `--seed N` ⇒ Some(N), the operator's explicit override, unchanged. ABSENT ⇒ was `None` =
+    // `thread_rng()`; S91 makes the default an IMAGE-DERIVED seed so the same image composes the
+    // same harmony every run. See the render handler above for the full rationale. Set once, before
+    // the composer/planner runs. engine.rs is never touched — the register is read inside
     // chord_engine::pick_progression.
-    audiohax::seed::set_composition_seed(play_args.seed);
+    audiohax::seed::set_composition_seed(Some(
+        play_args
+            .seed
+            .unwrap_or_else(|| audiohax::composition::image_seed(&understanding)),
+    ));
 
     // ── S79 cadence-figure differentiation: ARMED S80 (production default). ──
     // Per-image + within-piece-developing cadential figure, grounded on LIVE `understanding.*`

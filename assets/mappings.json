@@ -148,13 +148,48 @@
         "avg_saturation":  0.20,
         "fg_bg_contrast":  0.10
       },
+
+      "_s91_tempo_note": "S91-S3. TEMPO IS AN ENERGY PARAMETER AND IT WAS BEING DRIVEN BY AN EXPOSURE METER. It used to be interp(global.brightness_to_tempo_bpm, avg_brightness) and NOTHING else, then CLAMPED into character_tempo. Because that curve floors at 72 BPM and the old lament window ceiling was 66, every lament pinned to exactly 66.0 and a sub-66 BPM piece was impossible for ANY image that could ever exist. The four lament images differ in brightness by 3.6 points but in MOTION by an order of magnitude, so the information to separate them was already in the feature vector and the tempo surface was discarding it. NOW: bpm = (energy_tempo line evaluated at tempo_energy) * character_tempo_factor, then bounded by character_tempo.",
+
+      "tempo_energy_weights": {
+        "edge_activity": 0.40,
+        "texture":       0.25,
+        "complexity":    0.20,
+        "colorfulness":  0.15
+      },
+
+      "_s91_energy_note": "MOTION only. avg_brightness and avg_saturation are DELIBERATELY ABSENT: exposure is not energy (a dark image is not necessarily a slow one), and vividness is not motion (a saturated but perfectly still image should be SLOW). This is a SEPARATE blend from arousal_weights on purpose -- arousal is a GATING coordinate that sorts the character ladder, and re-weighting it would move character/home_mode. This blend feeds tempo and nothing else.",
+
+      "energy_tempo": { "bpm_at_zero": 52.0, "bpm_at_one": 162.0 },
+
+      "_s91_factor_note": "The character SHIFTS the tempo MULTIPLICATIVELY, it does not clamp it. Perceived tempo difference is a RATIO (the ~8% JND is scale-free), so a per-character multiplier leaves every within-character ratio EXACTLY invariant: the character can say 'a lament is slower than a march' as loudly as it likes and remain arithmetically incapable of collapsing two laments onto each other. A window-clamp destroys ratios; a blend toward a window centre is a contraction map and compresses them. A multiplier is the transformation that shifts without saturating.",
+
+      "character_tempo_factor": {
+        "drone":    0.68,
+        "lament":   0.78,
+        "nocturne": 0.86,
+        "hymn":     0.96,
+        "ballad":   1.00,
+        "waltz":    1.06,
+        "lilt":     1.10,
+        "march":    1.18,
+        "gigue":    1.24,
+        "scherzo":  1.28
+      },
+
+      "_s91_rail_note": "character_tempo is DEMOTED from shaper to SAFETY RAIL: a wide, musically absolute per-character bound (the tempo range beyond which the character name stops being true), there to bound a pathological image, NOT to position an ordinary one. If a rail is ever seen to bind on a real image it is too tight and should be widened -- a tempo produced by a rail is a tempo not produced by the image, which is the defect this surface exists to remove. Verified: 0 of the 9 corpus images sit on a rail. lament was widened from 44..66 (its ceiling sat BELOW the old curve's 72 floor -- the bug) and march from 96..132 (which would have re-pinned s3 at 132). scherzo 120..168 and ballad 56..96 are RETAINED at their legacy values because those genuinely are the standard tempo ranges for those characters.",
+
       "character_tempo": {
+        "drone":    { "bpm_min": 30,  "bpm_max": 72  },
+        "lament":   { "bpm_min": 34,  "bpm_max": 86  },
+        "nocturne": { "bpm_min": 38,  "bpm_max": 96  },
+        "hymn":     { "bpm_min": 42,  "bpm_max": 108 },
         "ballad":   { "bpm_min": 56,  "bpm_max": 96  },
-        "scherzo":  { "bpm_min": 120, "bpm_max": 168 },
-        "march":    { "bpm_min": 96,  "bpm_max": 132 },
-        "lament":   { "bpm_min": 44,  "bpm_max": 66  },
-        "hymn":     { "bpm_min": 60,  "bpm_max": 92  },
-        "nocturne": { "bpm_min": 50,  "bpm_max": 80  }
+        "waltz":    { "bpm_min": 48,  "bpm_max": 124 },
+        "lilt":     { "bpm_min": 50,  "bpm_max": 130 },
+        "march":    { "bpm_min": 56,  "bpm_max": 152 },
+        "gigue":    { "bpm_min": 64,  "bpm_max": 176 },
+        "scherzo":  { "bpm_min": 120, "bpm_max": 168 }
       },
       "mode_valence_cuts": { "major_min": 0.55, "minor_max": 0.45 }
     },
