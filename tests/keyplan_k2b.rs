@@ -137,6 +137,15 @@ fn planner_pinned_to(scheme_id: &str, m: &MappingTable) -> CompositionPlanner {
 fn firing_distinct_regions() -> ImageUnderstanding {
     ImageUnderstanding {
         fg_bg_contrast: 0.30,
+        // S92 P2 2.6 — the catch-all excursion trigger moved off fg_bg_contrast onto complexity
+        // (the wrong-knob fix). This fixture drives the catch-all (rounded_binary_excursion) via the
+        // shipped routing, so it now clears complexity >= 0.60 to fire that scheme under the new
+        // predicate. edge_activity stays 0 (< 0.60) so it takes the DEFAULT rounded_binary form and
+        // the catch-all's `edge_activity < 0.60 AND aspect_ratio < 1.60` form-alignment guard holds
+        // (it is NOT stolen by, and does not steal from, the theme_and_variations rule). The region
+        // energy/hue/brightness axes below (which drive the +7/+5 offsets these tests assert) are
+        // untouched: complexity feeds no offset, so the resolved spine is identical to pre-fix.
+        complexity: 0.70,
         subject_hue: 40.0,
         avg_saturation: 50.0,
         foreground_energy: 0.9,     // rank 0 → B
@@ -657,10 +666,15 @@ fn home_only_byte_zero() {
             .collect::<Vec<_>>()
     );
 
-    // (b) Shipped routing, subject gate NOT fired (fg_bg_contrast 0.0 < 0.25) → home_only default.
+    // (b) Shipped routing, NO excursion rule armed → home_only default. S92 P2 2.6 moved the
+    // catch-all trigger off fg_bg_contrast onto complexity, so a genuinely non-firing image must be
+    // below BOTH gates: fg_bg_contrast < 0.25 (disarms the 5 geometry excursion rules that kept it)
+    // AND complexity < 0.60 (disarms the re-anchored catch-all). The builder now carries complexity
+    // 0.70 to drive the catch-all in the firing tests, so we zero it here to model the non-firing image.
     let shipped = shipped_planner(&m);
     let below_gate = ImageUnderstanding {
-        fg_bg_contrast: 0.0, // below the 0.25 subject gate on every active rule
+        fg_bg_contrast: 0.0, // below the 0.25 gate on the 5 geometry excursion rules
+        complexity: 0.0,     // below the 0.60 gate on the re-anchored catch-all
         ..firing_distinct_regions()
     };
     let plan_b = shipped.plan(&below_gate, &m);

@@ -2180,7 +2180,16 @@ fn pick_archetype(u: &ImageUnderstanding) -> MotifArchetype {
     // `dominant_hue` (warm half 0..180 vs cool half 180..360) breaks the remaining tie.
     let arousal = u.affect_arousal;
     let valence = u.affect_valence;
-    let high_arousal = arousal >= 0.5;
+    // S92 P2 2.4 — arousal split RE-ANCHORED 0.5 -> 0.37. Corpus arousal tops out at 0.440, so the
+    // old 0.5 cut made `high_arousal` ALWAYS false: the RISING (Ascent/RisingSequence) and
+    // OSCILLATING (Pendulum/NeighborTurn) families — the engine's entire ENERGETIC melodic
+    // vocabulary — were dead code, and only ARCHED/FALLING ever fired. 0.37 sits in the natural
+    // corpus gap (s7 0.308 | s3 0.432) so `high_arousal` is true ONLY for {s3 0.432, s8a 0.440}:
+    // s8a (high arousal, high valence 0.519) -> RISING (a lifting contour under the neon drive);
+    // s3 (high arousal, low valence 0.433) -> OSCILLATING. The valence split stays at 0.5 (valence
+    // genuinely straddles it, the honest major/minor divide). Moves motif_archetype for {s3,s8a}
+    // only (C7); margins to 0.37 are 0.062 (both s3 above, s7 below) — no knife-edge (C2).
+    let high_arousal = arousal >= 0.37;
     let high_valence = valence >= 0.5;
     // vertical_emphasis high (upper-mass) → the rising/active member; low → the settling one.
     let upper = u.vertical_emphasis >= 0.5;
@@ -2247,9 +2256,21 @@ fn pick_archetype(u: &ImageUnderstanding) -> MotifArchetype {
 // cells 0/1/2 edge ramp entirely (zero benefit on the six bundled images: example/magic are
 // high-complexity → cell 3 under either value). So the cell axis is reverted to its pre-S50
 // values; the S50 spread is delivered by the band re-range (chord_engine.rs) + the character gate
-// (mappings.json), both UNTOUCHED. Invariant BROAD < BUSY holds (0.33 < 0.66).
-const CELL_EDGE_BROAD: f32 = 0.33;
-const CELL_EDGE_BUSY: f32 = 0.66;
+// (mappings.json), both UNTOUCHED. Invariant BROAD < BUSY holds (0.20 < 0.35).
+//
+// S92 P2 2.5 — RE-ANCHORED onto the realized edge_activity range [0, 0.550]. The old 0.33/0.66 cuts
+// left cell 2 (the busiest, even-subdivided gait) UNREACHABLE via edge (edge maxes at 0.550 < 0.66),
+// so the engine's most driving gait was dead. 0.20/0.35 spreads the density ramp across the real
+// range: broadest/augmented gait for the 4 stillest {s2,s4,s5,s6} (edge < 0.20); the S39 anchor for
+// the mid {s7 0.210, s8b 0.248}; the BUSIEST even gait for the active {s1 0.550, s8a 0.399}. This is
+// the gait half of s8a's gridded drive. The stale "theme exists only when complexity >= 0.4" premise
+// in the revert note above no longer holds (theme_behaviour defaults to `fragment` for all 9 since
+// S62, so pick_rhythm_cell runs on every image) — but CELL_COMPLEXITY_PROFILED stays 0.66 (>> 0.4),
+// so the PROFILED diversion still only catches the genuinely intricate {s3,s5} and the edge ramp
+// stays reachable. This drives the THEME rhythm cell (audible; C9), NOT the S53 motto_cell fingerprint
+// (that is pick_piece_cell in chord_engine, frozen), so it moves no BAR-D axis and no probe field.
+const CELL_EDGE_BROAD: f32 = 0.20;
+const CELL_EDGE_BUSY: f32 = 0.35;
 // SECONDARY axis = `complexity`. A high-complexity image is diverted onto cell 3 — the
 // PROFILED / SYNCOPATED CHARACTER gait — so two images of equal `edge_activity` do NOT
 // re-collapse onto the same density-picked cell: the busy/calm one keeps its density gait,

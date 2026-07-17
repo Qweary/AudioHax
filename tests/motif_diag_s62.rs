@@ -64,7 +64,7 @@ fn pick_archetype_recon(
     vertical_emphasis: f32,
     hue: f32,
 ) -> MotifArchetype {
-    let high_arousal = arousal >= 0.5;
+    let high_arousal = arousal >= 0.37; // S92 P2 2.4: arousal split re-anchored 0.5 -> 0.37
     let high_valence = valence >= 0.5;
     let upper = vertical_emphasis >= 0.5;
     let warm = hue.rem_euclid(360.0) < 180.0;
@@ -113,14 +113,16 @@ fn length_steps_recon(u: &ImageUnderstanding) -> usize {
     ((3.0 + u.complexity * 5.0).round() as usize).max(MOTIF_LENGTH_FLOOR)
 }
 
-// pick_rhythm_cell exactly as composition.rs:1869 (CELL_EDGE_BROAD 0.33, CELL_EDGE_BUSY 0.66,
-// CELL_COMPLEXITY_PROFILED 0.66). This is the THEME-PATH cell (the pitched motif's gait).
+// pick_rhythm_cell exactly as composition.rs (S92 P2 2.5: CELL_EDGE_BROAD 0.20, CELL_EDGE_BUSY 0.35,
+// CELL_COMPLEXITY_PROFILED 0.66). This is the THEME-PATH cell (the pitched motif's gait). The edge
+// cuts were re-anchored onto the realized edge range [0, 0.55] so the busiest even cell (cell 2) is
+// reachable; the reconstruction tracks the production cuts to stay a faithful cross-validator.
 fn pick_rhythm_cell_recon(u: &ImageUnderstanding, cell_count: usize) -> usize {
     let index = if u.complexity >= 0.66 && cell_count > 3 {
         3
-    } else if u.edge_activity < 0.33 {
+    } else if u.edge_activity < 0.20 {
         1
-    } else if u.edge_activity < 0.66 {
+    } else if u.edge_activity < 0.35 {
         0
     } else {
         2

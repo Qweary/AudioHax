@@ -129,6 +129,18 @@ fn craft(
         quadrant_contrast,
         background_energy,
         foreground_energy,
+        // S92 P2 2.6 — the key excursion trigger was RE-ANCHORED off `fg_bg_contrast` onto
+        // `complexity` (the wrong-knob fix: fg_bg is subject pop-out, not harmonic density; it
+        // wrongly modulated the still image s1). These ladders were written with `fg_bg_contrast`
+        // as the excursion trigger, so to keep them exercising the SAME excursion path under the new
+        // routing the builder now raises `complexity` in LOCKSTEP with the `fg_bg_contrast` gate:
+        // a firing fixture (`fg_bg_contrast >= 0.25`) also clears `complexity >= 0.60` so the shipped
+        // catch-all (`complexity >= 0.60 AND edge_activity < 0.60 AND aspect_ratio < 1.60`) fires the
+        // identical `rounded_binary_excursion` [0, region, 0] it fired pre-fix; a non-firing fixture
+        // (`< 0.25`) keeps `complexity 0` and stays `home_only`. The scheme, its resolution, the
+        // offset direction, and the key-count these tests assert are all UNCHANGED — only the knob
+        // that arms the excursion moved, exactly as the sealed re-anchor intends.
+        complexity: if fg_bg_contrast >= 0.25 { 0.70 } else { 0.0 },
         ..ImageUnderstanding::neutral()
     }
 }

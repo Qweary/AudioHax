@@ -372,10 +372,14 @@ fn test_p4_same_contour_image_moves_the_gait() {
     // throughout → the affect quadrant (hence the archetype) and the theme length are constant; only
     // the edge-driven cell (and range) move.
     let corner = |edge: f32| img(85.0, 10.0, 0.1, 0.5, edge, 40.0, 0.8);
+    // S92 P2 2.5: the edge-ramp cuts were re-anchored onto the realized range (CELL_EDGE_BROAD
+    // 0.33->0.20, CELL_EDGE_BUSY 0.66->0.35). The three probe edges are re-spaced onto the NEW bands
+    // so the sweep still lands one image in each of cells 1/0/2 (the clap-test premise). complexity
+    // stays 0.5 (< 0.66) so the PROFILED cell-3 divert does not fire and the edge ramp is live.
     let sweep = [
-        corner(0.10), // edge < 0.33 → cell 1 (broadest gait)
-        corner(0.50), // edge in [0.33, 0.66) → cell 0 (S39 anchor gait)
-        corner(0.80), // edge >= 0.66 → cell 2 (busiest gait)
+        corner(0.10), // edge < 0.20 → cell 1 (broadest gait)
+        corner(0.28), // edge in [0.20, 0.35) → cell 0 (S39 anchor gait)
+        corner(0.50), // edge >= 0.35 → cell 2 (busiest gait)
     ];
 
     // Confirm the corner holds ONE archetype across the whole sweep (the premise of the clap test:

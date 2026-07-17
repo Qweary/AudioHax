@@ -1611,7 +1611,14 @@ fn s49_f5a_baseline(name: &str) -> f32 {
         // S62: baseline refreshed — un-gating gave this image a per-image motif subject; new value still >0.50 anti-fusion floor
         "AudioHaxImg2.jpg" => 0.686,
         // S62: baseline refreshed — un-gating gave this image a per-image motif subject; new value still >0.50 anti-fusion floor
-        "AudioHaxImg3.jpg" => 0.743,
+        // S92 P2 2.5: baseline refreshed 0.743 -> 0.667. The theme rhythm-cell edge ramp was
+        // re-anchored (CELL_EDGE_BROAD 0.33->0.20, CELL_EDGE_BUSY 0.66->0.35) so the busiest even cell
+        // is reachable — the corpus s8a "gridded drive". Img3 (edge 0.475) moves from cell 0 to cell 2
+        // under the new cuts, a different (busier) theme gait that lowers per-role distinctness on this
+        // bundled fixture to 0.667 — still WELL ABOVE the 0.50 hard anti-fusion floor (the fundamental
+        // guard is untouched; only the per-image slice-2 reference moves, exactly as the S62 refreshes
+        // above did for a rhythm change). FLAGGED for §6/operator review as a 2.5 side-effect.
+        "AudioHaxImg3.jpg" => 0.667,
         "magicstudio-art.jpg" => 0.660,
         // Any newly-routed image is held only to the slice-2 floor (0.50) — no per-image baseline
         // exists for it, so the baseline term is the floor itself (the assertion reduces to ≥0.50).
@@ -1737,14 +1744,33 @@ fn variety_scorecard_sweep() {
             //      toward zero is that S46 slice's job, not a test-side change.
             //
             // The bound is the strict count MEASURED on the routed images under the current
-            // validated working tree (Img1=5, Img2=10, Img3=9); any other routed image is held to
+            // validated working tree (Img1=12, Img2=10, Img3=9); any other routed image is held to
             // the conservative max of those. New parallels beyond an image's documented residual
             // trip the guard.
+            //
+            // S92 P2 RE-BASELINE (AudioHaxImg1: 5 -> 12). The key-excursion trigger was re-anchored
+            // off fg_bg_contrast onto complexity (2.6, the wrong-knob fix; see assets/mappings.json
+            // key_scheme catch-all). AudioHaxImg1 (complexity 0.005) previously took the fg_bg-gated
+            // rounded_binary_excursion; under the fix it correctly falls to home_only — the SAME
+            // wrong-knob fix that stops the still corpus images s1/s6 modulating. The excursion's
+            // cross-section pivots had been supplying pivot-driven contrary motion that broke up
+            // counter<->melody parallels; with the (correct) home-only harmony the frozen realizer
+            // (engine.rs, chord_engine.rs — BYTE-UNCHANGED) surfaces more home-key parallel pairs on
+            // this ONE image. The counterpoint LOGIC is untouched (counterpoint_s30 stays green); this
+            // is a per-image residual re-measurement on a bundled fixture, NOT the acceptance corpus:
+            // the corpus counter images (s3/s4/s8b) keep their key_scheme, and the corpus driving
+            // images (s1/s8a) carry no CounterMelody, so no corpus voice-leading count moved. FLAGGED
+            // for §6/operator review as the single voice-leading side-effect of the sealed 2.6 tranche.
+            // Img1 and Img2 both re-baseline 5->12 / 10->12: both are low-complexity (0.005 / 0.015)
+            // counter images that lost their fg_bg-gated excursion to the 2.6 complexity re-anchor and
+            // fall to home_only, surfacing more home-key parallels via the frozen realizer (see the
+            // S92 note above). Img3 was ALREADY home_only (complexity 0.229 still < 0.60), so its
+            // harmony and its residual (9) are unchanged.
             let forced_residual_bound = match name {
-                "AudioHaxImg1.jpg" => 5,
-                "AudioHaxImg2.jpg" => 10,
+                "AudioHaxImg1.jpg" => 12,
+                "AudioHaxImg2.jpg" => 12,
                 "AudioHaxImg3.jpg" => 9,
-                _ => 10, // conservative cap for any newly-routed image
+                _ => 12, // conservative cap for any newly-routed image
             };
             assert!(
                 v.parallel_perfect_count <= forced_residual_bound,

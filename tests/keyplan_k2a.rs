@@ -604,13 +604,17 @@ fn per_region_fallback_reproduces_k1() {
     //     (avg_brightness = region_valence*100, avg_saturation = 50, fg_bg_contrast = 0.30):
     //       v = 0.70*(avg_brightness/100) + 0.20*(avg_saturation/100) + 0.10*(0.5 + 0.5*fg_bg)
     //         = 0.70*region_valence + 0.10 + 0.065 = 0.70*region_valence + 0.165
-    //   * v >= 0.55 → MAJOR family; v <= 0.45 → MINOR family; the dead band (0.45,0.55) leaves the
+    //   * v >= 0.63 → MAJOR family; v <= 0.385 → MINOR family; the dead band (0.385,0.63) leaves the
     //     HUE-selected mode (and hence its family) untouched (legacy behaviour).
     // We reuse the PUBLIC `valence_family_mode` so this expectation tracks the production rule
     // automatically, then read the family off the resolved mode string (the same `minor_family`
     // predicate `relative_offset` uses internally).
-    const MAJOR_MIN: f32 = 0.55; // == assets/mappings.json composition.affect.mode_valence_cuts
-    const MINOR_MAX: f32 = 0.45;
+    // S92 P2 2.1 — the mode dead-band was WIDENED (major_min 0.55->0.63, minor_max 0.45->0.385) so
+    // hue's modal color survives across the broad middle (delivers s3->Mixolydian-major, s5->Aeolian).
+    // This test mirrors the SHIPPED cuts, so it tracks them here; the loop still exercises the minor
+    // (rv 0.0), dead-band (rv 0.39..0.61), and major (rv 1.0) regions under the widened band.
+    const MAJOR_MIN: f32 = 0.63; // == assets/mappings.json composition.affect.mode_valence_cuts
+    const MINOR_MAX: f32 = 0.385;
     fn projected_minor_family(hue_mode: &str, region_valence: f32) -> bool {
         let affect_valence = 0.70 * region_valence + 0.20 * 0.5 + 0.10 * (0.5 + 0.5 * 0.30);
         let cuts = Some(ModeValenceCuts {

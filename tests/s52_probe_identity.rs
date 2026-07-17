@@ -83,12 +83,25 @@ struct Golden {
     palette_bimodality: f32,
 }
 
+// S92 P2 RE-BASELINE: this behaviour-neutral gate captures the UNSEATED (raw-feature) probe
+// selection, so the affect-gated S92 texture rules (monody/counter, which need a seated arousal/
+// valence) never fire here — but the EDGE-gated driving rule (2.3, `edge_activity >= 0.35 AND
+// valence < 0.60 AND subject_energy < 0.45`) DOES fire on unseated probes (valence -1 < 0.60), and
+// the COMPLEXITY-gated key re-anchor (2.6) fires on raw complexity. So the sealed re-anchors move
+// six goldens, each a deliberate consequence (verified via the gitignored poc_s92_s52 probe):
+//   - texture example/Lena/img2/img3 -> pad_broken_up  (2.3: all have edge >= 0.35)
+//   - key_scheme img1/img2 -> home_only  (2.6: complexity 0.005/0.015 < 0.60, they no longer modulate
+//       on fg_bg — the same wrong-knob fix that stops s1 modulating)
+//   - key_scheme magic -> rounded_binary_excursion  (2.6: complexity 1.000 >= 0.60, edge 0.106 < 0.60,
+//       aspect 1.0 < 1.60 -> the re-anchored catch-all now correctly grants the dense image a journey)
+// form and the raw fe/palette goldens are UNMOVED (the re-anchors touch neither the form ladder nor
+// the image-analysis knobs).
 const GOLDEN: [Golden; 6] = [
     // example.jpg
     Golden {
         form: "theme_and_variations",
         key_scheme: "home_only",
-        texture: "pad_broken_wave",
+        texture: "pad_broken_up",
         foreground_energy: 0.038705416,
         palette_bimodality: 0.0,
     },
@@ -96,14 +109,14 @@ const GOLDEN: [Golden; 6] = [
     Golden {
         form: "rounded_binary",
         key_scheme: "home_only",
-        texture: "pad_bed",
+        texture: "pad_broken_up",
         foreground_energy: 0.015574455,
         palette_bimodality: 0.0,
     },
     // AudioHaxImg1.jpg
     Golden {
         form: "rounded_binary",
-        key_scheme: "rounded_binary_excursion",
+        key_scheme: "home_only",
         texture: "pad_bed_counter",
         foreground_energy: 0.016607774,
         palette_bimodality: 0.0,
@@ -111,8 +124,8 @@ const GOLDEN: [Golden; 6] = [
     // AudioHaxImg2.jpg
     Golden {
         form: "rounded_binary",
-        key_scheme: "rounded_binary_excursion",
-        texture: "pad_bed_counter",
+        key_scheme: "home_only",
+        texture: "pad_broken_up",
         foreground_energy: 0.034058183,
         palette_bimodality: 0.0,
     },
@@ -120,14 +133,14 @@ const GOLDEN: [Golden; 6] = [
     Golden {
         form: "rounded_binary",
         key_scheme: "home_only",
-        texture: "pad_bed_counter",
+        texture: "pad_broken_up",
         foreground_energy: 0.023566082,
         palette_bimodality: 0.0,
     },
     // magicstudio-art.jpg  *** fe = 0.00308, BELOW the 0.015 floor — the `ge 0.015` term BITES here. ***
     Golden {
         form: "rounded_binary",
-        key_scheme: "home_only",
+        key_scheme: "rounded_binary_excursion",
         texture: "pad_bed",
         foreground_energy: 0.0030758698,
         palette_bimodality: 0.0,
