@@ -306,7 +306,13 @@ mod tests {
         };
         assert_eq!(find("sustained").kind, BassPatternKind::Sustained);
         assert_eq!(find("walking").kind, BassPatternKind::Walking);
-        assert_eq!(find("walking").density, 2);
+        // S102/FC-7: amended 2 -> 1 alongside the catalogue — a config-mirror round-trip
+        // assertion, not a musical pin. See the twin in `composition.rs`. The musical evidence
+        // for the value lives in
+        // `chord_engine::tests::s102_walking_bass_is_not_the_busiest_voice_at_shipped_density`,
+        // which reads the catalogue and asserts the FC-7 texture property the value exists to
+        // secure (it fails at density 2 and 4).
+        assert_eq!(find("walking").density, 1);
         assert_eq!(find("walking_q").density, 4);
         assert_eq!(find("pedal").kind, BassPatternKind::Pedal);
         assert_eq!(find("pedal").pedal_degree, 1);

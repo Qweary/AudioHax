@@ -1618,8 +1618,42 @@ fn s49_f5a_baseline(name: &str) -> f32 {
         // bundled fixture to 0.667 — still WELL ABOVE the 0.50 hard anti-fusion floor (the fundamental
         // guard is untouched; only the per-image slice-2 reference moves, exactly as the S62 refreshes
         // above did for a rhythm change). FLAGGED for §6/operator review as a 2.5 side-effect.
-        "AudioHaxImg3.jpg" => 0.667,
-        "magicstudio-art.jpg" => 0.660,
+        // S102 FC-7: baseline refreshed 0.667 -> 0.556. The `walking` bass pattern's density was
+        // lowered 2 -> 1 (assets/mappings.json `bass_pattern_catalogue`) per the Artistic
+        // Director's FC-7 ("the bass must not be the busiest voice") and the escalation-by-density
+        // directive, which REQUIRES a sparse baseline. Img3 routes to `walking`, so its bass drops
+        // from 2 onsets/step to 1 and its onset grid converges with the bed's on the steps where
+        // the bed also strikes once — which is precisely what F5a measures, so the drop is the
+        // metric working, not a bug.
+        //
+        // WHY THIS IS A REFRESH AND NOT A FLOOR BREACH: the new value 0.556 still clears the
+        // slice-2 HARD ANTI-FUSION FLOOR of 0.50, which is untouched. Only the per-image slice-2
+        // reference moves — exactly as the S62 refreshes and the S92 P2 2.5 refresh (0.743 ->
+        // 0.667, same image, same class of deliberate rhythm change) did before it.
+        //
+        // ⚠ FLAGGED FOR §6 / ARTISTIC-DIRECTOR EAR REVIEW. The drop (-0.111) exceeds the -0.050
+        // cross-platform FP tolerance, so this is a REAL convergence of the bass and bed grids,
+        // not matrix noise. The bass/bed pair converging does not threaten the MELODY's figure
+        // (F1/F2/F4 all still pass), and a bass that lands with the bed on the downbeat is
+        // idiomatic for the declared AMBIENT MIX ROLE — but that is a taste judgement this gate
+        // cannot render and I am not certifying it. If the ear rules the floor now reads as too
+        // still, the correct remedy is articulation/phase contrast between bass and bed (a
+        // chord_engine change), NOT raising `walking` back to a repetition-generating density 2.
+        "AudioHaxImg3.jpg" => 0.556,
+        // S102 FC-7: baseline refreshed 0.660 -> 0.601, and this one is a COMPOUND of two
+        // independent drops that must not be conflated:
+        //   (a) PRE-EXISTING STALENESS, NOT FROM THIS CHANGE (-0.022). With `walking` still at
+        //       density 2, this image measured 0.638, already below its stored 0.660 — it was
+        //       passing only on the -0.050 matrix tolerance (0.638 >= 0.610). Something earlier in
+        //       the tree (the uncommitted S99 whole-ensemble restoration is the likely candidate,
+        //       since it changes this image's programs) had already walked it back and the stored
+        //       baseline was never refreshed. ⚠ SURFACED FOR §2/§6 — it is not mine to attribute.
+        //   (b) THE S102 DENSITY CHANGE (-0.037). `walking` 2 -> 1 per FC-7; this image routes to
+        //       `walking`, so its bass grid converges with the bed's exactly as on Img3.
+        // Neither drop alone trips the gate; together they cross it (0.601 < 0.610). Still well
+        // clear of the slice-2 HARD ANTI-FUSION FLOOR of 0.50, which is untouched.
+        // ⚠ FLAGGED FOR §6 / ARTISTIC-DIRECTOR EAR REVIEW with the Img3 refresh above.
+        "magicstudio-art.jpg" => 0.601,
         // Any newly-routed image is held only to the slice-2 floor (0.50) — no per-image baseline
         // exists for it, so the baseline term is the floor itself (the assertion reduces to ≥0.50).
         _ => 0.50,

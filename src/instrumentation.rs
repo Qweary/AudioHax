@@ -135,7 +135,7 @@ pub struct RolePool {
 /// `#[serde(default)]` at the use site: an OLD `mappings.json` with no such key yields empty
 /// `roles`, which routes selection back to the whole-image `ensemble_catalogue` path — the
 /// back-compat floor.
-#[derive(Debug, Clone, PartialEq, Default, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct InstrumentationPools {
     /// Per-seat eligibility pools.
     #[serde(default)]
@@ -150,10 +150,37 @@ pub struct InstrumentationPools {
     /// scaled to zero.
     #[serde(default = "default_global_weight")]
     pub global_weight: f32,
+    /// S99 — route an image to the per-seat WILDCARD arm only when NO curated `instrumentation`
+    /// rule claimed it (see [`select_programs_live`]). `true` (the shipped default) makes
+    /// whole-ensemble selection the MAJORITY arm and per-seat draws the MINORITY arm; `false`
+    /// disables the wildcard entirely and every image takes its curated ensemble.
+    ///
+    /// `#[serde(default)]` = `true`, so a `mappings.json` with no such key gets the restored
+    /// majority/minority behaviour rather than silently keeping the B2-a regression.
+    #[serde(default = "default_wildcard_on_unclaimed")]
+    pub wildcard_on_unclaimed: bool,
 }
 
 fn default_global_weight() -> f32 {
     0.5
+}
+
+fn default_wildcard_on_unclaimed() -> bool {
+    true
+}
+
+/// Hand-written so `Default` and the serde defaults CANNOT drift apart. A derived `Default`
+/// would yield `global_weight: 0.0` and `wildcard_on_unclaimed: false` — neither of which is the
+/// shipped meaning of an absent key, and the second of which would silently disable the S99
+/// majority/minority split for any caller that built the block programmatically.
+impl Default for InstrumentationPools {
+    fn default() -> Self {
+        Self {
+            roles: Vec::new(),
+            global_weight: default_global_weight(),
+            wildcard_on_unclaimed: default_wildcard_on_unclaimed(),
+        }
+    }
 }
 
 impl InstrumentationPools {
@@ -309,6 +336,79 @@ pub fn select_programs(
         .collect()
 }
 
+/// True when some curated `instrumentation` rule EXPLICITLY claimed this image.
+///
+/// `SelectTable::select` collapses "a rule matched and picked X" with "no rule matched, so the
+/// table's `default` is X" — both return the same `String`. The S99 arm split needs to tell those
+/// two apart, so it re-runs the same first-match-wins scan and reports only whether a rule fired.
+/// Pure, allocation-free, and exactly the predicate `SelectTable::select` already uses, so the two
+/// cannot disagree about what "matched" means.
+pub fn image_is_claimed_by_a_curated_rule(
+    u: &ImageUnderstanding,
+    comp: &CompositionMappings,
+) -> bool {
+    comp.instrumentation
+        .rules
+        .iter()
+        .any(|r| r.when.iter().all(|p| p.holds(u)))
+}
+
+/// **S99 — THE LIVE SELECTION ENTRY POINT.** This is what a render calls; nothing else should.
+///
+/// Restores WHOLE-ENSEMBLE selection as the MAJORITY arm and keeps the S98/B2-a per-seat draws as
+/// a MINORITY WILDCARD arm.
+///
+/// # Why this exists
+///
+/// S98/B2-a repointed both `main.rs` call sites from [`select_programs`] (one atomic catalogue-row
+/// lookup) to [`select_programs_per_voice`] (four INDEPENDENT per-seat draws). The four draws are
+/// coupled through the shared `global_weight` term, so most curated combinations became
+/// arithmetically unreachable: measured over 599,781 sampled `(avg_brightness, 4 bands)`
+/// configurations, EIGHT of the nine catalogue rows scored ZERO hits — `neon_synth` among them —
+/// and only `ethereal_violet` survived, at 239 hits (0.04%). The existing suite stayed green
+/// because every non-`#[cfg(test)]` reference to [`select_programs`] was inside a branch that is
+/// unreachable on the shipped config: the tests covered a path the renders no longer took.
+///
+/// # The arm split
+///
+/// The wildcard fires **exactly when no curated rule claimed the image** — i.e. when the image
+/// fell through every `instrumentation` rule to the table's `default`. This is not a rate dialed
+/// to taste; it is the catalogue's own statement about its coverage. Where a rule fired, the
+/// catalogue has a considered opinion about how that image should sound and the ensemble is
+/// honoured verbatim. Where nothing fired, the catalogue has no opinion — and dumping every
+/// unclassified image into the single `default` row is precisely the between-piece flattening the
+/// wildcard is better at avoiding. Measured over a 983,040-point sweep of the six keying features,
+/// that is **6.40%** of the space (see the module tests), which keeps the split firmly
+/// majority-curated while leaving the wildcard genuinely live.
+///
+/// Two properties follow BY CONSTRUCTION rather than by tuning:
+///   * every ear-certified corpus image is claimed by an explicit rule, so all six golden program
+///     arrays are reproducible again — the wildcard cannot reach them at any parameter setting;
+///   * every routed catalogue row stays reachable across its whole routing region, so the wildcard
+///     carves no hole in curated coverage.
+///
+/// Set `instrumentation_pools.wildcard_on_unclaimed = false` to disable the wildcard entirely.
+pub fn select_programs_live(
+    u: &ImageUnderstanding,
+    comp: &CompositionMappings,
+    num_instruments: usize,
+    bands: &[BandFeatures],
+) -> Vec<u8> {
+    // MINORITY arm — no curated rule claimed this image, so the catalogue has no opinion about it
+    // and the per-seat draws are free to assort. Gated on the pool block so the wildcard cannot
+    // fire into an empty pool set (that would floor the whole piece to `(i*7)%128`).
+    if comp.instrumentation_pools.wildcard_on_unclaimed
+        && !comp.instrumentation_pools.roles.is_empty()
+        && !image_is_claimed_by_a_curated_rule(u, comp)
+    {
+        return select_programs_per_voice(u, comp, num_instruments, bands);
+    }
+    // MAJORITY arm — the curated ensemble, verbatim, as one indivisible unit. Band features are
+    // deliberately NOT consulted here: the ensemble is the piece's sonic identity, and letting
+    // per-band brightness perturb it is exactly what made 8 of 9 rows unreachable.
+    select_programs(u, comp, num_instruments)
+}
+
 /// S98/B2-a — resolve the per-voice GM program vector with **one independent selection event per
 /// voice** over the per-seat eligibility pools.
 ///
@@ -342,6 +442,25 @@ pub fn select_programs_per_voice(
     bands: &[BandFeatures],
 ) -> Vec<u8> {
     // Capability floor: no per-voice input, or no pool data → the whole-image catalogue path.
+    //
+    // S99 RULING on these two branches. A prior audit flagged both as DEAD on the shipped config
+    // and it was RIGHT on the facts: `main.rs` feeds `voice_bands(..)`, which returns exactly
+    // `instrument_count` entries whenever the source has steps, and the shipped `mappings.json`
+    // defines all three role pools — so on the live path neither branch could be taken, and
+    // `select_programs` had no live caller anywhere outside `#[cfg(test)]`. That is precisely why
+    // the suite stayed green through the B2-a regression: the golden-array tests exercised a
+    // function the renders no longer reached.
+    //
+    // They are KEPT, and they are no longer load-bearing for reachability. The audit's implicit
+    // remedy — make this fallback live — would have been the wrong fix: it is a CAPABILITY floor
+    // ("no per-voice input exists"), not a coherence policy, and routing ensemble selection
+    // through a degradation path would have made the curated catalogue an accident of missing
+    // data. The real remedy is upstream: `select_programs_live` now calls `select_programs`
+    // DIRECTLY as the majority arm, so the catalogue path is unambiguously live and independently
+    // tested. These two branches revert to what they were always meant to be — a total-function
+    // guard against a caller that hands over a short/absent band slice or an old `mappings.json`.
+    // They remain unreachable on shipped config BY DESIGN, and that is now a safe property rather
+    // than a hidden single point of failure.
     if bands.len() != num_instruments || num_instruments == 0 {
         return select_programs(u, comp, num_instruments);
     }
@@ -413,15 +532,15 @@ pub fn select_programs_per_voice(
             let pool = pools.pool(seat_for(b, num_instruments)).unwrap_or(&[]);
             let want = entry(b, idx[b]).sustain;
             let bass = entry(a, idx[a]).program;
-            if let Some(k) = nearest(pool, idx[b], |e| {
-                e.sustain == want && e.program != bass
-            }) {
+            if let Some(k) = nearest(pool, idx[b], |e| e.sustain == want && e.program != bass) {
                 idx[b] = k;
             }
         }
     }
 
-    (0..num_instruments).map(|i| entry(i, idx[i]).program).collect()
+    (0..num_instruments)
+        .map(|i| entry(i, idx[i]).program)
+        .collect()
 }
 
 #[cfg(test)]
@@ -611,7 +730,14 @@ mod tests {
     #[test]
     fn empty_bands_reproduces_whole_image_path() {
         let c = comp();
-        for u in [u_img1(), u_img2(), u_img3(), u_example(), u_lena(), u_magic()] {
+        for u in [
+            u_img1(),
+            u_img2(),
+            u_img3(),
+            u_example(),
+            u_lena(),
+            u_magic(),
+        ] {
             assert_eq!(
                 select_programs_per_voice(&u, &c, 4, &[]),
                 select_programs(&u, &c, 4),
@@ -668,7 +794,10 @@ mod tests {
         let u = u_img1();
         let a = select_programs_per_voice(&u, &c, 4, &bands([10.0, 40.0, 70.0, 90.0]));
         let b = select_programs_per_voice(&u, &c, 4, &bands([90.0, 70.0, 40.0, 10.0]));
-        assert_ne!(a, b, "band permutation must change the vector (else hollow)");
+        assert_ne!(
+            a, b,
+            "band permutation must change the vector (else hollow)"
+        );
     }
 
     /// **C1 (hard) — tessitura eligibility is enforced by pool membership**, so no draw can seat a
@@ -678,10 +807,26 @@ mod tests {
     fn c1_tessitura_pool_membership_is_the_guard() {
         let c = comp();
         let p = &c.instrumentation_pools;
-        let bass: Vec<u8> = p.pool(Seat::Bass).unwrap().iter().map(|e| e.program).collect();
-        let mel: Vec<u8> = p.pool(Seat::Melody).unwrap().iter().map(|e| e.program).collect();
-        assert!(!bass.contains(&72), "piccolo must not be reachable in the bass seat");
-        assert!(mel.contains(&72), "piccolo is an ordinary melody-seat program");
+        let bass: Vec<u8> = p
+            .pool(Seat::Bass)
+            .unwrap()
+            .iter()
+            .map(|e| e.program)
+            .collect();
+        let mel: Vec<u8> = p
+            .pool(Seat::Melody)
+            .unwrap()
+            .iter()
+            .map(|e| e.program)
+            .collect();
+        assert!(
+            !bass.contains(&72),
+            "piccolo must not be reachable in the bass seat"
+        );
+        assert!(
+            mel.contains(&72),
+            "piccolo is an ordinary melody-seat program"
+        );
         // And no draw, over a wide sweep of band structures, escapes its pool.
         for k in 0..64 {
             let b = bands([
@@ -777,6 +922,246 @@ mod tests {
             assert_eq!(got.len(), n, "must fill exactly n voices");
         }
         assert!(select_programs_per_voice(&u_img1(), &c, 0, &[]).is_empty());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // S99 — whole-ensemble MAJORITY arm / per-seat WILDCARD minority arm
+    //
+    // These tests exercise `select_programs_live`, which is what `main.rs` calls. Everything
+    // above this banner that tests `select_programs` exercises a path the renders did NOT take
+    // between b617d07 and this change — which is exactly why a green suite failed to catch the
+    // regression, and why a green suite is not on its own evidence for anything here.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// **THE LIVE-PATH REGRESSION GUARD — the test that fails before the S99 fix and passes after.**
+    ///
+    /// The six corpus images are ear-certified: their program arrays are the approved sound, as
+    /// data. Under S98/B2-a the LIVE path could not reproduce a single one of them, because the
+    /// four per-seat draws are coupled through `global_weight` and the curated combinations became
+    /// arithmetically unreachable (8 of 9 rows measured at ZERO hits over 599,781 configs).
+    ///
+    /// Band features are supplied — and swept — deliberately: every real render HAS them, so a
+    /// test that omitted them would take the empty-`bands` capability floor and pass vacuously
+    /// against a broken live path. Sweeping them also pins the load-bearing property of the
+    /// majority arm: an image claimed by a curated rule gets its ensemble REGARDLESS of band
+    /// structure. The ensemble is the identity; the bands do not get a vote on it.
+    #[test]
+    fn live_path_reproduces_the_six_ear_certified_ensembles() {
+        let c = comp();
+        let cases: [(ImageUnderstanding, Vec<u8>, &str); 6] = [
+            (u_img1(), vec![70, 60, 69, 71], "Img1 dark_reeds"),
+            (u_img2(), vec![58, 61, 57, 56], "Img2 bright_brass"),
+            (u_img3(), vec![32, 46, 6, 24], "Img3 warm_plucked"),
+            (u_example(), vec![12, 11, 13, 9], "example cool_mallets"),
+            (u_lena(), vec![42, 48, 41, 40], "Lena lush_strings"),
+            (u_magic(), vec![89, 52, 8, 10], "magic ethereal_violet"),
+        ];
+        for b in [
+            [10.0, 40.0, 70.0, 90.0],
+            [90.0, 70.0, 40.0, 10.0],
+            [50.0, 50.0, 50.0, 50.0],
+            [0.0, 33.0, 66.0, 99.0],
+            [88.0, 12.0, 61.0, 27.0],
+        ] {
+            for (u, want, name) in &cases {
+                assert_eq!(
+                    &select_programs_live(u, &c, 4, &bands(b)),
+                    want,
+                    "{name}: live path lost the ear-certified ensemble on bands {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Every image in the six-image corpus is CLAIMED by an explicit curated rule — which is why
+    /// the guard above holds by construction and not by parameter tuning. The wildcard arm cannot
+    /// reach an ear-certified image at any setting, because it is gated on the absence of a match.
+    #[test]
+    fn every_corpus_image_is_claimed_by_a_curated_rule() {
+        let c = comp();
+        for (u, name) in [
+            (u_img1(), "Img1"),
+            (u_img2(), "Img2"),
+            (u_img3(), "Img3"),
+            (u_example(), "example"),
+            (u_lena(), "Lena"),
+            (u_magic(), "magic"),
+        ] {
+            assert!(
+                image_is_claimed_by_a_curated_rule(&u, &c),
+                "{name} fell through to the default arm — it would take the wildcard"
+            );
+        }
+    }
+
+    /// **The wildcard arm is genuinely LIVE.** An image that no curated rule claims must take the
+    /// per-seat path and must respond to band structure — otherwise the "minority arm" is just
+    /// dead code and the change is a plain revert rather than the ordered split that was asked for.
+    #[test]
+    fn unclaimed_images_take_the_per_seat_wildcard_arm() {
+        let c = comp();
+        // A mid-everything warm image: matches no splitter, falls to `default` (`warm_plucked`).
+        let u = u_with(60.0, 50.0, 0.30, 0.20, 40.0, 0.50);
+        assert!(
+            !image_is_claimed_by_a_curated_rule(&u, &c),
+            "fixture must be unclaimed"
+        );
+
+        let a = select_programs_live(&u, &c, 4, &bands([10.0, 40.0, 70.0, 90.0]));
+        let b = select_programs_live(&u, &c, 4, &bands([90.0, 70.0, 40.0, 10.0]));
+        assert_eq!(
+            a,
+            select_programs_per_voice(&u, &c, 4, &bands([10.0, 40.0, 70.0, 90.0]))
+        );
+        assert_ne!(a, b, "wildcard arm must respond to band structure");
+        assert_ne!(
+            a,
+            select_programs(&u, &c, 4),
+            "wildcard arm must not collapse back onto the default catalogue row"
+        );
+    }
+
+    /// The wildcard is a MINORITY arm, and that proportion is a tested contract rather than a
+    /// comment. Swept over the six keying features; asserts the claimed ~6.4% and, more
+    /// importantly, that the majority arm is overwhelmingly the curated one.
+    #[test]
+    fn wildcard_is_a_minority_of_the_keying_feature_space() {
+        let c = comp();
+        let (mut unclaimed, mut total) = (0u64, 0u64);
+        for hi in 0..24 {
+            for bi in 0..10 {
+                for ei in 0..8 {
+                    for ci in 0..8 {
+                        for si in 0..8 {
+                            for xi in 0..8 {
+                                let u = u_with(
+                                    hi as f32 * 15.0,
+                                    bi as f32 * 11.0,
+                                    ei as f32 / 7.0,
+                                    ci as f32 / 7.0,
+                                    si as f32 * 14.0,
+                                    xi as f32 / 7.0,
+                                );
+                                total += 1;
+                                if !image_is_claimed_by_a_curated_rule(&u, &c) {
+                                    unclaimed += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let share = unclaimed as f64 / total as f64;
+        assert!(
+            (0.01..0.20).contains(&share),
+            "wildcard share {share:.4} left the minority band — the split is no longer \
+             majority-curated (or the wildcard has gone dead)"
+        );
+        assert!(
+            (share - 0.064).abs() < 0.01,
+            "wildcard share {share:.4} drifted from the documented 6.40%"
+        );
+    }
+
+    /// **`neon_synth` reachability — measured, not asserted.** It scored EXACTLY ZERO on the live
+    /// path under S98/B2-a. Sweep the live entry point over the keying-feature grid and count the
+    /// configurations that actually realize its program array.
+    #[test]
+    fn neon_synth_is_reachable_on_the_live_path() {
+        let c = comp();
+        let want: Vec<u8> = c
+            .ensemble_catalogue
+            .iter()
+            .find(|e| e.id == "neon_synth")
+            .expect("neon_synth is in the catalogue")
+            .programs
+            .clone();
+        let b = bands([23.0, 57.0, 41.0, 78.0]);
+        let (mut hits, mut total) = (0u64, 0u64);
+        for hi in 0..24 {
+            for bi in 0..10 {
+                for ei in 0..8 {
+                    for ci in 0..8 {
+                        let u = u_with(
+                            hi as f32 * 15.0,
+                            bi as f32 * 11.0,
+                            ei as f32 / 7.0,
+                            ci as f32 / 7.0,
+                            50.0,
+                            0.5,
+                        );
+                        total += 1;
+                        if select_programs_live(&u, &c, 4, &b) == want {
+                            hits += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            hits > 0,
+            "neon_synth still unreachable on the live path ({hits}/{total})"
+        );
+        // Well clear of zero, not a single lucky cell.
+        assert!(
+            hits as f64 / total as f64 > 0.01,
+            "neon_synth reachable but vanishingly so: {hits}/{total}"
+        );
+    }
+
+    /// EVERY routed catalogue row must be reachable on the LIVE path — the general form of the
+    /// `neon_synth` case. Under S98/B2-a this held for exactly one row out of nine.
+    #[test]
+    fn every_routed_ensemble_is_reachable_on_the_live_path() {
+        let c = comp();
+        let b = bands([23.0, 57.0, 41.0, 78.0]);
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        // Every keying feature must VARY — `lush_strings` is gated on `texture < 0.3` and
+        // `avg_saturation >= 45`, so a sweep that pins either knob reports it unreachable and the
+        // test lies about the code.
+        for hi in 0..36 {
+            for bi in 0..12 {
+                for ei in 0..6 {
+                    for ci in 0..6 {
+                        for si in 0..6 {
+                            for xi in 0..6 {
+                                let u = u_with(
+                                    hi as f32 * 10.0,
+                                    bi as f32 * 9.0,
+                                    ei as f32 / 5.0,
+                                    ci as f32 / 5.0,
+                                    si as f32 * 20.0,
+                                    xi as f32 / 5.0,
+                                );
+                                seen.insert(select_programs_live(&u, &c, 4, &b));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Only rows an explicit RULE can pick are guaranteed on the majority arm. A row reachable
+        // solely as the table's `default` is, under S99, exactly the case the wildcard arm now
+        // serves, so it is deliberately outside this guarantee. (`warm_plucked` is both, and is
+        // therefore still covered here.)
+        let rule_picks: Vec<&str> = c
+            .instrumentation
+            .rules
+            .iter()
+            .map(|r| r.pick.as_str())
+            .collect();
+        for e in &c.ensemble_catalogue {
+            if !rule_picks.contains(&e.id.as_str()) {
+                continue; // staged-but-unrouted, or default-only, rows are outside the guarantee
+            }
+            assert!(
+                seen.contains(&e.programs),
+                "{} unreachable on the live path ({:?})",
+                e.id,
+                e.programs
+            );
+        }
     }
 
     /// Every program of every ROUTED `ensemble_catalogue` row must be reachable in its own seat's

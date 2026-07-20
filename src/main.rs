@@ -485,11 +485,12 @@ fn run_render_wav(
     //    constant (matches the per-channel-at-t=0 emission model). ──
     #[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
     let programs: Vec<u8> = match mappings.composition.as_ref() {
-        // S98/B2-a: ONE INDEPENDENT DRAW PER VOICE over that voice's seat pool, keyed on that
-        // voice's own image band (deviation-coded against the image mean). Falls back to the
-        // whole-image `ensemble_catalogue` path byte-identically when no pool data or no band
-        // features exist — a CAPABILITY floor, not a per-piece gate.
-        Some(comp) => audiohax::instrumentation::select_programs_per_voice(
+        // S99: WHOLE-ENSEMBLE selection is the MAJORITY arm — an image claimed by a curated
+        // `instrumentation` rule gets that catalogue row verbatim, so the ensemble stays the
+        // piece's sonic identity and the six ear-certified goldens reproduce. The S98/B2-a
+        // per-seat draws survive as the MINORITY WILDCARD arm, firing only on images no curated
+        // rule claimed (~6.4% of the keying-feature space). See `select_programs_live`.
+        Some(comp) => audiohax::instrumentation::select_programs_live(
             &understanding,
             comp,
             instrument_count,
@@ -826,11 +827,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    live `understanding` only. Absent/empty axis ⇒ every voice == legacy `(i*7)%128`. ──
     #[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
     let programs: Vec<u8> = match mappings.composition.as_ref() {
-        // S98/B2-a: ONE INDEPENDENT DRAW PER VOICE over that voice's seat pool, keyed on that
-        // voice's own image band (deviation-coded against the image mean). Falls back to the
-        // whole-image `ensemble_catalogue` path byte-identically when no pool data or no band
-        // features exist — a CAPABILITY floor, not a per-piece gate.
-        Some(comp) => audiohax::instrumentation::select_programs_per_voice(
+        // S99: WHOLE-ENSEMBLE selection is the MAJORITY arm — an image claimed by a curated
+        // `instrumentation` rule gets that catalogue row verbatim, so the ensemble stays the
+        // piece's sonic identity and the six ear-certified goldens reproduce. The S98/B2-a
+        // per-seat draws survive as the MINORITY WILDCARD arm, firing only on images no curated
+        // rule claimed (~6.4% of the keying-feature space). See `select_programs_live`.
+        Some(comp) => audiohax::instrumentation::select_programs_live(
             &understanding,
             comp,
             instrument_count,

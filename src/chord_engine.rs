@@ -10524,6 +10524,132 @@ mod tests {
         );
     }
 
+    /// **S102 / FC-7 — THE BASS IS NOT THE BUSIEST VOICE IN THE TEXTURE.**
+    ///
+    /// FC-7 states the artistic constraint negatively: "the bass is the busiest voice in the
+    /// texture" must be FALSE. This test asserts exactly that, on a REALIZED four-role texture,
+    /// at whatever `walking` density `assets/mappings.json` currently ships.
+    ///
+    /// WHY THIS SHAPE, AND NOT AN INTRA-STEP CONNECTEDNESS CHECK: harmonic rhythm here is one
+    /// chord per beat (`plan_phrases_scheme` emits one `StepPlan` per chord), so at density 1 the
+    /// `walking` generator emits exactly ONE onset per step (`let n = density.max(1)`). Any
+    /// property phrased over ADJACENT onsets WITHIN a step — connectedness, no-immediate-
+    /// repetition, direction — is structurally untestable at the shipped value: there is no
+    /// adjacent pair to compare. A `windows(2)` check there makes zero comparisons and passes
+    /// vacuously. The predecessor of this test did precisely that. The property that IS real at
+    /// density 1 is a CROSS-VOICE one, and it is the property the direction actually cares about.
+    ///
+    /// WHERE THE CONSTRAINT BINDS: the bass arm is exempt from the Pad's `recede_pad_onsets`
+    /// governor and is uncapped, so its onset count scales linearly with density while the other
+    /// voices do not. The other voices are SPARSEST on a calm image (a sustained melody), so the
+    /// calm/ambient end — the declared idiom for this mix role — is where a dense bass first
+    /// takes over the texture. The test therefore sweeps image busyness and requires the property
+    /// to hold at every point, which is what makes a density regression visible: measured onset
+    /// totals over this progression are
+    ///
+    ///   calm: bass 7/14/28 at density 1/2/4 vs busiest other voice 14
+    ///   mid:  bass 7/14/28                  vs busiest other voice 18
+    ///   busy: bass 7/14/28                  vs busiest other voice 23
+    ///
+    /// so density 2 makes the bass CO-BUSIEST on a calm image (14 vs 14) and density 4 makes it
+    /// the outright busiest everywhere. Both regressions fail this test. Density 1 leaves the
+    /// bass at or below every other voice with real headroom — the sparse baseline that
+    /// escalation-by-density requires, since escalation has nowhere to go from a bass that is
+    /// already leading the texture.
+    ///
+    /// The shipped density is READ from the catalogue rather than asserted against a literal:
+    /// this test tracks the config instead of mirroring it, and carries evidence for the musical
+    /// consequence of the value rather than restating the value.
+    ///
+    /// NOTE ON THE PATTERN'S NAME: at density 1 this emits one root per chord. This test asserts
+    /// nothing about that line "walking"; it asserts only its weight in the texture.
+    #[test]
+    fn s102_walking_bass_is_not_the_busiest_voice_at_shipped_density() {
+        // The shipped `walking` spec, read whole from the catalogue so the test tracks the config.
+        let shipped = crate::mapping_loader::load_mappings("assets/mappings.json")
+            .expect("mappings.json loads")
+            .composition
+            .expect("composition block")
+            .bass_pattern_catalogue
+            .iter()
+            .find(|b| b.id == "walking")
+            .expect("`walking` is in the bass pattern catalogue")
+            .clone();
+
+        // A progression with real diatonic root motion — the walking generator's live input.
+        let chords: Vec<(&str, Vec<u8>)> = vec![
+            ("I", vec![60, 64, 67]),
+            ("IV", vec![65, 69, 72]),
+            ("V", vec![67, 71, 74]),
+            ("vi", vec![69, 72, 76]),
+            ("ii", vec![62, 65, 69]),
+            ("V", vec![67, 71, 74]),
+            ("I", vec![60, 64, 67]),
+        ];
+
+        // Sweep image busyness: the other voices thin out toward the calm/ambient end, so this is
+        // where an over-dense bass first becomes the busiest voice.
+        for (image, edge_density) in [("calm", 0.004f32), ("mid", 0.02), ("busy", 0.045)] {
+            let features = PerfFeatures {
+                saturation: 40.0,
+                brightness: 45.0,
+                edge_density,
+            };
+            let steps: Vec<StepPlan> = chords
+                .iter()
+                .enumerate()
+                .map(|(i, (name, notes))| {
+                    s34_step(
+                        Chord {
+                            name: name.to_string(),
+                            notes: notes.clone(),
+                        },
+                        i + 1,
+                    )
+                })
+                .collect();
+            let (section, kt) = s34_section(steps, s34_profile(None, Some(shipped.clone())));
+
+            // Onsets per role over the whole progression. inst 0 == Bass, 1 == Pad,
+            // 2 == HarmonicFill, 3 == Melody (the `s34_profile` layer order).
+            let mut onsets = [0usize; 4];
+            for (inst, slot) in onsets.iter_mut().enumerate() {
+                for si in 0..section.steps.len() {
+                    let ctx = StepContext {
+                        section: &section,
+                        key_tempo: &kt,
+                        step_in_section: si,
+                        theme: None,
+                        prev_key_offset_semitones: None,
+                    };
+                    *slot += realize_step(
+                        &section.steps[si],
+                        inst,
+                        4,
+                        &features,
+                        section.ms_per_step,
+                        &ctx,
+                    )
+                    .len();
+                }
+            }
+            let [bass, pad, fill, melody] = onsets;
+            let busiest_other = pad.max(fill).max(melody);
+
+            assert!(
+                bass < busiest_other,
+                "FC-7 VIOLATED on a {image} image at `walking` density {}: the Bass sounds \
+                 {bass} onsets against a busiest other voice of {busiest_other} \
+                 (Pad {pad}, HarmonicFill {fill}, Melody {melody}), so the bass is the busiest \
+                 — or co-busiest — voice in the texture. FC-7 requires that to be FALSE. The \
+                 bass arm is uncapped (no `recede_pad_onsets` governor), so density scales it \
+                 linearly while the other voices hold; density 1 is the value that keeps the \
+                 bass under the texture AND leaves escalation-by-density somewhere to go.",
+                shipped.density
+            );
+        }
+    }
+
     /// Every walking onset is DIATONIC to the section scale — NO chromatic approach this slice
     /// (OD-2: diatonic-only). C major scale pcs = {0,2,4,5,7,9,11}.
     #[test]
