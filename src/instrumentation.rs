@@ -686,12 +686,20 @@ mod tests {
         assert_eq!(select_programs(&u_img1(), &c, 4), vec![0, 7, 14, 21]);
     }
 
-    /// 6a.6 — DEFAULT ARM. A synthetic warm image matching NO splitter (mid-bright, mid-edge,
+    /// 6a.6 — DEFAULT ARM. A synthetic warm image matching NO splitter (upper-mid-bright, mid-edge,
     /// mid-texture, warm-but-not-red hue) resolves to the `default` `warm_plucked`.
+    ///
+    /// S104: `avg_brightness` is 62 (was 50). The S104 `neon_signature` rule
+    /// (`avg_saturation ≥ 36 AND avg_brightness < 60`) is hue-agnostic and now claims the
+    /// saturated-dark synthetic region, so the old sat-40/bri-50 fixture routes to `neon_synth`.
+    /// bri 62 (≥ 60) sits ABOVE the neon window, so it still falls through every splitter to the
+    /// default — preserving this test's purpose (an uncategorized warm image → `warm_plucked`).
+    /// This is the expected general-corpus footprint §8's ruling flagged; the real art corpus is
+    /// unchanged (see `six_golden_program_arrays` / `s104_neon_signature_routes_smashbob_cues_not_corpus`).
     #[test]
     fn default_arm_catches_uncategorized_warm() {
         let c = comp();
-        let u = u_with(60.0, 50.0, 0.30, 0.20, 40.0, 0.50);
+        let u = u_with(60.0, 62.0, 0.30, 0.20, 40.0, 0.50);
         assert_eq!(c.instrumentation.select(&u), "warm_plucked");
         assert_eq!(select_programs(&u, &c, 4), vec![32, 46, 6, 24]);
     }
@@ -1000,8 +1008,11 @@ mod tests {
     #[test]
     fn unclaimed_images_take_the_per_seat_wildcard_arm() {
         let c = comp();
-        // A mid-everything warm image: matches no splitter, falls to `default` (`warm_plucked`).
-        let u = u_with(60.0, 50.0, 0.30, 0.20, 40.0, 0.50);
+        // A warm image that matches no splitter, falls to `default` (`warm_plucked`), so it is
+        // unclaimed and takes the wildcard arm. S104: bri is 62 (was 50) so it sits ABOVE the new
+        // hue-agnostic `neon_signature` window (`avg_saturation ≥ 36 AND avg_brightness < 60`),
+        // which now claims the saturated-dark synthetic region.
+        let u = u_with(60.0, 62.0, 0.30, 0.20, 40.0, 0.50);
         assert!(
             !image_is_claimed_by_a_curated_rule(&u, &c),
             "fixture must be unclaimed"
@@ -1021,9 +1032,153 @@ mod tests {
         );
     }
 
+    /// **S104 — NEON-SIGNATURE ROUTING GUARD (Music Theory §3, from Perceptual/§8's ruling).**
+    ///
+    /// The four SmashBob cues are frames of ONE neon/synthwave game, and the operator approved a
+    /// single `neon_synth` ensemble across all four (Arm B). But their hue centroids scatter across
+    /// the whole wheel (33°, 71°, 76°, 327°) because `dominant_hue` is an UNWEIGHTED circular mean
+    /// and these are low-key frames — the dark ground's hue outvotes the neon accent. So the shipped
+    /// `neon_synth` HUE gate (`dominant_hue ∈ [240,300) AND avg_saturation ≥ 50`) catches only ONE
+    /// of the four. Neon is a `saturation-on-dark` signature, NOT a hue: what unifies the four cues
+    /// is `avg_saturation` in a tight 39–64 band over `avg_brightness` 11–56. §8's hue-agnostic rule
+    /// (`avg_saturation ≥ 36 AND avg_brightness < 60`), placed AFTER every hue-zone rule, routes 4/4
+    /// with ZERO non-SmashBob overshoot — measured.
+    ///
+    /// This guard is deliberately built the way the last three false greens were NOT:
+    ///   * it calls the LIVE entry point [`select_programs_live`] (what `main.rs:506/906` calls),
+    ///     not the `#[cfg(test)]`-reachable-only `select_programs`;
+    ///   * it loads the REAL shipped `assets/mappings.json` via `comp()`, not an inline rule table;
+    ///   * it is BIDIRECTIONAL — 4 cues IN (must be `neon_synth`), 6 corpus OUT (must NOT be) — so no
+    ///     single tautological predicate satisfies it, and any rule wide enough to steal a corpus
+    ///     image fails assertion B;
+    ///   * it locks the load-bearing ORDER via the two nearest misses (`example` sits inside the raw
+    ///     sat/bri neon window and is saved ONLY by `cool_mallets`' hue zone preceding the new rule;
+    ///     `magicstudio` is the violet-zone neighbor) — assertion C fails if the neon rule is placed
+    ///     above any hue-zone rule.
+    ///
+    /// Cue feature vectors are §8's independently-measured `understand_image_pure` outputs (from
+    /// `s104-hue-feature-ruling.md` §2/§3.3, cross-checked against a 13/13-faithful routing model).
+    /// The expected `neon_synth` program vector is derived from the loaded catalogue by id so it
+    /// cannot drift from the shipped data. Bands are swept because the majority arm must return the
+    /// ensemble REGARDLESS of band structure — the ensemble is the identity, the bands do not vote.
+    ///
+    /// RED before the `mappings.json` neon-signature rule is added (the four cues route
+    /// `dark_reeds`/`dark_reeds`/`warm_plucked`/`dark_reeds` → assertion A fails); GREEN after.
+    /// Assertions B and C are GREEN in both states — a diff that turns any of them red is the fix
+    /// overshooting the corpus.
+    #[test]
+    fn s104_neon_signature_routes_smashbob_cues_not_corpus() {
+        let c = comp();
+
+        // Expected catalogue rows, resolved by id from the REAL shipped catalogue (no hardcoded
+        // program bytes — the routing is what is under test, not the vector's content).
+        let cat = |id: &str| -> Vec<u8> {
+            c.ensemble_catalogue
+                .iter()
+                .find(|e| e.id == id)
+                .unwrap_or_else(|| panic!("catalogue must define `{id}`"))
+                .programs
+                .clone()
+        };
+        let neon = cat("neon_synth");
+        assert_eq!(neon.len(), 4, "neon_synth must be a 4-voice ensemble");
+
+        // Band structures swept to prove the majority arm ignores per-band brightness (an image
+        // claimed by a curated rule gets its ensemble verbatim regardless of band structure).
+        let sweeps = [
+            [10.0, 40.0, 70.0, 90.0],
+            [90.0, 70.0, 40.0, 10.0],
+            [50.0, 50.0, 50.0, 50.0],
+            [0.0, 33.0, 66.0, 99.0],
+        ];
+
+        // ── A. The four SmashBob cues MUST route to `neon_synth` (§8-measured features) ──
+        // (hue, bri, edge, cfl, sat, tex)
+        let cues: [(ImageUnderstanding, &str); 4] = [
+            (
+                u_with(76.047, 11.756, 0.1237, 0.2233, 63.687, 0.0461),
+                "title",
+            ),
+            (
+                u_with(32.709, 11.278, 0.2896, 0.4813, 38.930, 0.0228),
+                "gameplay_low",
+            ),
+            (
+                u_with(326.791, 56.274, 0.5724, 0.5131, 49.634, 0.0982),
+                "gameplay_high",
+            ),
+            (
+                u_with(70.968, 34.038, 0.7677, 0.4735, 54.430, 0.0474),
+                "death",
+            ),
+        ];
+        for b in sweeps {
+            for (u, name) in &cues {
+                assert_eq!(
+                    &select_programs_live(u, &c, 4, &bands(b)),
+                    &neon,
+                    "cue `{name}` must route to neon_synth on the LIVE path (bands {b:?})"
+                );
+            }
+        }
+
+        // ── B. THE OVERSHOOT GUARD — every non-SmashBob corpus image must NOT route to neon ──
+        // (uses the existing measured corpus fixtures u_img1..u_magic)
+        let corpus: [(ImageUnderstanding, &str); 6] = [
+            (u_example(), "example"),
+            (u_magic(), "magicstudio"),
+            (u_img1(), "audiohax_1"),
+            (u_img2(), "audiohax_2"),
+            (u_img3(), "audiohax_3"),
+            (u_lena(), "lena"),
+        ];
+        for b in sweeps {
+            for (u, name) in &corpus {
+                assert_ne!(
+                    &select_programs_live(u, &c, 4, &bands(b)),
+                    &neon,
+                    "OVERSHOOT: corpus image `{name}` must NOT route to neon_synth (bands {b:?})"
+                );
+            }
+        }
+
+        // ── C. ORDER LOCK — the two nearest misses are inside/beside the neon window and are safe
+        // ONLY because their hue-zone rule precedes the new sat/bri rule. Pin them to their own
+        // ensembles both by resolved id (readable "why") and by the live program vector. If the
+        // neon-signature rule is ever placed above a hue-zone rule, these flip and this fails.
+        assert_eq!(
+            c.instrumentation.select(&u_example()),
+            "cool_mallets",
+            "example (raw sat/bri in the neon window) must be pre-claimed by its hue zone"
+        );
+        assert_eq!(
+            c.instrumentation.select(&u_magic()),
+            "ethereal_violet",
+            "magicstudio (violet-zone neighbor) must be pre-claimed by its hue zone"
+        );
+        for b in sweeps {
+            assert_eq!(
+                select_programs_live(&u_example(), &c, 4, &bands(b)),
+                cat("cool_mallets"),
+                "example must keep cool_mallets on the live path (bands {b:?})"
+            );
+            assert_eq!(
+                select_programs_live(&u_magic(), &c, 4, &bands(b)),
+                cat("ethereal_violet"),
+                "magicstudio must keep ethereal_violet on the live path (bands {b:?})"
+            );
+        }
+    }
+
     /// The wildcard is a MINORITY arm, and that proportion is a tested contract rather than a
-    /// comment. Swept over the six keying features; asserts the claimed ~6.4% and, more
+    /// comment. Swept over the six keying features; asserts the claimed ~5.1% and, more
     /// importantly, that the majority arm is overwhelmingly the curated one.
+    ///
+    /// S104: the documented share moved 6.40% → 5.10% because the hue-agnostic `neon_signature`
+    /// rule (`avg_saturation ≥ 36 AND avg_brightness < 60`) claims ~1.3% more of the synthetic
+    /// keying-feature grid than the rules it sits among. The load-bearing property — the wildcard
+    /// stays a MINORITY (still inside the 0.01..0.20 band) and the majority arm is overwhelmingly
+    /// curated — is unchanged and, if anything, strengthened.
     #[test]
     fn wildcard_is_a_minority_of_the_keying_feature_space() {
         let c = comp();
@@ -1059,8 +1214,8 @@ mod tests {
              majority-curated (or the wildcard has gone dead)"
         );
         assert!(
-            (share - 0.064).abs() < 0.01,
-            "wildcard share {share:.4} drifted from the documented 6.40%"
+            (share - 0.051).abs() < 0.01,
+            "wildcard share {share:.4} drifted from the documented 5.10% (S104 neon_signature)"
         );
     }
 
