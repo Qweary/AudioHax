@@ -219,6 +219,18 @@ pub struct RenderArgs {
     /// `thread_rng()` behavior. Opt-in only.
     #[arg(long, value_name = "U64")]
     pub seed: Option<u64>,
+    /// Emit a SEAMLESSLY LOOPING cue: trim the render to the musical loop period
+    /// (`total_steps * grid_ms_per_step`) and wrap-fold the ring-out past that boundary back
+    /// onto the head, which is what an infinitely repeating loop sums to in steady state.
+    /// Without this flag the render boundary is `last_NoteOff + 1.5 s` — unrelated to the
+    /// musical period — so the file ends in dead air and restarts hard when looped.
+    ///
+    /// OFF by default and BYTE-IDENTICAL to the pre-existing path when absent: the longer
+    /// render tail this needs is applied ONLY on the loop path, so non-loop renders (and
+    /// every sealed golden) keep their exact bytes. Requires unity `--gain` — the soft-clip
+    /// is nonlinear, and the fold's exactness argument requires linearity.
+    #[arg(long = "loop", default_value_t = false)]
+    pub loop_cue: bool,
     #[command(flatten)]
     pub pipeline: PipelineArgs,
     #[command(flatten)]

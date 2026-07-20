@@ -404,6 +404,19 @@ fn run_render_wav(
         render_events_to_stereo, write_stereo_wav, SoundFontSource, SynthConfig,
     };
 
+    // The wrap-fold sums the ring-out onto the head, which is only the steady state of a
+    // repeating loop if the render path is LINEAR. `apply_gain_softclip` is `tanh` at
+    // non-unity gain, and `tanh(a) + tanh(b) != tanh(a + b)` — so refuse rather than emit a
+    // loop whose seam is quietly wrong.
+    if render_args.loop_cue && render_args.audio.gain != 1.0 {
+        return Err(format!(
+            "--loop requires unity --gain (got {}): the soft-clip is nonlinear, so folding the \
+             ring-out onto the head would no longer reproduce a repeating loop's steady state.",
+            render_args.audio.gain
+        )
+        .into());
+    }
+
     let mappings = load_mappings("assets/mappings.json")?;
     let engine_config = pipeline_to_engine_config(&render_args.pipeline);
     let instrument_count = engine_config.num_instruments;
@@ -561,8 +574,66 @@ fn run_render_wav(
         None => SoundFontSource::Bundled,
     };
     let sample_rate = 44_100u32;
-    // 1.5 s tail so the final notes' release + reverb don't get truncated.
-    let interleaved = render_events_to_stereo(font_src, synth_config, sample_rate, events, 1_500)?;
+
+    // ── Tail length. The DEFAULT path keeps the historical 1.5 s EXACTLY — every sealed
+    //    golden and every byte-identity guard depends on it, so it must not move. The loop
+    //    path needs a longer tail because the fold can only relocate ring-out it actually
+    //    RENDERED: a patch whose decay outlasts the buffer (measured: `warm_plucked`, GM 32/46/
+    //    6/24, still at −68.3 dBFS in the final 50 ms and decaying only −19.0 dB/s ⇒ ~1168 ms
+    //    short) would be folded mid-decay, silently losing its ring-out. 4 s clears the
+    //    measured worst case with margin; `tests/loop_boundary.rs` asserts the decay actually
+    //    completed rather than trusting this constant.
+    let tail_ms: u64 = if render_args.loop_cue { 4_000 } else { 1_500 };
+
+    let interleaved =
+        render_events_to_stereo(font_src, synth_config, sample_rate, events, tail_ms)?;
+
+    let interleaved = if render_args.loop_cue {
+        // The musical loop period — the quantity the render boundary SHOULD have been.
+        // Step `N` is anchored at `N * grid_ms_per_step` (`step_onset_offset_ms`), so the
+        // grid spans `[0, total_steps * grid_ms_per_step)` and the period is that width.
+        // Computed in u128 and rounded (not truncated) so the period matches the grid to the
+        // nearest frame at rates where `ms * sr` is not integral.
+        let period_ms = total_steps as u128 * grid_ms_per_step as u128;
+        let period_frames = ((period_ms * sample_rate as u128 + 500) / 1000) as usize;
+
+        // DECAY-COMPLETION GUARD. The fold can only relocate ring-out that was actually
+        // rendered. If the buffer is still sounding at its very end, the decay was cut off
+        // BEFORE the fold and that energy is simply gone — the cue loses its ring-out while
+        // still passing any seam/gap test, because the gap test only looks at the seam. This
+        // is the one failure a seam-only gate cannot see, so it is enforced here, at every
+        // real render, rather than only in the test suite.
+        const DECAY_WINDOW_MS: usize = 50;
+        const DECAY_FLOOR_DBFS: f32 = -90.0;
+        let win_frames = DECAY_WINDOW_MS * sample_rate as usize / 1000;
+        let tail_slice = &interleaved[interleaved.len().saturating_sub(win_frames * 2)..];
+        let rms = (tail_slice.iter().map(|s| s * s).sum::<f32>() / tail_slice.len() as f32).sqrt();
+        let dbfs = 20.0 * rms.max(1e-12).log10();
+        if dbfs > DECAY_FLOOR_DBFS {
+            return Err(format!(
+                "--loop: the render is still sounding at its end ({dbfs:.1} dBFS over the final \
+                 {DECAY_WINDOW_MS} ms, floor {DECAY_FLOOR_DBFS:.1}). The {tail_ms} ms tail did \
+                 not contain this patch's decay, so folding would DISCARD the ring-out rather \
+                 than relocate it. Raise the loop-path tail."
+            )
+            .into());
+        }
+
+        let folded = audiohax::synth_sink::fold_loop_tail(&interleaved, period_frames)?;
+        println!(
+            "render --wav: --loop → period {} steps x {} ms = {} ms ({} frames); \
+             folded {} ms of ring-out onto the head",
+            total_steps,
+            grid_ms_per_step,
+            period_ms,
+            period_frames,
+            (interleaved.len() / 2 - period_frames) as u128 * 1000 / sample_rate as u128,
+        );
+        folded
+    } else {
+        interleaved
+    };
+
     write_stereo_wav(wav_path, sample_rate, &interleaved)?;
 
     let secs = interleaved.len() as f32 / 2.0 / sample_rate as f32;

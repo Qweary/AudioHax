@@ -27,7 +27,12 @@ fn plan_mappings(m: &MappingTable) -> PlanMappings {
 
 /// Build a one-step section with the given motto at a given phrase position. `pos`/`phrase_len`
 /// drive `pre_cadence`; `position` drives `is_cadence` (both read in realize_rhythm).
-fn sec_with(motto: RhythmMotto, pos: usize, phrase_len: usize, position: PhrasePosition) -> Section {
+fn sec_with(
+    motto: RhythmMotto,
+    pos: usize,
+    phrase_len: usize,
+    position: PhrasePosition,
+) -> Section {
     let step = StepPlan {
         chord: Chord {
             name: "I".to_string(),
@@ -108,7 +113,11 @@ fn sig(sec: &Section, num_instruments: usize, inst_idx: usize) -> Vec<(u64, u64)
 /// (even) are authored zero-displacement, so they must equal neutral exactly.
 #[test]
 fn qg_neutral_motto_is_a_strict_no_op() {
-    let n = sig(&sec_with(RhythmMotto::neutral(), 2, 8, PhrasePosition::Interior), 1, 0);
+    let n = sig(
+        &sec_with(RhythmMotto::neutral(), 2, 8, PhrasePosition::Interior),
+        1,
+        0,
+    );
     let c0 = sig(&sec_with(cell(0), 2, 8, PhrasePosition::Interior), 1, 0);
     let c2 = sig(&sec_with(cell(2), 2, 8, PhrasePosition::Interior), 1, 0);
     assert!(n.len() >= 2, "busy band must give >= 2 onsets, got {n:?}");
@@ -120,7 +129,11 @@ fn qg_neutral_motto_is_a_strict_no_op() {
 /// interior onset, keeps the count, leaves the downbeat fixed, preserves order, stays in-step.
 #[test]
 fn qg_cell3_displaces_interior_preserves_count_anchors_downbeat() {
-    let n = sig(&sec_with(RhythmMotto::neutral(), 2, 8, PhrasePosition::Interior), 1, 0);
+    let n = sig(
+        &sec_with(RhythmMotto::neutral(), 2, 8, PhrasePosition::Interior),
+        1,
+        0,
+    );
     let p = sig(&sec_with(cell(3), 2, 8, PhrasePosition::Interior), 1, 0);
     assert_eq!(n.len(), p.len(), "count preserved: {n:?} vs {p:?}");
     assert_eq!(n[0].0, p[0].0, "downbeat anchor fixed");
@@ -129,7 +142,10 @@ fn qg_cell3_displaces_interior_preserves_count_anchors_downbeat() {
     for w in offs.windows(2) {
         assert!(w[0] < w[1], "onsets must stay strictly ordered: {offs:?}");
     }
-    assert!(*offs.last().unwrap() < STEP_MS, "no onset rings past the step: {offs:?}");
+    assert!(
+        *offs.last().unwrap() < STEP_MS,
+        "no onset rings past the step: {offs:?}"
+    );
 }
 
 /// CLAIM (cell 1 also biases, opposite direction): cell 1 (broad) pulls earlier; distinct from
@@ -138,20 +154,43 @@ fn qg_cell3_displaces_interior_preserves_count_anchors_downbeat() {
 fn qg_cell1_biases_distinctly_from_cell3() {
     let c1 = sig(&sec_with(cell(1), 2, 8, PhrasePosition::Interior), 1, 0);
     let c3 = sig(&sec_with(cell(3), 2, 8, PhrasePosition::Interior), 1, 0);
-    let n = sig(&sec_with(RhythmMotto::neutral(), 2, 8, PhrasePosition::Interior), 1, 0);
+    let n = sig(
+        &sec_with(RhythmMotto::neutral(), 2, 8, PhrasePosition::Interior),
+        1,
+        0,
+    );
     assert_eq!(c1.len(), n.len(), "cell 1 count-preserving");
     assert_eq!(c1[0].0, n[0].0, "cell 1 anchors the downbeat too");
     // cell 1 should differ from neutral on at least one interior onset (the earlier pull).
-    assert_ne!(c1, n, "cell 1 must bias (the earlier pull) — not a dead gait");
-    assert_ne!(c1, c3, "cell 1 (earlier) and cell 3 (later) must be different walks");
+    assert_ne!(
+        c1, n,
+        "cell 1 must bias (the earlier pull) — not a dead gait"
+    );
+    assert_ne!(
+        c1, c3,
+        "cell 1 (earlier) and cell 3 (later) must be different walks"
+    );
 }
 
 /// CLAIM (GR-2 cadence): at a cadence the cadence ring early-returns before the motto application,
 /// so a cell-3 motto equals neutral at the cadence (single sustained ring).
 #[test]
 fn qg_cadence_step_ignores_motto() {
-    let cn = sig(&sec_with(RhythmMotto::neutral(), 7, 8, PhrasePosition::PerfectAuthenticCadence), 1, 0);
-    let cp = sig(&sec_with(cell(3), 7, 8, PhrasePosition::PerfectAuthenticCadence), 1, 0);
+    let cn = sig(
+        &sec_with(
+            RhythmMotto::neutral(),
+            7,
+            8,
+            PhrasePosition::PerfectAuthenticCadence,
+        ),
+        1,
+        0,
+    );
+    let cp = sig(
+        &sec_with(cell(3), 7, 8, PhrasePosition::PerfectAuthenticCadence),
+        1,
+        0,
+    );
     assert_eq!(cn, cp, "motto must be ZERO at a cadence: {cn:?} vs {cp:?}");
     assert_eq!(cn.len(), 1, "cadence rings a single sustained note");
 }
@@ -161,16 +200,30 @@ fn qg_cadence_step_ignores_motto() {
 #[test]
 fn qg_precadence_attenuates_bias() {
     let full = sig(&sec_with(cell(3), 2, 8, PhrasePosition::Interior), 1, 0);
-    let nf = sig(&sec_with(RhythmMotto::neutral(), 2, 8, PhrasePosition::Interior), 1, 0);
+    let nf = sig(
+        &sec_with(RhythmMotto::neutral(), 2, 8, PhrasePosition::Interior),
+        1,
+        0,
+    );
     // pre-cadence: position_in_phrase + 2 >= phrase_len, not start, not cadence → pos 6 of 8.
     let pre = sig(&sec_with(cell(3), 6, 8, PhrasePosition::Interior), 1, 0);
-    let np = sig(&sec_with(RhythmMotto::neutral(), 6, 8, PhrasePosition::Interior), 1, 0);
+    let np = sig(
+        &sec_with(RhythmMotto::neutral(), 6, 8, PhrasePosition::Interior),
+        1,
+        0,
+    );
     if full.len() >= 2 && pre.len() >= 2 && nf.len() >= 2 && np.len() >= 2 {
         let d_full = (full[1].0 as i64 - nf[1].0 as i64).abs();
         let d_pre = (pre[1].0 as i64 - np[1].0 as i64).abs();
-        assert!(d_pre <= d_full, "pre-cadence displacement {d_pre} must be <= full {d_full}");
+        assert!(
+            d_pre <= d_full,
+            "pre-cadence displacement {d_pre} must be <= full {d_full}"
+        );
         // and the full-strength one must actually be > 0 (the bias is live at full strength).
-        assert!(d_full > 0, "full-strength interior displacement must be non-zero");
+        assert!(
+            d_full > 0,
+            "full-strength interior displacement must be non-zero"
+        );
     }
 }
 
@@ -195,7 +248,10 @@ fn qg_bed_roles_untouched_only_melody_biased() {
     let nm = sig(&neutral_sec, 4, 3);
     let pm = sig(&profiled_sec, 4, 3);
     assert_eq!(nm.len(), pm.len(), "melody count preserved");
-    assert_ne!(nm, pm, "the melody (inst 3) MUST carry the motto gait: {nm:?} vs {pm:?}");
+    assert_ne!(
+        nm, pm,
+        "the melody (inst 3) MUST carry the motto gait: {nm:?} vs {pm:?}"
+    );
 }
 
 /// CLAIM (6-probe table, REAL PLANNER PATH): the planner-stamped `Section.motto.cell_index` over

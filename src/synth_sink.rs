@@ -440,6 +440,94 @@ pub fn write_stereo_wav(
     Ok(())
 }
 
+/// Wrap-fold a rendered stereo buffer onto its musical loop period — the seamless-loop core.
+///
+/// # The defect this fixes
+///
+/// `render_events_to_stereo` renders `last_event_onset + tail_ms` frames. That boundary is
+/// **unrelated to the musical loop period** `total_steps * grid_ms_per_step`: it is the last
+/// `NoteOff` plus a fixed buffer. Playing such a file on repeat therefore yields the tail's
+/// dead air, then a hard restart — or, when a long-decay patch outlasts `tail_ms`, a
+/// mid-decay truncation. Tuning `tail_ms` cannot fix either; only relocating the boundary to
+/// the musical period can.
+///
+/// # The operation
+///
+/// Everything past the period is accumulated back onto the head, modulo the period:
+///
+/// ```text
+/// out[i] = Σ_{k≥0} raw[i + k·P]        (out.len() == P frames)
+/// ```
+///
+/// This is precisely what an infinitely repeating loop sums to in steady state: the ring-out
+/// of lap *n−1* is exactly what overlaps the head of lap *n*. For a **linear** decaying tail
+/// this is exact, not an approximation — which is why it beats a crossfade, where fading the
+/// head attenuates real musical content. The fold destroys nothing; it relocates energy to
+/// where a looping playback would actually put it.
+///
+/// The wrap is an accumulation over *all* laps, not a single `raw[i] + raw[P+i]` add, so a
+/// tail **longer than one period** folds correctly too (it wraps as many times as needed).
+///
+/// # Linearity precondition (IMPORTANT)
+///
+/// Exactness requires the render path to be linear from synth output to buffer.
+/// [`apply_gain_softclip`] is `tanh` whenever `gain != 1.0`, and `tanh(a) + tanh(b) !=
+/// tanh(a + b)` — so **at non-unity gain the fold is an approximation, not an identity**.
+/// Callers must reject the loop path at non-unity gain; `main.rs` does.
+///
+/// # Errors
+///
+/// - `interleaved` is not stereo-interleaved (odd length),
+/// - `period_frames == 0`,
+/// - `period_frames >= total frames` — there is no tail to fold, meaning the caller's period
+///   does not describe this buffer (§4's `P < len(raw)` liveness precondition, promoted to a
+///   hard error so a mis-specified period cannot silently no-op into a vacuous pass),
+/// - the folded result exceeds full scale, which [`write_stereo_wav`]'s clamp would silently
+///   distort.
+pub fn fold_loop_tail(
+    interleaved: &[f32],
+    period_frames: usize,
+) -> Result<Vec<f32>, AudioSinkError> {
+    if !interleaved.len().is_multiple_of(2) {
+        return Err(AudioSinkError::msg(format!(
+            "fold_loop_tail: buffer length {} is not stereo-interleaved (odd)",
+            interleaved.len()
+        )));
+    }
+    if period_frames == 0 {
+        return Err(AudioSinkError::msg("fold_loop_tail: period_frames == 0"));
+    }
+    let total_frames = interleaved.len() / 2;
+    if period_frames >= total_frames {
+        return Err(AudioSinkError::msg(format!(
+            "fold_loop_tail: period {period_frames} frames >= rendered {total_frames} frames — \
+             nothing to fold; the period does not describe this buffer"
+        )));
+    }
+
+    // `modulo` is even and the interleave stride is 2, so `i % modulo` preserves L/R parity.
+    let modulo = period_frames * 2;
+    let mut out = vec![0.0f32; modulo];
+    for (i, &s) in interleaved.iter().enumerate() {
+        out[i % modulo] += s;
+    }
+
+    if let Some(peak) = out
+        .iter()
+        .map(|s| s.abs())
+        .fold(None::<f32>, |acc, v| Some(acc.map_or(v, |a: f32| a.max(v))))
+    {
+        if peak > 1.0 {
+            return Err(AudioSinkError::msg(format!(
+                "fold_loop_tail: folded peak {peak:.4} exceeds full scale — the WAV writer's \
+                 clamp would distort it. Re-render with lower gain."
+            )));
+        }
+    }
+
+    Ok(out)
+}
+
 /// Load + parse a SoundFont from a [`SoundFontSource`] into a `rustysynth::SoundFont`.
 ///
 /// `Bundled` parses the `include_bytes!`-embedded GM SF2; `Path` reads the file off
@@ -568,6 +656,80 @@ fn build_f32_stream(
 mod tests {
     use super::*;
     use crate::engine::AudioSink;
+
+    // ── fold_loop_tail: the wrap-fold loop core ────────────────────────────────
+
+    /// The defining identity: folding produces EXACTLY the sum a repeating loop reaches in
+    /// steady state. Built as a hand-checkable stereo case so the arithmetic is visible.
+    #[test]
+    fn fold_loop_tail_sums_ring_out_onto_the_head() {
+        // 3 frames of period, 2 frames of tail. L/R distinct so a parity bug cannot hide.
+        // All values are exact binary fractions, so `assert_eq!` on f32 is safe here, and all
+        // stay inside full scale so the anti-clip guard is not what is under test.
+        // frames:       0            1              2      |     3              4
+        let raw = vec![
+            0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0625, -0.0625, 0.03125, -0.03125,
+        ];
+        let out = fold_loop_tail(&raw, 3).expect("fold");
+        assert_eq!(out.len(), 6, "output must be exactly the period");
+        // head frames 0,1 receive tail frames 3,4; frame 2 is untouched.
+        assert_eq!(out, vec![0.5625, -0.5625, 0.28125, -0.28125, 0.125, -0.125]);
+    }
+
+    /// A tail LONGER than one period must wrap repeatedly, not just once. §4's design used a
+    /// single `raw[i] + raw[P+i]` add, which silently drops everything past `2P`; the
+    /// accumulate-modulo form handles it exactly.
+    #[test]
+    fn fold_loop_tail_wraps_a_tail_longer_than_one_period() {
+        // period 1 frame; 3 further frames of tail all wrap onto it.
+        let raw = vec![0.5, 0.0, 0.25, 0.0, 0.125, 0.0, 0.0625, 0.0];
+        let out = fold_loop_tail(&raw, 1).expect("fold");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], 0.9375, "all four laps must accumulate");
+        assert_eq!(out[1], 0.0);
+    }
+
+    /// Energy is RELOCATED, never destroyed — the property that distinguishes the fold from a
+    /// crossfade (which attenuates real musical content).
+    #[test]
+    fn fold_loop_tail_conserves_total_signal() {
+        let raw: Vec<f32> = (0..40).map(|i| (i as f32 * 0.017).sin() * 0.1).collect();
+        let out = fold_loop_tail(&raw, 13).expect("fold");
+        let sum_in: f32 = raw.iter().sum();
+        let sum_out: f32 = out.iter().sum();
+        assert!(
+            (sum_in - sum_out).abs() < 1e-5,
+            "fold must conserve signal sum: in {sum_in} vs out {sum_out}"
+        );
+    }
+
+    /// A period that does not describe the buffer is a HARD ERROR, never a silent no-op —
+    /// otherwise a mis-specified period would return the input unchanged and a gap test
+    /// downstream would certify a vacuum.
+    #[test]
+    fn fold_loop_tail_rejects_period_with_no_tail_to_fold() {
+        let raw = vec![0.1f32; 8]; // 4 frames
+        assert!(fold_loop_tail(&raw, 4).is_err(), "period == len must error");
+        assert!(fold_loop_tail(&raw, 9).is_err(), "period > len must error");
+        assert!(fold_loop_tail(&raw, 0).is_err(), "zero period must error");
+    }
+
+    #[test]
+    fn fold_loop_tail_rejects_non_interleaved_buffer() {
+        let raw = vec![0.1f32; 7];
+        assert!(fold_loop_tail(&raw, 2).is_err(), "odd length must error");
+    }
+
+    /// The fold ADDS energy at the head, so it can push past full scale — where
+    /// `write_stereo_wav`'s clamp would silently distort. That must surface as an error.
+    #[test]
+    fn fold_loop_tail_rejects_a_fold_that_would_clip() {
+        let raw = vec![0.9, 0.9, 0.0, 0.0, 0.9, 0.9];
+        assert!(
+            fold_loop_tail(&raw, 2).is_err(),
+            "0.9 + 0.9 exceeds full scale and must be refused, not clamped"
+        );
+    }
 
     // ── MidiCmd → rustysynth process_midi_message argument mapping ──────────────
 
