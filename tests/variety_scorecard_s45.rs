@@ -1602,61 +1602,471 @@ fn s46_recession_bound(name: &str) -> usize {
 /// much) stays REPORTED in the scorecard row for the taste gate to size. A future change that
 /// FUSES two roles' grids (the S42 fusion regression) drops F5a below baseline and red-bars here.
 fn s49_f5a_baseline(name: &str) -> f32 {
-    match name {
-        "example.jpg" => 0.654,
-        // S62: baseline refreshed — un-gating gave this image a per-image motif subject; new value still >0.50 anti-fusion floor
-        "Lena.png" => 0.743,
-        // S62: baseline refreshed — un-gating gave this image a per-image motif subject; new value still >0.50 anti-fusion floor
-        "AudioHaxImg1.jpg" => 0.518,
-        // S62: baseline refreshed — un-gating gave this image a per-image motif subject; new value still >0.50 anti-fusion floor
-        "AudioHaxImg2.jpg" => 0.686,
-        // S62: baseline refreshed — un-gating gave this image a per-image motif subject; new value still >0.50 anti-fusion floor
-        // S92 P2 2.5: baseline refreshed 0.743 -> 0.667. The theme rhythm-cell edge ramp was
-        // re-anchored (CELL_EDGE_BROAD 0.33->0.20, CELL_EDGE_BUSY 0.66->0.35) so the busiest even cell
-        // is reachable — the corpus s8a "gridded drive". Img3 (edge 0.475) moves from cell 0 to cell 2
-        // under the new cuts, a different (busier) theme gait that lowers per-role distinctness on this
-        // bundled fixture to 0.667 — still WELL ABOVE the 0.50 hard anti-fusion floor (the fundamental
-        // guard is untouched; only the per-image slice-2 reference moves, exactly as the S62 refreshes
-        // above did for a rhythm change). FLAGGED for §6/operator review as a 2.5 side-effect.
-        // S102 FC-7: baseline refreshed 0.667 -> 0.556. The `walking` bass pattern's density was
-        // lowered 2 -> 1 (assets/mappings.json `bass_pattern_catalogue`) per the Artistic
-        // Director's FC-7 ("the bass must not be the busiest voice") and the escalation-by-density
-        // directive, which REQUIRES a sparse baseline. Img3 routes to `walking`, so its bass drops
-        // from 2 onsets/step to 1 and its onset grid converges with the bed's on the steps where
-        // the bed also strikes once — which is precisely what F5a measures, so the drop is the
-        // metric working, not a bug.
-        //
-        // WHY THIS IS A REFRESH AND NOT A FLOOR BREACH: the new value 0.556 still clears the
-        // slice-2 HARD ANTI-FUSION FLOOR of 0.50, which is untouched. Only the per-image slice-2
-        // reference moves — exactly as the S62 refreshes and the S92 P2 2.5 refresh (0.743 ->
-        // 0.667, same image, same class of deliberate rhythm change) did before it.
-        //
-        // ⚠ FLAGGED FOR §6 / ARTISTIC-DIRECTOR EAR REVIEW. The drop (-0.111) exceeds the -0.050
-        // cross-platform FP tolerance, so this is a REAL convergence of the bass and bed grids,
-        // not matrix noise. The bass/bed pair converging does not threaten the MELODY's figure
-        // (F1/F2/F4 all still pass), and a bass that lands with the bed on the downbeat is
-        // idiomatic for the declared AMBIENT MIX ROLE — but that is a taste judgement this gate
-        // cannot render and I am not certifying it. If the ear rules the floor now reads as too
-        // still, the correct remedy is articulation/phase contrast between bass and bed (a
-        // chord_engine change), NOT raising `walking` back to a repetition-generating density 2.
-        "AudioHaxImg3.jpg" => 0.556,
-        // S102 FC-7: baseline refreshed 0.660 -> 0.601, and this one is a COMPOUND of two
-        // independent drops that must not be conflated:
-        //   (a) PRE-EXISTING STALENESS, NOT FROM THIS CHANGE (-0.022). With `walking` still at
-        //       density 2, this image measured 0.638, already below its stored 0.660 — it was
-        //       passing only on the -0.050 matrix tolerance (0.638 >= 0.610). Something earlier in
-        //       the tree (the uncommitted S99 whole-ensemble restoration is the likely candidate,
-        //       since it changes this image's programs) had already walked it back and the stored
-        //       baseline was never refreshed. ⚠ SURFACED FOR §2/§6 — it is not mine to attribute.
-        //   (b) THE S102 DENSITY CHANGE (-0.037). `walking` 2 -> 1 per FC-7; this image routes to
-        //       `walking`, so its bass grid converges with the bed's exactly as on Img3.
-        // Neither drop alone trips the gate; together they cross it (0.601 < 0.610). Still well
-        // clear of the slice-2 HARD ANTI-FUSION FLOOR of 0.50, which is untouched.
-        // ⚠ FLAGGED FOR §6 / ARTISTIC-DIRECTOR EAR REVIEW with the Img3 refresh above.
-        "magicstudio-art.jpg" => 0.601,
-        // Any newly-routed image is held only to the slice-2 floor (0.50) — no per-image baseline
-        // exists for it, so the baseline term is the floor itself (the assertion reduces to ≥0.50).
-        _ => 0.50,
+    // S103 §6: the live baseline is no longer a hand-edited literal — it is the LAST entry of
+    // this image's `F5A_HISTORY` row. See `F5A_HISTORY` for why the history is the SOURCE and
+    // not a comment. Unknown/newly-routed images have no history and reduce to the hard floor.
+    f5a_history(name)
+        .map(|h| h.last().expect("a history row is never empty").1)
+        .unwrap_or(F5A_HARD_FLOOR)
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// S103 §6 — F5a BASELINE HISTORY + CUMULATIVE-DRIFT GUARD (the anti-ratchet).
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+//
+// WHY THIS EXISTS. The F5a per-image baseline is a REGRESSION FLOOR that each session refreshes
+// to the newly-measured value when a deliberate musical change moves it. Every individual refresh
+// was legitimate and carried a careful justification comment. But the refreshes COMPOUND, and
+// nothing was comparing the current value to where it STARTED — only to where it was last
+// session. `AudioHaxImg3.jpg` went 0.667 (S49) -> 0.743 (S62, a RISE) -> 0.667 (S92) -> 0.556
+// (S102): two consecutive permissive moves that gave back the S62 gain AND 0.111 more, landing
+// 0.056 above the hard anti-fusion floor. Each step read as "still well above 0.50". The
+// SEQUENCE never got read at all, because no artifact held the sequence.
+//
+// THREE THINGS THIS FIXES, in order of severity:
+//
+//   (1) THE eps CHANNEL — the largest and least visible hole. The per-image assertion admits
+//       `measured >= baseline - eps` with eps = 0.05 (a cross-platform CI-matrix tolerance).
+//       Because each refresh re-anchors `baseline` onto the newly-measured value, that tolerance
+//       is spendable AGAIN every session, and spending it requires NO code change, NO refresh and
+//       NO comment — the suite simply stays green while the value walks down. S102 caught
+//       `magicstudio-art.jpg` sitting at 0.638 against a stored 0.660 for an unknown number of
+//       sessions, passing only on this tolerance. That is the ratchet operating silently. The
+//       guard below closes it by comparing the MEASURED value against the HIGH-WATER mark, which
+//       no refresh can move down — so eps is spendable once against a fixed reference, not once
+//       per session against a moving one.
+//
+//   (2) THE COMPOUNDING REFRESH — compare to the anchor, not to the last refresh.
+//
+//   (3) THE UNREADABLE SEQUENCE — history now lives in a table the test READS, so it cannot
+//       drift out of sync with the value it documents.
+//
+// WHY A TABLE AND NOT A COMMENT OR A SIDECAR FILE.
+//   * NOT a comment: comments are exactly what already failed here. The S92 and S102 refreshes
+//     both carry long, accurate, explicitly-flagged ⚠ justification comments naming the risk.
+//     They were read, agreed with, and slid past anyway. A comment cannot fail a build.
+//   * NOT a sidecar file: a sidecar drifts out of sync with the code (nothing forces an edit to
+//     one to touch the other), and reading it needs file I/O inside the test, which adds a
+//     failure mode — a missing/unparseable sidecar would have to either fail the suite for a
+//     non-musical reason or be skipped, and "skipped" is how guards die.
+//   * A TABLE THE TEST READS, and which is the SOLE SOURCE of the live baseline. You cannot
+//     change a baseline without appending a history entry, because `s49_f5a_baseline` returns
+//     `history.last()`. History is not documentation of the baseline; it IS the baseline. That
+//     is the property that makes it durable — keeping it current is not a discipline anyone has
+//     to remember, it is the only way to make the change at all.
+//
+// EACH ENTRY: (session tag, measured value). ORDERED oldest -> newest. Reconstructed from
+// `git log -p tests/variety_scorecard_s45.rs` (commits db8b233 S49, de64ae9 S62, 756eeb2 S92,
+// 705302d S102), NOT from the prose in the docstring above — that prose reports a post-slice-2
+// Img3/Lena measurement of 0.750 which was never the value the function returned. The S49 row
+// below is what SHIPPED at db8b233.
+struct F5aRow {
+    image: &'static str,
+    history: &'static [(&'static str, f32)],
+}
+
+/// The hard anti-fusion floor. Untouched by any refresh; the drift guard exists to keep the
+/// baseline from arriving here one defensible step at a time.
+const F5A_HARD_FLOOR: f32 = 0.50;
+
+/// The cumulative-drift budget, as a fraction of each image's HIGH-WATER-to-floor headroom.
+///
+/// HOW THIS NUMBER WAS CHOSEN (it is not a round number picked for looking reasonable):
+///
+/// The guard is useful only if, at the moment it trips, enough headroom remains to DIAGNOSE and
+/// FIX before the hard floor — i.e. the trip point must sit at least one full typical slide above
+/// 0.50. The largest legitimate single slide observed in the actual history is 0.111 (Img3,
+/// S92->S102); the others are 0.076, 0.059 and 0.015. Sizing against the LARGEST observed slide
+/// rather than the median is the conservative choice: it means the guard fires with room for one
+/// more slide of the worst magnitude this project has actually produced.
+///
+/// For the image with the most headroom (Img3, high-water 0.743, headroom 0.243), requiring
+/// `(high_water - budget) - 0.50 >= 0.111` gives `budget <= 0.132`, i.e. a fraction <= 54.3%.
+/// Going to 0.60 would leave only 0.096 — less than one such slide, i.e. a guard that first
+/// fires when it is already too late to absorb another legitimate change.
+///
+/// The fraction is applied to per-image headroom rather than as one absolute delta because the
+/// images do not start from comparable places: Img3's high-water is 0.243 above the floor while
+/// AudioHaxImg1's is 0.033. A single absolute budget would be either vacuous on Img3 or
+/// instantly-tripped on Img1.
+///
+/// ── S103 §5 (SECOND KEY) CORRECTION: 0.55 -> 0.54 ────────────────────────────────────────
+/// §6's derivation above is sound and its arithmetic is right — `<= 54.3%` — but the constant
+/// shipped at 0.55, ABOVE its own derived bound, with the claim that "0.55 is the largest
+/// fraction at which that property still holds". It does not hold at 0.55: 0.55 x 0.243 =
+/// 0.13365, trip 0.60935, leaving 0.10935 — SHORT of the 0.111 max-observed slide the
+/// derivation requires. The rounding went in the permissive direction and the justifying
+/// sentence contradicted the derivation two lines above it. 0.54 is the largest 2-dp fraction
+/// that actually satisfies the stated criterion (0.54 x 0.243 = 0.13122, trip 0.61178, leaving
+/// 0.11178 >= 0.111). VERIFIED: the change moves no verdict — Img1 (drift 0.015 vs budget
+/// 0.01782) and magicstudio-art (0.059 vs 0.0864) stay within budget, Img3 (0.187 vs 0.13122)
+/// stays over and waived. `s103_f5a_budget_satisfies_its_own_derivation` now machine-checks
+/// this so the constant cannot silently drift past its justification again.
+///
+/// ⚠ NOT FIXED, FLAGGED FOR §6/OPERATOR: the derivation picks "the image with the MOST
+/// headroom" as binding. That is the image permitting the LARGEST budget — the most permissive
+/// choice, not the binding one. The genuinely binding image is the one with the SMALLEST
+/// headroom still exceeding one max-slide (example.jpg, 0.154), which yields
+/// `f <= 1 - 0.111/0.154 = 27.9%`. At 28% both AudioHaxImg1 (drift 0.015 vs budget 0.0092) and
+/// magicstudio-art.jpg (0.059 vs 0.0446) would RED-BAR. That is a substantive tightening with
+/// musical consequences and it is not the second key's call to impose unilaterally.
+const F5A_DRIFT_BUDGET_FRAC: f32 = 0.54;
+
+/// The largest single baseline slide observed in `F5A_HISTORY` — the unit the budget is sized
+/// against. Kept as a named constant so the derivation can be machine-checked rather than
+/// asserted in prose.
+const F5A_MAX_OBSERVED_SLIDE: f32 = 0.111;
+
+/// The reconstructed per-image history. APPEND to a row to change a baseline; do not edit an
+/// existing entry (existing entries are the evidence the guard reasons over).
+const F5A_HISTORY: &[F5aRow] = &[
+    F5aRow {
+        image: "example.jpg",
+        history: &[("S49", 0.654)],
+    },
+    F5aRow {
+        image: "Lena.png",
+        history: &[("S49", 0.667), ("S62", 0.743)],
+    },
+    F5aRow {
+        image: "AudioHaxImg1.jpg",
+        history: &[("S49", 0.533), ("S62", 0.518)],
+    },
+    F5aRow {
+        image: "AudioHaxImg2.jpg",
+        history: &[("S49", 0.667), ("S62", 0.686)],
+    },
+    F5aRow {
+        image: "AudioHaxImg3.jpg",
+        history: &[
+            ("S49", 0.667),
+            ("S62", 0.743),
+            ("S92", 0.667),
+            ("S102", 0.556),
+        ],
+    },
+    F5aRow {
+        image: "magicstudio-art.jpg",
+        history: &[("S49", 0.660), ("S102", 0.601)],
+    },
+];
+
+/// A cumulative-drift WAIVER. This is the escape hatch, and its shape is the reason it cannot
+/// become the next ratchet.
+///
+/// A waiver excuses ONE EXACT VALUE, not a direction and not a range:
+///   * W1 — it applies only while the image's live baseline is EXACTLY `waived_value`. The next
+///     slide appends a different last-entry, the waiver stops matching, and the guard fails. It
+///     cannot be inherited by a fourth slide the way a "still above 0.50" argument was.
+///   * W2 — if the image is NOT over budget, the waiver is STALE and the guard fails demanding
+///     its deletion. A waiver therefore cannot sit dormant pre-authorising a future slide.
+///   * W3 — it never relaxes `F5A_HARD_FLOOR`.
+/// Ratcheting past a waiver requires a human to type a NEW waiver with a NEW value and a NEW
+/// discharge condition, one per slide, visible in the diff. That is the intended cost.
+struct F5aDriftWaiver {
+    image: &'static str,
+    waived_value: f32,
+    opened: &'static str,
+    reason: &'static str,
+    discharge: &'static str,
+}
+
+const F5A_DRIFT_WAIVERS: &[F5aDriftWaiver] = &[F5aDriftWaiver {
+    image: "AudioHaxImg3.jpg",
+    waived_value: 0.556,
+    opened: "S102 (FC-7), waiver written S103",
+    reason:
+        "The S102 `walking` bass density 2->1 (FC-7, 'the bass must not be the busiest voice') \
+             converged the bass and bed onset grids on this image. The drop is the metric working, \
+             not a defect in it — but it takes cumulative drift from the S62 high-water to 0.187 \
+             (77% of headroom), over the budget (54% of headroom; S103 §5 corrected the constant from \
+             0.55, which had shipped above its own derived bound of 54.3% — the waiver holds at \
+             either value, since clearing it would need a 77% budget). This gate cannot rule on whether the result \
+             READS as too still; that is a taste judgement.",
+    discharge: "ARTISTIC-DIRECTOR EAR REVIEW of the bass/bed convergence on AudioHaxImg3. Either \
+                (a) the ear accepts it -> re-anchor the history row deliberately and retire this \
+                waiver, or (b) the ear rejects it -> restore contrast via articulation/phase \
+                separation between bass and bed (a chord_engine change), NOT by returning \
+                `walking` to a repetition-generating density 2.",
+}];
+
+fn f5a_history(name: &str) -> Option<&'static [(&'static str, f32)]> {
+    F5A_HISTORY
+        .iter()
+        .find(|r| r.image == name)
+        .map(|r| r.history)
+}
+
+/// The S49 ANCHOR — the first value ever committed for this image.
+fn f5a_anchor(name: &str) -> Option<f32> {
+    f5a_history(name).map(|h| h[0].1)
+}
+
+/// The HIGH-WATER mark — the tightest baseline this image has ever held.
+///
+/// WHY DRIFT IS MEASURED FROM HIGH-WATER AND NOT FROM THE S49 ANCHOR. Two of the six images
+/// (Lena, Img2) were refreshed UPWARD; Img3 was refreshed upward at S62 and then twice down. If
+/// drift were measured from the S49 anchor, a later session could hand back the whole of an
+/// earned rise for free — Lena could fall 0.743 -> 0.668 (a 0.075 slide, larger than two of the
+/// four historical slides) and register as ZERO drift, because it would still sit above its S49
+/// anchor of 0.667. Anchoring at high-water says: a value the system demonstrably achieved is
+/// the reference it must be argued down from. The S49 anchor is still asserted for well-
+/// formedness and reported in the failure text, but it is not the budget's reference.
+fn f5a_high_water(name: &str) -> Option<f32> {
+    f5a_history(name).map(|h| h.iter().fold(f32::MIN, |m, e| m.max(e.1)))
+}
+
+fn f5a_waiver(name: &str) -> Option<&'static F5aDriftWaiver> {
+    F5A_DRIFT_WAIVERS.iter().find(|w| w.image == name)
+}
+
+/// The EFFECTIVE cumulative floor for an image: the value the MEASURED metric must clear on top
+/// of the hard floor and the last-refresh baseline. Returns `None` for images with no history
+/// (newly-routed images are held only to `F5A_HARD_FLOOR`, as before).
+fn f5a_cumulative_floor(name: &str) -> Option<f32> {
+    let hw = f5a_high_water(name)?;
+    let budget = F5A_DRIFT_BUDGET_FRAC * (hw - F5A_HARD_FLOOR);
+    let trip = hw - budget;
+    // A matching waiver lowers the bar to the WAIVED POINT only — never below the hard floor,
+    // and never to a range (the waiver's validity is re-checked against the live baseline by
+    // `s103_f5a_cumulative_drift_guard`, which fails if the point has moved).
+    let eff = match f5a_waiver(name) {
+        Some(w) if (s49_f5a_baseline(name) - w.waived_value).abs() < 1e-6 => w.waived_value,
+        _ => trip,
+    };
+    Some(eff.max(F5A_HARD_FLOOR))
+}
+
+/// S103 §6 — THE CUMULATIVE-DRIFT GUARD (table half).
+///
+/// This half reasons over the HISTORY TABLE: it checks well-formedness, computes cumulative
+/// drift from each image's high-water mark, and enforces the budget and the waiver contract.
+/// It is deliberately a SEPARATE test from the scorecard: it must red-bar on a baseline edit
+/// even if the (slow, image-decoding) scorecard is filtered out of a run.
+///
+/// THE MEASURED HALF lives inside `variety_scorecard_s45` itself, where `f5a_cumulative_floor`
+/// is asserted against the REAL `rhythm_distinct_frac` from the REAL render. Both halves are
+/// required: the table half alone would be a table asserting over itself — a vacuum — and the
+/// measured half alone would not catch a baseline edited without a history append.
+#[test]
+fn s103_f5a_cumulative_drift_guard() {
+    println!("\n══════════════ S103 F5a CUMULATIVE-DRIFT GUARD ══════════════");
+    println!(
+        "budget = {:.0}% of (high_water - {:.2}) headroom; anchored at HIGH-WATER, not last refresh\n",
+        F5A_DRIFT_BUDGET_FRAC * 100.0,
+        F5A_HARD_FLOOR
+    );
+
+    let mut over_budget: Vec<String> = Vec::new();
+
+    for row in F5A_HISTORY {
+        let name = row.image;
+        let h = row.history;
+
+        // ── WELL-FORMEDNESS ────────────────────────────────────────────────────────────────
+        assert!(!h.is_empty(), "[{name}] history row must not be empty");
+        assert_eq!(
+            h[0].0, "S49",
+            "[{name}] the first history entry must be the S49 origin (the anchor the whole guard \
+             is measured against); got session tag {:?}",
+            h[0].0
+        );
+        for e in h {
+            assert!(
+                e.1 > F5A_HARD_FLOOR && e.1 <= 1.0,
+                "[{name}] history entry {:?} = {:.3} is outside the legal metric range \
+                 ({:.2}, 1.0]; a baseline at or below the hard anti-fusion floor is not a \
+                 baseline, it is a breach",
+                e.0,
+                e.1,
+                F5A_HARD_FLOOR
+            );
+        }
+        // The live baseline MUST be the last history entry. This is what makes history the
+        // source rather than documentation: you cannot move a baseline without appending.
+        let live = s49_f5a_baseline(name);
+        assert!(
+            (live - h[h.len() - 1].1).abs() < 1e-6,
+            "[{name}] the live baseline {live:.3} is not the last history entry {:.3} — a \
+             baseline was changed WITHOUT appending to F5A_HISTORY. Append a (session, value) \
+             entry; do not edit an existing one.",
+            h[h.len() - 1].1
+        );
+
+        let anchor = f5a_anchor(name).unwrap();
+        let hw = f5a_high_water(name).unwrap();
+        let budget = F5A_DRIFT_BUDGET_FRAC * (hw - F5A_HARD_FLOOR);
+        let drift = hw - live;
+        let used = if budget > 0.0 {
+            drift / budget * 100.0
+        } else {
+            0.0
+        };
+        let trip = hw - budget;
+        let waiver = f5a_waiver(name);
+
+        let path: Vec<String> = h.iter().map(|e| format!("{}:{:.3}", e.0, e.1)).collect();
+        println!(
+            "  {name:<22} {}\n      anchor(S49) {anchor:.3}  high-water {hw:.3}  live {live:.3}  \
+             drift {drift:.3} / budget {budget:.3} ({used:.0}% used)  trip<{trip:.3}  \
+             floor-margin {:.3}",
+            path.join(" -> "),
+            live - F5A_HARD_FLOOR
+        );
+
+        // ── THE WAIVER CONTRACT (W1/W2) ────────────────────────────────────────────────────
+        if let Some(w) = waiver {
+            // W1 — a waiver excuses one exact point. If the baseline moved, it does not apply.
+            assert!(
+                (live - w.waived_value).abs() < 1e-6,
+                "[{name}] STALE-POINT WAIVER: the drift waiver excuses the exact value \
+                 {:.3} (opened {}), but the live baseline is now {live:.3}. A waiver covers ONE \
+                 VALUE, never a direction — it does not carry forward to a further slide. Either \
+                 discharge it ({}) or write a NEW waiver for the new value with its own \
+                 justification.",
+                w.waived_value,
+                w.opened,
+                w.discharge
+            );
+            // W2 — a waiver that is no longer needed must be deleted, not left lying around
+            // pre-authorising the next slide.
+            assert!(
+                drift > budget,
+                "[{name}] UNNECESSARY WAIVER: cumulative drift {drift:.3} is now within the \
+                 budget {budget:.3}, so this waiver is doing nothing except pre-authorising the \
+                 next slide. DELETE it from F5A_DRIFT_WAIVERS."
+            );
+            println!(
+                "      ⚠ WAIVED at the exact point {:.3} (opened {}).\n        REASON: {}\n        \
+                 DISCHARGE: {}",
+                w.waived_value, w.opened, w.reason, w.discharge
+            );
+        } else if drift > budget {
+            over_budget.push(format!(
+                "[{name}] CUMULATIVE F5a DRIFT OVER BUDGET: history {} — the baseline has \
+                 eroded {drift:.3} from its high-water {hw:.3} (S49 anchor {anchor:.3}), against \
+                 a budget of {budget:.3} ({:.0}% of the {:.3} high-water-to-floor headroom). \
+                 Each individual refresh may have been justified; the SEQUENCE is not. Only \
+                 {:.3} now remains above the {:.2} hard anti-fusion floor. Do NOT refresh again: \
+                 either restore the distinctness, or open an F5aDriftWaiver pinned to this exact \
+                 value with a discharge condition.",
+                path.join(" -> "),
+                F5A_DRIFT_BUDGET_FRAC * 100.0,
+                hw - F5A_HARD_FLOOR,
+                live - F5A_HARD_FLOOR,
+                F5A_HARD_FLOOR
+            ));
+        }
+    }
+
+    // ── STRUCTURAL: no waiver may name an image with no history row. ───────────────────────
+    for w in F5A_DRIFT_WAIVERS {
+        assert!(
+            f5a_history(w.image).is_some(),
+            "[{}] drift waiver names an image with no F5A_HISTORY row",
+            w.image
+        );
+    }
+
+    // ── S103 §5: WAIVER UNIQUENESS — the third waiver state §6 asked about. ────────────────
+    // `f5a_waiver` resolves with `.find()`, which returns the FIRST match and silently ignores
+    // any others. Two waivers for one image is therefore a state the contract does not
+    // describe: W1/W2 would be evaluated against waiver #1 while #2 sits unread. It happens to
+    // be fail-safe today (a stale #1 still red-bars W1, so a second waiver cannot buy a pass),
+    // but "safe by accident" is not a contract. Make the state impossible instead.
+    for (i, w) in F5A_DRIFT_WAIVERS.iter().enumerate() {
+        assert!(
+            !F5A_DRIFT_WAIVERS[..i].iter().any(|p| p.image == w.image),
+            "[{}] TWO drift waivers name the same image. A waiver excuses ONE exact value; the \
+             resolver reads only the first, so the second would be silently ignored. Replace \
+             the existing waiver, do not stack a second one.",
+            w.image
+        );
+    }
+
+    assert!(
+        over_budget.is_empty(),
+        "\n\nF5a CUMULATIVE-DRIFT GUARD RED ({} image(s)):\n\n{}\n",
+        over_budget.len(),
+        over_budget.join("\n\n")
+    );
+    println!(
+        "  [OK] every image within its cumulative-drift budget (or waived at an exact point)\n"
+    );
+}
+
+/// S103 §5 (SECOND KEY) — THE BUDGET CONSTANT MUST SATISFY ITS OWN DERIVATION.
+///
+/// `F5A_DRIFT_BUDGET_FRAC` is justified by a prose derivation: the trip point must leave at
+/// least one max-observed slide of room above the hard floor, on the image the derivation names
+/// as binding. That justification shipped CONTRADICTED — the derivation computed `<= 54.3%` and
+/// the constant was set to 55%, so the guard's own sizing argument did not hold at the value it
+/// shipped with. A prose derivation cannot fail a build; this can. The same reasoning §6 gave
+/// for making the history a table the test READS rather than a comment applies to the number
+/// the table is measured against.
+#[test]
+fn s103_f5a_budget_satisfies_its_own_derivation() {
+    // The slide constant must actually be the largest slide in the recorded history — otherwise
+    // the budget is sized against a number nothing corroborates.
+    let mut worst_slide = 0.0f32;
+    for row in F5A_HISTORY {
+        for pair in row.history.windows(2) {
+            worst_slide = worst_slide.max(pair[0].1 - pair[1].1);
+        }
+    }
+    assert!(
+        (worst_slide - F5A_MAX_OBSERVED_SLIDE).abs() < 5e-4,
+        "F5A_MAX_OBSERVED_SLIDE is {F5A_MAX_OBSERVED_SLIDE:.3} but the largest downward slide \
+         actually present in F5A_HISTORY is {worst_slide:.3}. The budget is sized against this \
+         number; it must be re-derived from the history, not carried forward by hand."
+    );
+
+    // On the image the derivation names as binding (the one with the most headroom), the trip
+    // point must leave at least one such slide above the hard floor.
+    let widest = F5A_HISTORY
+        .iter()
+        .map(|r| f5a_high_water(r.image).unwrap())
+        .fold(f32::MIN, f32::max);
+    let remaining = (1.0 - F5A_DRIFT_BUDGET_FRAC) * (widest - F5A_HARD_FLOOR);
+    println!(
+        "  F5a budget {:.0}% of headroom; widest high-water {widest:.3} -> trip {:.4}, leaving \
+         {remaining:.4} above the {:.2} floor (needs >= {F5A_MAX_OBSERVED_SLIDE:.3})",
+        F5A_DRIFT_BUDGET_FRAC * 100.0,
+        widest - F5A_DRIFT_BUDGET_FRAC * (widest - F5A_HARD_FLOOR),
+        F5A_HARD_FLOOR
+    );
+    assert!(
+        remaining >= F5A_MAX_OBSERVED_SLIDE,
+        "F5A_DRIFT_BUDGET_FRAC = {:.3} does not satisfy its own derivation: on the widest-headroom \
+         image (high-water {widest:.3}) it leaves only {remaining:.4} above the {:.2} hard floor, \
+         short of the {F5A_MAX_OBSERVED_SLIDE:.3} max-observed slide the budget is sized to \
+         absorb. Lower the fraction, or re-derive it and update F5A_MAX_OBSERVED_SLIDE.",
+        F5A_DRIFT_BUDGET_FRAC,
+        F5A_HARD_FLOOR
+    );
+
+    // ── VACUOUS-FLOOR REPORT. The measured half asserts `measured >= cum_floor - eps` with
+    //    eps = 0.05. For a low-headroom image that threshold sinks BELOW the 0.50 hard floor,
+    //    which is asserted separately — so the cumulative guard contributes NOTHING on that
+    //    image. Solving `cum_floor - eps < 0.50` gives `high_water < 0.50 + eps/(1-frac)`.
+    //    MEASURED S103: AudioHaxImg1 (high-water 0.533) is below that line, so §6's new
+    //    measured assertion is subsumed by the pre-existing floor there. This is reported, not
+    //    failed: the hard floor still binds, and raising Img1's coverage means moving eps or
+    //    the floor, which is §6's/the operator's call.
+    const EPS: f32 = 0.05;
+    let vacuous_below = F5A_HARD_FLOOR + EPS / (1.0 - F5A_DRIFT_BUDGET_FRAC);
+    for row in F5A_HISTORY {
+        let hw = f5a_high_water(row.image).unwrap();
+        if hw < vacuous_below {
+            println!(
+                "  ⚠ [{}] cumulative floor is VACUOUS: high-water {hw:.3} < {vacuous_below:.3}, \
+                 so `cum_floor - eps` = {:.3} sits below the {:.2} hard floor. The cumulative \
+                 guard adds no coverage on this image; only the hard floor binds.",
+                row.image,
+                f5a_cumulative_floor(row.image).unwrap() - EPS,
+                F5A_HARD_FLOOR
+            );
+        }
     }
 }
 
@@ -2043,6 +2453,46 @@ fn variety_scorecard_sweep() {
                  regression (the gate brackets the slice-2 grid gain, never lets it walk back)",
                 v.rhythm_distinct_frac
             );
+            // ── S103 §6 — THE CUMULATIVE-DRIFT GUARD, MEASURED HALF. ─────────────────────
+            // The two assertions above compare the MEASURED value to the LAST REFRESH. That is
+            // precisely the comparison that let this metric walk down: `baseline` is re-anchored
+            // onto the measured value each time it moves, so the `eps` tolerance is spendable
+            // again every session against a reference that keeps following the code down. Here
+            // the same measured value is held against a floor derived from the HIGH-WATER mark,
+            // which no refresh can lower — so the tolerance is spendable ONCE, against a fixed
+            // reference. This is the assertion that catches silent drift (drift that never
+            // triggers a refresh and therefore never leaves a comment), which is how
+            // magicstudio-art.jpg reached 0.638 against a stored 0.660 unnoticed.
+            if let Some(cum_floor) = f5a_cumulative_floor(name) {
+                assert!(
+                    v.rhythm_distinct_frac >= cum_floor - eps,
+                    "[{name}] S49 F5a CUMULATIVE drift floor breached: measured {:.3} < \
+                     cumulative floor {cum_floor:.3} (−{eps:.3} matrix tolerance). This floor is \
+                     derived from this image's HIGH-WATER baseline ({:.3}) minus a {:.0}% \
+                     cumulative-drift budget — NOT from the last refresh ({:.3}). The value has \
+                     eroded across sessions past what the accumulated slides are allowed to \
+                     total, even though each step was individually defensible and even though it \
+                     is still above the {:.2} hard anti-fusion floor. See \
+                     `s103_f5a_cumulative_drift_guard` and F5A_HISTORY.",
+                    v.rhythm_distinct_frac,
+                    f5a_high_water(name).unwrap_or(f32::NAN),
+                    F5A_DRIFT_BUDGET_FRAC * 100.0,
+                    baseline,
+                    F5A_HARD_FLOOR
+                );
+                println!(
+                    "  [F5a CUMULATIVE] {name}: measured {:.3} ≥ cumulative floor {cum_floor:.3} \
+                     (high-water {:.3}, S49 anchor {:.3}){}",
+                    v.rhythm_distinct_frac,
+                    f5a_high_water(name).unwrap_or(f32::NAN),
+                    f5a_anchor(name).unwrap_or(f32::NAN),
+                    if f5a_waiver(name).is_some() {
+                        "  [WAIVED POINT]"
+                    } else {
+                        ""
+                    }
+                );
+            }
             let rose = v.rhythm_distinct_frac > baseline + eps;
             println!(
                 "  [F5a ASSERTED] {name}: rhythm_distinct {:.3} ≥ floor {f5a_floor:.2} AND ≥ \
