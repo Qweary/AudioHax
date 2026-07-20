@@ -344,6 +344,44 @@ fn build_step_event_timeline<S: FeatureSource>(
 ///
 /// Pure / total: `step_onset_offset_ms(0, _) == 0`, monotonic non-decreasing in
 /// `step_idx`, and exactly `step_idx * grid_ms_per_step`.
+/// S98/B2-a — step-aggregate each voice's own image band into the per-voice selection input.
+///
+/// `scan_image` already splits the image into `instrument_count` bands and voice `i` already
+/// sounds band `i`, so band `i` is the principled per-voice timbre driver and it costs no new
+/// extraction — this reads the SAME `FeatureSource` rows the engine already pulls. Aggregation is
+/// the arithmetic mean of band `i`'s `avg_brightness` over every scan step, which turns a per-step
+/// series into the piece-level constant the `at_ms = 0` `ProgramChange` emission model wants.
+///
+/// Deviation-coding against the image mean happens downstream in
+/// `instrumentation::select_programs_per_voice` (it needs all bands at once). An empty return —
+/// impossible here for `instrument_count > 0` — routes selection back to the whole-image path.
+#[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
+fn voice_bands<S: FeatureSource>(
+    source: &S,
+    instrument_count: usize,
+) -> Vec<audiohax::instrumentation::BandFeatures> {
+    let steps = source.step_count();
+    if steps == 0 || instrument_count == 0 {
+        return Vec::new();
+    }
+    let mut acc = vec![0f64; instrument_count];
+    for s in 0..steps {
+        for (i, b) in source
+            .scan_bar_features(s, instrument_count)
+            .iter()
+            .enumerate()
+            .take(instrument_count)
+        {
+            acc[i] += b.avg_brightness as f64;
+        }
+    }
+    acc.into_iter()
+        .map(|sum| audiohax::instrumentation::BandFeatures {
+            brightness: (sum / steps as f64) as f32,
+        })
+        .collect()
+}
+
 fn step_onset_offset_ms(step_idx: usize, grid_ms_per_step: u64) -> u64 {
     step_idx as u64 * grid_ms_per_step
 }
@@ -447,9 +485,16 @@ fn run_render_wav(
     //    constant (matches the per-channel-at-t=0 emission model). ──
     #[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
     let programs: Vec<u8> = match mappings.composition.as_ref() {
-        Some(comp) => {
-            audiohax::instrumentation::select_programs(&understanding, comp, instrument_count)
-        }
+        // S98/B2-a: ONE INDEPENDENT DRAW PER VOICE over that voice's seat pool, keyed on that
+        // voice's own image band (deviation-coded against the image mean). Falls back to the
+        // whole-image `ensemble_catalogue` path byte-identically when no pool data or no band
+        // features exist — a CAPABILITY floor, not a per-piece gate.
+        Some(comp) => audiohax::instrumentation::select_programs_per_voice(
+            &understanding,
+            comp,
+            instrument_count,
+            &voice_bands(&source, instrument_count),
+        ),
         None => (0..instrument_count)
             .map(audiohax::instrumentation::legacy_program)
             .collect(),
@@ -781,9 +826,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    live `understanding` only. Absent/empty axis ⇒ every voice == legacy `(i*7)%128`. ──
     #[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
     let programs: Vec<u8> = match mappings.composition.as_ref() {
-        Some(comp) => {
-            audiohax::instrumentation::select_programs(&understanding, comp, instrument_count)
-        }
+        // S98/B2-a: ONE INDEPENDENT DRAW PER VOICE over that voice's seat pool, keyed on that
+        // voice's own image band (deviation-coded against the image mean). Falls back to the
+        // whole-image `ensemble_catalogue` path byte-identically when no pool data or no band
+        // features exist — a CAPABILITY floor, not a per-piece gate.
+        Some(comp) => audiohax::instrumentation::select_programs_per_voice(
+            &understanding,
+            comp,
+            instrument_count,
+            &voice_bands(&source, instrument_count),
+        ),
         None => (0..instrument_count)
             .map(audiohax::instrumentation::legacy_program)
             .collect(),

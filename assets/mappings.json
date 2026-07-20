@@ -460,6 +460,79 @@
           "when": [ {"knob":"complexity","op":"ge","lo":0.1,"hi":0.0} ], "pick": "phrase_5" }
       ]
     },
+    "instrumentation_pools": {
+      "_note": "S98/B2-a PER-VOICE ENSEMBLE GRANULARITY \u2014 per-seat eligibility pools. Implements the \u00a73 (Music Theory) design ruling `s98-musictheory-b2a-design-constraint.md`. Instrumentation selection moves from ONE whole-image SelectTable draw read positionally into 4 voices (GRAIN_instrumentation = 1) to ONE INDEPENDENT DRAW PER VOICE over that voice's seat pool (GRAIN_instrumentation = num_instruments). Seats come from `instrument_role(i, n)` \u2014 the pure INDEX function (v0 Bass, v1+v2 HarmonicFill, v3 Melody), available before the plan is seated. THE LOAD-BEARING CALL: constrain REGISTER and ENVELOPE, LET FAMILY FLOAT. Family purity is the safe-feeling constraint that would collapse the whole gain while the grain metric still read 4, leaving the 'assembled from a bank' percept intact (\u00a73 \u00a74a); mixed-family quartets (cello+clarinet+horn+flute) are ordinary chamber ensembles and are unreachable in the shipped catalogue. C1 TESSITURA is enforced by POOL MEMBERSHIP: bass admits prog_lo<=48 && prog_hi>=52 (seat ~MIDI 36-55), harmonic_fill prog_lo<=60 && prog_hi>=67 (~48-72), melody prog_lo<=79 && prog_hi>=79 (~60-84) \u2014 this is the piccolo-bass guard, and it excludes GM 96-127 entirely per \u00a73's refusal to guess at uncharacterised register/envelope behaviour. C2 SUSTAIN is DATA per entry (not derivable from the program number) and is enforced cross-voice in Rust: at least one HarmonicFill seat must be SUSTAINING unless EVERY voice is DECAYING \u2014 'all-decaying is fine, half-decaying is forbidden', so the all-mallet ensemble (cool_mallets) stays reachable while a lone decaying program in a sustaining bed (which leaves the harmonic floor silent between onsets and reads to the ear as a BUG) is repaired. C3 separation/outer-polarity is SOFT and applied as a deterministic envelope-preserving nudge, never as a gate. POOL ORDER IS SEMANTIC: ascending spectral brightness, so a pool index IS a brightness position (\u00a73's HIGH-confidence primary axis, visual luminance <-> timbral brightness). NO PAIRWISE BLACKLIST \u2014 \u00a73 declined to invent one and so does this build: every 'bad' pair is bad for a reason already captured by C1/C2/C3. THE SHIPPED ENSEMBLES STAY REACHABLE BY CONSTRUCTION: every program of all 8 routed catalogue rows is present in its own seat's pool, and the brightness ordering means a uniformly dark image draws the dark end of every pool. They are NOT preserved by a special-cased whole-image arm \u2014 such an arm would make GRAIN read 1 on the pieces it fired for, failing the \u00a76 acceptance contract's M-a, and would be the G10 selective-scoping violation. BACK-COMPAT FLOOR: absent block / empty roles -> select_programs_per_voice falls back to the whole-image ensemble_catalogue path byte-identically (a CAPABILITY floor, not a per-piece gate).",
+      "global_weight": 0.5,
+      "_global_weight_note": "Blend on a seat's pool position: pos = w*global + (1-w)*band_rank. The GLOBAL term (whole-image brightness/100) carries image-relatedness \u2014 a dark photo draws the dark end of every pool, so the quartet still resembles its image. The BAND-RANK term carries per-voice differentiation and is deviation-coded against the image mean, which is \u00a73's \u00a74b mitigation and the most important choice in the build: measured on the nine-image corpus, ABSOLUTE band brightness is tightly correlated across bands (spread 4.6..20.0 on a 0..100 scale), so four absolute inputs would give four similar draws \u2014 timbral unison, which sounds WORSE than today. The band's RANK among its siblings is not correlated that way (8 distinct rank permutations across the 9 images). w=1 collapses all four draws to whole-image scalars \u2014 exactly \u00a76's pre-registered P-A hollow build \u2014 so w is deliberately < 1 and the rank term is never scaled away.",
+      "roles": [
+        {
+          "role": "bass",
+          "_seat": "v0 \u2014 harmonic foundation and metric anchor, tessitura ~MIDI 36-55. Needs a fundamental strong enough to define the root. Smallest pool of the three (\u00a73 \u00a74c: few GM programs are credible below MIDI 48), so v0 is a lower-entropy variable than v3 \u2014 'four variables' is true, 'four EQUAL variables' is not.",
+          "entries": [
+            { "program": 58, "sustain": "sustaining", "_gm": "Tuba" },
+            { "program": 43, "sustain": "sustaining", "_gm": "Contrabass" },
+            { "program": 70, "sustain": "sustaining", "_gm": "Bassoon" },
+            { "program": 32, "sustain": "decaying",   "_gm": "Acoustic Bass" },
+            { "program": 89, "sustain": "sustaining", "_gm": "Pad 2 (warm)" },
+            { "program": 42, "sustain": "sustaining", "_gm": "Cello" },
+            { "program": 33, "sustain": "decaying",   "_gm": "Electric Bass (finger)" },
+            { "program": 39, "sustain": "sustaining", "_gm": "Synth Bass 2" },
+            { "program": 16, "sustain": "sustaining", "_gm": "Drawbar Organ" },
+            { "program": 60, "sustain": "sustaining", "_gm": "French Horn" },
+            { "program": 46, "sustain": "decaying",   "_gm": "Orchestral Harp" },
+            { "program": 24, "sustain": "decaying",   "_gm": "Acoustic Guitar (nylon)" },
+            { "program": 45, "sustain": "decaying",   "_gm": "Pizzicato Strings" },
+            { "program": 12, "sustain": "decaying",   "_gm": "Marimba" },
+            { "program": 87, "sustain": "sustaining", "_gm": "Lead 8 (bass + lead)" }
+          ]
+        },
+        {
+          "role": "harmonic_fill",
+          "_seat": "v1/v2 \u2014 inner voices, tessitura ~MIDI 48-72. Sustains inner chord tones at the lowest rhythmic activity and a recessed velocity; the role is DESIGNED to be unobtrusive, so per \u00a73 \u00a74d these seats contribute the least perceptual variance per unit of plan space. v1 and v2 SHARE this pool but draw INDEPENDENTLY \u2014 they are separately DETERMINED (not merely separately called) because each is keyed on its own band's brightness RANK, and a rank is a permutation, so v1 and v2 can never receive the same rank. That distinction is exactly the difference between realized grain 3 and grain 4.",
+          "entries": [
+            { "program": 57, "sustain": "sustaining", "_gm": "Trombone" },
+            { "program": 69, "sustain": "sustaining", "_gm": "English Horn" },
+            { "program": 60, "sustain": "sustaining", "_gm": "French Horn" },
+            { "program": 41, "sustain": "sustaining", "_gm": "Viola" },
+            { "program":  6, "sustain": "decaying",   "_gm": "Harpsichord" },
+            { "program": 89, "sustain": "sustaining", "_gm": "Pad 2 (warm)" },
+            { "program": 90, "sustain": "sustaining", "_gm": "Pad 3 (polysynth)" },
+            { "program": 52, "sustain": "sustaining", "_gm": "Choir Aahs" },
+            { "program": 48, "sustain": "sustaining", "_gm": "String Ensemble 1" },
+            { "program": 61, "sustain": "sustaining", "_gm": "Brass Section" },
+            { "program": 46, "sustain": "decaying",   "_gm": "Orchestral Harp" },
+            { "program": 71, "sustain": "sustaining", "_gm": "Clarinet" },
+            { "program": 68, "sustain": "sustaining", "_gm": "Oboe" },
+            { "program": 11, "sustain": "decaying",   "_gm": "Vibraphone" },
+            { "program":  8, "sustain": "decaying",   "_gm": "Celesta" },
+            { "program": 81, "sustain": "sustaining", "_gm": "Lead 2 (sawtooth)" },
+            { "program": 13, "sustain": "decaying",   "_gm": "Xylophone" }
+          ]
+        },
+        {
+          "role": "melody",
+          "_seat": "v3 \u2014 the tune, tessitura ~MIDI 60-84. Highest register, most rhythmic freedom, velocity-forward, and the target of the S23 prominence weight. Together with v0 it carries nearly all of the piece's audible identity (\u00a73 \u00a74d), so this pool is the one whose ordering matters most to the ear. GM 72 (Piccolo) is ADMISSIBLE HERE and inadmissible in bass: the piccolo-bass guard is about the SEAT, not the program \u2014 a piccolo on the tune is an ordinary orchestration, a piccolo on the root at MIDI 36 is a sample-map artifact that reads as a bug.",
+          "entries": [
+            { "program": 71, "sustain": "sustaining", "_gm": "Clarinet" },
+            { "program": 52, "sustain": "sustaining", "_gm": "Choir Aahs" },
+            { "program": 68, "sustain": "sustaining", "_gm": "Oboe" },
+            { "program": 24, "sustain": "decaying",   "_gm": "Acoustic Guitar (nylon)" },
+            { "program": 48, "sustain": "sustaining", "_gm": "String Ensemble 1" },
+            { "program": 40, "sustain": "sustaining", "_gm": "Violin" },
+            { "program": 73, "sustain": "sustaining", "_gm": "Flute" },
+            { "program": 11, "sustain": "decaying",   "_gm": "Vibraphone" },
+            { "program": 56, "sustain": "sustaining", "_gm": "Trumpet" },
+            { "program": 10, "sustain": "decaying",   "_gm": "Music Box" },
+            { "program": 80, "sustain": "sustaining", "_gm": "Lead 1 (square)" },
+            { "program":  8, "sustain": "decaying",   "_gm": "Celesta" },
+            { "program": 13, "sustain": "decaying",   "_gm": "Xylophone" },
+            { "program": 81, "sustain": "sustaining", "_gm": "Lead 2 (sawtooth)" },
+            { "program":  9, "sustain": "decaying",   "_gm": "Glockenspiel" },
+            { "program": 72, "sustain": "sustaining", "_gm": "Piccolo" }
+          ]
+        }
+      ]
+    },
     "ensemble_catalogue": [
       { "id": "dark_reeds",      "label": "Dark warm reeds",         "programs": [70, 60, 69, 71] },
       { "id": "bright_brass",    "label": "Bright brass",            "programs": [58, 61, 57, 56] },

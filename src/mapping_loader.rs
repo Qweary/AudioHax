@@ -167,6 +167,14 @@ pub struct CompositionMappings {
     /// Carried onto `PlanMappings` by the `From<CompositionMappings>` impl in composition.rs.
     #[serde(default)]
     pub ensemble_catalogue: Vec<crate::composition::EnsembleSpec>,
+    /// S98/B2-a — the PER-SEAT eligibility pools that make instrumentation selection per-voice
+    /// (`GRAIN_instrumentation` 1 → `num_instruments`). `#[serde(default)]` back-compat floor:
+    /// absent → empty pools → `select_programs_per_voice` falls back to the whole-image
+    /// `ensemble_catalogue` path, byte-identically. NOT carried onto `PlanMappings`: this axis is
+    /// consumed by `instrumentation::select_programs_per_voice` before the plan is seated, and the
+    /// planner never reads it.
+    #[serde(default)]
+    pub instrumentation_pools: crate::instrumentation::InstrumentationPools,
 }
 
 /// S40 / Slice-2 (Finding #1) — the per-image home block (schema Option S1, range-map shape).
