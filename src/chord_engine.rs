@@ -2005,7 +2005,83 @@ pub fn assign_role(
 /// IGNORING the orchestral role, `features`, and harmonic-rhythm acceleration.
 /// Pass B replaces this body with the four-dimension realization specified in
 /// docs/design-s6-expressivity.md while keeping THIS signature.
+///
+/// S107/X0: this is now a THIN WRAPPER over [`realize_step_body`]. Its signature, its
+/// behaviour and its return value are byte-unchanged — the FROZEN `engine.rs:740` call site
+/// compiles and behaves identically. The wrapper exists so the event-level dump observes
+/// **every** exit path of the realizer, including the theme-driven melody rest that returns an
+/// empty vector before `realize_velocity` is ever reached. Recording at the call site instead
+/// would silently omit those rests from the coverage denominator, which overstates coverage —
+/// the exact shape of `s106-03` trap (a7).
 pub fn realize_step(
+    step: &StepPlan,
+    inst_idx: usize,
+    num_instruments: usize,
+    features: &PerfFeatures,
+    ms_per_step: u64,
+    ctx: &crate::composition::StepContext,
+) -> Vec<NoteEvent> {
+    let events = realize_step_body(step, inst_idx, num_instruments, features, ms_per_step, ctx);
+    // DIAGNOSTIC ONLY, and read-only: `events` is moved out untouched. Disarmed (every default
+    // render) this whole block is one `Relaxed` atomic load. `assign_role` is a pure function
+    // and is re-evaluated here rather than plumbed out of the body, so the body is unchanged.
+    if crate::expression_dump::is_armed() {
+        let role = assign_role(inst_idx, num_instruments, ctx);
+        let onsets: Vec<crate::expression_dump::Onset> = events
+            .iter()
+            .map(|e| crate::expression_dump::Onset {
+                note: e.note,
+                velocity: e.velocity,
+                hold_ms: e.hold_ms,
+                offset_ms: e.offset_ms,
+            })
+            .collect();
+        crate::expression_dump::record_step_frame(
+            &crate::expression_dump::StepMeta {
+                inst_idx,
+                role: orchestral_role_name(role),
+                section: ctx.section.label.clone(),
+                phrase_index: step.phrase_index,
+                position_in_phrase: step.position_in_phrase,
+                phrase_len: step.phrase_len,
+                phrase_position: phrase_position_name(step.position),
+                floor_velocity: step.velocity,
+                ms_per_step,
+            },
+            &onsets,
+        );
+    }
+    events
+}
+
+/// The stable diagnostic name of an [`OrchestralRole`].
+///
+/// Deliberately explicit rather than `{:?}`: the dump's per-role counters and the S106 design's
+/// per-role matrices key on these strings, so they must not drift if a variant is ever renamed
+/// without the analysis being revisited.
+pub fn orchestral_role_name(role: OrchestralRole) -> &'static str {
+    match role {
+        OrchestralRole::Bass => "Bass",
+        OrchestralRole::HarmonicFill => "HarmonicFill",
+        OrchestralRole::Melody => "Melody",
+        OrchestralRole::Pad => "Pad",
+        OrchestralRole::CounterMelody => "CounterMelody",
+    }
+}
+
+/// The stable diagnostic name of a [`PhrasePosition`].
+pub fn phrase_position_name(p: PhrasePosition) -> &'static str {
+    match p {
+        PhrasePosition::PhraseStart => "PhraseStart",
+        PhrasePosition::Interior => "Interior",
+        PhrasePosition::HalfCadence => "HalfCadence",
+        PhrasePosition::PerfectAuthenticCadence => "PerfectAuthenticCadence",
+    }
+}
+
+/// The realization body — the pre-S107 `realize_step`, moved verbatim behind the wrapper above.
+/// Not public: `realize_step` remains the single entry point, and its public seam is unchanged.
+fn realize_step_body(
     step: &StepPlan,
     inst_idx: usize,
     num_instruments: usize,
@@ -2369,7 +2445,20 @@ fn realize_velocity(
         vel += (prominence_w - PROMINENCE_NEUTRAL) * PROMINENCE_VEL_SPAN;
     }
 
-    vel.round().clamp(1.0, 127.0) as u8
+    // S107/X0 — DIAGNOSTIC ONLY, and the ONLY place `vel` is observable BEFORE the clamp.
+    // `s106-03` §5.1 trap (a2): for a highly saturated image `level_gain` reaches +18, and if
+    // the sum crosses 127 every velocity difference above the ceiling is destroyed SILENTLY,
+    // flattening the contour on exactly the vivid images most likely to be demoed. The clamp
+    // counter cannot be reconstructed downstream — `NoteEvent.velocity` is already clamped —
+    // so it is captured here. Also carries `level_gain` so the dump can report the STRUCTURAL
+    // series (`vel - level_gain`), which is the series the design tabulates and the one in
+    // which the phrase-start-vs-cadence inversion is legible.
+    //
+    // FREEZE DISCIPLINE: this reads `vel`; it never writes it. Disarmed (every default render)
+    // it is one `Relaxed` atomic load. The returned value below is byte-unchanged.
+    let vel_out = vel.round().clamp(1.0, 127.0) as u8;
+    crate::expression_dump::note_velocity_detail(vel, level_gain, vel_out);
+    vel_out
 }
 
 /// The articulation classes, expressed as the fraction of a note's time slot it

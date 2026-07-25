@@ -231,6 +231,22 @@ pub struct RenderArgs {
     /// is nonlinear, and the fold's exactness argument requires linearity.
     #[arg(long = "loop", default_value_t = false)]
     pub loop_cue: bool,
+    /// S107/X0 DIAGNOSTIC: write the resolved event-level dump to this JSON path.
+    ///
+    /// Emits, per realized note event, its full musical identity (cue, step, section, role,
+    /// phrase index / position-in-phrase / phrase length, cadence + pre-cadence status, onset
+    /// index within the step's figure), its velocity BOTH before and after
+    /// `round().clamp(1,127)`, and — the point of the whole instrument — the onset BOTH as
+    /// requested (`at_ms`) and as the renderer will actually apply it
+    /// (`realized_at_ms == floor(at_ms/10)*10`, the exact 10 ms block lattice of
+    /// `synth_sink.rs:378`). A dump that reported only the request would certify what the code
+    /// ASKED for, never what the render DID.
+    ///
+    /// OFF by default and inert when absent: the recorder is a disarmed atomic, so a render
+    /// without this flag is BYTE-IDENTICAL to one built before the flag existed. Purely
+    /// diagnostic — it changes no musical value and cannot move a golden.
+    #[arg(long = "event-dump", value_name = "PATH")]
+    pub event_dump: Option<PathBuf>,
     #[command(flatten)]
     pub pipeline: PipelineArgs,
     #[command(flatten)]

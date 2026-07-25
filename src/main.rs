@@ -290,10 +290,17 @@ fn build_step_event_timeline<S: FeatureSource>(
         });
     }
 
+    audiohax::expression_dump::set_plan(total_steps, grid_ms_per_step, instrument_count);
+
     for step_idx in 0..total_steps {
         // In compose mode the per-step cadence is the PLAN's base_ms_per_step; falls back to
         // config when not composing (grid_ms_per_step == ms_per_step in that branch).
         let step_base_ms = step_onset_offset_ms(step_idx, grid_ms_per_step);
+        // S107/X0 DIAGNOSTIC: hand the dump this step's absolute grid anchor. This is the ONLY
+        // place both the anchor and the realizer's musical context are simultaneously in
+        // reach — `realize_step` knows the role and the phrase but not `step_base_ms`, and the
+        // frozen `engine.rs` in between knows neither. Disarmed by default: one atomic load.
+        audiohax::expression_dump::begin_step(step_idx, step_base_ms);
         for dec in engine.decide_step(source, step_idx) {
             for ev in &dec.events {
                 let on_ms = step_base_ms + ev.offset_ms;
@@ -555,6 +562,25 @@ fn run_render_wav(
     // the two paths are identical by construction. ProgramChange init, per-step NoteOn/NoteOff
     // accumulation (with the deliberate cross-step overlap, NO grid clamp), and the global
     // stable sort all live in `build_step_event_timeline` now.
+    // ── S107/X0 DIAGNOSTIC: arm the event-level dump around the timeline build. ──
+    // Armed ONLY when `--event-dump <PATH>` is given; absent, `is_armed()` is false for the
+    // whole render and every hook is a no-op, so the WAV is byte-identical to a build without
+    // the flag. `expression_armed` is recorded as `false` because no expression axis exists at
+    // X0 — a dump must never be mistakable for evidence about a build it did not observe.
+    if let Some(p) = &render_args.event_dump {
+        let cue = wav_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "cue".to_string());
+        let image = render_args
+            .image
+            .as_ref()
+            .map(|i| i.display().to_string())
+            .unwrap_or_else(|| "<bundled example>".to_string());
+        println!("render --wav: event dump ARMED → {}", p.display());
+        audiohax::expression_dump::arm(&cue, &image, render_args.seed, false);
+    }
+
     let events = build_step_event_timeline(
         &engine,
         &source,
@@ -563,6 +589,22 @@ fn run_render_wav(
         instrument_count,
         &programs,
     );
+
+    if let Some(p) = &render_args.event_dump {
+        audiohax::expression_dump::disarm();
+        let json = audiohax::expression_dump::to_json()
+            .ok_or("event dump: failed to serialize the recorded timeline")?;
+        std::fs::write(p, json)?;
+        let d = audiohax::expression_dump::snapshot()
+            .ok_or("event dump: failed to snapshot the recorded timeline")?;
+        println!(
+            "render --wav: event dump wrote {} events over {} frames ({} silent) → {}",
+            d.counters.total_events,
+            d.counters.frames,
+            d.counters.silent_frames,
+            p.display()
+        );
+    }
 
     // ── Synthesize offline + write the WAV, honoring the A/B controls. ──
     let synth_config = SynthConfig {

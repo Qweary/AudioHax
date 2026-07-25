@@ -13,6 +13,13 @@ pub mod mapping_loader;
 // signature. Pure-Rust; builds & unit-tests under `--no-default-features`.
 pub mod seed;
 
+// S107 / X0 — the event-level DUMP: a deterministic, diagnostic-flag-gated recorder for the
+// resolved note-event timeline (requested AND renderer-realized onsets, velocity pre/post
+// clamp, per-term displacement counters). Pure-Rust, no image/audio type, no engine
+// dependency — builds & unit-tests headlessly under `--no-default-features`. Inert unless
+// explicitly armed, so the default render path is byte-identical.
+pub mod expression_dump;
+
 // S15 Slice 1 — the pure-Rust COMPOSER layer (form catalogue, plan, planner, StepContext).
 // `--no-default-features`-clean: NO image type, NO OpenCV. Builds & unit-tests headlessly.
 pub mod composition;
