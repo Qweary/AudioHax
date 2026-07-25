@@ -109,6 +109,8 @@ fn pad_figured() -> OrchestrationProfile {
         bass_pattern_resolved: None,
         prominence: Vec::new(),
         motto: RhythmMotto::neutral(),
+        // S107/X1 — additive fixture field, INERT (byte-unchanged).
+        expression: audiohax::composition::ExpressionProfile::inert(),
     }
 }
 
@@ -131,6 +133,8 @@ fn pad_bed() -> OrchestrationProfile {
         bass_pattern_resolved: None,
         prominence: Vec::new(),
         motto: RhythmMotto::neutral(),
+        // S107/X1 — additive fixture field, INERT (byte-unchanged).
+        expression: audiohax::composition::ExpressionProfile::inert(),
     }
 }
 
@@ -153,6 +157,8 @@ fn pad_figured_unresolved() -> OrchestrationProfile {
         bass_pattern_resolved: None,
         prominence: Vec::new(),
         motto: RhythmMotto::neutral(),
+        // S107/X1 — additive fixture field, INERT (byte-unchanged).
+        expression: audiohax::composition::ExpressionProfile::inert(),
     }
 }
 

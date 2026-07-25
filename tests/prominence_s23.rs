@@ -158,6 +158,8 @@ fn trio(bed: LayerRole, prominence: Vec<LayerProminence>) -> OrchestrationProfil
         bass_pattern_resolved: None,
         prominence,
         motto: RhythmMotto::neutral(),
+        // S107/X1 — additive fixture field, INERT (byte-unchanged).
+        expression: audiohax::composition::ExpressionProfile::inert(),
     }
 }
 
@@ -256,6 +258,8 @@ fn prominence_neutral_is_byte_identical() {
         bass_pattern_resolved: None,
         prominence: all_neutral(),
         motto: RhythmMotto::neutral(),
+        // S107/X1 — additive fixture field, INERT (byte-unchanged).
+        expression: audiohax::composition::ExpressionProfile::inert(),
     };
 
     // Sweep both a non-cadence interior step AND a cadence step (covers the velocity nudge,

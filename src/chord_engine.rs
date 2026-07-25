@@ -880,7 +880,17 @@ impl ChordEngine {
 
         let phrase_count = n.div_ceil(phrase_len);
 
-        // Structural-velocity floor (NOT expressive dynamics — S6 builds those).
+        // Structural-velocity floor. NOT expressive dynamics.
+        //
+        // S107/X1 CORRECTION (s106-03 §2.5): this comment previously read "NOT expressive dynamics
+        // — S6 builds those." S6 did NOT build them, and the sentence stood as a false statement of
+        // record for many sessions — it pointed a reader at work that did not exist. The expressive
+        // layer is built from S107 onward and lives in `realize_velocity` (:2282), carried by
+        // `OrchestrationProfile::expression` and inert by default; it is NOT here. This block
+        // remains the structural FLOOR only, and the three constants below are deliberately
+        // untouched by the expression work (s106-03 §3.1: they are the phrase-parsing skeleton and
+        // they are approximately right — the defect was a contour term duplicating them, not the
+        // floor itself).
         // theory: phrase shape is marked by weighting structural arrival points
         // differently from passing interior steps. A phrase START gets a modest
         // downbeat accent; the CADENCE step gets the heaviest weight (the point
@@ -2197,7 +2207,14 @@ fn realize_step_body(
     // what makes the realized series' variance STRICTLY EXCEED the floor's
     // (the contour adds variation to the NON-cadence steps).
     // ------------------------------------------------------------------
-    let velocity = realize_velocity(step, features, is_cadence, role, prominence_w);
+    let velocity = realize_velocity(
+        step,
+        features,
+        is_cadence,
+        role,
+        prominence_w,
+        ctx.section.orchestration.expression,
+    );
 
     // ------------------------------------------------------------------
     // RHYTHM + ARTICULATION — choose a rhythm pattern from (role,
@@ -2364,6 +2381,12 @@ fn realize_velocity(
     // (the pad_voices precedent) — realize_step's signature is unchanged. Drives the
     // centered velocity nudge; at 0.5 the nudge is exactly 0 (byte-frozen identity).
     prominence_w: f32,
+    // S107/X1 — the EXPRESSION deltas for this section. Additive PRIVATE param on this free fn
+    // (the `prominence_w` / `pad_voices` / `ctx` precedent) — `realize_step`'s PUBLIC signature is
+    // UNCHANGED and the FROZEN `engine.rs:740` call site is untouched. Under `inert()` every field
+    // is exactly 0.0 and `enabled` is false, so every term below short-circuits and the sealed
+    // goldens cannot move.
+    expr: crate::composition::ExpressionProfile,
 ) -> u8 {
     // Overall LEVEL from saturation: map 0..=100 to roughly [-12, +18] velocity
     // added to the floor — a dull bar still respects the floor's phrase marking,
@@ -2394,7 +2417,19 @@ fn realize_velocity(
         // staying smaller than the floor's start/cadence weighting so phrase
         // structure still reads.
         let accent = if step.position_in_phrase == 0 {
-            9.0 // phrase downbeat — strongest metric position
+            // S107/X1 (E1) — THE ENTRANCE DE-STACK. `V_START` (:892) has ALREADY marked this step
+            // as the phrase's opening; this accent marks the same fact a second time and nothing
+            // subtracts the duplication, so every phrase departs LOUDER than it arrives — the
+            // inverse of the ordering :886-893 declares. `downbeat_destack` is 0.0 under `inert()`,
+            // so the default path is byte-identically 9.0; armed, E1 sets it to -7.0, taking the
+            // accent to +2.0 — what any strong interior beat contributes. Measured consequence
+            // (s107-02, event dump): the Melody's structural phrase-start falls from 107/103/108
+            // to 100/96/101 against a cadence of 96, restoring `cadence >= start` on all three cues.
+            9.0 + if expr.enabled {
+                expr.downbeat_destack
+            } else {
+                0.0
+            }
         } else if step.position_in_phrase.is_multiple_of(2) {
             2.0 // a strong interior beat
         } else {
@@ -9493,6 +9528,9 @@ mod tests {
             // pattern, so the Bass arm takes the byte-unchanged sustained/pre-cadence path).
             bass_pattern: None,
             bass_pattern_resolved: None,
+            // S107/X1 — mechanical additive fixture field. INERT, so this net's realized
+            // velocities are byte-unchanged and the expression term never fires here.
+            expression: crate::composition::ExpressionProfile::inert(),
             // S23 — empty prominence: this existing counter net is a UNIFORM fixture, so
             // every role's weight is PROMINENCE_NEUTRAL (0.5) and the three prominence
             // nudges are all 0.0 — this test stays byte-identical (additive freeze).
@@ -10240,6 +10278,8 @@ mod tests {
             bass_pattern_resolved,
             prominence: Vec::new(),
             motto: RhythmMotto::neutral(), // S53 — neutral gait; realizer short-circuits (freeze)
+            // S107/X1 — additive fixture field, INERT (byte-unchanged).
+            expression: crate::composition::ExpressionProfile::inert(),
         }
     }
 
@@ -11472,9 +11512,35 @@ mod tests {
         };
         // Equal prominence (neutral) for all three roles → the ONLY difference is the per-role bias.
         let w = PROMINENCE_NEUTRAL;
-        let mel = realize_velocity(&step, &features, false, OrchestralRole::Melody, w);
-        let counter = realize_velocity(&step, &features, false, OrchestralRole::CounterMelody, w);
-        let fill = realize_velocity(&step, &features, false, OrchestralRole::HarmonicFill, w);
+        const EXPR_INERT: crate::composition::ExpressionProfile =
+            crate::composition::ExpressionProfile {
+                enabled: false,
+                downbeat_destack: 0.0,
+            };
+        let mel = realize_velocity(
+            &step,
+            &features,
+            false,
+            OrchestralRole::Melody,
+            w,
+            EXPR_INERT,
+        );
+        let counter = realize_velocity(
+            &step,
+            &features,
+            false,
+            OrchestralRole::CounterMelody,
+            w,
+            EXPR_INERT,
+        );
+        let fill = realize_velocity(
+            &step,
+            &features,
+            false,
+            OrchestralRole::HarmonicFill,
+            w,
+            EXPR_INERT,
+        );
         assert!(
             counter < mel,
             "the counter must recede below an equal-prominence melody (counter {counter} < melody {mel})"

@@ -127,6 +127,8 @@ fn profile(
         bass_pattern_resolved,
         prominence: Vec::new(),
         motto: RhythmMotto::neutral(),
+        // S107/X1 — additive fixture field, INERT (byte-unchanged).
+        expression: audiohax::composition::ExpressionProfile::inert(),
     }
 }
 

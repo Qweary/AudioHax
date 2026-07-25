@@ -388,6 +388,8 @@ fn pad_bed_counter() -> OrchestrationProfile {
         bass_pattern_resolved: None,
         prominence: Vec::new(),
         motto: RhythmMotto::neutral(),
+        // S107/X1 — additive fixture field, INERT (byte-unchanged).
+        expression: audiohax::composition::ExpressionProfile::inert(),
     }
 }
 

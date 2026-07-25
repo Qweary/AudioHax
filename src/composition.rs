@@ -726,6 +726,91 @@ pub enum LayerRole {
     Pad,
 }
 
+/// S107 / X1 — the EXPRESSION carrier.
+///
+/// Every field is a **delta from today's behaviour**, and `inert()` sets every one of them to
+/// exactly `0.0` with `enabled: false`. That is the byte-freeze hinge: on the default path every
+/// expression term adds literal `0.0` to a value it would otherwise not have touched, so the
+/// sealed S82/S87 goldens cannot move. Expressing the terms as deltas rather than as replacement
+/// magnitudes is deliberate — a replacement magnitude would have to carry the legacy value as its
+/// "identity", and a future edit to the legacy value would then silently desynchronise the two.
+///
+/// `Copy` + all-`f32`: this rides [`OrchestrationProfile`] (the R2-sanctioned carrier, whose every
+/// legacy construction goes through `identity()`), and it **never touches `NoteEvent`** — so R1's
+/// `Copy`/`Eq`/no-float constraint on that struct is untouched by construction.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+pub struct ExpressionProfile {
+    /// Master enable. `false` ⇒ every consumer early-returns before reading any field below.
+    #[serde(default)]
+    pub enabled: bool,
+    /// **E1 — the entrance de-stack.** A delta applied to the `position_in_phrase == 0` metric
+    /// accent in `realize_velocity`. `0.0` ⇒ the legacy `+9.0` stands. The S106 design's E1 sets
+    /// the accent to `+2.0`, i.e. this delta to `-7.0`.
+    ///
+    /// theory (`s106-03` §3.1): `V_START` and the `position_in_phrase == 0` metric accent encode
+    /// the SAME musical fact — "this is the first note of the phrase" — and both fire, with nothing
+    /// subtracting the duplication. When two independent markings of one event coincide, a
+    /// performer marks it once; accenting a downbeat that is already the loudest note by structural
+    /// weight reads as an accident, not as emphasis. Removing the duplicate restores the ordering
+    /// the file's own comment at `:886-893` declares and has never delivered.
+    #[serde(default)]
+    pub downbeat_destack: f32,
+}
+
+impl ExpressionProfile {
+    /// The identity profile: disabled, every delta exactly `0.0`. **Byte-identical by construction.**
+    pub fn inert() -> Self {
+        ExpressionProfile {
+            enabled: false,
+            downbeat_destack: 0.0,
+        }
+    }
+
+    /// The S106 §3.3 **E1** profile: the phrase-downbeat accent `+9.0 → +2.0`.
+    pub fn e1_entrance_destack() -> Self {
+        ExpressionProfile {
+            enabled: true,
+            downbeat_destack: -7.0,
+        }
+    }
+}
+
+impl Default for ExpressionProfile {
+    fn default() -> Self {
+        // `#[serde(default)]` on the `OrchestrationProfile` field routes here, so every existing
+        // `mappings.json` texture row parses with expression INERT and is byte-stable.
+        ExpressionProfile::inert()
+    }
+}
+
+/// S107 / X1 — the freeze-safe thread-local expression register.
+///
+/// Same seam and same discipline as the S41 composition-seed register (`src/seed.rs`) and the S79
+/// cadence-figure register: `main.rs` sets it ONCE, before the planner runs; the planner stamps
+/// the resolved value onto each section's [`OrchestrationProfile`]; the realizer reads it off the
+/// section it already borrows. `engine.rs` is never touched and no caller signature changes.
+///
+/// Default is `inert()`, so a process that never calls the setter renders byte-identically.
+pub mod expression_register {
+    use super::ExpressionProfile;
+    use std::cell::Cell;
+
+    thread_local! {
+        static ACTIVE: Cell<ExpressionProfile> =
+            const { Cell::new(ExpressionProfile { enabled: false, downbeat_destack: 0.0 }) };
+    }
+
+    /// Arm (or disarm) expression for this thread. Call once, before composing.
+    pub fn set(p: ExpressionProfile) {
+        ACTIVE.with(|c| c.set(p));
+    }
+
+    /// The active profile for this thread. `inert()` unless `set` was called.
+    pub fn active() -> ExpressionProfile {
+        ACTIVE.with(|c| c.get())
+    }
+}
+
 /// One named orchestration/texture profile — pure STRUCTURE, no note content. The planner
 /// attaches one per [`Section`] (selected by the `texture` [`SelectTable`]); the realizer's
 /// role-assignment + Pad branch read it. Adding a profile is a JSON row in `mappings.json`,
@@ -744,6 +829,11 @@ pub struct OrchestrationProfile {
     /// How many chord tones the Pad holds simultaneously (`0` == no pad). Default `0`.
     #[serde(default)]
     pub pad_voices: u8,
+    /// S107/X1 — the EXPRESSION deltas for this section. `#[serde(default)]` == `inert()`, so
+    /// every existing `mappings.json` texture row parses byte-unchanged and the realizer's reads
+    /// are exactly `0.0`. The planner stamps this from the thread-local `expression_register`.
+    #[serde(default)]
+    pub expression: ExpressionProfile,
     /// NEW S20 — id of a `figuration_catalogue` row this profile's Pad animates with, or None
     /// for the S17 block bed. `#[serde(default)]` (== None) so EVERY old profile parses unchanged
     /// → byte-identical to S18. The planner resolves this handle (into `figuration_resolved`);
@@ -834,6 +924,12 @@ impl OrchestrationProfile {
             // (cell_index == None), so `realize_rhythm`'s motto read short-circuits and every
             // identity/legacy/`single_section_default` path stays byte-identical to pre-S53.
             motto: RhythmMotto::neutral(),
+            // S107/X1 — the byte-freeze hinge, same shape as the S53 neutral motto above: the
+            // identity profile carries INERT expression, so `realize_velocity`'s E1 read
+            // short-circuits and every identity/legacy/`single_section_default` path — including
+            // the FROZEN `engine::legacy_default_section`, which builds this via `identity()` and
+            // not a literal — stays byte-identical.
+            expression: ExpressionProfile::inert(),
         }
     }
 
@@ -1981,6 +2077,13 @@ impl CompositionPlanner {
                 .and_then(|id| lookup_bass_pattern(&self.plan_mappings.bass_pattern_catalogue, id))
                 .cloned();
         }
+
+        // S107/X1 — stamp the per-render EXPRESSION profile from the freeze-safe register, at the
+        // same point and in the same manner as the figuration and bass-pattern handle resolves
+        // above. Placed HERE, immediately before the section loop clones `orchestration` onto every
+        // Section, so exactly one site covers every section on every path. Unset register ⇒
+        // `inert()` ⇒ every delta is 0.0 ⇒ byte-identical.
+        orchestration.expression = expression_register::active();
 
         let mut sections: Vec<Section> = Vec::with_capacity(form_spec.sections.len());
         let mut assigned = 0usize;

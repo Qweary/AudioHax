@@ -231,6 +231,18 @@ pub struct RenderArgs {
     /// is nonlinear, and the fold's exactness argument requires linearity.
     #[arg(long = "loop", default_value_t = false)]
     pub loop_cue: bool,
+    /// S107/X1: arm the EXPRESSION axis (`on`), or leave it inert (`off`, the default).
+    ///
+    /// X1 ships exactly one term — E1, the entrance de-stack: the `position_in_phrase == 0` metric
+    /// accent falls from `+9` to `+2`. `V_START` has already marked that step as the phrase's
+    /// opening, so the accent marks the same fact a second time and every phrase currently departs
+    /// LOUDER than it arrives, inverting the ordering `chord_engine.rs:886-893` declares. This is a
+    /// DEFECT REPAIR, not an enhancement.
+    ///
+    /// OFF by default and BYTE-IDENTICAL when absent: every expression field is a delta whose
+    /// inert value is exactly `0.0`, so the sealed S82/S87 goldens cannot move with the flag off.
+    #[arg(long = "expression", value_enum, default_value_t = Toggle::Off)]
+    pub expression: Toggle,
     /// S107/X0 DIAGNOSTIC: write the resolved event-level dump to this JSON path.
     ///
     /// Emits, per realized note event, its full musical identity (cue, step, section, role,

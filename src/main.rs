@@ -481,6 +481,17 @@ fn run_render_wav(
             .unwrap_or_else(|| audiohax::composition::image_seed(&understanding)),
     ));
 
+    // ── S107/X1 — arm the EXPRESSION axis, at the SAME freeze-safe site and in the SAME manner
+    //    as the seed register above: set ONCE, here, BEFORE compose runs; the planner stamps it
+    //    onto every section's OrchestrationProfile; the realizer reads it off the section it
+    //    already borrows. `engine.rs` untouched, no caller signature changed. Absent the flag the
+    //    register stays `inert()` and every expression delta is exactly 0.0.
+    audiohax::composition::expression_register::set(if render_args.expression.is_on() {
+        audiohax::composition::ExpressionProfile::e1_entrance_destack()
+    } else {
+        audiohax::composition::ExpressionProfile::inert()
+    });
+
     // ── S79 cadence-figure differentiation: ARMED S80 (production default). ──
     // Per-image + within-piece-developing cadential figure, grounded on LIVE `understanding.*`
     // extraction — NOT the hardcoded test fixture the QG flagged. Set here BEFORE compose, the
@@ -578,7 +589,38 @@ fn run_render_wav(
             .map(|i| i.display().to_string())
             .unwrap_or_else(|| "<bundled example>".to_string());
         println!("render --wav: event dump ARMED → {}", p.display());
-        audiohax::expression_dump::arm(&cue, &image, render_args.seed, false);
+        audiohax::expression_dump::arm(
+            &cue,
+            &image,
+            render_args.seed,
+            render_args.expression.is_on(),
+        );
+    }
+
+    // S107/X1 gate discipline, step 2 (s106-03 §5.1 (b1)): read the RESOLVED profile back out
+    // IN THE SAME PROCESS THAT RENDERS and assert it is actually enabled. A byte-identity check
+    // with the axis off passes perfectly on an enabled path that was never wired to the flag at
+    // all; this is the assertion that catches that, and it is the mirror of the identity check —
+    // neither alone is a gate. Read off the composed plan's own sections, not off the register,
+    // so it certifies the value the realizer will actually see.
+    if render_args.expression.is_on() {
+        let armed = engine
+            .composition()
+            .map(|p| {
+                p.sections
+                    .iter()
+                    .filter(|s| s.orchestration.expression.enabled)
+                    .count()
+            })
+            .unwrap_or(0);
+        let total = engine.composition().map(|p| p.sections.len()).unwrap_or(0);
+        if armed == 0 || armed != total {
+            return Err(format!(
+                "--expression on: the resolved profile is NOT enabled on every section                  ({armed}/{total}). The axis is wired to the flag but not to the realizer's                  input; refusing to render a build that would look like a null result."
+            )
+            .into());
+        }
+        println!("render --wav: expression ARMED and VERIFIED on {armed}/{total} sections");
     }
 
     let events = build_step_event_timeline(

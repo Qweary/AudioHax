@@ -132,6 +132,8 @@ fn pad_bed() -> OrchestrationProfile {
         bass_pattern_resolved: None,
         prominence: Vec::new(),
         motto: RhythmMotto::neutral(),
+        // S107/X1 — additive fixture field, INERT (byte-unchanged).
+        expression: audiohax::composition::ExpressionProfile::inert(),
     }
 }
 
@@ -423,6 +425,8 @@ fn test_countermelody_is_no_longer_harmonicfill_delegate() {
         bass_pattern_resolved: None,
         prominence: Vec::new(),
         motto: RhythmMotto::neutral(),
+        // S107/X1 — additive fixture field, INERT (byte-unchanged).
+        expression: audiohax::composition::ExpressionProfile::inert(),
     };
     // A strong (even) interior beat with real edge so the HarmonicFill SOUNDS (a single
     // onset at 0). The single-step fixture has no prior step (step_in_section == 0), so
