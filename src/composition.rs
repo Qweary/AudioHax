@@ -755,14 +755,75 @@ pub struct ExpressionProfile {
     /// the file's own comment at `:886-893` declares and has never delivered.
     #[serde(default)]
     pub downbeat_destack: f32,
+    /// **E3 — per-role accent scaling** (S113, `s113-09` §1.1). A BOOLEAN, not a delta: `false` ⇒
+    /// every role's accent factor is exactly `1.0` and — decisively — the multiplication is not
+    /// performed at all, so no float operation occurs on the default path. `true` ⇒ the metric
+    /// accent computed in `realize_velocity` is scaled by a per-role compile-time constant
+    /// (`chord_engine::e3_role_accent_factor`) before it is summed into the velocity.
+    ///
+    /// theory (`s106-03` §3.2 (V-c), re-ruled by `s107-03` §6.1): every voice today takes the
+    /// IDENTICAL metric accent, so the measured Melody-to-bed dynamic-range ratio is exactly
+    /// `1.000` — five voices swelling and dipping in lockstep, which is what fuses them into one
+    /// mass. Scaling the accent by role opens a range gap in the level domain **without adding a
+    /// single event**, which is the only lever in the inventory that buys figure-ground separation
+    /// at zero cost in event density.
+    ///
+    /// A flag rather than five `f32` fields deliberately: the factors are ear-tunable by editing
+    /// one table in one file, and putting five floats on a `Copy` struct that rides
+    /// [`OrchestrationProfile`] would widen the serde surface for no gain (`s113-09` §1.1).
+    #[serde(default)]
+    pub role_accent_scale: bool,
+    /// **E2′ — the re-scoped metric hierarchy** (S113, `s113-09` §1.2 / `s107-03` §3.3). A BOOLEAN:
+    /// `false` ⇒ the legacy `position_in_phrase`-parity accent selector stands, unchanged, and no
+    /// new arithmetic is performed. `true` ⇒ `realize_velocity` selects the metric accent from the
+    /// position's ROLE INSIDE ITS OWN PHRASE — head / anacrusis / secondary-strong / weak — read
+    /// from both ends, with the cadence at the far end.
+    ///
+    /// theory (`s107-03` §3.2 fact (10), verified at `chord_engine.rs:916`): the phrase's LAST
+    /// position is ALWAYS the cadence, and every `!is_cadence`-guarded contour term is off there.
+    /// So the reachable non-cadence positions are `0 ..= phrase_len - 2` — at most three, ever.
+    /// The legacy selector's even/odd parity imposes a metric ALTERNATION on a shape that has no
+    /// meter to alternate: a three- or four-step phrase is *head → approach → arrival*. E2′ gives
+    /// it that shape, dipping the step immediately before the arrival BELOW the weak interior so
+    /// the phrase leans into its landing instead of ticking evenly toward it.
+    ///
+    /// ⚠ **MUTUALLY EXCLUSIVE WITH E1 AT `p == 0`, BY CONSTRUCTION.** E2′'s head value `+2.0` IS
+    /// E1's post-de-stack value. When this flag is set the head arm emits `+2.0` DIRECTLY and
+    /// [`Self::downbeat_destack`] is NOT additionally applied — composing them would take the head
+    /// to `+2.0 - 7.0 = -5.0` and collapse the phrase head below the weak beat (`s113-09` §1.2).
+    #[serde(default)]
+    pub metric_hierarchy: bool,
+    /// **T-A — metric inequality** (S113, `s113-09` §1.3 / `s106-03` §A.4 as amended by `s107-03`
+    /// §8.3). The inequality FRACTION, as a share of the local realized gap. `0.0` ⇒ the term is
+    /// entirely inert and no onset is displaced; the shipped value is
+    /// [`Self::SHIPPED_INEQ_FRAC`] (`0.15`, the FLOOR of the ear window `[0.15, 0.24]`).
+    ///
+    /// theory: a run of nominally equal notes played exactly equally is the machine signature the
+    /// ear names. Metric inequality is the performer's answer — the WEAK member of each pair goes
+    /// late, so the pair reads long-short. T-A delays every ODD onset index within a step's figure;
+    /// index 0 is the downbeat anchor and is NEVER moved, at any magnitude.
+    ///
+    /// ⚠ `0.0` is genuinely inert here, unlike FLOOR-1's detach interval: `0.0 * gap` rounds to 0
+    /// rungs and LR-2′ zeroes it a second time. The realizer additionally short-circuits on
+    /// `!enabled`, so there are two independent inert paths.
+    ///
+    /// ⚠ **This field is a REQUEST, not a realization.** Everything emitted is floored to a whole
+    /// 10 ms rung as the LAST operation after every clamp (LR-1/LR-5), and the realized inequality
+    /// is therefore quantized — see `chord_engine::apply_ta_metric_inequality`.
+    #[serde(default)]
+    pub ineq_frac: f32,
 }
 
 impl ExpressionProfile {
-    /// The identity profile: disabled, every delta exactly `0.0`. **Byte-identical by construction.**
+    /// The identity profile: disabled, every delta exactly `0.0`, every axis flag `false`.
+    /// **Byte-identical by construction.**
     pub fn inert() -> Self {
         ExpressionProfile {
             enabled: false,
             downbeat_destack: 0.0,
+            role_accent_scale: false,
+            metric_hierarchy: false,
+            ineq_frac: 0.0,
         }
     }
 
@@ -771,7 +832,45 @@ impl ExpressionProfile {
         ExpressionProfile {
             enabled: true,
             downbeat_destack: -7.0,
+            role_accent_scale: false,
+            metric_hierarchy: false,
+            ineq_frac: 0.0,
         }
+    }
+
+    /// Builder: set the **E3** per-role accent-scaling axis, leaving every other field alone.
+    ///
+    /// Used by `main.rs` to compose a v2 rung on top of the X1/E1 base profile. Passing `false`
+    /// returns `self` unchanged, so `--v2` absent is exactly the pre-S113 profile.
+    pub fn with_role_accent_scale(mut self, on: bool) -> Self {
+        self.role_accent_scale = on;
+        self
+    }
+
+    /// Builder: set the **E2′** re-scoped-metric-hierarchy axis, leaving every other field alone.
+    ///
+    /// Used by `main.rs` to compose a v2 rung on top of the X1/E1 base profile. Passing `false`
+    /// returns `self` unchanged, so `--v2 e3` (without `e2`) is exactly the rung-2 profile.
+    pub fn with_metric_hierarchy(mut self, on: bool) -> Self {
+        self.metric_hierarchy = on;
+        self
+    }
+
+    /// The **T-A** inequality fraction this build ships, per `s113-09` §1.3: the **FLOOR** of the
+    /// ear window `[0.15, 0.24]`, deliberately not `s106-03` §4.3's `0.19`.
+    ///
+    /// `s113-09`'s ground, recorded here because a bare constant loses it: T-A's magnitude was
+    /// calibrated in `s106-03` against *relaxed jazz eighths* (60:40), and the governing direction
+    /// (`s101` FC-9) names vernacular idiom markers as world-destroying — *"one is enough"*. The
+    /// hedge is free on tight gaps (the rung lattice quantizes `0.15` and `0.19` to the same rung)
+    /// and buys a real reduction on wide ones, which is where a lilt reads most as style.
+    pub const SHIPPED_INEQ_FRAC: f32 = 0.15;
+
+    /// Builder: set the **T-A** inequality fraction, leaving every other field alone. `0.0`
+    /// returns an inert term, so `--v2 e3,e2` (without `ta`) is exactly the rung-3 profile.
+    pub fn with_ineq_frac(mut self, frac: f32) -> Self {
+        self.ineq_frac = frac;
+        self
     }
 }
 
@@ -796,8 +895,15 @@ pub mod expression_register {
     use std::cell::Cell;
 
     thread_local! {
-        static ACTIVE: Cell<ExpressionProfile> =
-            const { Cell::new(ExpressionProfile { enabled: false, downbeat_destack: 0.0 }) };
+        static ACTIVE: Cell<ExpressionProfile> = const {
+            Cell::new(ExpressionProfile {
+                enabled: false,
+                downbeat_destack: 0.0,
+                role_accent_scale: false,
+                metric_hierarchy: false,
+                ineq_frac: 0.0,
+            })
+        };
     }
 
     /// Arm (or disarm) expression for this thread. Call once, before composing.

@@ -128,6 +128,68 @@ pub enum Toggle {
     Off,
 }
 
+/// S113 — the set of **v2 expression terms** requested on the command line.
+///
+/// Parsed from `--v2`'s comma-separated list. This is the composite opt-in surface `s113-09` §1.4
+/// asks for: one flag that can arm the whole set, and individual terms reachable so the attribution
+/// LADDER (`v1` · `v1+E3` · `v1+E3+E2′` · `v1+E3+E2′+T-A`) can be rendered rung by rung.
+///
+/// Every field defaults to `false`, so an absent `--v2` is the identity request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct V2Spec {
+    /// **E3** — per-role accent scaling. BUILT (S113).
+    pub e3: bool,
+    /// **E2′** — the re-scoped metric hierarchy. BUILT (S113).
+    pub e2: bool,
+    /// **T-A** — metric inequality. BUILT (S113).
+    pub ta: bool,
+}
+
+impl V2Spec {
+    /// `true` when no v2 term is armed.
+    pub fn is_empty(self) -> bool {
+        !self.e3 && !self.e2 && !self.ta
+    }
+
+    /// The names of any requested terms that are not implemented yet, in ladder order.
+    pub fn unbuilt(self) -> Vec<&'static str> {
+        // S113-02-C2: all three ladder terms are BUILT. The hook stays — a fourth term added to
+        // this struct without a realizer behind it must REFUSE, not silently render the rung below.
+        Vec::new()
+    }
+}
+
+impl std::str::FromStr for V2Spec {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut spec = V2Spec::default();
+        for tok in s.split(',') {
+            match tok.trim().to_ascii_lowercase().as_str() {
+                "e3" => spec.e3 = true,
+                "e2" | "e2'" | "e2p" => spec.e2 = true,
+                "ta" | "t-a" => spec.ta = true,
+                "all" => {
+                    spec.e3 = true;
+                    spec.e2 = true;
+                    spec.ta = true;
+                }
+                other => {
+                    return Err(format!(
+                        "unknown v2 term `{other}` — known terms are `e3`, `e2`, `ta`, `all`"
+                    ));
+                }
+            }
+        }
+        if spec.is_empty() {
+            return Err(
+                "no v2 term requested — pass at least one of `e3`, `e2`, `ta`, `all`".to_string(),
+            );
+        }
+        Ok(spec)
+    }
+}
+
 impl Toggle {
     /// `true` when the toggle is `on`.
     pub fn is_on(self) -> bool {
@@ -243,6 +305,21 @@ pub struct RenderArgs {
     /// inert value is exactly `0.0`, so the sealed S82/S87 goldens cannot move with the flag off.
     #[arg(long = "expression", value_enum, default_value_t = Toggle::Off)]
     pub expression: Toggle,
+    /// S113/v2: arm one or more **v2 expression terms** on top of `--expression on`.
+    ///
+    /// Comma-separated, from `e3` (per-role accent scaling), `e2` (re-scoped metric hierarchy),
+    /// `ta` (metric inequality), or `all`. Absent ⇒ no v2 term is armed and the render is exactly
+    /// the pre-S113 render.
+    ///
+    /// **`--v2` REQUIRES `--expression on` and the binary refuses without it.** The v2 terms are
+    /// deltas on top of the X1/E1 base profile, not an alternative to it: `e3` scales the very
+    /// metric accent X1 amends, and the pre-registered acceptance figures for `e3` are stated
+    /// against an X1-armed baseline. Requiring the flag rather than implying it keeps the whole
+    /// arming state visible on the command line, so each ladder rung reads as "v1 plus X".
+    ///
+    /// Terms that are not yet built refuse loudly rather than rendering a null result.
+    #[arg(long = "v2", value_name = "TERMS")]
+    pub v2: Option<V2Spec>,
     /// S107/X0 DIAGNOSTIC: write the resolved event-level dump to this JSON path.
     ///
     /// Emits, per realized note event, its full musical identity (cue, step, section, role,
@@ -1160,5 +1237,61 @@ mod tests {
         let text = toml::to_string(&cfg).expect("serialize");
         let back: ConfigFile = toml::from_str(&text).expect("deserialize");
         assert_eq!(cfg, back);
+    }
+
+    /// S113 — `--v2` parses the composite term list, is case- and space-insensitive, accepts the
+    /// ladder's cumulative subsets, and REFUSES anything it cannot honour rather than silently
+    /// arming a subset.
+    #[test]
+    fn s113_v2_spec_parses_the_ladder_rungs() {
+        use std::str::FromStr;
+
+        let e3 = V2Spec::from_str("e3").expect("e3 parses");
+        assert_eq!(
+            e3,
+            V2Spec {
+                e3: true,
+                e2: false,
+                ta: false
+            }
+        );
+        assert!(e3.unbuilt().is_empty(), "e3 is built");
+
+        // Rung 3 and rung 4 of the ladder, in the exact spelling the render lane will use.
+        assert_eq!(
+            V2Spec::from_str("e3,e2").expect("rung 3"),
+            V2Spec {
+                e3: true,
+                e2: true,
+                ta: false
+            }
+        );
+        assert_eq!(V2Spec::from_str(" E3 , e2 , T-A ").expect("rung 4 with noise"), V2Spec {
+            e3: true,
+            e2: true,
+            ta: true
+        });
+        assert_eq!(V2Spec::from_str("all").expect("all"), V2Spec::from_str("e3,e2,ta").unwrap());
+
+        // S113-02-C2: all three ladder terms are BUILT, so the unbuilt list is empty for every
+        // spelling. The hook is retained deliberately — a fourth term added to `V2Spec` without a
+        // realizer behind it must REFUSE, not silently render the rung below.
+        for spelling in ["e3", "e3,e2", "e3,e2,ta", "all", "ta", "e2"] {
+            assert!(
+                V2Spec::from_str(spelling)
+                    .expect("a built rung parses")
+                    .unbuilt()
+                    .is_empty(),
+                "`{spelling}` names only BUILT terms"
+            );
+        }
+
+        // An absent flag is the identity request.
+        assert!(V2Spec::default().is_empty());
+
+        // Refusals.
+        assert!(V2Spec::from_str("").is_err(), "empty list is refused");
+        assert!(V2Spec::from_str("e4").is_err(), "unknown term is refused");
+        assert!(V2Spec::from_str("e3,nope").is_err(), "one bad term fails the whole list");
     }
 }

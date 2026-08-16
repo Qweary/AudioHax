@@ -2234,6 +2234,7 @@ fn realize_step_body(
         pad_voices,
         ctx,
         counter_present,
+        ctx.section.orchestration.expression,
     )
 }
 
@@ -2371,6 +2372,76 @@ fn seat_pc_in_register(pc: u8, floor: u8) -> u8 {
     note.clamp(24, 108)
 }
 
+/// S113 / **E3** — the per-role metric-accent factor.
+///
+/// Multiplies the metric accent computed in [`realize_velocity`] so that the accompaniment stops
+/// marking the meter as hard as the melody does. Compile-time constants rather than profile fields
+/// (`s113-09` §1.1): they are ear-tunable by editing this one table, and five `f32`s on the `Copy`
+/// [`crate::composition::ExpressionProfile`] would widen the serde surface for nothing.
+///
+/// Factors are from `s106-03` §3.3 (E3) with the one trim `s107-03` §6.2 mandates — the
+/// CounterMelody's "+2 phase rotation" is **WITHDRAWN** (with at most three reachable non-cadence
+/// positions it relabels the phrase head as an upbeat in one voice only, which reads as mis-barring
+/// rather than as a second line). **Scaling only.**
+///
+/// `Melody` is exactly `1.00`, so E3's maximum positive contribution to the melody is `0.0` and the
+/// HR-1 clamp rule is vacuous for this term — every other factor is `< 1`, so the term is purely
+/// subtractive in magnitude and cannot push any voice into the `clamp(1, 127)` ceiling.
+fn e3_role_accent_factor(role: OrchestralRole) -> f32 {
+    match role {
+        // The foreground carries the meter — unchanged, by definition of "foreground".
+        OrchestralRole::Melody => 1.00,
+        // A real second voice, at a fraction: it must read as a line, not as a doubling.
+        OrchestralRole::CounterMelody => 0.70,
+        // Giving the bed the melody's meter is precisely what fuses them into one mass.
+        OrchestralRole::HarmonicFill => 0.35,
+        // The foundation states the meter but does not surge (cf. the existing `-1` role bias).
+        OrchestralRole::Bass => 0.50,
+        // A bed with meter is not a bed.
+        OrchestralRole::Pad => 0.15,
+    }
+}
+
+/// S113 / **E2′** — the re-scoped metric accent, keyed on the position's role inside its OWN
+/// phrase rather than on the absolute parity of `position_in_phrase` (`s113-09` §1.2, from
+/// `s107-03` §3.3). Pure, total, deterministic; no clamping, no state.
+///
+/// `s107-03` §3.2 fact (10), verified at source (`chord_engine.rs:916`): the phrase's LAST
+/// position is ALWAYS the cadence, and every `!is_cadence`-guarded contour term is off there.
+/// The reachable non-cadence set is therefore `0 ..= phrase_len - 2` — **at most three positions,
+/// ever** — so `last_nc = phrase_len - 2` is the step that actually approaches the arrival.
+///
+/// | `phrase_len` | reachable `p` | series | distinct |
+/// |---|---|---|---|
+/// | 4 | 0, 1, 2 | `+2, -6, -3` | 3 |
+/// | 3 | 0, 1 | `+2, -3` | 2 |
+/// | 2 | 0 | `+2` | 1 |
+/// | 1 | 0 | `+2` | 1 |
+///
+/// ⚠ The `+1.0` secondary-strong branch is **DEAD ON THIS CORPUS** and ships with its deadness
+/// asserted rather than removed: it needs an even interior position that is neither the head nor
+/// `last_nc` (i.e. `p == 2` with `phrase_len >= 5`) and the maximum realized `phrase_len` is 4.
+/// A level that cannot fire cannot be certified, so it is certified as dead, deliberately
+/// (criterion E2-C).
+fn e2p_metric_accent(position_in_phrase: usize, phrase_len: usize) -> f32 {
+    // `last_nc` == L-2 for L>=2 (the last NON-cadence position), == 0 for L<=1.
+    let last_nc = phrase_len.saturating_sub(2);
+    if position_in_phrase == 0 {
+        // PHRASE HEAD — the structural floor (`V_START`) already marks it, so it is marked ONCE.
+        // This value IS E1's post-de-stack accent; see the mutual-exclusion note at the call site.
+        2.0
+    } else if position_in_phrase == last_nc {
+        // ANACRUSIS — the step immediately before the arrival, leaning forward into it.
+        -3.0
+    } else if position_in_phrase.is_multiple_of(2) {
+        // SECONDARY STRONG — see the deadness note above.
+        1.0
+    } else {
+        // WEAK INTERIOR — unchanged from the legacy selector.
+        -6.0
+    }
+}
+
 /// Realize the phrase-contoured velocity for a step. Pure, deterministic.
 fn realize_velocity(
     step: &StepPlan,
@@ -2416,7 +2487,39 @@ fn realize_velocity(
         // structural floor — the strong beats rise, the weak beats deepen — while
         // staying smaller than the floor's start/cadence weighting so phrase
         // structure still reads.
-        let accent = if step.position_in_phrase == 0 {
+        //
+        // S113/E2′ — THE RE-SCOPED METRIC HIERARCHY (`s113-09` §1.2, from `s107-03` §3.3).
+        //
+        // The legacy selector below keys on the PARITY of `position_in_phrase` — an absolute
+        // even/odd alternation. `s107-03` §3.2 fact (10) establishes at source (`:916`) that the
+        // phrase's LAST position is ALWAYS the cadence, and every `!is_cadence`-guarded term is
+        // off there, so the reachable non-cadence positions are `0 ..= phrase_len-2` — at most
+        // THREE, ever. A parity rule needs an interior to alternate over and there is none: the
+        // realized shape is head → approach → arrival.
+        //
+        // theory: E2′ assigns the metric level by the position's role inside its OWN phrase, read
+        // from both ends. The head keeps `+2` (one musical fact marked once — this IS E1). The
+        // step immediately before the arrival takes `-3` where the legacy parity rule gave it a
+        // `+2` BUMP, so the approach now leans forward into the cadence's structural 96 from five
+        // units further down. The interior weak beat is unchanged at `-6`.
+        //
+        // ⚠ `-3` is ABOVE the weak interior's `-6` as an ACCENT, but the REALIZED series still
+        // dips below the weak beat there, because the phrase-end taper (`-4.0`, ~30 lines down)
+        // fires on that same position and not on the weak interior. `s107-03` §3.5's projected
+        // Melody series at `phrase_len = 4` is `106.56 / 83.00 / 82.00 / 96.00` post-E2′ against
+        // `106.56 / 83.00 / 87.00 / 96.00` today — a 14-unit lift into the arrival where there
+        // was a 9-unit one. The accent table alone does not show that; the taper is the reason.
+        //
+        // ⚠ MUTUAL EXCLUSION WITH X1/E1: the `p == 0` arm emits `+2.0` DIRECTLY and
+        // `downbeat_destack` is NOT additionally applied. `+2.0` IS E1's post-de-stack value;
+        // composing both would give `+2.0 - 7.0 = -5.0` and collapse the head below the weak beat.
+        // Asserted by `s113_e2p_head_is_exactly_plus_two_with_both_flags_on` (criterion E2-D).
+        //
+        // ⚠ BYTE-IDENTITY: when the axis is off, control falls through to the legacy chain below,
+        // character for character. No new arithmetic is performed on the default path.
+        let accent = if expr.enabled && expr.metric_hierarchy {
+            e2p_metric_accent(step.position_in_phrase, step.phrase_len)
+        } else if step.position_in_phrase == 0 {
             // S107/X1 (E1) — THE ENTRANCE DE-STACK. `V_START` (:892) has ALREADY marked this step
             // as the phrase's opening; this accent marks the same fact a second time and nothing
             // subtracts the duplication, so every phrase departs LOUDER than it arrives — the
@@ -2435,6 +2538,32 @@ fn realize_velocity(
         } else {
             -6.0 // a weak interior beat — the valley of the metric arch
         };
+
+        // S113/E3 — PER-ROLE ACCENT SCALING (`s113-09` §1.1, re-ruled from `s107-03` §6.1/§6.2).
+        //
+        // Everything above this line is role-BLIND: the Melody, the CounterMelody, the
+        // HarmonicFill, the Bass and the Pad all take the SAME metric accent, so all five voices
+        // swell and dip in exact lockstep and the measured Melody-to-bed dynamic-RANGE ratio is
+        // exactly 1.000. That identity is the defect — `s106-03` §3.2 (V-c)'s "one lumpy mass
+        // breathing as a unit" stated as a number. Giving the bed the melody's meter is what fuses
+        // them; taking it away is what separates foreground from background.
+        //
+        // theory: in an ensemble the accompaniment states the meter and the melody INFLECTS it. A
+        // pad that accents every strong beat as hard as the tune is not a bed, it is a second tune
+        // in unison. The factors below are therefore a hierarchy of metric responsibility, not a
+        // mix balance — the Bass keeps half the accent because the foundation genuinely does state
+        // the meter, the Pad keeps almost none because a bed with meter is not a bed.
+        //
+        // ⚠ BYTE-IDENTITY: when the axis is off this arm performs NO arithmetic on `accent` at
+        // all. It deliberately does not multiply by a `1.0` factor — `x * 1.0` is bit-exact for
+        // every finite `f32`, but relying on that is relying on a property of the multiplication
+        // rather than on its absence, and the sealed S82/S87 goldens are worth the extra branch.
+        let accent = if expr.enabled && expr.role_accent_scale {
+            accent * e3_role_accent_factor(role)
+        } else {
+            accent
+        };
+
         vel += accent;
 
         // Phrase-end taper: the last interior step before the cadence eases off
@@ -2560,6 +2689,22 @@ const RITARDANDO_FACTOR: f32 = 1.30;
 /// of a beat's "and") that the ear reads as a different WALK without fragmenting the texture or
 /// muddying the downbeat. Ear-tune window [0.12, 0.25]; below 0.12 the gait is inaudible (GR-4),
 /// above 0.25 the syncopation starts to read as a metric error rather than a swung profile.
+/// S113 / T-A — the 10 ms floor lattice's rung, in ms. Every emitted deviation is a whole multiple
+/// of this (LR-1/LR-5). `realize_rhythm` emits step-RELATIVE offsets and cannot observe the lattice
+/// phase, so whole rungs are the only deviation whose realization is phase-independent.
+const TA_RUNG_MS: i64 = 10;
+/// S113 / T-A — LR-2′ (`s107-03` §8.3): the WITHIN-VOICE audibility floor, in rungs. Raised from
+/// `s106-03`'s 2 because the un-displaced class carries one rung of ambient spread of its own.
+const TA_MIN_RUNGS: i64 = 3;
+/// S113 / T-A — the ceiling, in rungs (`s106-03` §A.4). ⚠ On wide gaps this BINDS before the
+/// fraction does, so the realized inequality falls below `frac`; that is the lattice's own ceiling,
+/// not a build defect, and it is measured rather than assumed.
+const TA_MAX_RUNGS: i64 = 5;
+/// S113 / T-A — LR-4: no deviation may exceed this share of its own realized gap.
+const TA_LR4_FRAC: f32 = 0.30;
+/// S113 / T-A — the CounterMelody's share of the melody's inequality (`s106-03` §A.4).
+const TA_COUNTER_SCALE: f32 = 0.6;
+
 const MOTTO_ONSET_BIAS_DEPTH: f32 = 0.18;
 /// S53 (D-CELL) — the pre-cadence attenuation of the motto onset bias (GR-2): the phrase RELAXES
 /// into its close, so the bias is HALVED on the pre-cadence approach step and ZEROED at the cadence
@@ -2623,6 +2768,12 @@ fn realize_rhythm(
     // engine_equivalence goldens (counter_present == false) every comp term short-circuits and
     // the freeze holds, EXACTLY as the seat guard's counter_present gate does.
     counter_present: bool,
+    // S113/T-A — the EXPRESSION deltas for this section. Additive PRIVATE param on this free fn
+    // (the `prominence_w` / `pad_voices` / `ctx` precedent, and the route `realize_velocity`
+    // already took for X1) — `realize_step`'s PUBLIC signature is UNCHANGED and the FROZEN
+    // `engine.rs:740` call site is untouched. Under `inert()` `ineq_frac` is exactly 0.0, so the
+    // post-pass short-circuits before any arithmetic and the sealed goldens cannot move.
+    expr: crate::composition::ExpressionProfile,
 ) -> Vec<NoteEvent> {
     // S13: normalize the RAW per-bar edge density into a 0..1 ACTIVITY knob. The old
     // code compared raw edge (≈0.005 on real photos) against 0.25/0.70 cutoffs, so
@@ -2829,7 +2980,21 @@ fn realize_rhythm(
         return vec![sustained(0, step_ms, LEGATO_FRAC)];
     }
 
-    match role {
+    // S113/T-A — the RETAINED PRE-EXPRESSION grid offsets (trap a11 / MT-3-cumulative). The motto
+    // bias displaces melody onsets BEFORE T-A runs, so the cumulative cap must be taken against the
+    // figure as it stood before ANY expressive displacement, not against the motto's output.
+    // ⚠ `expression_dump::note_grid_offsets()` exists for exactly this and is NEVER CALLED from
+    // production code (only from its own unit tests), so the dump's `grid_offset_ms` is not this
+    // quantity and cannot be used as it. The snapshot is taken here, in the realizer, or nowhere.
+    // Allocated ONLY when T-A is armed: on the default path this stays `None` and costs nothing.
+    let ta_frac = if expr.enabled {
+        ta_role_ineq_frac(role, expr.ineq_frac)
+    } else {
+        0.0
+    };
+    let mut ta_pre_grid: Option<Vec<u64>> = None;
+
+    let mut events = match role {
         OrchestralRole::Bass => {
             // S34 PART (B) — GENERATOR-BACKED BASS DISPATCH. Before the legacy bass body, branch
             // on this section's RESOLVED bass pattern (read zero-copy off the borrowed `ctx`, the
@@ -3424,6 +3589,9 @@ fn realize_rhythm(
             // before the next onset / the step boundary), so it can never re-order onsets or ring
             // across the kernel step (the same freeze-safety the comp push above relies on).
             let motto = ctx.section.orchestration.motto;
+            if ta_frac > 0.0 {
+                ta_pre_grid = Some(events.iter().map(|e| e.offset_ms).collect());
+            }
             if matches!(role, OrchestralRole::Melody) && !motto.is_neutral() && events.len() >= 2 {
                 let atten = if pre_cadence {
                     MOTTO_PRECADENCE_ATTEN
@@ -3435,6 +3603,151 @@ fn realize_rhythm(
 
             events
         }
+    };
+
+    // S113/T-A — METRIC INEQUALITY, the last thing that touches an onset.
+    //
+    // It runs AFTER `apply_motto_onset_bias` (whose displacement it must see, and cap against —
+    // see `apply_ta_metric_inequality`) and after every figure branch, so ONE call covers every
+    // role rather than one per arm. Three independent gates keep it off the default path and off
+    // the material it must not touch:
+    //   * `expr.enabled == false` or `ineq_frac == 0.0`  =>  `ta_frac == 0.0`  =>  no arithmetic;
+    //   * the bed roles resolve to `0.0` in `ta_role_ineq_frac` — T-A is a Melody/CounterMelody
+    //     term, and giving the bed the melody's rubato is the timing-domain form of the very
+    //     fusion E3 exists to undo;
+    //   * `pre_cadence` steps are suppressed entirely (`s106-03` §A.4 redesign) so the phrase
+    //     "drives evenly, then waits" and a later T-C lands on virgin ground.
+    // The cadence ring never reaches here at all — it early-returns above the role match.
+    if ta_frac > 0.0 && !pre_cadence {
+        let pre = ta_pre_grid.unwrap_or_else(|| events.iter().map(|e| e.offset_ms).collect());
+        apply_ta_metric_inequality(&mut events, &pre, step_ms, ta_frac);
+    }
+
+    events
+}
+
+/// S113 / **T-A** — METRIC INEQUALITY, on the 10 ms rung lattice.
+///
+/// `s113-09` §1.3, built to `s106-03` §A.4's lattice form **as amended by `s107-03` §8.3 (LR-2′)**:
+/// the within-voice audibility floor is **3 rungs (30 ms)**, not the 2 rungs `s106-03` specifies,
+/// because the un-displaced class is not a scalar zero but a distribution with one rung of spread
+/// (`realized_gap − requested_gap ∈ [−9, +9]`, measured), so a 2-rung deviation is only one rung
+/// clear of the ambient. **This is the 3-rung form.**
+///
+/// theory: a run of nominally equal notes played exactly equally is a machine signature. The
+/// performer's answer is metric inequality — the WEAK member of each pair goes late, so the pair
+/// reads long-short. Every ODD onset index is delayed; **index 0 is NEVER moved at any magnitude**
+/// (the downbeat anchor the ear locks onto — `apply_motto_onset_bias` already embodies this rule
+/// and states it in those words), and even interior indices are the strong members of their own
+/// pairs and stay put. Because only odd indices move, **a displaced onset's two neighbours are
+/// themselves never displaced**, so onset ORDER and COUNT are invariant by construction and the
+/// gaps this function reads are stable regardless of iteration order.
+///
+/// **THE FLOORING IS THE LAST OPERATION AFTER EVERY CLAMP** — trap (L1), *"the single most likely
+/// way LR-1 is violated in practice"*: `gap_after − 1` is virtually never a multiple of 10, so a
+/// margin clamp applied after the rung-flooring would re-introduce the phase-dependent dither the
+/// lattice exists to remove. LR-2′ is re-applied after the re-floor for the same reason.
+///
+/// The lattice rules this satisfies, in the order they are applied:
+/// * **LR-1 (exactness)** — every emitted deviation is a whole multiple of 10 ms, so realized ==
+///   requested at every lattice phase. `realize_rhythm` computes offsets step-relative and cannot
+///   observe the phase, so whole rungs are the only phase-independent control available.
+/// * **LR-4** — no deviation exceeds 30 % of its own realized gap.
+/// * **LR-2′** — a non-zero within-voice deviation is at least 3 rungs; anything less is zero.
+/// * **LR-5 (integrity)** — asserted, in a `debug_assert!`, on every emitted value.
+/// * **cumulative cap (trap a11 / MT-3-cumulative)** — the deviation is additionally capped so the
+///   TOTAL displacement from `pre_grid` (the offsets as they stood BEFORE any expressive pass,
+///   i.e. before `apply_motto_onset_bias`) also respects LR-4. Without it, T-A stacked on a
+///   syncopated motto cell would push an onset past 30 % of its gap while each term alone looked
+///   compliant.
+///
+/// **Suppressed entirely on `pre_cadence` steps** (`s106-03` §A.4 redesign): T-A and a later T-C
+/// stacked breach LR-3 and LR-4 simultaneously at any gap ≲ 167 ms, and *"drive evenly, then wait"*
+/// is better music than *"drive unevenly, then wait slightly more."* Suppressing here also leaves
+/// virgin ground for a T-C that is not built in v2.
+///
+/// `frac == 0.0` (the identity value) short-circuits before any arithmetic, so the default render
+/// path is untouched. Pure; no RNG, no clock.
+fn apply_ta_metric_inequality(
+    events: &mut [NoteEvent],
+    pre_grid: &[u64],
+    step_ms: u64,
+    frac: f32,
+) -> u32 {
+    if frac <= 0.0 || events.len() < 2 {
+        return 0;
+    }
+    let n = events.len();
+    let mut displaced = 0u32;
+    for i in (1..n).step_by(2) {
+        // i is ODD by construction: index 0 is the anchor, even interior indices are the strong
+        // members of their own pairs.
+        let here = events[i].offset_ms;
+        let prev = events[i - 1].offset_ms;
+        let next = if i + 1 < n {
+            events[i + 1].offset_ms
+        } else {
+            step_ms
+        };
+        // The pair's own gap — the quantity the inequality is a FRACTION of. `gap_after` is the
+        // ordering margin, a different quantity; the spec names both, which is why `gap` cannot be
+        // `gap_after` (the `min(dev, gap_after - 1)` clamp would be vacuous if it were).
+        let gap = here.saturating_sub(prev);
+        let gap_after = next.saturating_sub(here);
+        if gap == 0 {
+            continue;
+        }
+
+        let rung = TA_RUNG_MS as f32;
+        let mut units = (frac * gap as f32 / rung).round() as i64;
+        units = units.clamp(TA_MIN_RUNGS, TA_MAX_RUNGS);
+        // LR-4 — never more than 30 % of the realized gap.
+        let lr4_units = (TA_LR4_FRAC * gap as f32 / rung).floor() as i64;
+        units = units.min(lr4_units);
+        // LR-2′ — the within-voice audibility floor is 3 rungs. Reachable here only because LR-4
+        // can pull `units` back below the clamp's own lower bound.
+        if units < TA_MIN_RUNGS {
+            continue;
+        }
+        let mut dev = units * TA_RUNG_MS;
+
+        // ── every clamp from here on is followed by a re-floor and a re-application of LR-2′ ──
+        // (a) the ordering margin: stay strictly before the next onset / the step boundary.
+        dev = dev.min(gap_after.saturating_sub(1) as i64);
+        // (b) the CUMULATIVE cap against the pre-expression grid (trap a11 / MT-3-cumulative).
+        let cum_before = here as i64 - pre_grid.get(i).copied().unwrap_or(here) as i64;
+        let cum_cap = lr4_units * TA_RUNG_MS;
+        dev = dev.min(cum_cap - cum_before);
+        // (c) re-floor to a whole rung — LAST, after every clamp (trap L1).
+        dev = (dev.max(0) / TA_RUNG_MS) * TA_RUNG_MS;
+        if dev < TA_MIN_RUNGS * TA_RUNG_MS {
+            continue;
+        }
+        debug_assert_eq!(dev % TA_RUNG_MS, 0, "LR-5: every emitted deviation is a whole rung");
+
+        let new_offset = here + dev as u64;
+        // Translate the note rather than re-articulate it: the hold is PRESERVED, and clamped only
+        // where it would ring past the next onset (the `apply_motto_onset_bias` precedent). The
+        // acceptance criterion is that the change is TIMING, not articulation.
+        let room = next.saturating_sub(new_offset).max(1);
+        events[i].offset_ms = new_offset;
+        events[i].hold_ms = events[i].hold_ms.max(1).min(room);
+        displaced += 1;
+    }
+    displaced
+}
+
+/// The per-role T-A magnitude, per `s106-03` §A.4's role matrix (unchanged by `s107-03`).
+///
+/// The Melody takes the full fraction; the CounterMelody takes `0.6 ×` and therefore self-zeroes
+/// under LR-2′ on most gaps — **which is correct, not a defect**: a second line that lilts as hard
+/// as the tune is a doubling, not a counter-line. The three bed roles take none at all: giving the
+/// bed the melody's rubato is the timing-domain form of the very fusion E3 exists to undo.
+fn ta_role_ineq_frac(role: OrchestralRole, base: f32) -> f32 {
+    match role {
+        OrchestralRole::Melody => base,
+        OrchestralRole::CounterMelody => TA_COUNTER_SCALE * base,
+        OrchestralRole::HarmonicFill | OrchestralRole::Pad | OrchestralRole::Bass => 0.0,
     }
 }
 
@@ -11516,6 +11829,9 @@ mod tests {
             crate::composition::ExpressionProfile {
                 enabled: false,
                 downbeat_destack: 0.0,
+                role_accent_scale: false,
+                metric_hierarchy: false,
+                ineq_frac: 0.0,
             };
         let mel = realize_velocity(
             &step,
@@ -11556,6 +11872,567 @@ mod tests {
         assert!(
             counter >= 1,
             "S45: the counter recedes in LEVEL but is never muted to silence"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // S113 / E3 — PER-ROLE ACCENT SCALING. `s113-09` §1.1.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// The non-cadence structural velocity RANGE realized by one role across a whole phrase —
+    /// the quantity E3-A is stated in. Cadence steps are excluded because the contour block that
+    /// E3 scales is itself nested inside `if !is_cadence`.
+    fn e3_test_role_range(
+        role: OrchestralRole,
+        expr: crate::composition::ExpressionProfile,
+        phrase_len: usize,
+    ) -> u8 {
+        let features = PerfFeatures {
+            saturation: 60.0,
+            brightness: 50.0,
+            edge_density: 0.3,
+        };
+        let mut lo = u8::MAX;
+        let mut hi = u8::MIN;
+        // Non-cadence positions only: the phrase's last position is ALWAYS the cadence
+        // (`s107-03` §3.2 fact 10), so the reachable set is `0 ..= phrase_len - 2`.
+        for p in 0..phrase_len.saturating_sub(1) {
+            let step = StepPlan {
+                chord: c_major_triad(),
+                phrase_index: 0,
+                position_in_phrase: p,
+                phrase_len,
+                position: PhrasePosition::Interior,
+                velocity: 80,
+            };
+            let v = realize_velocity(&step, &features, false, role, PROMINENCE_NEUTRAL, expr);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        hi - lo
+    }
+
+    /// PROPERTY (E3 identity): with the axis OFF, every one of the five roles realizes the
+    /// **exact same** non-cadence velocity range. That identity is not an accident — it is the
+    /// defect E3 exists to remove (`s107-03` §6.1 measures the baseline Melody-to-bed ratio as
+    /// exactly 1.000 on all three cues), and asserting it here means a future edit that quietly
+    /// de-correlates the voices some other way cannot slip past E3's gate wearing E3's name.
+    #[test]
+    fn s113_e3_baseline_range_is_identical_across_every_role() {
+        for expr in [
+            crate::composition::ExpressionProfile::inert(),
+            crate::composition::ExpressionProfile::e1_entrance_destack(),
+        ] {
+            let mel = e3_test_role_range(OrchestralRole::Melody, expr, 4);
+            for role in [
+                OrchestralRole::CounterMelody,
+                OrchestralRole::HarmonicFill,
+                OrchestralRole::Bass,
+                OrchestralRole::Pad,
+            ] {
+                let r = e3_test_role_range(role, expr, 4);
+                assert_eq!(
+                    r, mel,
+                    "baseline: {role:?} range {r} must equal Melody range {mel} — \
+                     the whole ensemble breathes in lockstep until E3 fires"
+                );
+            }
+        }
+    }
+
+    /// PROPERTY (E3-A, unit form): with the axis ON, the Melody's range is UNCHANGED (its factor
+    /// is exactly 1.00, so E3's maximum positive contribution to the melody is 0.0 and HR-1 is
+    /// vacuous) while every bed voice's range CONTRACTS — opening the figure-ground gap in the
+    /// level domain without adding a single event.
+    #[test]
+    fn s113_e3_opens_a_melody_to_bed_range_gap() {
+        let off = crate::composition::ExpressionProfile::e1_entrance_destack();
+        let on = off.with_role_accent_scale(true);
+
+        let mel_off = e3_test_role_range(OrchestralRole::Melody, off, 4);
+        let mel_on = e3_test_role_range(OrchestralRole::Melody, on, 4);
+        assert_eq!(
+            mel_on, mel_off,
+            "E3's Melody factor is exactly 1.00 — the foreground must not move"
+        );
+
+        for role in [
+            OrchestralRole::CounterMelody,
+            OrchestralRole::HarmonicFill,
+            OrchestralRole::Bass,
+            OrchestralRole::Pad,
+        ] {
+            let bed_on = e3_test_role_range(role, on, 4);
+            assert!(
+                bed_on < mel_on,
+                "E3 armed: {role:?} range {bed_on} must fall below the Melody's {mel_on}"
+            );
+        }
+
+        // The gate `s107-03` §6.1 pre-registers, in its unit form: the deepest bed voice.
+        let pad_on = e3_test_role_range(OrchestralRole::Pad, on, 4);
+        assert!(pad_on > 0, "the bed must still breathe, not flatten to zero");
+        let ratio = f64::from(mel_on) / f64::from(pad_on);
+        assert!(
+            ratio >= 1.20,
+            "E3-A: Melody/Pad range ratio {ratio:.3} must reach 1.20 (baseline is exactly 1.000)"
+        );
+    }
+
+    /// PROPERTY (the `enabled` gate): `role_accent_scale` alone must do NOTHING. The axis is
+    /// gated on `expr.enabled` first, so a profile that sets the sub-flag without the master
+    /// enable is byte-identical to `inert()` on every role and every position. This is the
+    /// realizer-side half of `main.rs`'s per-field arming assertion.
+    #[test]
+    fn s113_e3_is_inert_without_the_master_enable() {
+        let sub_only = crate::composition::ExpressionProfile::inert().with_role_accent_scale(true);
+        for role in [
+            OrchestralRole::Melody,
+            OrchestralRole::CounterMelody,
+            OrchestralRole::HarmonicFill,
+            OrchestralRole::Bass,
+            OrchestralRole::Pad,
+        ] {
+            for len in [2usize, 3, 4, 8] {
+                assert_eq!(
+                    e3_test_role_range(role, sub_only, len),
+                    e3_test_role_range(
+                        role,
+                        crate::composition::ExpressionProfile::inert(),
+                        len
+                    ),
+                    "{role:?} @ phrase_len {len}: role_accent_scale must be inert without `enabled`"
+                );
+            }
+        }
+    }
+
+    /// PROPERTY (HR-1, and the trap-(a6) catch): the per-role factor table is strictly ordered
+    /// Melody > CounterMelody > Bass > HarmonicFill > Pad, Melody is EXACTLY 1.0, and no factor
+    /// exceeds 1.0 — so the term is purely subtractive in accent magnitude and cannot drive any
+    /// voice into the `clamp(1, 127)` ceiling. A table that collapsed to all-1.0 (trap a6, the
+    /// term keyed on a role variable that never varies) fails here as well as at E3-A.
+    #[test]
+    fn s113_e3_factor_table_is_ordered_and_subtractive() {
+        let m = e3_role_accent_factor(OrchestralRole::Melody);
+        let c = e3_role_accent_factor(OrchestralRole::CounterMelody);
+        let b = e3_role_accent_factor(OrchestralRole::Bass);
+        let f = e3_role_accent_factor(OrchestralRole::HarmonicFill);
+        let p = e3_role_accent_factor(OrchestralRole::Pad);
+        assert_eq!(m, 1.0, "the foreground carries the meter, unscaled");
+        assert!(
+            m > c && c > b && b > f && f > p,
+            "metric responsibility must be strictly ordered: {m} > {c} > {b} > {f} > {p}"
+        );
+        assert!(p > 0.0, "no voice is stripped of the meter entirely");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // S113 / E2′ — THE RE-SCOPED METRIC HIERARCHY. `s113-09` §1.2 / `s107-03` §3.3.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// The realized non-cadence velocity series for one role across a whole phrase, in position
+    /// order — the quantity `s107-03` §3.5 states E2′'s projection in.
+    fn e2p_test_series(
+        role: OrchestralRole,
+        expr: crate::composition::ExpressionProfile,
+        phrase_len: usize,
+    ) -> Vec<u8> {
+        let features = PerfFeatures {
+            saturation: 60.0,
+            brightness: 50.0,
+            edge_density: 0.3,
+        };
+        (0..phrase_len.saturating_sub(1))
+            .map(|p| {
+                let step = StepPlan {
+                    chord: c_major_triad(),
+                    phrase_index: 0,
+                    position_in_phrase: p,
+                    phrase_len,
+                    position: PhrasePosition::Interior,
+                    velocity: 80,
+                };
+                realize_velocity(&step, &features, false, role, PROMINENCE_NEUTRAL, expr)
+            })
+            .collect()
+    }
+
+    /// **E2-D** — the mutual exclusion with X1/E1, asserted where it would silently fail.
+    ///
+    /// E2′'s head value `+2.0` IS E1's post-de-stack accent (`9.0 + (-7.0)`). If a build composed
+    /// them instead of superseding — applied `downbeat_destack` on top of E2′'s `+2.0` — the head
+    /// would take `-5.0` and collapse BELOW the weak interior's `-6.0`-shaped valley. This test
+    /// pins the realized head velocity to be EXACTLY equal with E2′ on and with E1 alone, and
+    /// strictly below the pre-X1 legacy head, so both failure directions are caught.
+    #[test]
+    fn s113_e2p_head_is_exactly_plus_two_with_both_flags_on() {
+        let legacy = crate::composition::ExpressionProfile::inert();
+        let e1 = crate::composition::ExpressionProfile::e1_entrance_destack();
+        let e1_e2p = e1.with_metric_hierarchy(true);
+
+        for role in [
+            OrchestralRole::Melody,
+            OrchestralRole::CounterMelody,
+            OrchestralRole::HarmonicFill,
+            OrchestralRole::Bass,
+            OrchestralRole::Pad,
+        ] {
+            for phrase_len in 1..=6usize {
+                let h_legacy = e2p_test_series(role, legacy, phrase_len);
+                let h_e1 = e2p_test_series(role, e1, phrase_len);
+                let h_both = e2p_test_series(role, e1_e2p, phrase_len);
+                if h_legacy.is_empty() {
+                    continue;
+                }
+                assert_eq!(
+                    h_both[0], h_e1[0],
+                    "E2-D: {role:?} L{phrase_len} — E2′'s head must be EXACTLY E1's head \
+                     (+2.0 marked once), not E1's delta applied a second time"
+                );
+                assert!(
+                    h_both[0] < h_legacy[0],
+                    "E2-D: {role:?} L{phrase_len} — the de-stacked head {} must sit below the \
+                     legacy +9.0 head {}",
+                    h_both[0],
+                    h_legacy[0]
+                );
+            }
+        }
+    }
+
+    /// **E2-A** — the realized distinct-accent-level counts per phrase-length class, exactly as
+    /// `s107-03` §3.3 tabulates them. A degeneracy here is DECLARED, not discovered: at
+    /// `phrase_len <= 2` the hierarchy has one value and neither design can invent a second.
+    #[test]
+    fn s113_e2p_distinct_levels_per_phrase_length() {
+        for (phrase_len, expected_distinct, expected_series) in [
+            (4usize, 3usize, vec![2.0f32, -6.0, -3.0]),
+            (3, 2, vec![2.0, -3.0]),
+            (2, 1, vec![2.0]),
+            (1, 1, vec![2.0]),
+        ] {
+            let series: Vec<f32> = (0..phrase_len.saturating_sub(1).max(1))
+                .map(|p| e2p_metric_accent(p, phrase_len))
+                .collect();
+            assert_eq!(
+                series, expected_series,
+                "E2-A: L{phrase_len} accent series must be {expected_series:?}"
+            );
+            let mut distinct = series.clone();
+            distinct.dedup();
+            distinct.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in the accent table"));
+            distinct.dedup();
+            assert_eq!(
+                distinct.len(),
+                expected_distinct,
+                "E2-A: L{phrase_len} must realize {expected_distinct} distinct levels"
+            );
+        }
+    }
+
+    /// **E2-C** — the `+1.0` secondary-strong branch is REACHABLE (proved at `phrase_len = 6`)
+    /// and is NEVER taken at any phrase length this corpus realizes (max `phrase_len` is 4).
+    /// *A level that cannot fire cannot be certified*, so it is certified as dead, deliberately.
+    #[test]
+    fn s113_e2p_secondary_strong_branch_is_reachable_at_phrase_len_6() {
+        assert_eq!(
+            e2p_metric_accent(2, 6),
+            1.0,
+            "E2-C: the +1.0 branch must be reachable at phrase_len = 6, p = 2"
+        );
+        for phrase_len in 1..=4usize {
+            for p in 0..=phrase_len.saturating_sub(2) {
+                assert_ne!(
+                    e2p_metric_accent(p, phrase_len),
+                    1.0,
+                    "E2-C: the +1.0 branch must be DEAD at L{phrase_len} p{p} \
+                     (max realized phrase_len on this corpus is 4)"
+                );
+            }
+        }
+    }
+
+    /// **The anacrusis actually dips.** With E2′ armed the step before the arrival falls by
+    /// EXACTLY 5 velocity units against the same step un-armed (`+2.0 -> -3.0`), and the realized
+    /// series puts it BELOW the weak interior — which the accent table alone does not show,
+    /// because the phrase-end taper fires on that position and not on the weak one.
+    #[test]
+    fn s113_e2p_dips_the_anacrusis_below_the_weak_beat() {
+        let off = crate::composition::ExpressionProfile::e1_entrance_destack();
+        let on = off.with_metric_hierarchy(true);
+
+        let s_off = e2p_test_series(OrchestralRole::Melody, off, 4);
+        let s_on = e2p_test_series(OrchestralRole::Melody, on, 4);
+        assert_eq!(s_off.len(), 3, "L4 has three reachable non-cadence positions");
+
+        assert_eq!(s_on[0], s_off[0], "the head is unchanged (both are +2.0)");
+        assert_eq!(s_on[1], s_off[1], "the weak interior is unchanged (-6.0)");
+        assert_eq!(
+            i32::from(s_off[2]) - i32::from(s_on[2]),
+            5,
+            "the anacrusis accent moves +2.0 -> -3.0, i.e. exactly 5 units down"
+        );
+
+        assert!(
+            s_off[2] > s_off[1],
+            "baseline: the approach BUMPS above the weak beat ({} > {})",
+            s_off[2],
+            s_off[1]
+        );
+        assert!(
+            s_on[2] < s_on[1],
+            "E2′: the approach DIPS below the weak beat ({} < {})",
+            s_on[2],
+            s_on[1]
+        );
+    }
+
+    /// The realizer-side half of the arming guard: `metric_hierarchy` set while the master enable
+    /// is `false` must change NOTHING. `main.rs` cannot reach this state (it only ever sets the
+    /// axis on an enabled profile) — which is exactly why the realizer must refuse it on its own,
+    /// rather than trusting a caller-side invariant to hold forever.
+    #[test]
+    fn s113_e2p_is_inert_without_the_master_enable() {
+        let inert = crate::composition::ExpressionProfile::inert();
+        let armed_but_disabled = inert.with_metric_hierarchy(true);
+        for role in [
+            OrchestralRole::Melody,
+            OrchestralRole::CounterMelody,
+            OrchestralRole::HarmonicFill,
+            OrchestralRole::Bass,
+            OrchestralRole::Pad,
+        ] {
+            for phrase_len in 1..=6usize {
+                assert_eq!(
+                    e2p_test_series(role, armed_but_disabled, phrase_len),
+                    e2p_test_series(role, inert, phrase_len),
+                    "{role:?} L{phrase_len}: E2′ must be inert while `enabled == false`"
+                );
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // S113 / T-A — METRIC INEQUALITY ON THE RUNG LATTICE. `s113-09` §1.3, `s107-03` §8.3.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// A figure of `n` evenly-spaced onsets across `step_ms`, holds fitted to the slot.
+    fn ta_test_figure(n: usize, step_ms: u64) -> Vec<NoteEvent> {
+        let slot = step_ms / n as u64;
+        (0..n as u64)
+            .map(|k| NoteEvent {
+                note: 60,
+                velocity: 80,
+                hold_ms: slot / 2,
+                offset_ms: k * slot,
+            })
+            .collect()
+    }
+
+    fn ta_offsets(e: &[NoteEvent]) -> Vec<u64> {
+        e.iter().map(|x| x.offset_ms).collect()
+    }
+
+    /// **THE ANCHOR RULE.** Onset index 0 is never moved, at any magnitude, in any figure —
+    /// including magnitudes far outside the ear window. `apply_motto_onset_bias` states the same
+    /// rule in its own words (*"skip index 0 — the downbeat anchor"*); a pass that perturbs index 0
+    /// is wrong at any magnitude, so this is asserted against an adversarial fraction rather than
+    /// only against the shipped one.
+    #[test]
+    fn s113_ta_never_moves_the_downbeat_anchor() {
+        for frac in [0.15f32, 0.19, 0.5, 5.0] {
+            for n in 2..=6usize {
+                for step_ms in [300u64, 500, 686, 811, 1200] {
+                    let mut e = ta_test_figure(n, step_ms);
+                    let pre = ta_offsets(&e);
+                    apply_ta_metric_inequality(&mut e, &pre, step_ms, frac);
+                    assert_eq!(
+                        e[0].offset_ms, pre[0],
+                        "frac {frac} n {n} step {step_ms}: the downbeat anchor must never move"
+                    );
+                    for k in (2..n).step_by(2) {
+                        assert_eq!(
+                            e[k].offset_ms, pre[k],
+                            "frac {frac} n {n} step {step_ms}: even index {k} is the strong member \
+                             of its own pair and must not move"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **LR-1 / LR-5 / LR-2′ / LR-4, swept.** Every emitted deviation is a whole 10 ms rung
+    /// (so realized == requested at every lattice phase), is either zero or at least the 3-rung
+    /// within-voice floor, and never exceeds 30 % of its own gap. The sweep is deliberately wider
+    /// than this corpus so a future cue geometry cannot walk out of the guarantee unnoticed.
+    #[test]
+    fn s113_ta_emits_only_whole_rungs_within_every_lattice_rule() {
+        for frac in [0.05f32, 0.15, 0.19, 0.24, 0.40] {
+            for n in 2..=6usize {
+                for step_ms in (120u64..=1600).step_by(37) {
+                    let mut e = ta_test_figure(n, step_ms);
+                    let pre = ta_offsets(&e);
+                    apply_ta_metric_inequality(&mut e, &pre, step_ms, frac);
+                    for k in 1..n {
+                        let dev = e[k].offset_ms as i64 - pre[k] as i64;
+                        assert!(dev >= 0, "T-A only ever DELAYS: k{k} moved {dev} ms");
+                        assert_eq!(
+                            dev % TA_RUNG_MS,
+                            0,
+                            "LR-5: k{k} dev {dev} is not a whole 10 ms rung \
+                             (frac {frac} n {n} step {step_ms})"
+                        );
+                        if dev != 0 {
+                            assert!(
+                                dev >= TA_MIN_RUNGS * TA_RUNG_MS,
+                                "LR-2': k{k} dev {dev} is below the 3-rung within-voice floor"
+                            );
+                            let gap = (pre[k] - pre[k - 1]) as f32;
+                            assert!(
+                                dev as f32 <= TA_LR4_FRAC * gap + 1e-6,
+                                "LR-4: k{k} dev {dev} exceeds 30 % of its gap {gap}"
+                            );
+                            assert!(
+                                dev <= (TA_MAX_RUNGS * TA_RUNG_MS),
+                                "the 5-rung ceiling must bind: k{k} dev {dev}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// **Onset ORDER and COUNT are invariant**, and no onset reaches the next one or the step
+    /// boundary. Only odd indices move, so a displaced onset's two neighbours are themselves never
+    /// displaced — the property that makes this safe without an iteration-order argument.
+    #[test]
+    fn s113_ta_preserves_onset_order_and_count() {
+        for frac in [0.15f32, 0.24, 2.0] {
+            for n in 2..=6usize {
+                for step_ms in [240u64, 500, 811, 1500] {
+                    let mut e = ta_test_figure(n, step_ms);
+                    let before = e.len();
+                    let pre = ta_offsets(&e);
+                    apply_ta_metric_inequality(&mut e, &pre, step_ms, frac);
+                    assert_eq!(e.len(), before, "T-A is COUNT-PRESERVING");
+                    for k in 1..e.len() {
+                        assert!(
+                            e[k].offset_ms > e[k - 1].offset_ms,
+                            "onsets must stay strictly increasing: {:?}",
+                            ta_offsets(&e)
+                        );
+                    }
+                    assert!(
+                        e.last().expect("non-empty").offset_ms < step_ms,
+                        "no onset may reach the step boundary"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The identity path: `frac == 0.0` performs no arithmetic and returns the figure untouched.
+    /// This is the realizer-side half of the arming guard — `main.rs` only ever sets a non-zero
+    /// fraction on an enabled profile, and the realizer refuses to depend on that holding forever.
+    #[test]
+    fn s113_ta_is_inert_at_zero_fraction() {
+        for n in 1..=6usize {
+            let mut e = ta_test_figure(n.max(1), 500);
+            let pre = ta_offsets(&e);
+            let holds: Vec<u64> = e.iter().map(|x| x.hold_ms).collect();
+            let moved = apply_ta_metric_inequality(&mut e, &pre, 500, 0.0);
+            assert_eq!(moved, 0);
+            assert_eq!(ta_offsets(&e), pre, "n{n}: zero fraction must displace nothing");
+            assert_eq!(
+                e.iter().map(|x| x.hold_ms).collect::<Vec<_>>(),
+                holds,
+                "n{n}: zero fraction must not re-articulate either"
+            );
+        }
+    }
+
+    /// **The per-role matrix.** The Melody takes the full fraction, the CounterMelody `0.6 ×`, and
+    /// the three bed roles EXACTLY ZERO — giving the bed the melody's rubato is the timing-domain
+    /// form of the fusion E3 exists to undo.
+    #[test]
+    fn s113_ta_bed_roles_take_no_inequality() {
+        let base = 0.15f32;
+        assert_eq!(ta_role_ineq_frac(OrchestralRole::Melody, base), base);
+        assert!(
+            (ta_role_ineq_frac(OrchestralRole::CounterMelody, base) - 0.6 * base).abs() < 1e-7
+        );
+        for role in [
+            OrchestralRole::HarmonicFill,
+            OrchestralRole::Pad,
+            OrchestralRole::Bass,
+        ] {
+            assert_eq!(
+                ta_role_ineq_frac(role, base),
+                0.0,
+                "{role:?} must take no metric inequality at all"
+            );
+        }
+    }
+
+    /// **The CUMULATIVE cap (trap a11 / MT-3-cumulative) actually binds.** An onset that a prior
+    /// expressive pass has already pushed off the grid gets LESS T-A than the same onset on virgin
+    /// ground — and once the prior push has already spent the 30 % budget, it gets none. Without
+    /// this, T-A stacked on a syncopated motto cell walks past LR-4 while each term alone looks
+    /// compliant.
+    #[test]
+    fn s113_ta_cumulative_cap_binds_against_a_pre_displaced_grid() {
+        let step_ms = 536u64;
+        // Virgin ground: the even arpeggio the motto never touched.
+        let mut clean = ta_test_figure(3, step_ms);
+        let clean_pre = ta_offsets(&clean);
+        apply_ta_metric_inequality(&mut clean, &clean_pre, step_ms, 0.15);
+        let clean_dev = clean[1].offset_ms - clean_pre[1];
+        assert!(clean_dev > 0, "the control case must displace");
+
+        // The same figure with onset 1 already pushed +32 ms by a prior pass. `pre` is the grid as
+        // it stood BEFORE that push — which is the whole point of retaining it.
+        let mut pushed = ta_test_figure(3, step_ms);
+        pushed[1].offset_ms += 32;
+        let pushed_dev_before = pushed[1].offset_ms;
+        apply_ta_metric_inequality(&mut pushed, &clean_pre, step_ms, 0.15);
+        let pushed_dev = pushed[1].offset_ms - pushed_dev_before;
+        assert!(
+            pushed_dev < clean_dev,
+            "the cumulative cap must reduce T-A on already-displaced material \
+             (clean {clean_dev} ms vs pushed {pushed_dev} ms)"
+        );
+    }
+
+    /// **The 5-rung ceiling binds on wide gaps, and the realized inequality falls BELOW the
+    /// fraction that was requested.** Asserted so the effect cannot silently change: on a `title`
+    /// -sized step the ceiling — not `INEQ_FRAC` — is what sets the magnitude, which means tuning
+    /// `INEQ_FRAC` there moves nothing.
+    #[test]
+    fn s113_ta_five_rung_ceiling_binds_on_wide_gaps() {
+        let step_ms = 811u64; // the `title` grid
+        let mut e = ta_test_figure(2, step_ms); // one 405 ms gap
+        let pre = ta_offsets(&e);
+        apply_ta_metric_inequality(&mut e, &pre, step_ms, 0.15);
+        let dev = e[1].offset_ms - pre[1];
+        assert_eq!(
+            dev,
+            (TA_MAX_RUNGS * TA_RUNG_MS) as u64,
+            "a 405 ms gap requests 6 rungs at 0.15 and must be held at the 5-rung ceiling"
+        );
+        let realized = dev as f32 / (pre[1] - pre[0]) as f32;
+        assert!(
+            realized < 0.15,
+            "the ceiling drives the REALIZED inequality ({realized:.3}) below the REQUESTED 0.15"
+        );
+        // …and raising the fraction changes nothing here, because the ceiling is what binds.
+        let mut e19 = ta_test_figure(2, step_ms);
+        apply_ta_metric_inequality(&mut e19, &pre, step_ms, 0.19);
+        assert_eq!(
+            e19[1].offset_ms, e[1].offset_ms,
+            "0.15 and 0.19 realize identically once the 5-rung ceiling binds"
         );
     }
 

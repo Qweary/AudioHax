@@ -486,8 +486,47 @@ fn run_render_wav(
     //    onto every section's OrchestrationProfile; the realizer reads it off the section it
     //    already borrows. `engine.rs` untouched, no caller signature changed. Absent the flag the
     //    register stays `inert()` and every expression delta is exactly 0.0.
+    // ── S113/v2 — resolve the v2 term set BEFORE the register is set, and refuse every request
+    //    that could render a null result rather than rendering one quietly.
+    //
+    //    RULING — `--v2` REQUIRES `--expression on`; it neither implies it nor excludes it.
+    //    (i) E3's arithmetic is gated on `expr.enabled`, so a v2 term physically cannot fire with
+    //    expression off; (ii) the ladder's own rung 1 IS `--expression on`, and every higher rung
+    //    is defined as "v1 plus X"; (iii) E3's pre-registered acceptance figures are stated against
+    //    an X1-armed baseline, so the gate is uninterpretable on any other one; (iv) there is
+    //    exactly ONE enable path and ONE enable assertion in this binary, and adding a second
+    //    would double the surface of the very trap that assertion exists to close.
+    //    Requiring the flag rather than implying it keeps the arming state readable off the
+    //    command line without knowing a coupling rule.
+    let v2 = render_args.v2.unwrap_or_default();
+    if !v2.is_empty() && !render_args.expression.is_on() {
+        return Err(
+            "--v2 requires `--expression on`. The v2 terms are deltas on top of the X1/E1 base \
+             profile and are gated on it in the realizer, so with expression off they would fire \
+             on nothing; refusing to render a build that would look like a null result."
+                .into(),
+        );
+    }
+    let unbuilt = v2.unbuilt();
+    if !unbuilt.is_empty() {
+        return Err(format!(
+            "--v2: term(s) `{}` are NOT IMPLEMENTED in this binary (S113 built `e3`, `e2` and \
+             `ta`). Refusing rather than silently arming a subset — a rung that renders without \
+             its named term is indistinguishable from the rung below it.",
+            unbuilt.join("`, `")
+        )
+        .into());
+    }
+
     audiohax::composition::expression_register::set(if render_args.expression.is_on() {
         audiohax::composition::ExpressionProfile::e1_entrance_destack()
+            .with_role_accent_scale(v2.e3)
+            .with_metric_hierarchy(v2.e2)
+            .with_ineq_frac(if v2.ta {
+                audiohax::composition::ExpressionProfile::SHIPPED_INEQ_FRAC
+            } else {
+                0.0
+            })
     } else {
         audiohax::composition::ExpressionProfile::inert()
     });
@@ -621,6 +660,47 @@ fn run_render_wav(
             .into());
         }
         println!("render --wav: expression ARMED and VERIFIED on {armed}/{total} sections");
+
+        // S113 — the SAME assertion, PER FIELD. `s113-09` §6.3 hole 2 names this exactly: a
+        // composite axis can satisfy `enabled == true` on every section while a sub-flag is false
+        // everywhere, and the `enabled`-only check above would pass on a two-thirds-wired build.
+        // That is trap (a1) — "the gate proves the gate" — reappearing one level down INSIDE the
+        // guard written to close it. Each armed v2 term therefore asserts its own field, read back
+        // off the composed plan's own sections in the same process that renders.
+        // One row per BUILT v2 term. Adding a term to the ladder without adding its row here
+        // would reintroduce exactly the two-thirds-wired build this guard exists to refuse, so the
+        // rows are kept beside the `V2Spec` fields they mirror.
+        type ExprPred = fn(&audiohax::composition::ExpressionProfile) -> bool;
+        let v2_fields: [(bool, &str, &str, ExprPred); 3] = [
+            (v2.e3, "E3", "role_accent_scale", |e| e.role_accent_scale),
+            (v2.e2, "E2'", "metric_hierarchy", |e| e.metric_hierarchy),
+            (v2.ta, "T-A", "ineq_frac", |e| e.ineq_frac > 0.0),
+        ];
+        for (requested, label, field, pred) in v2_fields {
+            if !requested {
+                continue;
+            }
+            let field_armed = engine
+                .composition()
+                .map(|p| {
+                    p.sections
+                        .iter()
+                        .filter(|s| s.orchestration.expression.enabled && pred(&s.orchestration.expression))
+                        .count()
+                })
+                .unwrap_or(0);
+            if field_armed == 0 || field_armed != total {
+                return Err(format!(
+                    "--v2 {label}: `{field}` is NOT set on every section ({field_armed}/{total}). \
+                     The term is wired to the flag but not to the realizer's input; refusing to \
+                     render a build that would look like a null result."
+                )
+                .into());
+            }
+            println!(
+                "render --wav: v2 term {label} ({field}) ARMED and VERIFIED on {field_armed}/{total} sections"
+            );
+        }
     }
 
     let events = build_step_event_timeline(
