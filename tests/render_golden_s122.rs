@@ -9,45 +9,67 @@
 //! against values recorded from the PRE-Phase-0 binary (HEAD `1d5c4db`), so it pins yesterday's
 //! sound, not whatever today's tree produces.
 //!
-//! TWO GOLDENS, BECAUSE THEY ARE PORTABLE TO DIFFERENT DEGREES.
+//! TWO GOLDENS: ONE GUARDS CI ON EVERY OS, ONE IS A LOCAL OPT-IN GUARD.
 //!
-//!   1. STRUCTURE golden (`golden_structure_portable`, runs on EVERY platform). The SHA-256 of a
-//!      canonical, integer-only serialization (`audiohax-structure-v1`, see [`structure_bytes`])
-//!      of: sample rate, `total_steps`, `grid_ms_per_step`, `instrument_count`, per-voice
-//!      programs, every timeline event (`at_ms`, kind, channel, note/program, velocity), and the
-//!      final interleaved sample count. No float is hashed. It catches:
-//!        * any COMPOSITION change: a note, an onset, a duration, a velocity, a program, the seed
-//!          (QG mutation M12, `--seed N` composing as `N+1`);
+//!   1. STRUCTURE golden (`golden_structure_portable`). ALWAYS ON, every OS, every `cargo test`,
+//!      including CI. The SHA-256 of a canonical, integer-only serialization
+//!      (`audiohax-structure-v1`, see [`structure_bytes`]) of: sample rate, `total_steps`,
+//!      `grid_ms_per_step`, `instrument_count`, per-voice programs, every timeline event
+//!      (`at_ms`, kind, channel, note/program, velocity), and the final interleaved sample count.
+//!      No float is hashed. It catches:
+//!        * any COMPOSITION change on an explicit seed: a note, an onset, a duration, a velocity,
+//!          a program, the seed itself (QG mutation M12, `--seed N` composing as `N+1`);
 //!        * any LENGTH change: the synthesis tail or the loop fold (M8 moves the sample count by
 //!          882 = 10 ms × 44.1 kHz × 2 channels). The event list alone CANNOT see M8: the tail
 //!          is a synthesis parameter, not an event.
 //!
-//!      Cases use an EXPLICIT seed only. The image-derived seed (S91, `composition::image_seed`)
-//!      hashes the raw f32 BITS of 11 image features, some computed through platform libm
-//!      (`sin`/`cos`/`atan2`/`ln` in `pure_analysis.rs`), so a 1-ULP libm difference changes
-//!      the whole piece. That case lives in the platform-gated golden below.
+//!      It does not depend on the platform's libm: it stayed green with EVERY libm result moved
+//!      by ±1 ULP (an `LD_PRELOAD` perturbation of ~22 M calls, S122 Quality Gate). Cases use an
+//!      EXPLICIT seed only, because the image-derived seed (S91, `composition::image_seed`)
+//!      hashes the raw f32 BITS of image features computed through libm
+//!      (`sin`/`cos`/`atan2`/`ln` in `pure_analysis.rs`).
 //!
-//!   2. WAV-BYTES golden (`golden_wav_bytes_x86_64_linux`). The SHA-256 of the exact `.wav` file
-//!      `synth_sink::write_stereo_wav` writes (compare with `sha256sum` on a CLI render). It
-//!      catches everything above PLUS synthesis-only changes that keep the length: reverb /
-//!      chorus, gain or soft-clip, sample quantization, the WAV header, a different SoundFont.
-//!      It is platform-bound: s121-01 § 3.3 measured identical composition but ±1 LSB samples
-//!      between native and wasm on a PNG input (float rounding in synthesis). So it runs ONLY on
-//!      x86_64 Linux (CI's `ubuntu-latest` job and the operator's box). Elsewhere it is reported
-//!      as `ignored` with the reason, and it also returns early if forced with `--ignored`.
-//!      It also requires the embedded SoundFont to be the one the goldens were taken with
-//!      (`SF2_SHA256`): `ci.yml` fetches GeneralUser-GS from an UNPINNED upstream `main`, so an
-//!      upstream font update would otherwise be a red that no repo change caused. On a font
-//!      mismatch the WAV check is SKIPPED with a printed reason (the structure golden, which is
-//!      font-independent, still runs).
+//!   2. WAV-BYTES golden (`golden_wav_bytes_local_opt_in`). LOCAL and OPT-IN: it is `#[ignore]`d
+//!      and it also does nothing unless `AUDIOHAX_WAV_GOLDEN=1` is set, so CI (which runs plain
+//!      `cargo test`) never runs it, and neither does a blanket `--include-ignored` without the
+//!      variable. It hashes the exact `.wav` file `synth_sink::write_stereo_wav` writes (compare
+//!      with `sha256sum` on a CLI render) for every case, and also checks the structure of the
+//!      image-derived-seed case. WHY IT IS NOT IN CI: synthesis output is libm-bound. With one
+//!      libm result moved by 1 ULP in `log10f`, `powf`, `sinf` or `cosf` alone, every WAV hash
+//!      moves (S122 Quality Gate), and the goldens were recorded on glibc 2.43; a CI runner on
+//!      another glibc could go red with no change in this repo.
 //!
-//! WHICH GOLDEN CATCHES WHICH CLASS (each row demonstrated by a mutation in `s122-05` Wave 3):
+//!      Run it, on the machine the goldens were recorded on (or one whose libm matches):
 //!
-//!   | change                                         | structure | WAV (x86_64 Linux) |
-//!   |------------------------------------------------|-----------|--------------------|
-//!   | composition (notes / timing / seed / programs) | FAILS     | FAILS              |
-//!   | render length (tail, loop fold)                | FAILS     | FAILS              |
-//!   | synthesis only, same length (reverb, gain, …)  | passes    | FAILS              |
+//!      ```text
+//!      AUDIOHAX_WAV_GOLDEN=1 cargo test --test render_golden_s122 -- --include-ignored
+//!      ```
+//!
+//!      It needs the SoundFont the goldens were taken with (`SF2_SHA256`), and it compares a
+//!      small libm fingerprint (`LIBM_FINGERPRINT`, results of the libm functions the render
+//!      uses on fixed inputs) against the recording machine's. On a WAV red with a fingerprint
+//!      mismatch it names the libm functions that differ, so a libm red is not read as a sound
+//!      change. The fingerprint is a diagnostic over probe inputs only, not a proof that two
+//!      libms agree on the render's inputs.
+//!
+//! WHICH GUARD CATCHES WHICH CLASS (each row demonstrated by a mutation or a libm perturbation in
+//! `s122-05` Waves 3–4):
+//!
+//!   | change                                                 | CI: structure | LOCAL: WAV (opt-in)     |
+//!   |--------------------------------------------------------|---------------|-------------------------|
+//!   | composition, explicit seed (notes / timing / programs) | FAILS         | FAILS                   |
+//!   | render length (tail, loop fold)                        | FAILS         | FAILS                   |
+//!   | synthesis only, same length (reverb, gain, clip, …)    | passes        | FAILS                   |
+//!   | image-derived-seed path (S91 `image_seed`)             | passes        | FAILS                   |
+//!   | a platform libm 1-ULP difference (not a sound change)  | passes        | FAILS (why it is local) |
+//!
+//!   So CI guards STRUCTURE (length, events, programs). SOUND-ONLY changes (same notes, same
+//!   length, different samples) and the image-derived seed are guarded ONLY locally: run the
+//!   opt-in command above before committing any change that could touch synthesis.
+//!
+//! THE FULL GUARD lives outside this repository: a local before/after harness kept outside the
+//! repo, which renders a matrix of CLI configurations with the pre-Phase-0 release binary and
+//! the current one and byte-compares every output. This file is the in-repo subset of it.
 //!
 //! PROVENANCE. Every value in `GOLDENS` was produced by HEAD `1d5c4db` (pre-Phase-0):
 //! `wav_sha256` = `sha256sum` of the WAV that the BEFORE release binary
@@ -58,22 +80,26 @@
 //! UPDATING THE GOLDEN (an INTENTIONAL sound change). On a mismatch the failing test prints, for
 //! each case, the exact replacement `Golden { … },` line computed from the current tree.
 //!   1. Confirm the change is intended (listen to it; this guard cannot judge taste).
-//!   2. Run `cargo test --test render_golden_s122` on x86_64 Linux so both hashes are printed.
+//!   2. Run the opt-in command above, so both hashes are computed and printed.
 //!   3. Paste the printed line(s) over the matching line(s) in `GOLDENS`, in the SAME commit as
 //!      the sound change, and say in the commit message which cases moved and why.
 //!
 //!   Never update a golden to make an UNEXPLAINED red go away: that red is this file working.
-//!   Off x86_64 Linux the printed line carries the OLD `wav_sha256` (it cannot be computed
-//!   there); regenerate it on x86_64 Linux before committing.
+//!   Never paste WAV values computed on a machine whose libm fingerprint differs: re-record the
+//!   whole table and `LIBM_FINGERPRINT` together, on one machine, and say so in the commit.
+//!   Without the opt-in variable the printed line carries the OLD `wav_sha256`.
 //!
 //! Fixture: `assets/images/Lena.png`, the only committed PNG (PNG, not JPEG, because JPEG decode
 //! differs across CPUs: s121-01 § 7 U1). `--steps 6` scans 6 bars; the piece is still 36 steps,
-//! about 19.5 s. Cost: four debug renders on four threads, about 6–8 s wall on an 8-core box.
+//! about 19.5 s. Cost: three debug renders on three threads (four with the opt-in), about 6–8 s
+//! wall on an 8-core box.
 //!
-//! Filesystem: the WAV golden writes each case's WAV to `std::env::temp_dir()` through the lib's
-//! own writer and removes it, because the property pinned IS the bytes that writer puts on disk.
+//! Filesystem: only the opt-in WAV golden writes, each case's WAV to `std::env::temp_dir()`
+//! through the lib's own writer, and removes it, because the property pinned IS the bytes that
+//! writer puts on disk. The always-on path writes nothing.
 #![cfg(all(feature = "synth", feature = "pure-analysis"))]
 
+use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -111,10 +137,38 @@ const GOLDENS: &[Golden] = &[
 /// file `ci.yml` fetched on 2026-10-20.
 const SF2_SHA256: &str = "9575028c7a1f589f5770fccc8cff2734566af40cd26ed836944e9a5152688cfe";
 
+/// The opt-in switch for the local WAV golden. Only the exact value `1` enables it.
+const WAV_GOLDEN_ENV: &str = "AUDIOHAX_WAV_GOLDEN";
+
+/// The libm fingerprint of the machine the WAV goldens were recorded on (x86_64 Linux,
+/// glibc 2.43), one entry per probed function, from [`libm_fingerprint`]. Diagnostic only.
+#[rustfmt::skip]
+const LIBM_FINGERPRINT: &[(&str, &str)] = &[
+    ("sinf", "e50e3adff704931c"),
+    ("cosf", "198c9474b74a745b"),
+    ("powf", "8901514243eed73b"),
+    ("log10f", "9f803a95d7e15dd1"),
+    ("expf", "b41755ecf98c2b2d"),
+    ("exp2f", "6147fdb43d343040"),
+    ("tanhf", "8e3e06b9401e0e81"),
+    ("atan2f", "2775e464552a883a"),
+    ("hypotf", "a76ef1e0026d191c"),
+    ("sin", "3c741a3ce2259eaa"),
+    ("cos", "161f2b6e31e98be3"),
+    ("atan2", "8690f9c9a231cdaf"),
+    ("exp", "f363ec20c061b28f"),
+    ("log", "d3c49f8b61121b96"),
+    ("log10", "c4ab1fcbb9214a3b"),
+];
+
 /// Whether this case's composition depends on the image-derived seed (f32 bits through libm),
-/// which keeps it out of the portable golden. See the module doc.
+/// which keeps it out of the always-on golden. See the module doc.
 fn portable(case: &str) -> bool {
     case != "lena_image_seed"
+}
+
+fn wav_golden_enabled() -> bool {
+    std::env::var(WAV_GOLDEN_ENV).is_ok_and(|v| v == "1")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -160,14 +214,17 @@ fn request(case: &str) -> RenderRequest {
     }
 }
 
-/// Every case rendered once per test binary, each on its own new thread (the seed / expression /
-/// cadence registers are thread-local, so the renders cannot see each other; the event dump is
-/// process-global and is never armed here). Order follows `GOLDENS`.
+/// The cases this process needs rendered, once per test binary, each on its own new thread (the
+/// seed / expression / cadence registers are thread-local, so the renders cannot see each other;
+/// the event dump is process-global and is never armed here). Without the opt-in variable only
+/// the portable cases are rendered, so the always-on path runs no libm-bound case at all.
 fn renders() -> &'static [(&'static str, RenderOutput)] {
     static R: OnceLock<Vec<(&'static str, RenderOutput)>> = OnceLock::new();
     R.get_or_init(|| {
+        let all = wav_golden_enabled();
         let handles: Vec<_> = GOLDENS
             .iter()
+            .filter(|g| all || portable(g.case))
             .map(|g| {
                 let case = g.case;
                 std::thread::spawn(move || {
@@ -192,6 +249,15 @@ fn renders() -> &'static [(&'static str, RenderOutput)] {
             .map(|h| h.join().expect("render thread panicked"))
             .collect()
     })
+}
+
+/// The render of `case`; panics if this process did not render it (see [`renders`]).
+fn rendered(case: &str) -> &'static RenderOutput {
+    renders()
+        .iter()
+        .find(|(c, _)| *c == case)
+        .map(|(_, out)| out)
+        .unwrap_or_else(|| panic!("golden case {case} was not rendered in this process"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -313,6 +379,43 @@ fn sha256_hex(data: &[u8]) -> String {
     h.iter().map(|x| format!("{x:08x}")).collect()
 }
 
+/// Results of the libm functions the render path imports (`nm -D` of this test binary, S122),
+/// on fixed inputs, hashed per function: `(name, first 16 hex of SHA-256 of the result bits)`.
+/// `black_box` keeps the compiler from folding a call away, so every probe reaches libm.
+fn libm_fingerprint() -> Vec<(&'static str, String)> {
+    const N: u32 = 512;
+    fn probe(name: &'static str, f: impl Fn(u32) -> u64) -> (&'static str, String) {
+        let mut bytes = Vec::with_capacity(N as usize * 8);
+        for i in 0..N {
+            bytes.extend_from_slice(&f(black_box(i)).to_le_bytes());
+        }
+        (name, sha256_hex(&bytes)[..16].to_string())
+    }
+    // Inputs: a signed range wide enough to exercise range reduction, a positive range, and a
+    // second operand for the two-argument functions.
+    let s32 = |i: u32| black_box(i as f32 * 0.113 - 28.9);
+    let p32 = |i: u32| black_box(i as f32 * 0.0391 + 0.0007);
+    let s64 = |i: u32| black_box(i as f64 * 0.113 - 28.9);
+    let p64 = |i: u32| black_box(i as f64 * 0.0391 + 0.0007);
+    vec![
+        probe("sinf", |i| s32(i).sin().to_bits() as u64),
+        probe("cosf", |i| s32(i).cos().to_bits() as u64),
+        probe("powf", |i| p32(i).powf(s32(i) * 0.1).to_bits() as u64),
+        probe("log10f", |i| p32(i).log10().to_bits() as u64),
+        probe("expf", |i| (s32(i) * 0.3).exp().to_bits() as u64),
+        probe("exp2f", |i| (s32(i) * 0.3).exp2().to_bits() as u64),
+        probe("tanhf", |i| (s32(i) * 0.2).tanh().to_bits() as u64),
+        probe("atan2f", |i| s32(i).atan2(s32(N - 1 - i)).to_bits() as u64),
+        probe("hypotf", |i| s32(i).hypot(p32(i)).to_bits() as u64),
+        probe("sin", |i| s64(i).sin().to_bits()),
+        probe("cos", |i| s64(i).cos().to_bits()),
+        probe("atan2", |i| s64(i).atan2(s64(N - 1 - i)).to_bits()),
+        probe("exp", |i| (s64(i) * 0.3).exp().to_bits()),
+        probe("log", |i| p64(i).ln().to_bits()),
+        probe("log10", |i| p64(i).log10().to_bits()),
+    ]
+}
+
 /// The paste-ready replacement line for one case.
 fn golden_line(case: &str, out: &RenderOutput, structure: &str, wav: &str) -> String {
     format!(
@@ -320,10 +423,6 @@ fn golden_line(case: &str, out: &RenderOutput, structure: &str, wav: &str) -> St
         out.interleaved.len(),
         out.events.len()
     )
-}
-
-fn wav_golden_platform() -> bool {
-    cfg!(all(target_os = "linux", target_arch = "x86_64"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -348,19 +447,17 @@ fn golden_sha256_matches_fips_vectors() {
     );
 }
 
-/// Composition + render length, on every platform: the pre-Phase-0 piece's notes, onsets,
-/// velocities, programs and sample count, for every explicit-seed case.
+/// ALWAYS ON (CI, every OS). Composition + render length: the pre-Phase-0 piece's notes,
+/// onsets, velocities, programs and sample count, for every explicit-seed case. Libm-independent
+/// (see the module doc); it does not read the opt-in variable except to print WAV hashes.
 #[test]
 fn golden_structure_portable() {
     let mut failures = Vec::new();
     let mut lines = Vec::new();
-    for (g, (case, out)) in GOLDENS.iter().zip(renders()) {
-        assert_eq!(g.case, *case);
-        if !portable(case) {
-            continue;
-        }
+    for g in GOLDENS.iter().filter(|g| portable(g.case)) {
+        let (case, out) = (g.case, rendered(g.case));
         let structure = sha256_hex(&structure_bytes(out));
-        let wav = if wav_golden_platform() {
+        let wav = if wav_golden_enabled() {
             sha256_hex(&wav_bytes(case, out))
         } else {
             g.wav_sha256.to_string()
@@ -396,43 +493,50 @@ fn golden_structure_portable() {
          See the module doc's update procedure.\n",
         failures.join("\n  "),
         lines.join("\n"),
-        if wav_golden_platform() {
+        if wav_golden_enabled() {
             ""
         } else {
-            "(wav_sha256 above is the OLD value: regenerate it on x86_64 Linux.)\n"
+            "(wav_sha256 above is the OLD value: regenerate it with the local opt-in WAV golden.)\n"
         }
     );
 }
 
-/// The exact WAV bytes, every case including the image-derived seed. Platform-bound (float
-/// rounding in synthesis, libm in the image seed), so x86_64 Linux only.
+/// LOCAL OPT-IN (never in CI). The exact WAV bytes for every case, plus the structure of the
+/// image-derived-seed case. Both are libm-bound. Enable with `AUDIOHAX_WAV_GOLDEN=1` AND
+/// `--include-ignored` (see the module doc for the command and what it guards).
 #[test]
-#[cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
-    ignore = "WAV-byte golden is x86_64-Linux-only (synthesis float rounding is platform-bound, s121-01 § 3.3); the structure golden still runs"
-)]
-fn golden_wav_bytes_x86_64_linux() {
-    if !wav_golden_platform() {
+#[ignore = "LOCAL opt-in guard (WAV bytes are libm-bound). Run: AUDIOHAX_WAV_GOLDEN=1 cargo test --test render_golden_s122 -- --include-ignored"]
+fn golden_wav_bytes_local_opt_in() {
+    if !wav_golden_enabled() {
         eprintln!(
-            "golden_wav_bytes_x86_64_linux: SKIPPED, not x86_64 Linux (forced with --ignored)"
+            "golden_wav_bytes_local_opt_in: SKIPPED, {WAV_GOLDEN_ENV} is not set to 1. This is a \
+             LOCAL guard (WAV bytes are libm-bound); the structure golden still ran."
         );
         return;
     }
     let sf2 = std::fs::read(manifest("assets/soundfonts/default.sf2"))
         .expect("assets/soundfonts/default.sf2 (embedded at build time) is readable");
     let sf2_sha = sha256_hex(&sf2);
-    if sf2_sha != SF2_SHA256 {
-        eprintln!(
-            "golden_wav_bytes_x86_64_linux: SKIPPED. The embedded SoundFont sha256 is {sf2_sha}, \
-             the goldens were rendered with {SF2_SHA256}. WAV bytes cannot be compared across \
-             fonts. The structure golden (font-independent) still ran."
-        );
-        return;
-    }
+    assert_eq!(
+        sf2_sha, SF2_SHA256,
+        "golden_wav_bytes_local_opt_in: CANNOT COMPARE. The embedded SoundFont is not the one the \
+         goldens were rendered with, so WAV bytes cannot match. Rebuild with that font."
+    );
+    let fingerprint = libm_fingerprint();
+    let libm_moved: Vec<&str> = fingerprint
+        .iter()
+        .filter(|(name, hash)| {
+            LIBM_FINGERPRINT
+                .iter()
+                .find(|(n, _)| n == name)
+                .is_none_or(|(_, h)| h != hash)
+        })
+        .map(|(name, _)| *name)
+        .collect();
     let mut failures = Vec::new();
     let mut lines = Vec::new();
-    for (g, (case, out)) in GOLDENS.iter().zip(renders()) {
-        assert_eq!(g.case, *case);
+    for g in GOLDENS {
+        let (case, out) = (g.case, rendered(g.case));
         let structure = sha256_hex(&structure_bytes(out));
         let wav = sha256_hex(&wav_bytes(case, out));
         if wav != g.wav_sha256 {
@@ -459,12 +563,38 @@ fn golden_wav_bytes_x86_64_linux() {
         }
         lines.push(golden_line(case, out, &structure, &wav));
     }
-    assert!(
-        failures.is_empty(),
-        "\nRENDERED AUDIO CHANGED (WAV golden, tests/render_golden_s122.rs):\n  {}\n\n\
-         If, and only if, this change is INTENDED, replace the matching line(s) in GOLDENS with:\n{}\n\
-         See the module doc's update procedure.\n",
+    let fingerprint_lines: Vec<String> = fingerprint
+        .iter()
+        .map(|(n, h)| format!("    (\"{n}\", \"{h}\"),"))
+        .collect();
+    if failures.is_empty() {
+        if !libm_moved.is_empty() {
+            eprintln!(
+                "golden_wav_bytes_local_opt_in: bytes MATCH although the libm fingerprint differs \
+                 in {libm_moved:?}; the probes disagree but the render did not. This machine's \
+                 fingerprint:\n{}",
+                fingerprint_lines.join("\n")
+            );
+        }
+        return;
+    }
+    if libm_moved.is_empty() {
+        panic!(
+            "\nRENDERED AUDIO CHANGED (local WAV golden, tests/render_golden_s122.rs):\n  {}\n\n\
+             The libm fingerprint matches the recording machine (probe inputs only).\n\
+             If, and only if, this change is INTENDED, replace the matching line(s) in GOLDENS with:\n{}\n\
+             See the module doc's update procedure.\n",
+            failures.join("\n  "),
+            lines.join("\n")
+        );
+    }
+    panic!(
+        "\nLOCAL WAV GOLDEN RED ON A DIFFERENT LIBM (tests/render_golden_s122.rs):\n  {}\n\n\
+         This machine's libm differs from the recording machine's in: {libm_moved:?}.\n\
+         A WAV red here may be libm, not sound. Do NOT paste these values into GOLDENS. Trust the\n\
+         structure golden, compare on the recording machine, or re-record the WHOLE table and\n\
+         LIBM_FINGERPRINT together on one machine. This machine's fingerprint:\n{}\n",
         failures.join("\n  "),
-        lines.join("\n")
+        fingerprint_lines.join("\n")
     );
 }
