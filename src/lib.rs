@@ -59,3 +59,9 @@ pub mod synth_sink; // Lane B — rustysynth+cpal; implements engine::AudioSink
 // is gated on both; the bare `--no-default-features` lib is unchanged.
 #[cfg(all(feature = "pure-analysis", feature = "synth"))]
 pub mod render;
+
+// S123 — the first desktop window (egui/eframe), a front-end over `render`. Behind the
+// NON-default `gui` feature (which enables `pure-analysis`, `synth` and `midi-out`), so every
+// default and `--no-default-features` build compiles none of it.
+#[cfg(feature = "gui")]
+pub mod gui;

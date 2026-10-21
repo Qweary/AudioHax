@@ -81,3 +81,19 @@ jobs:
       # correctness lint class passes green today. See design §1.2 / §2.5.
       - name: Clippy correctness gate
         run: cargo clippy --all-targets -- -D clippy::correctness
+
+      # S123 — the desktop window (`gui` feature, NOT in default). ADDED after every step
+      # above, which are unchanged. Proves the window builds and its headless logic tests
+      # pass on all three OSes (the implementer could build Linux only). No display is
+      # needed: the tests drive egui headlessly and never open a window. Linux needs no
+      # package beyond ALSA (eframe's glow/winit/xkbcommon and rfd's portal backend load
+      # their system libraries at run time; measured: a box without libxkbcommon-dev or
+      # libgtk-3-dev builds it).
+      - name: Build the desktop window (gui feature)
+        run: cargo build --features gui --bin audiohax-gui
+
+      - name: Test the desktop window's logic (gui feature, headless)
+        run: cargo test --features gui --lib gui::
+
+      - name: Clippy correctness gate (gui feature)
+        run: cargo clippy --all-targets --features gui -- -D clippy::correctness

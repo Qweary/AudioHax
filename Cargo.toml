@@ -46,6 +46,15 @@ path = "src/main.rs"
 # (pure-analysis absent), so `cargo test --no-default-features` stays green.
 required-features = ["pure-analysis", "synth"]
 
+# S123 — the first desktop window (egui/eframe). Behind the NON-default `gui` feature, so
+# `cargo build`, `cargo test` and every `--no-default-features` build compile none of it.
+# `gui` itself enables `pure-analysis`, `synth` and `midi-out` (the window renders, plays
+# through the bundled synth, and can route to a MIDI port), so the one feature is enough.
+[[bin]]
+name = "audiohax-gui"
+path = "src/bin/audiohax-gui.rs"
+required-features = ["gui"]
+
 [[bin]]
 name = "make_tiled_payload"
 path = "src/bin/make_tiled_payload.rs"
@@ -147,6 +156,11 @@ opencv = ["dep:opencv", "image"]
 # the bundled synth (the exact-FluidSynth-parity reference, and "use my own synth").
 midi-out = ["dep:midir"]
 
+# ── S123: the desktop window (`audiohax-gui`, src/gui/). NOT in `default`. Pulls eframe/egui
+# (glow renderer only, no wgpu) and `rfd` (native file dialogs). Every GUI-side bound on
+# untrusted input lives in src/gui/ (Shielding s123-SH, lead ruling L-9).
+gui = ["dep:eframe", "dep:rfd", "pure-analysis", "synth", "midi-out"]
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -212,6 +226,20 @@ imageproc = { version = "0.23", optional = true }
 # default feature set off. crossterm is ratatui's default backend; pinned explicitly.
 ratatui = "0.29"                                   # terminal UI widgets (tui.rs render path)
 crossterm = "0.28"                                 # terminal backend / event loop (audiohax-tui bin)
+
+# ── S123 — desktop window deps (optional; only the `gui` feature pulls them) ──
+# Pinned EXACTLY to releases at least 14 days old at adoption (Shielding s123-SH § 4.10):
+# eframe/egui 0.36.2 (2026-09-08; 0.37.0 of 2026-10-15 is too new), rfd 0.17.2 (2026-01-12).
+# Transitive crates are locked to releases at least 14 days old too (`cargo update --precise`).
+# eframe: ONE renderer (glow), accesskit kept (screen-reader floor), default fonts, X11 and
+# Wayland. NO egui_extras / image loaders (s123-SH D-2: they would decode untrusted bytes a
+# second time with none of the caps). NOTE: eframe 0.36 itself depends on `image 0.25`
+# (png only, for window icons) and its clipboard crate `arboard` uses it too, so a gui build
+# carries both `image` majors; the window decodes picture bytes ONLY with this crate's 0.24.
+eframe = { version = "=0.36.2", optional = true, default-features = false, features = ["glow", "accesskit", "default_fonts", "x11", "wayland"] }
+# rfd: native Open/Save dialogs. Default backend on Linux is xdg-desktop-portal (pure Rust, no
+# libgtk-3-dev at build time).
+rfd = { version = "=0.17.2", optional = true }
 
 [dev-dependencies]
 rand_chacha = "0.3"
