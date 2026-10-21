@@ -50,3 +50,11 @@ pub mod pure_analysis; // Lane A — image+imageproc; implements engine::Feature
 // lib (music + modem) stays dependency-free.
 #[cfg(feature = "synth")]
 pub mod synth_sink; // Lane B — rustysynth+cpal; implements engine::AudioSink
+
+// S122 Phase 0 (operator ruling D-28) — the ONE render/play orchestration seam: `render()`,
+// `prepare_play()` + `play()`, and the shared `build_step_event_timeline`, MOVED out of
+// `main.rs` so the CLI, the TUI and the GUI call one function and cannot drift. Needs the
+// pure-Rust analyzer (image in) and the synth module (event model + offline synthesis), so it
+// is gated on both; the bare `--no-default-features` lib is unchanged.
+#[cfg(all(feature = "pure-analysis", feature = "synth"))]
+pub mod render;

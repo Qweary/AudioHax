@@ -217,8 +217,15 @@ pub struct MappingTable {
 
 pub fn load_mappings(path: &str) -> Result<MappingTable, Box<dyn std::error::Error>> {
     let data = fs::read_to_string(path)?;
-    let mappings: MappingTable = serde_json::from_str(&data)?;
+    let mappings: MappingTable = parse_mappings(&data)?;
     Ok(mappings)
+}
+
+/// Parse a `mappings.json` document already in memory (S122 Phase 0: the GUI / embedded-
+/// mappings entry point, which has no path to read). [`load_mappings`] is exactly
+/// `fs::read_to_string` + this, so both entry points parse identically.
+pub fn parse_mappings(json: &str) -> Result<MappingTable, serde_json::Error> {
+    serde_json::from_str(json)
 }
 
 /// Deep-copy a [`MappingTable`] by hand-rebuilding it from its public fields (all public,
@@ -346,5 +353,22 @@ mod tests {
             res.is_err(),
             "an unknown bass-pattern kind must be rejected by serde at load time"
         );
+    }
+
+    /// S122 — `parse_mappings` (in-memory) and `load_mappings` (path) parse the shipped table
+    /// identically, and `parse_mappings` surfaces a malformed document as an error.
+    #[test]
+    fn s122_parse_mappings_matches_load_mappings() {
+        let path = "assets/mappings.json";
+        let text = std::fs::read_to_string(path).expect("read shipped mappings");
+        let parsed = parse_mappings(&text).expect("parse shipped mappings");
+        let loaded = load_mappings(path).expect("load shipped mappings");
+        assert_eq!(parsed.composition, loaded.composition);
+        assert_eq!(parsed.global.hue_to_mode, loaded.global.hue_to_mode);
+        assert_eq!(
+            parsed.global.progression_families,
+            loaded.global.progression_families
+        );
+        assert!(parse_mappings("{ not json").is_err());
     }
 }

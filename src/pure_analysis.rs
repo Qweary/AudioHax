@@ -105,6 +105,20 @@ pub fn load_pure_image(src: &PureImageSource) -> Result<PureImage, AnalysisError
     Ok(PureImage { inner: rgb })
 }
 
+/// Load an ENCODED image already in memory (PNG/JPEG bytes — the GUI / drag-and-drop path,
+/// S122 Phase 0) into a `PureImage`. Same decode → `to_rgb8` → empty-check as
+/// [`load_pure_image`]; the only difference is that the format is sniffed from the bytes
+/// (`image::load_from_memory`) instead of taken from a file extension.
+pub fn load_pure_image_bytes(bytes: &[u8]) -> Result<PureImage, AnalysisError> {
+    let dynimg = image::load_from_memory(bytes)
+        .map_err(|e| AnalysisError::Decode(format!("<in-memory image>: {e}")))?;
+    let rgb = dynimg.to_rgb8();
+    if rgb.width() == 0 || rgb.height() == 0 {
+        return Err(AnalysisError::EmptyImage("load_pure_image_bytes"));
+    }
+    Ok(PureImage { inner: rgb })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Per-pixel color conversion (parity-critical: OpenCV output ranges)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1099,6 +1113,37 @@ mod tests {
     /// Build a solid-color RGB image of the given size.
     fn solid(w: u32, h: u32, rgb: [u8; 3]) -> RgbImage {
         RgbImage::from_pixel(w, h, Rgb(rgb))
+    }
+
+    /// S122 — the in-memory entry decodes a PNG to exactly the pixels the path entry decodes
+    /// from the same PNG file, and rejects non-image bytes with `Decode`.
+    #[test]
+    fn s122_load_pure_image_bytes_matches_path_load() {
+        let img = solid(7, 5, [12, 200, 77]);
+        let mut png: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgb8(img.clone())
+            .write_to(
+                &mut std::io::Cursor::new(&mut png),
+                image::ImageOutputFormat::Png,
+            )
+            .expect("encode png");
+        let from_bytes = load_pure_image_bytes(&png).expect("decode png bytes");
+        assert_eq!(from_bytes.as_rgb(), &img);
+
+        let path =
+            std::env::temp_dir().join(format!("audiohax-s122-bytes-{}.png", std::process::id()));
+        std::fs::write(&path, &png).expect("write png");
+        let from_path = load_pure_image(&PureImageSource::UserPath(path.clone()));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            from_path.expect("decode png path").as_rgb(),
+            from_bytes.as_rgb()
+        );
+
+        assert!(matches!(
+            load_pure_image_bytes(b"definitely not an image"),
+            Err(AnalysisError::Decode(_))
+        ));
     }
 
     // ── rgb_to_hsv: known color conversions ──────────────────────────────────
