@@ -230,7 +230,9 @@ crossterm = "0.28"                                 # terminal backend / event lo
 # ── S123 — desktop window deps (optional; only the `gui` feature pulls them) ──
 # Pinned EXACTLY to releases at least 14 days old at adoption (security review s123-SH § 4.10):
 # eframe/egui 0.36.2 (2026-09-08; 0.37.0 of 2026-10-15 is too new), rfd 0.17.2 (2026-01-12).
-# Transitive crates are locked to releases at least 14 days old too (`cargo update --precise`).
+# Transitive crates too: every package in Cargo.lock, for EVERY target (not only those built on
+# Linux), was at least 14 days old when swept on 2026-10-21 (`tokio` pinned to 1.53.2 with
+# `cargo update --precise`; it is reached only on emscripten with an unstable cfg flag).
 # eframe: ONE renderer (glow), accesskit kept (screen-reader floor), default fonts, X11 and
 # Wayland. NO egui_extras / image loaders (s123-SH D-2: they would decode untrusted bytes a
 # second time with none of the caps). NOTE: eframe 0.36 itself depends on `image 0.25`

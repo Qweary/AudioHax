@@ -1124,8 +1124,12 @@ mod tests {
         }
     }
 
+    /// Stale-result dropping: after an abandon, only the wanted (newer) job's result reaches the
+    /// window. This counts delivered results only, so it cannot see T-3 (one job alive) broken;
+    /// `tests/gui_sealA_s123.rs` `t3_a_job_submitted_while_an_abandoned_one_runs_waits_in_the_one_pending_slot`
+    /// pins T-3.
     #[test]
-    fn controller_runs_one_job_at_a_time_and_drops_stale_results() {
+    fn controller_delivers_only_the_wanted_result_after_an_abandon() {
         let mut c = Controller::new(mappings(), || {});
         let img = GuardedImage::admit(structured(64, 48, ImageFormat::Png)).expect("admit");
         let req = Controls::default().request();
@@ -1135,7 +1139,7 @@ mod tests {
             save_to: None,
         });
         assert!(c.is_busy());
-        // Abandon, then submit while the abandoned job may still run: it waits (T-3).
+        // Abandon, then submit while the abandoned job may still run; its result must be dropped.
         c.abandon();
         let g2 = c.submit(JobKind::Render {
             request: req,

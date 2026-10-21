@@ -101,9 +101,11 @@ pub fn read_bounded(path: &Path) -> Result<Vec<u8>, Refusal> {
 
 /// [`read_bounded`] with an explicit cap (the test seam; the window always uses the constant).
 ///
-/// Two checks bound the read. The file's reported size is checked FIRST, so an oversize file is
-/// refused without reading any of it (`s123-SH2` N-5). The `take(cap + 1)` read stays as the
-/// guard against a file that grows between the size check and the read.
+/// Three checks bound the read. The path's reported type and size are checked FIRST, so a
+/// non-regular or oversize file is refused without opening or reading it (`s123-SH2` N-5). The
+/// OPENED handle is then checked again (`read_opened`), so a path swapped for something else
+/// between the check and the open is refused before any read. The `take(cap + 1)` read
+/// (`read_capped`) stays as the memory guard against a file that grows after both checks.
 pub fn read_bounded_with_cap(path: &Path, cap: u64) -> Result<Vec<u8>, Refusal> {
     let meta = std::fs::metadata(path).map_err(|e| Refusal::Io(e.to_string()))?;
     if !meta.is_file() {
@@ -113,8 +115,27 @@ pub fn read_bounded_with_cap(path: &Path, cap: u64) -> Result<Vec<u8>, Refusal> 
         return Err(Refusal::FileTooBig { cap });
     }
     let file = std::fs::File::open(path).map_err(|e| Refusal::Io(e.to_string()))?;
+    read_opened(file, cap)
+}
+
+/// The opened handle's own type and size (fstat), then the capped read.
+fn read_opened(file: std::fs::File, cap: u64) -> Result<Vec<u8>, Refusal> {
+    let meta = file.metadata().map_err(|e| Refusal::Io(e.to_string()))?;
+    if !meta.is_file() {
+        return Err(Refusal::NotARegularFile);
+    }
+    if meta.len() > cap {
+        return Err(Refusal::FileTooBig { cap });
+    }
+    read_capped(file, cap)
+}
+
+/// Read at most `cap + 1` bytes from `source`, then refuse if it held more than `cap`. The
+/// `take` bounds MEMORY: however much `source` could yield, no more than `cap + 1` is read.
+fn read_capped(source: impl Read, cap: u64) -> Result<Vec<u8>, Refusal> {
     let mut bytes = Vec::new();
-    file.take(cap.saturating_add(1))
+    source
+        .take(cap.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|e| Refusal::Io(e.to_string()))?;
     if bytes.len() as u64 > cap {
@@ -313,7 +334,7 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn scratch_dir(name: &str) -> std::path::PathBuf {
         crate::gui::test_scratch_dir(&format!("ingest-{name}"))
@@ -613,9 +634,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_file_that_reports_a_small_size_is_still_cut_off_by_the_read_cap() {
-        // The `take(cap + 1)` guard behind the size check: a `/proc` file reports length 0 but
-        // yields content when read, which is the "file grew after the size check" case.
+    fn a_file_that_reports_size_zero_is_still_refused_when_its_content_is_over_the_cap() {
+        // A `/proc` file reports length 0 but yields content when read, which is the "file grew
+        // after the size checks" case. The verdict here comes from `read_capped`'s length check;
+        // the `take` memory bound is pinned by `the_read_cap_reads_no_more_than_cap_plus_one_byte`.
         let path = Path::new("/proc/self/maps");
         let reported = std::fs::metadata(path).map(|m| m.len()).unwrap_or(1);
         if reported != 0 {
@@ -625,6 +647,64 @@ mod tests {
             read_bounded_with_cap(path, 16),
             Err(Refusal::FileTooBig { cap: 16 })
         );
+    }
+
+    /// A source that can yield `left` bytes and counts how many it actually handed out.
+    struct CountingSource {
+        left: u64,
+        served: u64,
+    }
+
+    impl Read for CountingSource {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = (buf.len() as u64).min(self.left) as usize;
+            buf[..n].fill(0x55);
+            self.left -= n as u64;
+            self.served += n as u64;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn the_read_cap_reads_no_more_than_cap_plus_one_byte() {
+        // `s123-06` MA11: the old test stayed green with the `take` removed, because the length
+        // check decided its verdict. This one measures what `take` bounds: bytes READ.
+        let cap = 16;
+        let mut src = CountingSource {
+            left: 1 << 20,
+            served: 0,
+        };
+        assert_eq!(read_capped(&mut src, cap), Err(Refusal::FileTooBig { cap }));
+        assert_eq!(src.served, cap + 1, "read past the cap");
+        // Control: a source at exactly the cap is read whole and admitted.
+        let mut ok = CountingSource {
+            left: cap,
+            served: 0,
+        };
+        assert_eq!(read_capped(&mut ok, cap).map(|b| b.len() as u64), Ok(cap));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_opened_handle_that_is_not_a_regular_file_is_refused_before_any_read() {
+        // `s123-06` N-B: the path check runs before `open`; a path swapped between the two is
+        // caught by the fstat of the OPENED handle. `/dev/zero` reports size 0, so without that
+        // check it would be read up to the cap and refused as too big instead.
+        let t0 = Instant::now();
+        let zero = std::fs::File::open("/dev/zero").expect("open /dev/zero");
+        assert_eq!(read_opened(zero, 4096), Err(Refusal::NotARegularFile));
+        let dir = scratch_dir("fstat");
+        let handle = std::fs::File::open(&dir).expect("open a directory read-only");
+        assert_eq!(read_opened(handle, 4096), Err(Refusal::NotARegularFile));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        // Control: a regular file's handle is read.
+        let dir = scratch_dir("fstat-ok");
+        let path = dir.join("ok.bin");
+        std::fs::write(&path, [1u8, 2, 3]).expect("write");
+        let f = std::fs::File::open(&path).expect("open");
+        assert_eq!(read_opened(f, 4096), Ok(vec![1, 2, 3]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

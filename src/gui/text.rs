@@ -295,7 +295,7 @@ mod tests {
             "sunset.wav"
         );
         assert_eq!(
-            suggest_wav_name(Some("/home/u/My Photo.png")),
+            suggest_wav_name(Some("/srv/pictures/My Photo.png")),
             "My Photo.wav"
         );
         assert_eq!(suggest_wav_name(Some("a:b.png")), "ab.wav");

@@ -93,11 +93,14 @@ jobs:
         run: cargo build --features gui --bin audiohax-gui
 
       - name: Test the desktop window's logic (gui feature, headless)
-        run: cargo test --features gui --lib gui::
+        # Quoted: an unquoted value ending in `::` is a YAML mapping key, and the file would not parse.
+        run: 'cargo test --features gui --lib gui::'
 
-      # S123 fix round: the window's integration tests (tests/gui_*.rs). They are compiled out
-      # of the default `cargo test` above by a file-level `#![cfg(feature = "gui")]`, so without
-      # this step none of them ran in CI. Cargo expands the quoted glob itself, on every OS. A
+      # S123 fix round: the window's integration tests (tests/gui_*.rs). All but one are compiled
+      # out of the default `cargo test` above by a file-level `#![cfg(feature = "gui")]`, so
+      # without this step those never ran in CI. The exception, gui_worker_registers_s123.rs, is
+      # gated on `synth` + `pure-analysis` and already runs in the default `cargo test`; this
+      # step runs it again. Cargo expands the quoted glob itself, on every OS. A
       # separate step, not a second line in the step above: on Windows the default shell is
       # PowerShell, where a multi-line `run` reports only the LAST command's exit code.
       - name: Test the desktop window end to end (gui feature, headless, tests/gui_*)
