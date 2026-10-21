@@ -8,7 +8,7 @@
 //! outside the egui drawing code):
 //!
 //! * [`ingest`] — the picture's way in: bounded read, header probe, dimension caps, format
-//!   allowlist, display decode (Shielding `s123-SH` B-1, B-2, B-3, D-1).
+//!   allowlist, display decode (security review `s123-SH` B-1, B-2, B-3, D-1).
 //! * [`job`] — the single worker thread, `catch_unwind` around every job, generation counter,
 //!   at most one job alive (SH T-1, T-2, T-3, C-1..C-3, W-1, W-2).
 //! * [`sinks`] — the live sinks the window plays through, each silencing itself on Stop and on

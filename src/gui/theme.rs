@@ -62,7 +62,9 @@ impl Palette {
         text: hex(0xDADCE6),
         text_muted: hex(0x9D9AB0),
         text_faint: hex(0x7E7B92),
-        control_border: hex(0x6E6A82),
+        // UI2 F8: was #6E6A82 (2.91 : 1 on `raised`, where the modal outline and the Presets
+        // card sit). #76728A is >= 3 : 1 on bg / surface / raised.
+        control_border: hex(0x76728A),
         accent: hex(0x7CC4E8),
         on_accent: hex(0x13121A),
         accent_2: hex(0xB6A6E6),
@@ -71,9 +73,9 @@ impl Palette {
         error: hex(0xE88A8A),
     };
 
-    /// The optional light palette (UI § 10.2 light table). The designer's table gives no
-    /// `text-faint` or hover step for light mode; `text_faint` reuses `text-muted` (AA on every
-    /// light surface) and `raised_hover` is one step darker than `bg` (flagged in the report).
+    /// The optional light palette (UI § 10.2 light table, with the designer's corrections from
+    /// `s123-UI2` F2: `control_border`, `warn` and `text_faint`, each AA-or-better on bg, surface
+    /// and raised). `raised_hover` is the implementer's step, kept by the designer.
     pub const LIGHT: Palette = Palette {
         dark: false,
         bg: hex(0xF4F3F8),
@@ -82,13 +84,13 @@ impl Palette {
         raised_hover: hex(0xE9E7F1),
         text: hex(0x20202B),
         text_muted: hex(0x55536A),
-        text_faint: hex(0x55536A),
-        control_border: hex(0xB7B3C6),
+        text_faint: hex(0x6E6C83),
+        control_border: hex(0x87839C),
         accent: hex(0x2E7CB0),
         on_accent: hex(0xFFFFFF),
         accent_2: hex(0x6B52B0),
         focus: hex(0x5B86C9),
-        warn: hex(0x9A6B12),
+        warn: hex(0x7D5609),
         error: hex(0xB23B3B),
     };
 
@@ -130,7 +132,8 @@ impl Palette {
         v.warn_fg_color = self.warn;
         v.error_fg_color = self.error;
         v.selection.bg_fill = Palette::with_alpha(self.accent, 0.35);
-        // The focus ring: a 2 px lavender stroke, distinct from the blue primary.
+        // Text-edit focus outline and selected-label ink. The keyboard focus ring of every
+        // other control is drawn OUTSIDE the widget by [`focus_ring`] (UI2 F1).
         v.selection.stroke = Stroke::new(2.0, self.focus);
         v.window_corner_radius = CornerRadius::same(10);
         v.menu_corner_radius = CornerRadius::same(6);
@@ -159,7 +162,10 @@ impl Palette {
 
         w.active.bg_fill = self.raised_hover;
         w.active.weak_bg_fill = self.raised_hover;
-        w.active.bg_stroke = Stroke::new(2.0, self.focus);
+        // egui draws a FOCUSED widget with these `active` visuals. The edge stays an ordinary
+        // 1 px outline; the focus ring is [`focus_ring`], outside the widget (UI2 F1). Drawing
+        // the ring ON the edge made it vanish on the accent-filled Play button (1.05 : 1).
+        w.active.bg_stroke = Stroke::new(1.0, self.control_border);
         w.active.fg_stroke = Stroke::new(2.0, self.text);
         w.active.corner_radius = r6;
 
@@ -169,6 +175,14 @@ impl Palette {
         w.open.fg_stroke = Stroke::new(1.0, self.text);
         w.open.corner_radius = r6;
         v
+    }
+
+    /// How far outside a widget's rect the focus ring sits (UI § 10.2: a 2 px ring, offset).
+    pub const FOCUS_RING_OFFSET: f32 = 3.0;
+
+    /// The focus ring's stroke: 2 px of `color.focus`.
+    pub fn focus_stroke(&self) -> Stroke {
+        Stroke::new(2.0, self.focus)
     }
 
     /// Apply this palette, the type scale (`type.body` 15 / `type.label` 13 / `type.mono` 13 px)
@@ -205,6 +219,33 @@ impl Palette {
     }
 }
 
+/// UI2 F1: if `r` has keyboard focus, draw the 2 px focus ring OUTSIDE it, offset by
+/// [`Palette::FOCUS_RING_OFFSET`], so it is seen against the panel rather than against the widget's
+/// own fill (lavender on the frost-blue Play button measures 1.05 : 1; on the panel, 7.2–9.4 : 1).
+pub fn focus_ring(ui: &egui::Ui, r: &egui::Response, p: &Palette) {
+    if r.has_focus() {
+        ui.painter().rect_stroke(
+            r.rect.expand(Palette::FOCUS_RING_OFFSET),
+            CornerRadius::same(8),
+            p.focus_stroke(),
+            egui::StrokeKind::Outside,
+        );
+    }
+}
+
+/// UI2 F4: a selected pill (Music | Modem, Room On | Off) gets a 1 px frost-blue outline, so the
+/// selection reads as blue rather than as a slate fill. Label contrast is untouched.
+pub fn selected_outline(ui: &egui::Ui, r: &egui::Response, selected: bool, p: &Palette) {
+    if selected {
+        ui.painter().rect_stroke(
+            r.rect,
+            CornerRadius::same(6),
+            Stroke::new(1.0, p.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,10 +277,9 @@ mod tests {
             assert!(contrast(p.text_muted, ground) >= 4.5);
             assert!(contrast(p.focus, ground) >= 3.0);
         }
-        // The designer states control-border contrast on bg and surface (3.59 / 3.28); on
-        // `raised` it is 2.91, which is why widget outlines sit against the panel (surface).
-        for ground in [p.bg, p.surface] {
-            assert!(contrast(p.control_border, ground) >= 3.0);
+        // UI2 F8: control-border is >= 3 : 1 on all three grounds (designer: 4.02 / 3.68 / 3.26).
+        for ground in [p.bg, p.surface, p.raised] {
+            assert!(contrast(p.control_border, ground) >= 3.0, "{ground:?}");
         }
         assert!(contrast(p.text_faint, p.bg) >= 4.5);
         assert!(
@@ -264,12 +304,41 @@ mod tests {
             "primary button label"
         );
         assert!(contrast(p.error, p.bg) >= 4.5);
-        // warn is AA on the panels where the window draws it (surface 4.50, raised 4.68).
-        assert!(contrast(p.warn, p.surface) >= 4.5);
-        // KNOWN, flagged to the UI Designer (build report): the light table's control-border
-        // #B7B3C6 measures 1.85 / 1.97 / 2.04 on bg / surface / raised, not the stated >= 3:1,
-        // and warn #9A6B12 measures 4.24 on bg. The designer's hex values are kept as given.
-        assert!(contrast(p.control_border, p.bg) < 3.0);
+        // UI2 F2: the corrected tokens (designer: control-border 3.30 / 3.51 / 3.65, warn
+        // 5.93 / 6.30 / 6.55, text-faint 4.60 / 4.88 / 5.08 on bg / surface / raised).
+        for ground in [p.bg, p.surface, p.raised] {
+            assert!(contrast(p.control_border, ground) >= 3.0, "{ground:?}");
+            assert!(contrast(p.warn, ground) >= 4.5, "{ground:?}");
+            assert!(contrast(p.text_faint, ground) >= 4.5, "{ground:?}");
+        }
+        assert!(contrast(p.warn, p.bg) >= 4.5);
+        // Both operator hues are unchanged by the correction (D-41).
+        assert_eq!(p.accent, hex(0x2E7CB0));
+        assert_eq!(p.accent_2, hex(0x6B52B0));
+    }
+
+    #[test]
+    fn f1_the_focus_ring_is_seen_against_every_ground_it_is_drawn_on() {
+        // The ring is drawn outside the widget, so it sits on the stage (bg), a panel
+        // (surface), a card or modal (raised), or next to a hovered control (raised_hover).
+        // It is never judged against the accent fill, where it measured 1.05 : 1.
+        for p in [Palette::DARK, Palette::LIGHT] {
+            for ground in [p.bg, p.surface, p.raised, p.raised_hover] {
+                assert!(
+                    contrast(p.focus, ground) >= 3.0,
+                    "dark={} focus on {ground:?}: {:.2}",
+                    p.dark,
+                    contrast(p.focus, ground)
+                );
+            }
+            // The edge of a focused widget is no longer the focus colour: one ring, not two.
+            let v = p.visuals();
+            assert_eq!(
+                v.widgets.active.bg_stroke,
+                Stroke::new(1.0, p.control_border)
+            );
+            assert_eq!(p.focus_stroke(), Stroke::new(2.0, p.focus));
+        }
     }
 
     #[test]

@@ -95,5 +95,13 @@ jobs:
       - name: Test the desktop window's logic (gui feature, headless)
         run: cargo test --features gui --lib gui::
 
+      # S123 fix round: the window's integration tests (tests/gui_*.rs). They are compiled out
+      # of the default `cargo test` above by a file-level `#![cfg(feature = "gui")]`, so without
+      # this step none of them ran in CI. Cargo expands the quoted glob itself, on every OS. A
+      # separate step, not a second line in the step above: on Windows the default shell is
+      # PowerShell, where a multi-line `run` reports only the LAST command's exit code.
+      - name: Test the desktop window end to end (gui feature, headless, tests/gui_*)
+        run: cargo test --features gui --test 'gui_*'
+
       - name: Clippy correctness gate (gui feature)
         run: cargo clippy --all-targets --features gui -- -D clippy::correctness

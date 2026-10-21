@@ -1,4 +1,4 @@
-//! Save WAV (UI `s123-UI` § 5.2; Shielding `s123-SH` § 4.7).
+//! Save WAV (UI `s123-UI` § 5.2; security review `s123-SH` § 4.7).
 //!
 //! The path comes from the user through a native dialog, so there is no traversal threat to
 //! defend; the only attacker-influenced string near a path is the SUGGESTED name, built in
@@ -50,8 +50,21 @@ pub fn partial_path(target: &Path) -> Result<PathBuf, SaveError> {
 
 /// V-3: write `interleaved` (stereo, `sample_rate`) to `target` atomically: temp file in the same
 /// directory, then rename. On any error the temp file is removed and `target` is unchanged.
+///
+/// `s123-SH2` N-4: the temp name is predictable, so it is first CREATED with `create_new`, which
+/// fails if anything (a file, or a symlink, dangling or not) already has that name. Only then does
+/// the library's writer open it (`File::create` inside `write_stereo_wav`), so a planted symlink
+/// can never redirect the write onto another file. In a sticky shared directory nobody else can
+/// swap the file between the two opens.
 pub fn write_atomic(target: &Path, sample_rate: u32, interleaved: &[f32]) -> Result<(), SaveError> {
     let tmp = partial_path(target)?;
+    // Reserve the name. On failure nothing was created, so there is nothing to remove (and the
+    // thing already at that name is NOT ours to remove).
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| SaveError::Write(format!("could not create {}: {e}", tmp.display())))?;
     if let Err(e) = write_stereo_wav(&tmp, sample_rate, interleaved) {
         let _ = std::fs::remove_file(&tmp);
         return Err(SaveError::Write(e.to_string()));
@@ -166,6 +179,38 @@ mod tests {
         assert!(matches!(r, Err(SaveError::Write(_))), "{r:?}");
         assert_eq!(std::fs::read(&target).expect("read"), before);
         assert!(!partial_path(&target).expect("partial").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn n4_a_planted_symlink_at_the_temp_name_cannot_redirect_the_save() {
+        let dir = crate::gui::test_scratch_dir("save-n4");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"the user's other file").expect("seed victim");
+        let target = dir.join("piece.wav");
+        let tmp = partial_path(&target).expect("partial");
+        std::os::unix::fs::symlink(&victim, &tmp).expect("plant symlink");
+        let r = write_atomic(&target, 44_100, &tone(100));
+        assert!(matches!(r, Err(SaveError::Write(_))), "{r:?}");
+        assert_eq!(
+            std::fs::read(&victim).expect("victim"),
+            b"the user's other file",
+            "the file the link points at is untouched"
+        );
+        assert!(!target.exists(), "nothing was saved through the link");
+        assert!(
+            std::fs::symlink_metadata(&tmp).is_ok(),
+            "the planted link is not ours to delete"
+        );
+        // A dangling link at the temp name is refused the same way.
+        std::fs::remove_file(&tmp).expect("rm link");
+        std::os::unix::fs::symlink(dir.join("nowhere"), &tmp).expect("dangling");
+        assert!(matches!(
+            write_atomic(&target, 44_100, &tone(100)),
+            Err(SaveError::Write(_))
+        ));
+        assert!(!dir.join("nowhere").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

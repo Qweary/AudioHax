@@ -1,5 +1,5 @@
-//! S123 — Shielding `s123-SH` W-3 / T14: the GUI worker's post-panic correctness, as a forcing
-//! test.
+//! S123 — security review `s123-SH` W-3 / T14: the GUI worker's post-panic correctness, as a
+//! forcing test.
 //!
 //! The window renders many pieces on one worker thread and catches panics there. The seed,
 //! expression and cadence registers are `thread_local!`, and the event dump is process-global.
@@ -127,6 +127,101 @@ fn note_name(n: &RenderNote<'_>) -> &'static str {
     }
 }
 
+/// The expression register's poison: the base expression profile. It is EXACTLY what `compose()`
+/// writes for `expression: On` with no v2 term (`src/render.rs`), which is what makes the
+/// potency control below a control for this very value.
+fn expression_poison() -> audiohax::composition::ExpressionProfile {
+    audiohax::composition::ExpressionProfile::e1_entrance_destack()
+}
+
+/// The cadence register's poison: a figure the test picture's own analysis does not produce.
+fn cadence_poison() -> audiohax::chord_engine::CadenceFigure {
+    audiohax::chord_engine::CadenceFigure {
+        shape: Some(audiohax::chord_engine::select_cadence_shape(0.9, 2.0)),
+        drive: 0.8,
+    }
+}
+
+/// Potency control for the expression poison (fix round; `s123-SH2` H-2). If `compose()` stopped
+/// resetting the expression register, a plain render after the poison would compose under this
+/// profile. A render that asks for it (`expression: On`, no v2 term) shows that doing so changes
+/// the piece, so equality in `directly_poisoned_registers_do_not_leak_into_the_next_render` is
+/// evidence of the reset, not of a poison that never mattered.
+#[test]
+fn expression_poison_is_potent() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let bytes = picture();
+    let fresh = fresh_snapshot(&bytes);
+    let with_expression = std::thread::spawn({
+        let bytes = bytes.clone();
+        move || {
+            render(
+                &RenderRequest {
+                    expression: Toggle::On,
+                    ..plain_request()
+                },
+                ImageInput::Bytes(&bytes),
+                &mappings(),
+                SoundFontSource::Bundled,
+                &mut |_| Ok(()),
+            )
+            .expect("expression render")
+        }
+    })
+    .join()
+    .expect("thread");
+    assert_ne!(
+        with_expression.events, fresh.0,
+        "control: the expression poison (base profile) must change the piece"
+    );
+}
+
+/// Potency control for the cadence poison (fix round; `s123-SH2` H-2). No request makes
+/// `compose()` write this figure, so the control writes it itself, from the note callback at
+/// `Planned`: that is AFTER `compose()` has set the register from the picture and BEFORE the
+/// timeline is realised, which is the window a missing reset would leave the poison in. The piece
+/// changes, so the poison is potent on the path that reads it.
+#[test]
+fn cadence_poison_is_potent() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let bytes = picture();
+    let fresh = fresh_snapshot(&bytes);
+    let poisoned = std::thread::spawn({
+        let bytes = bytes.clone();
+        move || {
+            let mut own_figure = None;
+            let out = render(
+                &plain_request(),
+                ImageInput::Bytes(&bytes),
+                &mappings(),
+                SoundFontSource::Bundled,
+                &mut |n: RenderNote<'_>| {
+                    if matches!(n, RenderNote::Planned { .. }) {
+                        own_figure = Some(audiohax::chord_engine::cadence_development());
+                        audiohax::chord_engine::set_cadence_development(cadence_poison());
+                    }
+                    Ok(())
+                },
+            )
+            .expect("poisoned render");
+            (out, own_figure)
+        }
+    })
+    .join()
+    .expect("thread");
+    let (out, own_figure) = poisoned;
+    let own_figure = own_figure.expect("Planned fired");
+    assert_ne!(
+        own_figure,
+        cadence_poison(),
+        "the picture's own figure must differ from the poison, or the control proves nothing"
+    );
+    assert_ne!(
+        out.events, fresh.0,
+        "control: the cadence poison must change the piece"
+    );
+}
+
 /// Inject a panic at the note named `at` inside an armed render, catch it on THIS thread, then
 /// check the same-thread snapshot equals a fresh thread's.
 fn panic_then_compare(at: &'static str, expect_dump_armed_at_panic: bool) {
@@ -199,13 +294,8 @@ fn directly_poisoned_registers_do_not_leak_into_the_next_render() {
     for _ in 0..5 {
         let _ = audiohax::seed::next_seed_call();
     }
-    audiohax::composition::expression_register::set(
-        audiohax::composition::ExpressionProfile::e1_entrance_destack(),
-    );
-    audiohax::chord_engine::set_cadence_development(audiohax::chord_engine::CadenceFigure {
-        shape: Some(audiohax::chord_engine::select_cadence_shape(0.9, 2.0)),
-        drive: 0.8,
-    });
+    audiohax::composition::expression_register::set(expression_poison());
+    audiohax::chord_engine::set_cadence_development(cadence_poison());
 
     let same = plain_snapshot(&bytes, &m);
     // Control: the poison is POTENT — a render that really used seed 7 differs from the plain
@@ -225,6 +315,8 @@ fn directly_poisoned_registers_do_not_leak_into_the_next_render() {
         seeded.events, fresh.0,
         "control: seed 7 must change the piece"
     );
+    // The other two poisons are proven potent by `expression_poison_is_potent` and
+    // `cadence_poison_is_potent` below (security review `s123-SH2` H-2 / § 8 item 2).
     assert_eq!(same.0, fresh.0, "render events leaked a poisoned register");
     assert_eq!(same.1, fresh.1, "render samples leaked a poisoned register");
     assert_eq!(

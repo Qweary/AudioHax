@@ -38,7 +38,8 @@ pub enum Control {
     ModeSwitch,
     /// The output selector (speakers / MIDI port).
     OutputSelector,
-    /// Variation, Voices, Room, Level.
+    /// Variation, Voices, Room, Level. Room and Level stay live whatever the output is
+    /// (lead ruling L-20, `s123-UI2` F3): see [`output_notice`].
     SoundControls,
     /// Render.
     Render,
@@ -94,6 +95,32 @@ pub fn enablement(control: Control, phase: Phase) -> Result<(), &'static str> {
     }
 }
 
+/// L-20 / `s123-UI2` F3, the designer's words verbatim: the one-line notice shown under Room and
+/// Level while a MIDI port is the output.
+pub const MIDI_ROOM_LEVEL_NOTICE: &str =
+    "For Play through MIDI, your synth sets Room and Level. Save WAV still uses the values here.";
+
+/// Where Play sends sound, as far as the sound controls care.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputKind {
+    /// The built-in synth: Room and Level shape what Play sounds like.
+    Speakers,
+    /// An external MIDI synth: Room and Level do not reach it, but `render()` still applies them
+    /// to Save WAV (`src/render.rs`: `SynthConfig { enable_reverb_and_chorus: req.reverb…, gain:
+    /// req.gain }`).
+    Midi,
+}
+
+/// L-20: Room and Level are live exactly when the other sound controls are; the output choice
+/// never greys them, because they still shape Save WAV. With a MIDI output the window shows
+/// [`MIDI_ROOM_LEVEL_NOTICE`] instead. Returns that notice, or `None`.
+pub fn output_notice(output: OutputKind) -> Option<&'static str> {
+    match output {
+        OutputKind::Speakers => None,
+        OutputKind::Midi => Some(MIDI_ROOM_LEVEL_NOTICE),
+    }
+}
+
 /// L-14: the Voices maximum for a picture is `min(schema max, min(width, height))`. With the
 /// 16 px floor (SH B-2) this is the schema's 16 for every admitted picture; it is still DERIVED,
 /// so a later change to either bound stays honest.
@@ -121,7 +148,10 @@ pub enum EverydayError {
     #[error(transparent)]
     Schema(#[from] SchemaError),
     /// The Everyday tier is not exactly the four rows this window draws.
-    #[error("the window draws seed/instruments/reverb/gain as Everyday, but the schema's Everyday rows are {0:?}")]
+    #[error(
+        "the window draws seed/instruments/reverb/gain as Everyday, but the schema's Everyday \
+         rows are {0:?}"
+    )]
     Mismatch(Vec<String>),
 }
 
@@ -290,8 +320,12 @@ mod tests {
     fn voices_bound_derives_from_the_picture() {
         assert_eq!(voices_max(16, 640, 480), 16);
         assert_eq!(voices_max(16, 16, 5000), 16);
-        // Below the admission floor (never reached through the window) it still derives.
+        // Below the admission floor (never reached through the window) it still derives, from
+        // whichever side is smaller (strengthened in the fix round, TODO-6: with the small side
+        // only ever in `width`, `min(16, width)` passed this test too).
         assert_eq!(voices_max(16, 12, 900), 12);
+        assert_eq!(voices_max(16, 900, 12), 12);
+        assert_eq!(voices_max(16, 900, 9), 9);
         assert_eq!(voices_max(8, 640, 480), 8);
         let mut c = Controls {
             instruments: 16,
@@ -299,6 +333,24 @@ mod tests {
         };
         c.clamp_voices(12);
         assert_eq!(c.instruments, 12);
+    }
+
+    #[test]
+    fn l20_room_and_level_are_never_greyed_by_the_output_choice() {
+        // The output choice adds a notice and changes no enablement: `enablement` takes no
+        // output at all, so every phase gives Room/Level the same answer under either output.
+        assert_eq!(output_notice(OutputKind::Speakers), None);
+        assert_eq!(
+            output_notice(OutputKind::Midi),
+            Some(MIDI_ROOM_LEVEL_NOTICE)
+        );
+        assert_eq!(
+            MIDI_ROOM_LEVEL_NOTICE,
+            "For Play through MIDI, your synth sets Room and Level. Save WAV still uses the \
+             values here."
+        );
+        assert!(enablement(Control::SoundControls, Phase::ImageLoaded).is_ok());
+        assert!(enablement(Control::SoundControls, Phase::Stopped).is_ok());
     }
 
     #[test]

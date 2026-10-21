@@ -3,8 +3,8 @@
 //!
 //! The builder tests `probe` / `read_bounded` as functions. These tests drive the WINDOW'S load
 //! path (`gui::job::run_load`, the function the worker runs for File ▸ Open, drag-and-drop and
-//! "Try a sample") end to end, and they pin the exact cap boundaries (Shielding `s123-SH` § 4.1
-//! B-1/B-2, § 5 T3–T9, T12, T13).
+//! "Try a sample") end to end, and they pin the exact cap boundaries (security review
+//! `s123-SH` § 4.1 B-1/B-2, § 5 T3–T9, T12, T13).
 //!
 //! Filesystem fixtures are written under `CARGO_TARGET_TMPDIR` (inside the cargo target dir),
 //! never `/tmp` and never inside the repository. No large file is materialised: the 256 MiB
@@ -258,8 +258,9 @@ fn non_regular_files_are_refused_promptly_through_the_load_path() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// T11's one missing format: Radiance HDR (named by Shielding B-3, absent from the builder's
-/// list) is kept away from the decoder — refused as unsupported, or not recognised at all.
+/// T11's one missing format: Radiance HDR (named by the security review's B-3, absent from the
+/// builder's list) is kept away from the decoder — refused as unsupported, or not recognised at
+/// all.
 #[test]
 fn radiance_hdr_is_not_admitted() {
     // `DynamicImage::write_to` cannot encode HDR in image 0.24; the codec's encoder can.

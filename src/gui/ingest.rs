@@ -1,4 +1,4 @@
-//! The picture's way into the window (Shielding `s123-SH` § 4.1 and § 4.9).
+//! The picture's way into the window (the security review `s123-SH` § 4.1 and § 4.9).
 //!
 //! Every byte the window hands to the library passes through here first, in this order:
 //!
@@ -100,10 +100,17 @@ pub fn read_bounded(path: &Path) -> Result<Vec<u8>, Refusal> {
 }
 
 /// [`read_bounded`] with an explicit cap (the test seam; the window always uses the constant).
+///
+/// Two checks bound the read. The file's reported size is checked FIRST, so an oversize file is
+/// refused without reading any of it (`s123-SH2` N-5). The `take(cap + 1)` read stays as the
+/// guard against a file that grows between the size check and the read.
 pub fn read_bounded_with_cap(path: &Path, cap: u64) -> Result<Vec<u8>, Refusal> {
     let meta = std::fs::metadata(path).map_err(|e| Refusal::Io(e.to_string()))?;
     if !meta.is_file() {
         return Err(Refusal::NotARegularFile);
+    }
+    if meta.len() > cap {
+        return Err(Refusal::FileTooBig { cap });
     }
     let file = std::fs::File::open(path).map_err(|e| Refusal::Io(e.to_string()))?;
     let mut bytes = Vec::new();
@@ -130,20 +137,32 @@ pub struct Probe {
 /// B-3: the picture formats the window accepts. Everything else the `image` crate's default
 /// features would decode (OpenEXR, HDR, DDS, TGA, PNM, Farbfeld, QOI, ICO, AVIF…) is refused,
 /// which removes most of the reachable decoder surface with no loss to a non-technical user.
+///
+/// WebP is NOT accepted (lead ruling L-16, `s123-SH2` H-1 / N-1). In `image 0.24` the WebP
+/// decoder decodes the whole frame in its constructor, so [`probe`]'s `into_dimensions` is not a
+/// header-only read for WebP: a 52-byte extended WebP declaring a 65535² canvas makes it request
+/// about 17 GiB, and an allocation failure aborts the process (no `catch_unwind` can catch it).
+/// Because this check runs BEFORE `into_dimensions`, a WebP file never reaches that decoder.
+/// Re-admitting WebP needs a hand-parsed RIFF/VP8/VP8L/VP8X size check first (L-16 (a)).
 pub fn allowed_format(format: ImageFormat) -> bool {
     matches!(
         format,
         ImageFormat::Png
             | ImageFormat::Jpeg
             | ImageFormat::Gif
-            | ImageFormat::WebP
             | ImageFormat::Bmp
             | ImageFormat::Tiff
     )
 }
 
-/// B-2: the three dimension caps, with the pixel count computed in `u64` (a `u32` product
-/// overflows at 65536²).
+/// B-2: `width × height` in `u64`. A `u32` product would wrap at 65536² (to 0), which the side
+/// cap happens to stop today; computing it here, in one tested place, keeps the pixel cap honest
+/// if the order of the checks ever changes.
+pub fn pixel_count(width: u32, height: u32) -> u64 {
+    u64::from(width) * u64::from(height)
+}
+
+/// B-2: the three dimension caps, with the pixel count from [`pixel_count`].
 pub fn check_dimensions(width: u32, height: u32) -> Result<(), Refusal> {
     if width.min(height) < MIN_SIDE {
         return Err(Refusal::TooSmall { width, height });
@@ -151,7 +170,7 @@ pub fn check_dimensions(width: u32, height: u32) -> Result<(), Refusal> {
     if width.max(height) > MAX_SIDE {
         return Err(Refusal::SideTooLarge { width, height });
     }
-    let pixels = u64::from(width) * u64::from(height);
+    let pixels = pixel_count(width, height);
     if pixels > MAX_PIXELS {
         return Err(Refusal::TooManyPixels {
             width,
@@ -162,8 +181,10 @@ pub fn check_dimensions(width: u32, height: u32) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// B-2 + B-3: sniff the format FROM THE BYTES and read the dimensions from the header, without
-/// decoding any pixel data, then apply the allowlist and the caps. Measured cost ≤ 86 µs (SH § 3.2).
+/// B-2 + B-3: sniff the format FROM THE BYTES, apply the allowlist, and only then read the
+/// dimensions from the header and apply the caps. For every format on the allowlist the
+/// dimension read is header-only (`s123-SH2` § 4: 0 ms and ≤ 11 MiB for PNG, JPEG, GIF, TIFF
+/// and BMP); that is exactly why WebP is off the allowlist (see [`allowed_format`]).
 pub fn probe(bytes: &[u8]) -> Result<Probe, Refusal> {
     let reader = image::io::Reader::new(Cursor::new(bytes))
         .with_guessed_format()
@@ -172,6 +193,14 @@ pub fn probe(bytes: &[u8]) -> Result<Probe, Refusal> {
         .format()
         .ok_or_else(|| Refusal::NotAnImage("the picture format could not be determined".into()))?;
     if !allowed_format(format) {
+        // `image 0.24` guesses WebP from the 4-byte "RIFF" prefix alone (its own TODO in
+        // `io/free_functions.rs`). A RIFF file that is not "RIFF....WEBP" (a WAV, an AVI, a
+        // SoundFont) is not a picture at all, and says so.
+        if format == ImageFormat::WebP && bytes.get(8..12) != Some(b"WEBP".as_slice()) {
+            return Err(Refusal::NotAnImage(
+                "a RIFF file (sound, video or SoundFont), not a picture".into(),
+            ));
+        }
         return Err(Refusal::UnsupportedFormat(format!("{format:?}")));
     }
     let (width, height) = reader
@@ -376,14 +405,25 @@ mod tests {
 
     #[test]
     fn t8_pixel_cap_boundary() {
-        // 7072 x 7072 = 50,013,184 > 50 M.
+        // The cap's own edge (strengthened in the S123 fix round: the old pair straddled the cap
+        // by 74,000 px, so `>` → `>=` survived it). 10000 x 5000 is EXACTLY the cap: admitted.
+        let p = probe(&png_with_dims(10_000, 5_000)).expect("exactly 50,000,000 px admitted");
+        assert_eq!((p.width, p.height), (10_000, 5_000));
+        // 2217 x 22553 = 50,000,001: one pixel over (both sides under the side cap).
+        assert_eq!(
+            probe(&png_with_dims(2217, 22_553)),
+            Err(Refusal::TooManyPixels {
+                width: 2217,
+                height: 22_553,
+                pixels: 50_000_001
+            })
+        );
+        // The original pair, kept: 7072² = 50,013,184 refused; 8160 x 6120 = 49,939,200 admitted.
         assert!(matches!(
             probe(&png_with_dims(7072, 7072)),
             Err(Refusal::TooManyPixels { .. })
         ));
-        // 8160 x 6120 = 49,939,200 <= 50 M: admitted (NOT decoded here).
-        let p = probe(&png_with_dims(8160, 6120)).expect("49.94 MP admitted");
-        assert_eq!((p.width, p.height), (8160, 6120));
+        assert!(probe(&png_with_dims(8160, 6120)).is_ok());
     }
 
     #[test]
@@ -396,10 +436,24 @@ mod tests {
     }
 
     #[test]
-    fn pixel_product_is_u64() {
-        // 65536 x 65536 overflows u32; the side cap fires first, but the product must not wrap.
-        assert!(check_dimensions(65_536, 65_536).is_err());
-        assert!(check_dimensions(20_000, 20_000).is_err()); // 400 MP, sides under the cap
+    fn pixel_count_is_computed_in_u64() {
+        // Strengthened in the S123 fix round (TODO-6): the old `pixel_product_is_u64` asserted
+        // only that check_dimensions refused, which the side cap guarantees whatever the product
+        // type, so it could not fail. `pixel_count` is the function the cap uses; a u32 product
+        // wraps 65536² to 0 and 65537 x 65535 to 0 as well.
+        assert_eq!(pixel_count(65_536, 65_536), 4_294_967_296);
+        assert_eq!(pixel_count(65_537, 65_535), 4_294_967_295);
+        assert_eq!(pixel_count(u32::MAX, u32::MAX), 18_446_744_065_119_617_025);
+        assert_eq!(pixel_count(10_000, 5_000), MAX_PIXELS);
+        // …and check_dimensions reports that same count.
+        assert_eq!(
+            check_dimensions(20_000, 20_000),
+            Err(Refusal::TooManyPixels {
+                width: 20_000,
+                height: 20_000,
+                pixels: pixel_count(20_000, 20_000)
+            })
+        );
     }
 
     #[test]
@@ -469,7 +523,49 @@ mod tests {
             let b = solid(32, 32, [10, 20, 30], f);
             assert!(probe(&b).is_ok(), "{f:?} should be accepted");
         }
-        assert!(allowed_format(ImageFormat::WebP));
+        // L-16: WebP is refused before its decoder is reached (see the two forcing tests below).
+        assert!(!allowed_format(ImageFormat::WebP));
+    }
+
+    /// `s123-SH2` H-1's 38-byte lossless (`VP8L`) WebP declaring 16383 x 16383. Through the
+    /// round-1 probe it took 1.86 s and about 2.0 GiB before being refused. Bytes copied from the
+    /// reviewer's crafted file (`webp-268mp-lossless.webp`); nothing is committed as a fixture.
+    pub(crate) const WEBP_VP8L_16383: [u8; 38] = [
+        0x52, 0x49, 0x46, 0x46, 0x1e, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38,
+        0x4c, 0x11, 0x00, 0x00, 0x00, 0x2f, 0xfe, 0xbf, 0xff, 0x0f, 0x07, 0x50, 0xad, 0xa2, 0x14,
+        0xb4, 0xff, 0x81, 0x88, 0xe8, 0x7f, 0x00, 0x00,
+    ];
+
+    /// `s123-SH2` H-1's 52-byte extended (`VP8X` + `ALPH`) WebP declaring a 65535 x 65535 canvas.
+    /// Through the round-1 probe it ABORTED the process on a 17 GiB allocation. Bytes copied from
+    /// the reviewer's crafted file (`webp-alph-vp8l-4gp.webp`).
+    pub(crate) const WEBP_VP8X_ALPH_65535: [u8; 52] = [
+        0x52, 0x49, 0x46, 0x46, 0x2c, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38,
+        0x58, 0x0a, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0xfe, 0xff, 0x00, 0xfe, 0xff, 0x00,
+        0x41, 0x4c, 0x50, 0x48, 0x0d, 0x00, 0x00, 0x00, 0x01, 0x07, 0x50, 0xad, 0xa2, 0x14, 0xb4,
+        0xff, 0x81, 0x88, 0xe8, 0x7f, 0x00, 0x00,
+    ];
+
+    fn assert_webp_refused_promptly(bytes: &[u8], what: &str) {
+        let t0 = Instant::now();
+        let r = probe(bytes);
+        let took = t0.elapsed();
+        assert_eq!(
+            r,
+            Err(Refusal::UnsupportedFormat("WebP".into())),
+            "{what}: must be refused by the allowlist, before any WebP decode"
+        );
+        assert!(took.as_millis() < 50, "{what}: probe took {took:?}");
+    }
+
+    #[test]
+    fn webp_vp8l_bomb_is_refused_before_any_decode() {
+        assert_webp_refused_promptly(&WEBP_VP8L_16383, "38-byte VP8L 16383²");
+    }
+
+    #[test]
+    fn webp_vp8x_alpha_bomb_is_refused_before_any_decode() {
+        assert_webp_refused_promptly(&WEBP_VP8X_ALPH_65535, "52-byte VP8X+ALPH 65535²");
     }
 
     #[test]
@@ -488,6 +584,47 @@ mod tests {
         assert!(read_bounded_with_cap(&path, 4097).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(MAX_IMAGE_BYTES, 268_435_456);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn n5_an_oversize_file_is_refused_by_its_size_without_reading_it() {
+        // `s123-SH2` N-5. The file is made UNREADABLE: if the window opened and read it before
+        // checking the size, the answer would be an I/O error. Refused by size, it never opens it.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("n5");
+        let path = dir.join("big-and-unreadable.bin");
+        let f = std::fs::File::create(&path).expect("create");
+        f.set_len(4097).expect("set_len");
+        drop(f);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let readable_anyway = std::fs::File::open(&path).is_ok(); // running as root
+        let r = read_bounded_with_cap(&path, 4096);
+        let at_cap = read_bounded_with_cap(&path, 4097);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod back");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r, Err(Refusal::FileTooBig { cap: 4096 }));
+        if !readable_anyway {
+            // Control: at a cap it does not exceed, the same file IS opened, and fails to open.
+            assert!(matches!(at_cap, Err(Refusal::Io(_))), "{at_cap:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_that_reports_a_small_size_is_still_cut_off_by_the_read_cap() {
+        // The `take(cap + 1)` guard behind the size check: a `/proc` file reports length 0 but
+        // yields content when read, which is the "file grew after the size check" case.
+        let path = Path::new("/proc/self/maps");
+        let reported = std::fs::metadata(path).map(|m| m.len()).unwrap_or(1);
+        if reported != 0 {
+            return; // not the /proc this test expects; nothing to show
+        }
+        assert_eq!(
+            read_bounded_with_cap(path, 16),
+            Err(Refusal::FileTooBig { cap: 16 })
+        );
     }
 
     #[test]
@@ -556,5 +693,11 @@ mod tests {
         sf2.extend_from_slice(b"sfbkLIST");
         sf2.resize(108, 0);
         assert!(matches!(probe(&sf2), Err(Refusal::NotAnImage(_))));
+        // The same holds for any non-WebP RIFF file, e.g. a WAV the user drops by mistake.
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&100u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.resize(108, 0);
+        assert!(matches!(probe(&wav), Err(Refusal::NotAnImage(_))));
     }
 }

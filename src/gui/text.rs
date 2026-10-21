@@ -102,6 +102,9 @@ pub enum ErrorKind {
     MidiGone,
     /// The WAV could not be written.
     SaveFailed,
+    /// The Open dialog returned at once with no file: probably no dialog could be shown
+    /// (`s123-SH2` N-2; heuristic, see `app::DIALOG_FAILURE_THRESHOLD`).
+    NoFileDialog,
     /// `--loop` with non-unity Level.
     LoopNeedsUnity,
     /// `--loop` cannot fold.
@@ -138,7 +141,8 @@ impl UserError {
     }
 }
 
-/// UI § 7: the headline for each kind. The numbers come from the Shielding caps.
+/// UI § 7: the headline for each kind. The numbers come from the security review's caps
+/// (`s123-SH` B-1, B-2).
 pub fn headline(kind: ErrorKind) -> String {
     match kind {
         ErrorKind::TooManyPixels => format!(
@@ -157,7 +161,7 @@ pub fn headline(kind: ErrorKind) -> String {
              damaged, or in a format AudioHax can't open — PNG and JPEG work best."
             .to_string(),
         ErrorKind::UnsupportedType => "AudioHax can't open this kind of picture. PNG, JPEG, GIF, \
-             WebP, BMP and TIFF work."
+             BMP and TIFF work."
             .to_string(),
         ErrorKind::CannotRead => "AudioHax couldn't open that file. Choose a picture file from \
              your computer (not a folder), under 256 MB."
@@ -179,6 +183,10 @@ pub fn headline(kind: ErrorKind) -> String {
             .to_string(),
         ErrorKind::SaveFailed => "AudioHax couldn't save the file there. Check you can write to \
              that folder, or choose another location."
+            .to_string(),
+        // `s123-SH2` N-2, the reviewer's wording verbatim.
+        ErrorKind::NoFileDialog => "AudioHax couldn't open a file dialog on this desktop. You can \
+             drag a picture onto the window instead."
             .to_string(),
         ErrorKind::LoopNeedsUnity => {
             "Seamless loop needs the Level at 1.0. Set Level to 1.0 and try again.".to_string()
@@ -309,6 +317,7 @@ mod tests {
             NoMidiPorts,
             MidiGone,
             SaveFailed,
+            NoFileDialog,
             LoopNeedsUnity,
             LoopRingsTooLong,
             ExpressionFirst,
@@ -326,9 +335,32 @@ mod tests {
     }
 
     #[test]
-    fn the_caps_in_the_headlines_are_the_shielding_numbers() {
+    fn the_caps_in_the_headlines_are_the_ingestion_caps() {
         assert!(headline(ErrorKind::TooManyPixels).contains("about 50 megapixels"));
         assert!(headline(ErrorKind::SideTooLarge).contains("32768×32768"));
+    }
+
+    #[test]
+    fn the_formats_the_window_names_are_the_formats_it_opens() {
+        // L-16 / UI2 F10: WebP left the allowlist, so no sentence may still offer it, and every
+        // format the refusal sentence names must really be accepted.
+        use super::super::ingest::allowed_format;
+        use image::ImageFormat;
+        let h = headline(ErrorKind::UnsupportedType);
+        assert!(!h.to_lowercase().contains("webp"), "{h}");
+        for (word, format) in [
+            ("PNG", ImageFormat::Png),
+            ("JPEG", ImageFormat::Jpeg),
+            ("GIF", ImageFormat::Gif),
+            ("BMP", ImageFormat::Bmp),
+            ("TIFF", ImageFormat::Tiff),
+        ] {
+            assert!(h.contains(word), "{word} missing from: {h}");
+            assert!(allowed_format(format), "{word} named but not accepted");
+        }
+        assert!(!allowed_format(ImageFormat::WebP));
+        // The Open dialog's filter offers no WebP either.
+        assert!(!super::super::app::OPEN_DIALOG_EXTENSIONS.contains(&"webp"));
     }
 
     #[test]

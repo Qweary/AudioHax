@@ -158,7 +158,7 @@ midi-out = ["dep:midir"]
 
 # ── S123: the desktop window (`audiohax-gui`, src/gui/). NOT in `default`. Pulls eframe/egui
 # (glow renderer only, no wgpu) and `rfd` (native file dialogs). Every GUI-side bound on
-# untrusted input lives in src/gui/ (Shielding s123-SH, lead ruling L-9).
+# untrusted input lives in src/gui/ (security review s123-SH, lead ruling L-9).
 gui = ["dep:eframe", "dep:rfd", "pure-analysis", "synth", "midi-out"]
 
 [dependencies]
@@ -228,7 +228,7 @@ ratatui = "0.29"                                   # terminal UI widgets (tui.rs
 crossterm = "0.28"                                 # terminal backend / event loop (audiohax-tui bin)
 
 # ── S123 — desktop window deps (optional; only the `gui` feature pulls them) ──
-# Pinned EXACTLY to releases at least 14 days old at adoption (Shielding s123-SH § 4.10):
+# Pinned EXACTLY to releases at least 14 days old at adoption (security review s123-SH § 4.10):
 # eframe/egui 0.36.2 (2026-09-08; 0.37.0 of 2026-10-15 is too new), rfd 0.17.2 (2026-01-12).
 # Transitive crates are locked to releases at least 14 days old too (`cargo update --precise`).
 # eframe: ONE renderer (glow), accesskit kept (screen-reader floor), default fonts, X11 and

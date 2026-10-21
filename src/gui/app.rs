@@ -10,16 +10,18 @@ use super::job::{Controller, Event, JobKind, LoadSource, LoadedImage, OutputChoi
 use super::overlay::{Playhead, PxRect, ScanGeometry};
 use super::save::{check_not_the_picture, default_save_dir, window_confirms_overwrite};
 use super::sinks::MidiPorts;
-use super::state::{enablement, voices_max, Control, Controls, EverydaySpecs, Phase};
+use super::state::{
+    enablement, output_notice, voices_max, Control, Controls, EverydaySpecs, OutputKind, Phase,
+};
 use super::text::{
     sanitize, sanitize_full, suggest_wav_name, ErrorKind, UserError, FILE_NAME_MAX, PORT_NAME_MAX,
 };
-use super::theme::Palette;
+use super::theme::{focus_ring, selected_outline, Palette};
 use crate::render::{CancelToken, RenderOutput, RenderRequest};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Id, Key, KeyboardShortcut, Layout,
-    Modifiers, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions,
-    Vec2,
+    Modifiers, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextStyle, TextureHandle,
+    TextureOptions, Vec2,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,6 +29,22 @@ use std::time::{Duration, Instant};
 
 /// After this long, a running job shows "Still working…" and a Cancel button (SH T-2).
 pub const STILL_WORKING_AFTER: Duration = Duration::from_secs(3);
+
+/// The file extensions the Open dialog offers: the formats [`super::ingest::allowed_format`]
+/// accepts. No WebP (lead ruling L-16). The bytes are sniffed anyway; this only filters the list.
+pub const OPEN_DIALOG_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff"];
+
+/// `s123-SH2` N-2: `rfd` returns `None` both when the person cancels the Open dialog and when no
+/// dialog could be shown at all (a Linux desktop with no portal FileChooser and no `zenity`). A
+/// `None` this fast is taken to be the second case. It is a heuristic: a person who cancels within
+/// this time sees the message too.
+pub const DIALOG_FAILURE_THRESHOLD: Duration = Duration::from_millis(150);
+
+/// N-2: did the Open dialog probably fail to appear, given that it returned no file after
+/// `elapsed`?
+pub fn dialog_probably_failed(elapsed: Duration) -> bool {
+    elapsed < DIALOG_FAILURE_THRESHOLD
+}
 
 /// Below this window width the sound panel moves to a bottom drawer (UI § 2.4).
 pub const NARROW_WIDTH: f32 = 1100.0;
@@ -193,6 +211,34 @@ impl AudioHaxApp {
             .map(|(_, a)| (a.interleaved.as_slice(), a.sample_rate))
     }
 
+    /// Is the scan-bar overlay shown (View ▸ Show scan bar, the V key)?
+    ///
+    /// TEST SEAM (fix round, `s123-05` TODO-5): read-only.
+    #[doc(hidden)]
+    pub fn scan_bar_shown(&self) -> bool {
+        self.show_scan_bar
+    }
+
+    /// The error the window is showing, if any.
+    ///
+    /// TEST SEAM (fix round): read-only.
+    #[doc(hidden)]
+    pub fn shown_error(&self) -> Option<&UserError> {
+        self.error.as_ref()
+    }
+
+    /// Choose a MIDI port as the output by its enumeration index and raw OS name, as picking it in
+    /// the Output selector does. Only the SELECTION is set; no port is opened, and a Play with a
+    /// name that is not in a real enumeration fails as "port gone", exactly as a vanished port
+    /// does.
+    ///
+    /// TEST SEAM (fix round, `s123-05` TODO-3/TODO-4): a headless test cannot create a MIDI port,
+    /// so this lets it put the window in the "MIDI output" state and read what is drawn.
+    #[doc(hidden)]
+    pub fn select_midi_output(&mut self, index: usize, raw_name: String) {
+        self.output = OutputSel::Midi(index, raw_name);
+    }
+
     /// Load the compiled-in sample picture (the "Try a sample" button).
     pub fn try_sample(&mut self) {
         self.load(LoadSource::Bytes {
@@ -256,10 +302,7 @@ impl AudioHaxApp {
         if !self.live(Control::Open) {
             return;
         }
-        let mut dialog = rfd::FileDialog::new().add_filter(
-            "Pictures",
-            &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"],
-        );
+        let mut dialog = rfd::FileDialog::new().add_filter("Pictures", OPEN_DIALOG_EXTENSIONS);
         if let Some(dir) = directories::UserDirs::new().and_then(|d| {
             d.picture_dir()
                 .map(|p| p.to_path_buf())
@@ -267,8 +310,22 @@ impl AudioHaxApp {
         }) {
             dialog = dialog.set_directory(dir);
         }
-        if let Some(path) = dialog.pick_file() {
-            self.open_path(path);
+        let asked = Instant::now();
+        match dialog.pick_file() {
+            Some(path) => self.open_path(path),
+            None => {
+                if dialog_probably_failed(asked.elapsed()) {
+                    self.error = Some(UserError::new(
+                        ErrorKind::NoFileDialog,
+                        format!(
+                            "the file dialog returned no file after {:?}, under the {:?} \
+                             threshold for a person cancelling it",
+                            asked.elapsed(),
+                            DIALOG_FAILURE_THRESHOLD
+                        ),
+                    ));
+                }
+            }
         }
     }
 
@@ -377,7 +434,25 @@ impl AudioHaxApp {
         if let Some(dir) = default_save_dir(self.last_save_dir.as_deref()) {
             dialog = dialog.set_directory(dir);
         }
-        let Some(mut path) = dialog.save_file() else {
+        let Some(path) = dialog.save_file() else {
+            return;
+        };
+        self.save_chosen_path(path);
+    }
+
+    /// Everything Save WAV does AFTER the dialog returned `path`: add `.wav` if there is no
+    /// extension, refuse the open picture's own file (V-4), ask before replacing an existing file
+    /// where the window confirms itself (V-2), else save (re-rendering first when the controls
+    /// changed since the last Render).
+    ///
+    /// TEST SEAM (fix round, `s123-05` TODO-2): this is the code path the dialog feeds, split out
+    /// unchanged so a headless test can hand it the path a dialog would have returned.
+    #[doc(hidden)]
+    pub fn save_chosen_path(&mut self, mut path: PathBuf) {
+        if !self.live(Control::SaveWav) {
+            return;
+        }
+        let Some(pic) = self.picture.as_ref() else {
             return;
         };
         if path.extension().is_none() {
@@ -798,8 +873,11 @@ impl AudioHaxApp {
             let switch_live = self.live(Control::ModeSwitch);
             ui.add_enabled_ui(switch_live, |ui| {
                 let mut mode = self.mode;
-                ui.selectable_value(&mut mode, Mode::Music, "Music");
-                ui.selectable_value(&mut mode, Mode::Modem, "Modem");
+                for (value, text) in [(Mode::Music, "Music"), (Mode::Modem, "Modem")] {
+                    let r = ui.selectable_value(&mut mode, value, text);
+                    selected_outline(ui, &r, mode == value, &p);
+                    focus_ring(ui, &r, &p);
+                }
                 self.mode = mode;
             })
             .response
@@ -820,6 +898,7 @@ impl AudioHaxApp {
                     let live = self.live(Control::OutputSelector);
                     ui.add_enabled_ui(live, |ui| {
                         let r = ui.menu_button(label, |ui| self.output_selector(ui));
+                        focus_ring(ui, &r.response, &p);
                         if r.response.clicked() {
                             // SH N-2: enumerate afresh whenever the selector opens.
                             self.ports = None;
@@ -831,7 +910,6 @@ impl AudioHaxApp {
                             .err()
                             .unwrap_or(""),
                     );
-                    let _ = p;
                 });
             }
         });
@@ -931,7 +1009,10 @@ impl AudioHaxApp {
         let reason = enablement(Control::SoundControls, self.phase)
             .err()
             .unwrap_or("");
-        let midi = matches!(self.output, OutputSel::Midi(..));
+        let output_kind = match self.output {
+            OutputSel::Speakers => OutputKind::Speakers,
+            OutputSel::Midi(..) => OutputKind::Midi,
+        };
 
         if !compact {
             ui.label(
@@ -967,11 +1048,12 @@ impl AudioHaxApp {
                         self.controls.seed = Some(v);
                     }
                 }
-                if ui
-                    .button("🎲")
-                    .on_hover_text("Pick a new Variation")
-                    .clicked()
-                {
+                // UI2 F7: the glyph at heading size, and a hover text that says what it does.
+                let dice = ui
+                    .button(RichText::new("🎲").text_style(TextStyle::Heading))
+                    .on_hover_text("Pick a different variation");
+                focus_ring(ui, &dice, &p);
+                if dice.clicked() {
                     let v = u64::from(rand::random::<u32>() % 1_000_000);
                     self.seed_text = v.to_string();
                     self.controls.seed = Some(v);
@@ -1003,6 +1085,7 @@ impl AudioHaxApp {
                     .labelled_by(l.id)
                     .on_hover_text(EverydaySpecs::help(&specs.instruments));
                 name_slider(&r, &specs.instruments.label, f64::from(voices));
+                focus_ring(ui, &r, &p);
             });
             self.controls.instruments = voices as usize;
         })
@@ -1011,22 +1094,21 @@ impl AudioHaxApp {
 
         ui.add_space(8.0);
         section_label(ui, p, "After the music");
-        let output_live = live && !midi;
-        let output_reason = if midi && live {
-            "Your MIDI synth sets these for Play. Save WAV uses the built-in synth with the values shown."
-        } else {
-            reason
-        };
-        ui.add_enabled_ui(output_live, |ui| {
+        // L-20 / UI2 F3: Room and Level follow the same enablement as the other sound controls,
+        // whatever the output, because `render()` applies them to Save WAV. A MIDI output adds
+        // a one-line notice below them instead of greying them.
+        ui.add_enabled_ui(live, |ui| {
             ui.horizontal(|ui| {
                 let l = ui.label(&specs.reverb.label);
                 let mut on = self.controls.reverb;
-                ui.selectable_value(&mut on, true, "On")
-                    .labelled_by(l.id)
-                    .on_hover_text(EverydaySpecs::help(&specs.reverb));
-                ui.selectable_value(&mut on, false, "Off")
-                    .labelled_by(l.id)
-                    .on_hover_text(EverydaySpecs::help(&specs.reverb));
+                for (value, text) in [(true, "On"), (false, "Off")] {
+                    let r = ui
+                        .selectable_value(&mut on, value, text)
+                        .labelled_by(l.id)
+                        .on_hover_text(EverydaySpecs::help(&specs.reverb));
+                    selected_outline(ui, &r, on == value, &p);
+                    focus_ring(ui, &r, &p);
+                }
                 self.controls.reverb = on;
             });
             let (gmin, gmax, gstep) = specs.gain_range();
@@ -1045,6 +1127,7 @@ impl AudioHaxApp {
                          rounds off the loudest peaks.",
                     );
                 name_slider(&r, &specs.gain.label, f64::from(g));
+                focus_ring(ui, &r, &p);
                 // The unity tick (UI § 10.1): where "no change" is.
                 let rect = r.rect;
                 let range = rect.x_range().shrink(rect.height() / 2.5);
@@ -1062,15 +1145,9 @@ impl AudioHaxApp {
             });
         })
         .response
-        .on_disabled_hover_text(output_reason);
-        if midi {
-            ui.label(
-                RichText::new(
-                    "Room and Level are set by your MIDI synth while a MIDI port is chosen.",
-                )
-                .color(p.warn)
-                .size(13.0),
-            );
+        .on_disabled_hover_text(reason);
+        if let Some(notice) = output_notice(output_kind) {
+            ui.label(RichText::new(notice).color(p.warn).size(13.0));
         }
 
         ui.add_space(8.0);
@@ -1111,11 +1188,14 @@ impl AudioHaxApp {
             } else {
                 "Render"
             };
-            ui.add_enabled(self.live(Control::Render), egui::Button::new(render_text))
+            let r = ui
+                .add_enabled(self.live(Control::Render), egui::Button::new(render_text))
                 .on_hover_text("Make the whole piece now, so Save WAV is instant.")
-                .on_disabled_hover_text(enablement(Control::Render, self.phase).err().unwrap_or(""))
-                .clicked()
-                .then(|| self.render());
+                .on_disabled_hover_text(
+                    enablement(Control::Render, self.phase).err().unwrap_or(""),
+                );
+            focus_ring(ui, &r, &p);
+            r.clicked().then(|| self.render());
 
             let play_live = self.live(Control::Play);
             let play_label = if self.phase == Phase::Playing {
@@ -1129,17 +1209,19 @@ impl AudioHaxApp {
                 p.text_muted
             }))
             .fill(if play_live { p.accent } else { p.raised });
-            ui.add_enabled(play_live, play_btn)
+            let r = ui
+                .add_enabled(play_live, play_btn)
                 .on_hover_text("Hear it now (Space)")
-                .on_disabled_hover_text(enablement(Control::Play, self.phase).err().unwrap_or(""))
-                .clicked()
-                .then(|| self.play());
+                .on_disabled_hover_text(enablement(Control::Play, self.phase).err().unwrap_or(""));
+            focus_ring(ui, &r, &p);
+            r.clicked().then(|| self.play());
 
-            ui.add_enabled(self.live(Control::Stop), egui::Button::new("⏹ Stop"))
+            let r = ui
+                .add_enabled(self.live(Control::Stop), egui::Button::new("⏹ Stop"))
                 .on_hover_text("Stop (Space or Esc)")
-                .on_disabled_hover_text(enablement(Control::Stop, self.phase).err().unwrap_or(""))
-                .clicked()
-                .then(|| self.stop());
+                .on_disabled_hover_text(enablement(Control::Stop, self.phase).err().unwrap_or(""));
+            focus_ring(ui, &r, &p);
+            r.clicked().then(|| self.stop());
 
             ui.add_space(16.0);
             // Step readout (the composer's steps, not the scan's).
@@ -1160,7 +1242,7 @@ impl AudioHaxApp {
                 let working =
                     matches!(self.phase, Phase::Loading | Phase::Rendering) || preparing_play;
                 if working {
-                    ui.add(egui::Spinner::new());
+                    ui.add(egui::Spinner::new().color(p.accent));
                     let waiting = c.waiting_on_abandoned();
                     let label = if waiting {
                         "Finishing the previous picture…"
@@ -1174,14 +1256,12 @@ impl AudioHaxApp {
                         .unwrap_or(false);
                     if long && !waiting {
                         ui.label(RichText::new("Still working…").color(p.text_muted));
-                        if ui
-                            .button("Cancel")
-                            .on_hover_text(
-                                "Stop waiting for this one. It finishes in the background; a new \
-                                 picture waits until it has.",
-                            )
-                            .clicked()
-                        {
+                        let r = ui.button("Cancel").on_hover_text(
+                            "Stop waiting for this one. It finishes in the background; a new \
+                             picture waits until it has.",
+                        );
+                        focus_ring(ui, &r, &p);
+                        if r.clicked() {
                             self.cancel_job();
                         }
                     }
@@ -1189,13 +1269,14 @@ impl AudioHaxApp {
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_enabled(self.live(Control::SaveWav), egui::Button::new("Save WAV…"))
+                let r = ui
+                    .add_enabled(self.live(Control::SaveWav), egui::Button::new("Save WAV…"))
                     .on_hover_text("Keep the piece as a WAV file (Ctrl/Cmd+S)")
                     .on_disabled_hover_text(
                         enablement(Control::SaveWav, self.phase).err().unwrap_or(""),
-                    )
-                    .clicked()
-                    .then(|| self.save_wav());
+                    );
+                focus_ring(ui, &r, &p);
+                r.clicked().then(|| self.save_wav());
                 if let Some((text, _)) = &self.toast {
                     ui.label(RichText::new(text.clone()).color(p.text).size(13.0));
                 }
@@ -1312,10 +1393,11 @@ impl AudioHaxApp {
                         Rect::from_min_size(Pos2::new(along, pos), target.size())
                     }
                 };
+                // UI2 F5: idle tint 28 % (was 22 %, faint on a saturated picture); 50 % sounding.
                 let alpha = if playing && self.play.step.is_some() {
                     0.50
                 } else {
-                    0.22
+                    0.28
                 };
                 draw_bar(&painter, p, shown, alpha);
                 // Per-voice stripe boundaries.
@@ -1422,28 +1504,26 @@ impl AudioHaxApp {
         child.label(RichText::new("— or —").color(p.text_muted));
         child.add_space(6.0);
         let live = self.live(Control::Open);
-        if child
-            .add_enabled(
-                live,
-                egui::Button::new("Open a picture…").min_size(Vec2::new(180.0, 30.0)),
-            )
-            .clicked()
-        {
+        let r = child.add_enabled(
+            live,
+            egui::Button::new("Open a picture…").min_size(Vec2::new(180.0, 30.0)),
+        );
+        focus_ring(&child, &r, &p);
+        if r.clicked() {
             self.open_dialog();
         }
-        if child
-            .add_enabled(
-                live,
-                egui::Button::new("Try a sample").min_size(Vec2::new(180.0, 30.0)),
-            )
-            .clicked()
-        {
+        let r = child.add_enabled(
+            live,
+            egui::Button::new("Try a sample").min_size(Vec2::new(180.0, 30.0)),
+        );
+        focus_ring(&child, &r, &p);
+        if r.clicked() {
             self.try_sample();
         }
         if self.phase == Phase::Loading {
             child.add_space(6.0);
             child.horizontal(|ui| {
-                ui.add(egui::Spinner::new());
+                ui.add(egui::Spinner::new().color(p.accent));
                 ui.label(RichText::new(self.job_label).color(p.text_muted));
             });
         }
@@ -1486,48 +1566,54 @@ impl AudioHaxApp {
 
     fn modals(&mut self, ctx: &egui::Context) {
         let p = self.palette;
+        // UI2 F6: the backdrop is the palette's ground, not egui's stock black.
+        let backdrop = Palette::with_alpha(p.bg, 0.6);
         if let Some(err) = self.error.clone() {
-            let r = egui::Modal::new(Id::new("error-modal")).show(ctx, |ui| {
-                ui.set_max_width(460.0);
-                ui.label(RichText::new(err.headline()).color(p.error).size(16.0));
-                ui.add_space(6.0);
-                egui::CollapsingHeader::new("Details")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(sanitize_full(&err.details))
-                                .monospace()
-                                .color(p.text_muted),
-                        );
-                    });
-                ui.add_space(8.0);
-                ui.button("OK").clicked()
-            });
+            let r = egui::Modal::new(Id::new("error-modal"))
+                .backdrop_color(backdrop)
+                .show(ctx, |ui| {
+                    ui.set_max_width(460.0);
+                    ui.label(RichText::new(err.headline()).color(p.error).size(16.0));
+                    ui.add_space(6.0);
+                    egui::CollapsingHeader::new("Details")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(sanitize_full(&err.details))
+                                    .monospace()
+                                    .color(p.text_muted),
+                            );
+                        });
+                    ui.add_space(8.0);
+                    ui.button("OK").clicked()
+                });
             if r.inner || r.backdrop_response.clicked() {
                 self.error = None;
             }
         }
         if let Some(path) = self.confirm.as_ref().map(|c| c.path.clone()) {
-            let r = egui::Modal::new(Id::new("overwrite-modal")).show(ctx, |ui| {
-                ui.set_max_width(460.0);
-                ui.label(format!(
-                    "“{}” already exists. Replace it?",
-                    sanitize(
-                        &path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default(),
-                        FILE_NAME_MAX
-                    )
-                ));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let replace = ui.button("Replace").clicked();
-                    let cancel = ui.button("Cancel").clicked();
-                    (replace, cancel)
-                })
-                .inner
-            });
+            let r = egui::Modal::new(Id::new("overwrite-modal"))
+                .backdrop_color(backdrop)
+                .show(ctx, |ui| {
+                    ui.set_max_width(460.0);
+                    ui.label(format!(
+                        "“{}” already exists. Replace it?",
+                        sanitize(
+                            &path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default(),
+                            FILE_NAME_MAX
+                        )
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let replace = ui.button("Replace").clicked();
+                        let cancel = ui.button("Cancel").clicked();
+                        (replace, cancel)
+                    })
+                    .inner
+                });
             let (replace, cancel) = r.inner;
             if replace {
                 self.confirm = None;
@@ -1560,25 +1646,27 @@ impl AudioHaxApp {
                 ),
             ];
             let i = step.min(STEPS.len() - 1);
-            let r = egui::Modal::new(Id::new("tour-modal")).show(ctx, |ui| {
-                ui.set_max_width(440.0);
-                ui.label(
-                    RichText::new(format!("Quick tour · {} of {}", i + 1, STEPS.len()))
-                        .color(p.text_muted)
-                        .size(13.0),
-                );
-                ui.add_space(4.0);
-                ui.label(RichText::new(STEPS[i].0).size(17.0));
-                ui.label(RichText::new(STEPS[i].1).color(p.text_muted));
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    let last = i + 1 == STEPS.len();
-                    let next = ui.button(if last { "Done" } else { "Next" }).clicked();
-                    let skip = !last && ui.button("Skip the tour").clicked();
-                    (next, last, skip)
-                })
-                .inner
-            });
+            let r = egui::Modal::new(Id::new("tour-modal"))
+                .backdrop_color(backdrop)
+                .show(ctx, |ui| {
+                    ui.set_max_width(440.0);
+                    ui.label(
+                        RichText::new(format!("Quick tour · {} of {}", i + 1, STEPS.len()))
+                            .color(p.text_muted)
+                            .size(13.0),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(STEPS[i].0).size(17.0));
+                    ui.label(RichText::new(STEPS[i].1).color(p.text_muted));
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let last = i + 1 == STEPS.len();
+                        let next = ui.button(if last { "Done" } else { "Next" }).clicked();
+                        let skip = !last && ui.button("Skip the tour").clicked();
+                        (next, last, skip)
+                    })
+                    .inner
+                });
             let (next, last, skip) = r.inner;
             if skip || (next && last) || r.backdrop_response.clicked() {
                 self.tour_step = None;
@@ -1587,46 +1675,50 @@ impl AudioHaxApp {
             }
         }
         if self.show_shortcuts {
-            let r = egui::Modal::new(Id::new("shortcuts-modal")).show(ctx, |ui| {
-                ui.label(RichText::new("Keyboard shortcuts").size(17.0));
-                ui.add_space(6.0);
-                egui::Grid::new("shortcuts")
-                    .num_columns(2)
-                    .spacing([24.0, 6.0])
-                    .show(ui, |ui| {
-                        for (k, what) in [
-                            ("Space", "Play / Stop"),
-                            ("V", "Show or hide the scan bar"),
-                            ("Ctrl/Cmd + O", "Open a picture"),
-                            ("Ctrl/Cmd + S", "Save WAV"),
-                            ("Esc", "Stop playback / close a dialog"),
-                        ] {
-                            ui.label(RichText::new(k).monospace());
-                            ui.label(what);
-                            ui.end_row();
-                        }
-                    });
-                ui.add_space(8.0);
-                ui.button("Close").clicked()
-            });
+            let r = egui::Modal::new(Id::new("shortcuts-modal"))
+                .backdrop_color(backdrop)
+                .show(ctx, |ui| {
+                    ui.label(RichText::new("Keyboard shortcuts").size(17.0));
+                    ui.add_space(6.0);
+                    egui::Grid::new("shortcuts")
+                        .num_columns(2)
+                        .spacing([24.0, 6.0])
+                        .show(ui, |ui| {
+                            for (k, what) in [
+                                ("Space", "Play / Stop"),
+                                ("V", "Show or hide the scan bar"),
+                                ("Ctrl/Cmd + O", "Open a picture"),
+                                ("Ctrl/Cmd + S", "Save WAV"),
+                                ("Esc", "Stop playback / close a dialog"),
+                            ] {
+                                ui.label(RichText::new(k).monospace());
+                                ui.label(what);
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(8.0);
+                    ui.button("Close").clicked()
+                });
             if r.inner || r.backdrop_response.clicked() {
                 self.show_shortcuts = false;
             }
         }
         if self.show_about {
-            let r = egui::Modal::new(Id::new("about-modal")).show(ctx, |ui| {
-                ui.set_max_width(460.0);
-                ui.label(RichText::new("AudioHax").size(20.0));
-                ui.label(
-                    RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
-                        .color(p.text_muted),
-                );
-                ui.add_space(6.0);
-                ui.label("AudioHax turns a picture into music.");
-                ui.add_space(6.0);
-                ui.label(RichText::new("https://github.com/Qweary/AudioHax").color(p.accent));
-                ui.add_space(6.0);
-                ui.label(
+            let r = egui::Modal::new(Id::new("about-modal"))
+                .backdrop_color(backdrop)
+                .show(ctx, |ui| {
+                    ui.set_max_width(460.0);
+                    ui.label(RichText::new("AudioHax").size(20.0));
+                    ui.label(
+                        RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
+                            .color(p.text_muted),
+                    );
+                    ui.add_space(6.0);
+                    ui.label("AudioHax turns a picture into music.");
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("https://github.com/Qweary/AudioHax").color(p.accent));
+                    ui.add_space(6.0);
+                    ui.label(
                     RichText::new(
                         "Credits: the bundled SoundFont is GeneralUser GS by S. Christian Collins. \
                          The window's fonts are the egui defaults (Ubuntu-Light, Hack, Noto Emoji, \
@@ -1635,9 +1727,9 @@ impl AudioHaxApp {
                     .color(p.text_muted)
                     .size(13.0),
                 );
-                ui.add_space(8.0);
-                ui.button("Close").clicked()
-            });
+                    ui.add_space(8.0);
+                    ui.button("Close").clicked()
+                });
             if r.inner || r.backdrop_response.clicked() {
                 self.show_about = false;
             }
@@ -1820,17 +1912,35 @@ mod tests {
     }
 
     #[test]
-    fn voices_cap_follows_the_picture() {
+    fn the_window_clamps_voices_to_the_pictures_bound() {
+        // Renamed and strengthened in the fix round (`s123-05` TODO-6). The old
+        // `voices_cap_follows_the_picture` asked for 16 voices on a 16-px picture and asserted
+        // `<= 16`, which held with or without any clamp. Every admitted picture derives a bound
+        // of exactly 16 (16-px floor = schema max, pinned by
+        // `schema_voices_max_equals_the_admission_floor`), so a clamp can only be seen from a
+        // value ABOVE 16. TWO paths enforce it: `on_loaded`'s `clamp_voices` call, and the Voices
+        // slider itself (egui's default `SliderClamping::Always` clamps the bound value every
+        // frame the sound panel is drawn). Removing either one alone leaves this green; removing
+        // both leaves 40 (fix-round controls M07 and M07b).
         let ctx = egui::Context::default();
         let mut app = AudioHaxApp::new_headless(&ctx);
         run_frames(&ctx, &mut app, 1);
-        app.controls.instruments = 16;
+        app.controls.instruments = 40;
         app.load(LoadSource::Bytes {
             bytes: super::super::ingest::fixtures::structured(16, 40, image::ImageFormat::Png),
             name: "tiny.png".into(),
         });
         wait_until(&ctx, &mut app, |a| a.phase() == Phase::ImageLoaded);
-        assert!(app.controls.instruments <= 16);
+        assert_eq!(app.controls.instruments, 16);
+    }
+
+    #[test]
+    fn n2_only_a_dialog_that_returns_at_once_counts_as_failed() {
+        assert!(dialog_probably_failed(Duration::ZERO));
+        assert!(dialog_probably_failed(Duration::from_millis(149)));
+        assert!(!dialog_probably_failed(Duration::from_millis(150)));
+        assert!(!dialog_probably_failed(Duration::from_secs(4)));
+        assert_eq!(DIALOG_FAILURE_THRESHOLD, Duration::from_millis(150));
     }
 
     #[test]

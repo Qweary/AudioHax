@@ -1,4 +1,4 @@
-//! The one worker thread (Shielding `s123-SH` § 4.2–§ 4.4; lead ruling L-3 carried).
+//! The one worker thread (security review `s123-SH` § 4.2–§ 4.4; lead ruling L-3 carried).
 //!
 //! * **T-1.** Reading, checking and decoding the picture, `render()`, `prepare_play()` and
 //!   `play()` all run here, never on the UI thread. The UI only sends [`JobKind`]s and reads
@@ -21,14 +21,23 @@
 //! * **W-2.** After a caught panic the worker thread EXITS and the next job gets a fresh thread,
 //!   so post-panic correctness does not rest on `compose()` resetting every thread-local register
 //!   by convention.
+//! * **L-21.** The worker keeps the LAST picture analysis ([`AnalysisCache`]), so Render, Play and
+//!   Save WAV on the same picture and the same Voices analyse it once instead of once per press
+//!   (about 38 s each on a 24 MP photo, `s123-SH2` N-6). The cache lives on the worker thread
+//!   only; it adds no job and no thread. A caught panic ends the thread and so drops the cache
+//!   with it, which is why borrowing it mutably inside the `AssertUnwindSafe` closure is sound.
 
 use super::ingest::{decode_for_display, probe, read_bounded, DisplayImage, Probe, Refusal};
 use super::sinks::{GuiMidiSink, MidiTarget, SilencingSink};
 use super::text::{from_refusal, from_render_error, ErrorKind, UserError};
+use crate::cli::{pipeline_to_engine_config, PipelineArgs};
+use crate::composition::ImageUnderstanding;
 use crate::engine::AudioSink;
 use crate::mapping_loader::MappingTable;
+use crate::pure_analysis::{load_pure_image_bytes, understand_image_pure, PureAnalysisSource};
 use crate::render::{
-    play, prepare_play, render, CancelToken, ImageInput, PlayEvent, RenderOutput, RenderRequest,
+    play, prepare_play_with_source, render, render_with_source, CancelToken, ImageInput, PlayEvent,
+    PlayPlan, RenderError, RenderOutput, RenderRequest,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -346,6 +355,137 @@ pub fn run_render(
     .map_err(|e| from_render_error(&e))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// L-21: one cached analysis per picture
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One analysed picture: what the library's private `render::acquire` produces.
+struct Analysed {
+    /// The picture it was made from (the same `Arc`, so identity is a pointer comparison and the
+    /// bytes cannot be freed and reused while the entry exists).
+    image: Arc<[u8]>,
+    /// Everything `acquire` reads from the request: the instrument count, bar thickness and step
+    /// count all change the extracted features. Keyed on the whole `PipelineArgs` so that any
+    /// later field `acquire` starts to read also invalidates the entry.
+    pipeline: PipelineArgs,
+    source: PureAnalysisSource,
+    understanding: ImageUnderstanding,
+}
+
+/// L-21: the most recent picture analysis, kept on the worker thread.
+///
+/// In `src/render.rs`, `render()` is `validate`, then `acquire`, then `render_with_source`; and
+/// `prepare_play()` is `acquire`, then `prepare_play_with_source`. `acquire` is private, so
+/// [`analyse`] repeats its steps through the library's PUBLIC functions, in the same order with
+/// the same arguments. It sets no thread-local register (the seed, expression and cadence
+/// registers are all set inside `compose()`, which both `*_with_source` entries call), so reusing
+/// its result changes nothing about the piece.
+/// `cached_render_and_play_are_byte_identical_to_the_library` pins that.
+#[derive(Default)]
+pub struct AnalysisCache {
+    entry: Option<Analysed>,
+    analyses: usize,
+}
+
+/// `render::acquire`'s steps, through public API: decode, understand, extract.
+fn analyse(
+    pipeline: &PipelineArgs,
+    bytes: &[u8],
+) -> Result<(PureAnalysisSource, ImageUnderstanding), RenderError> {
+    let engine_config = pipeline_to_engine_config(pipeline);
+    let img = load_pure_image_bytes(bytes)?;
+    let understanding = understand_image_pure(img.as_rgb())?;
+    let source = PureAnalysisSource::extract(
+        &img,
+        engine_config.num_instruments,
+        engine_config.bar_thickness_frac,
+        pipeline.steps,
+        None,
+    )?;
+    Ok((source, understanding))
+}
+
+impl AnalysisCache {
+    /// Forget the cached analysis (a new picture was loaded).
+    pub fn clear(&mut self) {
+        self.entry = None;
+    }
+
+    /// How many times this cache has run the analysis (misses). For tests.
+    pub fn analyses(&self) -> usize {
+        self.analyses
+    }
+
+    /// The analysis of `image` under `pipeline`, from the cache or freshly made.
+    fn get(
+        &mut self,
+        pipeline: &PipelineArgs,
+        image: &GuardedImage,
+    ) -> Result<(&PureAnalysisSource, &ImageUnderstanding), RenderError> {
+        let hit = self
+            .entry
+            .as_ref()
+            .is_some_and(|e| Arc::ptr_eq(&e.image, &image.bytes) && e.pipeline == *pipeline);
+        if !hit {
+            // Drop the old entry BEFORE analysing, so two analyses never sit in memory at once.
+            self.entry = None;
+            let (source, understanding) = analyse(pipeline, image.bytes())?;
+            self.analyses += 1;
+            self.entry = Some(Analysed {
+                image: image.bytes.clone(),
+                pipeline: pipeline.clone(),
+                source,
+                understanding,
+            });
+        }
+        match self.entry.as_ref() {
+            Some(e) => Ok((&e.source, &e.understanding)),
+            None => Err(RenderError::Refused(
+                "internal: the picture analysis was not kept".into(),
+            )),
+        }
+    }
+
+    /// `render()`, reusing the cached analysis. Byte-identical to [`run_render`].
+    pub fn render(
+        &mut self,
+        request: &RenderRequest,
+        image: &GuardedImage,
+        mappings: &MappingTable,
+    ) -> Result<RenderOutput, UserError> {
+        let go = |cache: &mut Self| -> Result<RenderOutput, RenderError> {
+            // `render()` validates BEFORE it analyses; keep that order for the same errors.
+            request.validate()?;
+            let (source, understanding) = cache.get(&request.pipeline, image)?;
+            render_with_source(
+                request,
+                source,
+                Some(understanding),
+                mappings,
+                super::gui_font_source(),
+                &mut |_| Ok(()),
+            )
+        };
+        go(self).map_err(|e| from_render_error(&e))
+    }
+
+    /// `prepare_play()`, reusing the cached analysis. Byte-identical to the library's.
+    pub fn prepare_play(
+        &mut self,
+        request: &RenderRequest,
+        image: &GuardedImage,
+        mappings: &MappingTable,
+    ) -> Result<PlayPlan, UserError> {
+        let go = |cache: &mut Self| -> Result<PlayPlan, RenderError> {
+            let (source, understanding) = cache.get(&request.pipeline, image)?;
+            prepare_play_with_source(request, source, Some(understanding), mappings, &mut |_| {
+                Ok(())
+            })
+        };
+        go(self).map_err(|e| from_render_error(&e))
+    }
+}
+
 /// Build the live sink for `output` (on the worker; the sink never leaves it).
 fn open_sink(
     output: OutputChoice,
@@ -376,10 +516,13 @@ fn run_job(
     mappings: &MappingTable,
     emit: &dyn Fn(Event),
     sink_live: &AtomicBool,
+    cache: &mut AnalysisCache,
 ) -> Result<(), UserError> {
     match kind {
         JobKind::Load(source) => {
             let loaded = run_load(source)?;
+            // A new picture is showing: the old analysis can never be asked for again.
+            cache.clear();
             emit(Event::Loaded(Box::new(loaded)));
         }
         JobKind::Render {
@@ -387,7 +530,7 @@ fn run_job(
             image,
             save_to,
         } => {
-            let audio = Arc::new(run_render(&request, &image, mappings)?);
+            let audio = Arc::new(cache.render(&request, &image, mappings)?);
             let saved_to = match save_to {
                 Some(path) => {
                     super::save::write_atomic(&path, audio.sample_rate, &audio.interleaved)
@@ -409,13 +552,7 @@ fn run_job(
             output,
             cancel,
         } => {
-            let plan = prepare_play(
-                &request,
-                ImageInput::Bytes(image.bytes()),
-                mappings,
-                &mut |_| Ok(()),
-            )
-            .map_err(|e| from_render_error(&e))?;
+            let plan = cache.prepare_play(&request, &image, mappings)?;
             emit(Event::PlayReady {
                 total_steps: plan.total_steps,
                 source_step_count: plan.source_step_count,
@@ -463,12 +600,14 @@ fn worker_main(
     mappings: Arc<MappingTable>,
     sink_live: Arc<AtomicBool>,
 ) {
+    // L-21: lives as long as this thread; a caught panic ends the thread and drops it.
+    let mut cache = AnalysisCache::default();
     while let Ok(Job { gen, kind }) = jobs.recv() {
         let emit = |event: Event| {
             let _ = out.send(WorkerMsg::Event { gen, event });
             notify();
         };
-        let result = run_guarded(|| run_job(kind, &mappings, &emit, &sink_live));
+        let result = run_guarded(|| run_job(kind, &mappings, &emit, &sink_live, &mut cache));
         let panicked = matches!(result, Err(JobError::Panicked(_)));
         if let Err(e) = result {
             emit(Event::Failed(e.into_user_error()));
@@ -693,7 +832,170 @@ mod tests {
     use super::super::ingest::fixtures::{solid, structured};
     use super::*;
     use crate::gui::state::Controls;
+    use crate::render::prepare_play;
     use image::ImageFormat;
+
+    /// The library's own `render()` and `prepare_play()`, uncached: the reference.
+    fn library(req: &RenderRequest, bytes: &[u8], m: &MappingTable) -> (RenderOutput, PlayPlan) {
+        let out = render(
+            req,
+            ImageInput::Bytes(bytes),
+            m,
+            crate::synth_sink::SoundFontSource::Bundled,
+            &mut |_| Ok(()),
+        )
+        .expect("library render");
+        let plan = prepare_play(req, ImageInput::Bytes(bytes), m, &mut |_| Ok(())).expect("prep");
+        (out, plan)
+    }
+
+    fn assert_same_render(a: &RenderOutput, b: &RenderOutput, what: &str) {
+        assert_eq!(a.sample_rate, b.sample_rate, "{what}: rate");
+        assert_eq!(a.interleaved, b.interleaved, "{what}: samples");
+        assert_eq!(a.events, b.events, "{what}: events");
+        assert_eq!(a.summary, b.summary, "{what}: summary");
+    }
+
+    #[test]
+    fn cached_render_and_play_are_byte_identical_to_the_library() {
+        // L-21's condition: the cached path must give exactly what the uncached library gives,
+        // on a miss, on a hit, after Voices changes (a new analysis), and back again.
+        let bytes = structured(96, 64, ImageFormat::Png);
+        let img = GuardedImage::admit(bytes.clone()).expect("admit");
+        let m = mappings();
+        let mut cache = AnalysisCache::default();
+        let four = Controls {
+            seed: Some(42),
+            ..Controls::default()
+        };
+        let three = Controls {
+            instruments: 3,
+            reverb: false,
+            gain: 0.8,
+            ..four
+        };
+        let (lib4, plan4) = library(&four.request(), &bytes, &m);
+        let (lib3, plan3) = library(&three.request(), &bytes, &m);
+
+        let miss = cache.render(&four.request(), &img, &m).expect("miss");
+        assert_same_render(&miss, &lib4, "4 voices, miss");
+        assert_eq!(cache.analyses(), 1);
+        let hit = cache.render(&four.request(), &img, &m).expect("hit");
+        assert_same_render(&hit, &lib4, "4 voices, hit");
+        assert_eq!(
+            cache.prepare_play(&four.request(), &img, &m).expect("play"),
+            plan4
+        );
+        assert_eq!(cache.analyses(), 1, "Render, Render, Play: one analysis");
+
+        let other = cache.render(&three.request(), &img, &m).expect("3 voices");
+        assert_same_render(&other, &lib3, "3 voices");
+        assert_eq!(
+            cache
+                .prepare_play(&three.request(), &img, &m)
+                .expect("play 3"),
+            plan3
+        );
+        assert_eq!(cache.analyses(), 2, "Voices changed: analysed again, once");
+        let back = cache.render(&four.request(), &img, &m).expect("back to 4");
+        assert_same_render(&back, &lib4, "back to 4 voices");
+        assert_eq!(cache.analyses(), 3);
+
+        // Room and Level and the Variation are NOT analysis inputs: no new analysis.
+        let louder = Controls {
+            gain: 1.5,
+            seed: Some(7),
+            ..four
+        };
+        let (lib_louder, _) = library(&louder.request(), &bytes, &m);
+        let r = cache.render(&louder.request(), &img, &m).expect("louder");
+        assert_same_render(&r, &lib_louder, "gain/seed changed");
+        assert_eq!(cache.analyses(), 3);
+
+        // Potency control: the key matters. A cache that served the 4-voice analysis to a 3-voice
+        // request would be wrong, because the two pieces differ.
+        assert_ne!(
+            lib4.events, lib3.events,
+            "control: Voices changes the piece"
+        );
+        assert_ne!(plan4, plan3);
+    }
+
+    #[test]
+    fn a_different_picture_with_the_same_bytes_is_still_a_new_analysis() {
+        // Identity is the loaded picture (its `Arc`), not the byte content: a re-load is analysed
+        // afresh, which is never wrong, only slower.
+        let bytes = structured(64, 48, ImageFormat::Png);
+        let a = GuardedImage::admit(bytes.clone()).expect("admit");
+        let b = GuardedImage::admit(bytes).expect("admit");
+        let m = mappings();
+        let mut cache = AnalysisCache::default();
+        let req = Controls::default().request();
+        let ra = cache.render(&req, &a, &m).expect("a");
+        let rb = cache.render(&req, &b, &m).expect("b");
+        assert_eq!(cache.analyses(), 2);
+        assert_same_render(&ra, &rb, "same bytes");
+        cache.clear();
+        let _ = cache.render(&req, &b, &m).expect("after clear");
+        assert_eq!(cache.analyses(), 3);
+    }
+
+    #[test]
+    fn a_refused_request_is_refused_before_the_analysis_as_in_render() {
+        // `render()` validates first; so does the cached path (same error, no analysis run).
+        let img = GuardedImage::admit(structured(64, 48, ImageFormat::Png)).expect("admit");
+        let mut req = Controls::default().request();
+        req.loop_cue = true;
+        req.gain = 2.0;
+        let mut cache = AnalysisCache::default();
+        let e = cache.render(&req, &img, &mappings()).expect_err("refused");
+        assert_eq!(e.kind, ErrorKind::LoopNeedsUnity);
+        assert_eq!(cache.analyses(), 0);
+    }
+
+    /// `s123-SH` T22 (`s123-05` TODO-7): what a 6000 x 4000 photo costs, and what L-21 saves.
+    /// Documents cost; asserts only that each step finishes and the cached second press is
+    /// cheaper. Run with `cargo test --features gui --release -- --ignored t22`.
+    #[test]
+    #[ignore = "cost documentation: about a minute and several hundred MiB on a laptop"]
+    fn t22_cost_of_a_24_megapixel_photo() {
+        let t = Instant::now();
+        let bytes = structured(6000, 4000, ImageFormat::Jpeg);
+        eprintln!(
+            "T22 fixture: {} bytes JPEG, made in {:?}",
+            bytes.len(),
+            t.elapsed()
+        );
+        let t = Instant::now();
+        let loaded = run_load(LoadSource::Bytes {
+            bytes,
+            name: "t22.jpg".into(),
+        })
+        .expect("a 24 MP photo is admitted");
+        eprintln!("T22 load (read, probe, display decode): {:?}", t.elapsed());
+        let m = mappings();
+        let req = Controls::default().request();
+        let mut cache = AnalysisCache::default();
+        let t = Instant::now();
+        let first = cache.render(&req, &loaded.image, &m).expect("render");
+        let miss = t.elapsed();
+        eprintln!("T22 first Render (analysis + compose + synth): {miss:?}");
+        let t = Instant::now();
+        let second = cache.render(&req, &loaded.image, &m).expect("render again");
+        let hit = t.elapsed();
+        eprintln!("T22 second Render, cached analysis (compose + synth): {hit:?}");
+        let t = Instant::now();
+        let _plan = cache
+            .prepare_play(&req, &loaded.image, &m)
+            .expect("prepare");
+        eprintln!("T22 Play's prepare, cached analysis: {:?}", t.elapsed());
+        assert_eq!(first.interleaved, second.interleaved);
+        assert_eq!(cache.analyses(), 1);
+        assert!(
+            hit < miss,
+            "the cached press must be cheaper ({hit:?} vs {miss:?})"
+        );
+    }
 
     fn mappings() -> MappingTable {
         crate::gui::embedded_mappings().expect("embedded mappings parse")

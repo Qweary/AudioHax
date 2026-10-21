@@ -1,4 +1,4 @@
-//! S123 Test Engineer (Specialist 5): display-string sanitising (Shielding `s123-SH` N-1) and
+//! S123 Test Engineer (Specialist 5): display-string sanitising (security review `s123-SH` N-1) and
 //! the suggested Save-WAV name (V-1), at the edges the builder's T19/T20 do not touch: the exact
 //! truncation boundary, character-vs-byte counting, the WHOLE C0/C1 and bidi lists, characters
 //! that must NOT be touched, and names that sanitise to nothing.
