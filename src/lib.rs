@@ -34,6 +34,7 @@ pub mod instrumentation;
 // OpenCV/image/midir type; the CLI is the headless-testable clap grammar.
 pub mod cli;
 pub mod engine;
+pub mod options_schema;
 
 // WS-4 Phase 3 (S10) — pure-Rust ratatui TUI front-end, a pure OBSERVER over the S9
 // engine seam. Builds & unit-tests under `cargo test --lib --no-default-features`.
