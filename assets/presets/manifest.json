@@ -1,0 +1,23 @@
+{
+  "manifest_version": 1,
+  "default": "default",
+  "presets": [
+    {
+      "id": "default",
+      "name": "Default",
+      "description": "AudioHax as it ships: the picture chooses the tempo, character, texture and instruments.",
+      "mappings": { "builtin": "default" },
+      "settings": {},
+      "soundfont": "bundled",
+      "voices": "inherit",
+      "picture": [],
+      "steps": "engine_default",
+      "seed": "image",
+      "provenance": {
+        "status": "certified",
+        "record": "The built-in mappings as of commit 553b788 (sha256 70150a9023d7a25a2a611a60917144abb02644ce1163d131c4f67bb9584e4c24); renders byte-identical to the pre-preset default on the 66-cell identity matrix.",
+        "lineage": "default"
+      }
+    }
+  ]
+}

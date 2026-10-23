@@ -30,14 +30,14 @@
 use super::ingest::{decode_for_display, probe, read_bounded, DisplayImage, Probe, Refusal};
 use super::sinks::{GuiMidiSink, MidiTarget, SilencingSink};
 use super::text::{from_refusal, from_render_error, ErrorKind, UserError};
-use crate::cli::{pipeline_to_engine_config, PipelineArgs};
+use crate::cli::PipelineArgs;
 use crate::composition::ImageUnderstanding;
 use crate::engine::AudioSink;
 use crate::mapping_loader::MappingTable;
-use crate::pure_analysis::{load_pure_image_bytes, understand_image_pure, PureAnalysisSource};
+use crate::pure_analysis::PureAnalysisSource;
 use crate::render::{
-    play, prepare_play_with_source, render, render_with_source, CancelToken, ImageInput, PlayEvent,
-    PlayPlan, RenderError, RenderOutput, RenderRequest,
+    acquire, play, prepare_play_with_source, render, render_with_source, CancelToken, ImageInput,
+    PlayEvent, PlayPlan, RenderError, RenderOutput, RenderRequest,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -359,7 +359,7 @@ pub fn run_render(
 // L-21: one cached analysis per picture
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// One analysed picture: what the library's private `render::acquire` produces.
+/// One analysed picture: what the library's `render::acquire` produces.
 struct Analysed {
     /// The picture it was made from (the same `Arc`, so identity is a pointer comparison and the
     /// bytes cannot be freed and reused while the entry exists).
@@ -375,11 +375,11 @@ struct Analysed {
 /// L-21: the most recent picture analysis, kept on the worker thread.
 ///
 /// In `src/render.rs`, `render()` is `validate`, then `acquire`, then `render_with_source`; and
-/// `prepare_play()` is `acquire`, then `prepare_play_with_source`. `acquire` is private, so
-/// [`analyse`] repeats its steps through the library's PUBLIC functions, in the same order with
-/// the same arguments. It sets no thread-local register (the seed, expression and cadence
-/// registers are all set inside `compose()`, which both `*_with_source` entries call), so reusing
-/// its result changes nothing about the piece.
+/// `prepare_play()` is `acquire`, then `prepare_play_with_source`. [`analyse`] calls the same
+/// `render::acquire` (public since S124; S123 had to repeat its three steps here). It sets no
+/// thread-local register (the seed, expression and cadence registers are all set inside
+/// `compose()`, which both `*_with_source` entries call), so reusing its result changes nothing
+/// about the piece.
 /// `cached_render_and_play_are_byte_identical_to_the_library` pins that.
 #[derive(Default)]
 pub struct AnalysisCache {
@@ -387,22 +387,13 @@ pub struct AnalysisCache {
     analyses: usize,
 }
 
-/// `render::acquire`'s steps, through public API: decode, understand, extract.
+/// `render::acquire` over the admitted bytes (decode, understand, extract). Its notes are
+/// dropped, as every GUI job drops them (C-2 (b)).
 fn analyse(
     pipeline: &PipelineArgs,
     bytes: &[u8],
 ) -> Result<(PureAnalysisSource, ImageUnderstanding), RenderError> {
-    let engine_config = pipeline_to_engine_config(pipeline);
-    let img = load_pure_image_bytes(bytes)?;
-    let understanding = understand_image_pure(img.as_rgb())?;
-    let source = PureAnalysisSource::extract(
-        &img,
-        engine_config.num_instruments,
-        engine_config.bar_thickness_frac,
-        pipeline.steps,
-        None,
-    )?;
-    Ok((source, understanding))
+    acquire(pipeline, ImageInput::Bytes(bytes), &mut |_| Ok(()))
 }
 
 impl AnalysisCache {

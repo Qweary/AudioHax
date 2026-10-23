@@ -145,6 +145,46 @@ impl RenderRequest {
         }
         Ok(())
     }
+
+    /// S124 (lead ruling L-30): lay a preset under this request. Field by field over the
+    /// presettable options (`presets::PRESET_SETTING_IDS`): an option the user TYPED (`explicit`)
+    /// keeps this request's value; every other one takes `preset`'s. `seed`, `loop_cue` and
+    /// `event_dump` always keep this request's value (a preset sets no seed and no output).
+    ///
+    /// For the CLI, an untyped field of `self` holds clap's default, and so does an unset field of
+    /// `preset` (it is parsed by clap from the preset's settings alone), so overlaying the `default`
+    /// preset — no settings — is the identity. The unit tests `overlay_covers_every_presettable_id`
+    /// and `overlaying_the_default_preset_is_the_identity` force both properties.
+    pub fn overlay_preset(
+        &self,
+        preset: &RenderRequest,
+        explicit: &crate::presets::ExplicitArgs,
+    ) -> RenderRequest {
+        let take = |id: &str| !explicit.contains(id);
+        let mut out = self.clone();
+        if take("instruments") {
+            out.pipeline.instruments = preset.pipeline.instruments;
+        }
+        if take("thickness") {
+            out.pipeline.thickness = preset.pipeline.thickness;
+        }
+        if take("steps") {
+            out.pipeline.steps = preset.pipeline.steps;
+        }
+        if take("expression") {
+            out.expression = preset.expression;
+        }
+        if take("v2") {
+            out.v2 = preset.v2;
+        }
+        if take("reverb") {
+            out.reverb = preset.reverb;
+        }
+        if take("gain") {
+            out.gain = preset.gain;
+        }
+        out
+    }
 }
 
 /// Where the image comes from. `Bytes` is the GUI / drag-and-drop path (encoded PNG/JPEG).
@@ -414,6 +454,11 @@ pub fn render_with_source<S: FeatureSource>(
     //    completed rather than trusting this constant.
     let tail_ms: u64 = if req.loop_cue { 4_000 } else { 1_500 };
 
+    // MB-5 (lead ruling L-32): refuse a piece longer than `MAX_PIECE_MS` BEFORE the synthesis
+    // buffer is sized from the timeline's last event (a hostile mappings table measured a 296 GB
+    // allocation and an abort there, which no `catch_unwind` can contain).
+    check_piece_length(&events, tail_ms)?;
+
     let interleaved =
         render_events_to_stereo(font, synth_config, sample_rate, events.clone(), tail_ms)?;
 
@@ -580,6 +625,8 @@ pub fn prepare_play_with_source<S: FeatureSource>(
         instrument_count,
         &programs,
     );
+    // MB-5: the same cap on the live path (a ten-day live play is a hang, `s124-SH` MB-5).
+    check_piece_length(&timeline, 0)?;
 
     Ok(PlayPlan {
         timeline,
@@ -703,7 +750,14 @@ pub fn play<A: AudioSink + ?Sized>(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Pure-Rust acquisition: decode, analyze (`ImageUnderstanding`), scan (`PureAnalysisSource`).
-fn acquire(
+///
+/// Public since S124 (a carried S123 item): the window's analysis cache (`gui::job`) calls this
+/// instead of repeating its three steps. It reads only `pipeline` (instrument count, bar
+/// thickness, scan step count) and sets NO thread-local register, so an analysis made once can be
+/// reused by [`render_with_source`] / [`prepare_play_with_source`] with no change to the piece.
+/// Notes, in order: [`RenderNote::ImageLoaded`], [`RenderNote::ImageScanned`],
+/// [`RenderNote::GlobalFeatures`].
+pub fn acquire(
     pipeline: &PipelineArgs,
     image: ImageInput<'_>,
     notes: &mut NoteSink<'_>,
@@ -740,6 +794,34 @@ fn acquire(
     })?;
     notes(RenderNote::GlobalFeatures(src.global_features()))?;
     Ok((src, understanding))
+}
+
+/// MB-5 (lead ruling L-32): the longest piece the library renders or plays, in milliseconds
+/// (10 minutes). The shipped mappings' worst case is about 160 s plus the tail (`s124-SH` MB-5), so
+/// no render of the shipped table reaches it; a hostile or broken mappings table can (one changed
+/// number measured a 42-minute piece and a 446 MB WAV).
+pub const MAX_PIECE_MS: u64 = 600_000;
+
+/// The start of the MB-5 refusal text, so a front-end that knows which mappings were used can
+/// name the file and the fields after it (`main.rs` does).
+pub const PIECE_TOO_LONG_PREFIX: &str = "This piece would last";
+
+/// MB-5: refuse when the timeline's last event plus `tail_ms` exceeds [`MAX_PIECE_MS`]. Runs
+/// before anything is sized from the timeline's length.
+fn check_piece_length(events: &[TimedMidiEvent], tail_ms: u64) -> Result<(), RenderError> {
+    let last = events.iter().map(|e| e.at_ms).max().unwrap_or(0);
+    let total = last.saturating_add(tail_ms);
+    if total > MAX_PIECE_MS {
+        let secs = total / 1000;
+        return Err(RenderError::Refused(format!(
+            "{PIECE_TOO_LONG_PREFIX} {}:{:02}:{:02}; the limit is 10 minutes. Nothing was rendered. \
+             (The mappings in use make each step very long or the form very long.)",
+            secs / 3600,
+            (secs / 60) % 60,
+            secs % 60
+        )));
+    }
+    Ok(())
 }
 
 /// Error-safe bracket for the process-global event dump: if this render armed it and is left
@@ -1772,5 +1854,182 @@ mod s122_tests {
         });
         assert_eq!(after_armed.events, fresh.events);
         assert_eq!(after_armed.interleaved, fresh.interleaved);
+    }
+}
+
+// S124 — tests for the preset overlay (L-30), the MB-5 piece cap (L-32) and the public `acquire`.
+#[cfg(test)]
+mod s124_tests {
+    use super::*;
+    use crate::presets::{default_preset, parse_with_explicit, preset_render_args, ExplicitArgs};
+
+    fn request(argv: &[&str]) -> (RenderRequest, ExplicitArgs) {
+        let (cli, ex) = parse_with_explicit(argv).expect("parse");
+        match cli.command {
+            crate::cli::Command::Render(r) => (RenderRequest::from(&r), ex),
+            crate::cli::Command::Play(p) => (RenderRequest::from(&p), ex),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// One NON-default probe per presettable id. A new id in `PRESET_SETTING_IDS` without a probe
+    /// fails here with its name.
+    const PROBES: &[(&str, &str)] = &[
+        ("instruments", "6"),
+        ("thickness", "0.3"),
+        ("steps", "10"),
+        ("expression", "on"),
+        ("v2", "e3"),
+        ("reverb", "off"),
+        ("gain", "0.8"),
+    ];
+
+    /// T-5 forcing: for EVERY presettable id, a preset that sets only that id changes the result
+    /// when the user did not type it, and does NOT when the user typed it. A missing overlay arm
+    /// (or a missing probe) is a red test.
+    #[test]
+    fn overlay_covers_every_presettable_id() {
+        let (base, none) = request(&["audiohax", "render"]);
+        assert_eq!(none, ExplicitArgs::none());
+        for id in crate::presets::PRESET_SETTING_IDS {
+            let (_, value) = PROBES
+                .iter()
+                .find(|(p, _)| p == id)
+                .unwrap_or_else(|| panic!("no overlay probe for presettable id `{id}`"));
+            let flag = format!("--{id}");
+            let (preset_req, _) = request(&["audiohax", "render", &flag, value]);
+            assert_ne!(
+                base.overlay_preset(&preset_req, &ExplicitArgs::none()),
+                base,
+                "`{id}`: the overlay does not carry this setting"
+            );
+            // The user typed the DEFAULT value of this option: the typed value wins.
+            let (typed_req, typed) = request(&["audiohax", "render", &flag, &default_of(id)]);
+            assert!(typed.contains(id), "{id} typed");
+            assert_eq!(
+                typed_req.overlay_preset(&preset_req, &typed),
+                typed_req,
+                "`{id}`: a typed flag must beat the preset"
+            );
+        }
+    }
+
+    fn default_of(id: &str) -> String {
+        let s = crate::options_schema::render_options_schema().expect("schema");
+        let o = s.iter().find(|o| o.id == id).expect("row");
+        // `v2` has no default; any value the user types counts, so use one that differs from the
+        // probe (`e3`), which makes "the typed value wins" observable.
+        o.default.clone().unwrap_or_else(|| "e2".into())
+    }
+
+    /// L-29 / T-5: overlaying the `default` preset is the identity for any parsed request, on
+    /// `render` and on `play`, whatever the user typed.
+    #[test]
+    fn overlaying_the_default_preset_is_the_identity() {
+        let d = RenderRequest::from(&preset_render_args(default_preset().expect("d")).expect("a"));
+        for argv in [
+            &["audiohax", "render"][..],
+            &[
+                "audiohax", "render", "x.png", "--wav", "o.wav", "--seed", "7",
+            ],
+            &[
+                "audiohax",
+                "render",
+                "--instruments",
+                "6",
+                "--gain",
+                "0.5",
+                "--reverb",
+                "off",
+            ],
+            &[
+                "audiohax",
+                "render",
+                "--expression",
+                "on",
+                "--v2",
+                "all",
+                "--loop",
+            ],
+            &["audiohax", "render", "--steps", "3", "--thickness", "0.9"],
+            &["audiohax", "play", "--instruments", "2", "--seed", "1"],
+            &["audiohax", "play"],
+        ] {
+            let (req, ex) = request(argv);
+            assert_eq!(req.overlay_preset(&d, &ex), req, "{argv:?}");
+            // ...and with nothing marked typed too (the untyped fields ARE clap's defaults).
+            let (plain, _) = request(&["audiohax", "render"]);
+            assert_eq!(plain.overlay_preset(&d, &ExplicitArgs::none()), plain);
+        }
+    }
+
+    /// T-10: `play --preset P` and `render --preset P` resolve to the same request (minus the
+    /// render-only fields).
+    #[test]
+    fn play_and_render_resolve_a_preset_alike() {
+        let (preset_req, _) =
+            request(&["audiohax", "render", "--instruments", "6", "--gain", "0.8"]);
+        let (r, rx) = request(&["audiohax", "render", "--preset", "default"]);
+        let (p, px) = request(&["audiohax", "play", "--preset", "default"]);
+        let r = r.overlay_preset(&preset_req, &rx);
+        let p = p.overlay_preset(&preset_req, &px);
+        assert_eq!(r, p);
+        assert_eq!(r.pipeline.instruments, 6);
+    }
+
+    /// MB-5: a timeline longer than ten minutes is refused before anything is sized from it; the
+    /// boundary itself passes.
+    #[test]
+    fn the_piece_cap_refuses_over_ten_minutes() {
+        use crate::synth_sink::MidiCmd;
+        let ev = |at_ms| TimedMidiEvent {
+            at_ms,
+            cmd: MidiCmd::NoteOff {
+                channel: 0,
+                note: 60,
+            },
+        };
+        assert!(check_piece_length(&[ev(0), ev(598_500)], 1_500).is_ok());
+        let e = check_piece_length(&[ev(2_527_500)], 1_500).expect_err("42 minutes");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("0:42:09") && msg.contains("limit is 10 minutes"),
+            "{msg}"
+        );
+        assert!(check_piece_length(&[ev(598_501)], 1_500).is_err());
+        assert!(check_piece_length(&[], 0).is_ok());
+    }
+
+    /// The public `acquire` gives the same analysis the cached window path relies on (the
+    /// byte-identity of render-from-acquire vs `render()` is pinned in `gui::job`'s tests).
+    #[test]
+    fn acquire_reports_its_three_notes_in_order() {
+        let img = image::RgbImage::from_fn(48, 32, |x, y| {
+            image::Rgb([(x * 5) as u8, (y * 7) as u8, 90])
+        });
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png),
+                image::ImageOutputFormat::Png,
+            )
+            .expect("png");
+        let mut seen = Vec::new();
+        let (src, _) = acquire(
+            &crate::cli::PipelineArgs::default(),
+            ImageInput::Bytes(&png),
+            &mut |n| {
+                seen.push(match n {
+                    RenderNote::ImageLoaded { .. } => "loaded",
+                    RenderNote::ImageScanned { .. } => "scanned",
+                    RenderNote::GlobalFeatures(_) => "global",
+                    _ => "other",
+                });
+                Ok(())
+            },
+        )
+        .expect("acquire");
+        assert_eq!(seen, vec!["loaded", "scanned", "global"]);
+        assert_eq!(src.step_count(), 40);
     }
 }

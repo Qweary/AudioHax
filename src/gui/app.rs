@@ -11,7 +11,9 @@ use super::overlay::{Playhead, PxRect, ScanGeometry};
 use super::save::{check_not_the_picture, default_save_dir, window_confirms_overwrite};
 use super::sinks::MidiPorts;
 use super::state::{
-    enablement, output_notice, voices_max, Control, Controls, EverydaySpecs, OutputKind, Phase,
+    any_modified, enablement, is_modified, loop_enablement, output_notice, request_with,
+    reset_knob, v2_enablement, voices_max, AdvancedControls, AdvancedSpecs, Baseline, Control,
+    Controls, EverydaySpecs, Knob, OutputKind, Phase, KNOBS,
 };
 use super::text::{
     sanitize, sanitize_full, suggest_wav_name, ErrorKind, UserError, FILE_NAME_MAX, PORT_NAME_MAX,
@@ -73,12 +75,25 @@ pub enum OutputSel {
     Midi(usize, String),
 }
 
-/// What identifies a rendered piece: the picture loaded and the request.
+/// What identifies a rendered piece: the picture loaded, the preset, and the request.
 #[derive(Debug, Clone, PartialEq)]
 struct PieceKey {
     image_seq: u64,
+    /// S124: the preset the piece was made with (its mappings are part of the piece).
+    preset: &'static str,
     request: RenderRequest,
 }
+
+/// S124 (`s124-UI` § 6): the Save fallback shown when no Save window could be opened.
+pub const SAVE_NO_DIALOG_HEADLINE: &str =
+    "AudioHax couldn't open a Save window on this system. You \
+    can still keep your piece — type or paste a full file path below and AudioHax will save there.";
+
+/// S124 (`s124-UI` § 1.4 / P9): the quiet note under a shelf of one preset.
+pub const ONE_PRESET_NOTE: &str = "More presets are coming.";
+
+/// S124 (`s124-UI` § 1.5 / P5): the hint shown while the held render was made with another preset.
+pub const STALE_PRESET_HINT: &str = "Re-render to hear the new preset.";
 
 /// The picture on screen.
 struct Picture {
@@ -130,6 +145,21 @@ pub struct AudioHaxApp {
     confirm: Option<ConfirmOverwrite>,
     last_save_dir: Option<PathBuf>,
     hovering_files: bool,
+    // ── S124 ──
+    /// The Advanced controls behind "More".
+    advanced: AdvancedControls,
+    /// The Advanced rows read from the schema (L-31: no sound bank).
+    adv_specs: Result<AdvancedSpecs, String>,
+    /// The selected preset's id (always one; `s124-UI` § 1.3).
+    preset_id: &'static str,
+    /// What the selected preset defines for every control (A6).
+    baseline: Baseline,
+    /// Is "More" open (persisted per viewer, `s124-UI` § 2.4)?
+    more_open: bool,
+    /// Write the preset choice and the "More" state to the config dir (only the real window).
+    persist: bool,
+    /// The typed-path Save fallback, while shown (`s124-UI` § 6).
+    save_fallback: Option<String>,
 }
 
 impl AudioHaxApp {
@@ -140,6 +170,15 @@ impl AudioHaxApp {
         if first_run_and_mark() {
             app.tour_step = Some(0);
         }
+        // S124 (`s124-UI` § 1.3, § 2.4): the last preset and the "More" state, per viewer. A stored
+        // id that is no longer shipped falls back to the default without an error.
+        app.persist = true;
+        if let Some(id) = read_setting(PRESET_SETTING_FILE) {
+            if let Ok(found) = crate::presets::find(&id) {
+                app.select_preset(&found.id);
+            }
+        }
+        app.more_open = read_setting(MORE_SETTING_FILE).as_deref() == Some("open");
         app
     }
 
@@ -168,6 +207,14 @@ impl AudioHaxApp {
                 .err()
                 .map(|e| UserError::new(ErrorKind::Other, e.clone()))
         });
+        let adv_specs = AdvancedSpecs::from_schema().map_err(|e| e.to_string());
+        let (preset_id, baseline) = match crate::presets::default_preset() {
+            Ok(d) => (
+                d.id.as_str(),
+                preset_baseline(d).unwrap_or_else(|_| default_baseline()),
+            ),
+            Err(_) => ("default", default_baseline()),
+        };
         AudioHaxApp {
             palette,
             specs,
@@ -195,6 +242,62 @@ impl AudioHaxApp {
             confirm: None,
             last_save_dir: None,
             hovering_files: false,
+            advanced: baseline.advanced,
+            adv_specs,
+            preset_id,
+            baseline,
+            more_open: false,
+            persist: false,
+            save_fallback: None,
+        }
+    }
+
+    /// The request the controls describe: the Everyday four plus "More" (S124).
+    fn request(&self) -> RenderRequest {
+        request_with(&self.controls, &self.advanced)
+    }
+
+    /// The selected preset's id.
+    ///
+    /// TEST SEAM (S124): read-only.
+    #[doc(hidden)]
+    pub fn preset_id(&self) -> &str {
+        self.preset_id
+    }
+
+    /// Select a preset (the panel's click, or a restored choice). Every control takes the preset's
+    /// value EXCEPT Variation, which is kept with the picture so the same picture can be heard
+    /// under another preset (`s124-UI` § 1.5, P7). An id not in the manifest changes nothing.
+    ///
+    /// Slice 1 (L-28): every shipped preset uses the built-in mappings (the manifest refuses any
+    /// other), which are the mappings the worker was started with, so a switch needs no new table.
+    pub fn select_preset(&mut self, id: &str) {
+        let Ok(preset) = crate::presets::find(id) else {
+            return;
+        };
+        let Ok(base) = preset_baseline(preset) else {
+            return;
+        };
+        let seed = self.controls.seed;
+        self.preset_id = preset.id.as_str();
+        self.baseline = base;
+        self.controls = Controls {
+            seed,
+            ..base.controls
+        };
+        self.advanced = base.advanced;
+        if let Some(pic) = self.picture.as_ref() {
+            let pr = pic.loaded.image.probe();
+            let schema_max = self
+                .specs
+                .as_ref()
+                .map(|s| s.voices_schema_max())
+                .unwrap_or(16);
+            self.controls
+                .clamp_voices(voices_max(schema_max, pr.width, pr.height));
+        }
+        if self.persist {
+            write_setting(PRESET_SETTING_FILE, self.preset_id);
         }
     }
 
@@ -267,14 +370,15 @@ impl AudioHaxApp {
     fn piece_key(&self) -> Option<PieceKey> {
         self.picture.as_ref().map(|p| PieceKey {
             image_seq: p.seq,
-            request: self.controls.request(),
+            preset: self.preset_id,
+            request: self.request(),
         })
     }
 
     fn geometry(&self) -> Option<ScanGeometry> {
         self.picture.as_ref().map(|p| {
             let probe = p.loaded.image.probe();
-            let req = self.controls.request();
+            let req = self.request();
             ScanGeometry {
                 width: probe.width,
                 height: probe.height,
@@ -337,7 +441,7 @@ impl AudioHaxApp {
             return;
         };
         let image = pic.loaded.image.clone();
-        let request = self.controls.request();
+        let request = self.request();
         if let Some(c) = self.controller.as_mut() {
             c.submit(JobKind::Render {
                 request,
@@ -380,7 +484,7 @@ impl AudioHaxApp {
             }
         };
         let image = pic.loaded.image.clone();
-        let request = self.controls.request();
+        let request = self.request();
         if let Some(c) = self.controller.as_mut() {
             c.submit(JobKind::Play {
                 request,
@@ -430,14 +534,78 @@ impl AudioHaxApp {
         );
         let mut dialog = rfd::FileDialog::new()
             .add_filter("WAV audio", &["wav"])
-            .set_file_name(suggested);
-        if let Some(dir) = default_save_dir(self.last_save_dir.as_deref()) {
+            .set_file_name(suggested.clone());
+        let dir = default_save_dir(self.last_save_dir.as_deref());
+        if let Some(dir) = dir.clone() {
             dialog = dialog.set_directory(dir);
         }
+        let asked = Instant::now();
         let Some(path) = dialog.save_file() else {
+            // S124 (`s124-UI` § 6): a dialog that returned at once probably never appeared (the same
+            // N-2 heuristic as Open). Offer the typed-path fallback so Save is not a dead button. A
+            // person who cancels within the threshold sees it too, and can press Cancel.
+            if dialog_probably_failed(asked.elapsed()) {
+                let prefill = dir
+                    .map(|d| d.join(&suggested))
+                    .unwrap_or_else(|| PathBuf::from(&suggested));
+                self.save_fallback = Some(prefill.display().to_string());
+            }
             return;
         };
         self.save_chosen_path(path);
+    }
+
+    /// The typed-path Save fallback (`s124-UI` § 6): the designer's headline, a path field
+    /// pre-filled with the default folder and the suggested name, Save and Cancel. Save goes
+    /// through [`Self::save_chosen_path`], so `.wav` is added, the open picture is refused (V-4)
+    /// and an existing file is confirmed (V-2) exactly as after a dialog.
+    fn save_fallback_panel(&mut self, ui: &mut egui::Ui) {
+        let p = self.palette;
+        let Some(mut text) = self.save_fallback.clone() else {
+            return;
+        };
+        ui.label(RichText::new(SAVE_NO_DIALOG_HEADLINE).color(p.warn));
+        let mut save = false;
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .desired_width(520.0)
+                    .char_limit(4096),
+            );
+            focus_ring(ui, &r, &p);
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            let b = ui.add_enabled(self.live(Control::SaveWav), egui::Button::new("Save"));
+            focus_ring(ui, &b, &p);
+            save = (b.clicked() || enter) && !text.trim().is_empty();
+            let c = ui.button("Cancel");
+            focus_ring(ui, &c, &p);
+            cancel = c.clicked();
+        });
+        if cancel {
+            self.save_fallback = None;
+        } else if save {
+            self.save_fallback = None;
+            self.save_chosen_path(PathBuf::from(text.trim()));
+        } else {
+            self.save_fallback = Some(text);
+        }
+    }
+
+    /// Show the typed-path Save fallback with `prefill`, as a failed Save dialog does.
+    ///
+    /// TEST SEAM (S124): a headless test cannot make `rfd` fail.
+    #[doc(hidden)]
+    pub fn show_save_fallback(&mut self, prefill: String) {
+        self.save_fallback = Some(prefill);
+    }
+
+    /// Is the typed-path Save fallback showing?
+    ///
+    /// TEST SEAM (S124): read-only.
+    #[doc(hidden)]
+    pub fn save_fallback_shown(&self) -> bool {
+        self.save_fallback.is_some()
     }
 
     /// Everything Save WAV does AFTER the dialog returned `path`: add `.wav` if there is no
@@ -714,6 +882,15 @@ impl AudioHaxApp {
                         .inner_margin(egui::Margin::symmetric(12, 8)),
                 )
                 .show(ui, |ui| self.transport(ui));
+            if self.save_fallback.is_some() {
+                egui::Panel::bottom("save_fallback")
+                    .frame(
+                        egui::Frame::new()
+                            .fill(p.raised)
+                            .inner_margin(egui::Margin::symmetric(12, 8)),
+                    )
+                    .show(ui, |ui| self.save_fallback_panel(ui));
+            }
             let narrow = ctx.content_rect().width() < NARROW_WIDTH;
             if narrow {
                 egui::Panel::bottom("sound_drawer")
@@ -726,6 +903,7 @@ impl AudioHaxApp {
                         egui::CollapsingHeader::new("Sound")
                             .default_open(true)
                             .show(ui, |ui| {
+                                visible_scroll_bars(ui);
                                 egui::ScrollArea::vertical()
                                     .max_height(220.0)
                                     .show(ui, |ui| {
@@ -743,6 +921,7 @@ impl AudioHaxApp {
                             .inner_margin(egui::Margin::same(16)),
                     )
                     .show(ui, |ui| {
+                        visible_scroll_bars(ui);
                         egui::ScrollArea::vertical().show(ui, |ui| self.sound_panel(ui, false));
                     });
             }
@@ -1023,10 +1202,14 @@ impl AudioHaxApp {
             );
             ui.add_space(4.0);
         }
+        // S124 (`s124-UI` § 1.1, P1): the preset surface is the FIRST group, above "Music".
+        self.preset_panel(ui);
+        ui.add_space(8.0);
         section_label(ui, p, "Music");
         ui.add_enabled_ui(live, |ui| {
             // Variation (seed): empty = the picture chooses (image-derived seed).
             ui.horizontal(|ui| {
+                self.knob_marker(ui, Knob::Seed);
                 let l = ui.label(&specs.seed.label);
                 let mut text = self.seed_text.clone();
                 let r = ui
@@ -1079,6 +1262,7 @@ impl AudioHaxApp {
                 .unwrap_or(specs.voices_schema_max());
             let mut voices = self.controls.instruments as u32;
             ui.horizontal(|ui| {
+                self.knob_marker(ui, Knob::Instruments);
                 let l = ui.label(&specs.instruments.label);
                 let r = ui
                     .add(egui::Slider::new(&mut voices, 1..=vmax).integer())
@@ -1099,6 +1283,7 @@ impl AudioHaxApp {
         // a one-line notice below them instead of greying them.
         ui.add_enabled_ui(live, |ui| {
             ui.horizontal(|ui| {
+                self.knob_marker(ui, Knob::Reverb);
                 let l = ui.label(&specs.reverb.label);
                 let mut on = self.controls.reverb;
                 for (value, text) in [(true, "On"), (false, "Off")] {
@@ -1113,6 +1298,7 @@ impl AudioHaxApp {
             });
             let (gmin, gmax, gstep) = specs.gain_range();
             ui.horizontal(|ui| {
+                self.knob_marker(ui, Knob::Gain);
                 let l = ui.label(&specs.gain.label);
                 let mut g = self.controls.gain;
                 let r = ui
@@ -1151,32 +1337,325 @@ impl AudioHaxApp {
         }
 
         ui.add_space(8.0);
-        egui::CollapsingHeader::new("More")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("More settings arrive in a later update.")
-                        .color(p.text_muted)
-                        .size(13.0),
+        // S124 (`s124-UI` § 2): the Advanced disclosure, closed on a fresh config, its state kept
+        // per viewer. Holds the schema's Advanced rows except the sound bank (L-31).
+        let more = egui::CollapsingHeader::new("More")
+            .default_open(self.more_open)
+            .show(ui, |ui| self.advanced_controls(ui, live, reason));
+        focus_ring(ui, &more.header_response, &p);
+        if more.header_response.clicked() {
+            self.more_open = !self.more_open;
+            if self.persist {
+                write_setting(
+                    MORE_SETTING_FILE,
+                    if self.more_open { "open" } else { "closed" },
                 );
-            });
-        if !compact {
-            ui.add_space(12.0);
-            egui::Frame::new()
-                .fill(p.raised)
-                .stroke(Stroke::new(1.0, Palette::with_alpha(p.control_border, 0.6)))
-                .corner_radius(CornerRadius::same(10))
-                .inner_margin(egui::Margin::same(12))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(RichText::new("Presets").strong());
+            }
+        }
+    }
+
+    /// S124 (`s124-UI` § 1): the preset panel. Pills for up to five presets, a drop-down for
+    /// more; the selected preset's one-line description under it; "default" marks the default;
+    /// "(modified)" and "Reset to preset" while any control differs from the preset (A6); locked
+    /// with the sound controls while rendering or playing (P6).
+    fn preset_panel(&mut self, ui: &mut egui::Ui) {
+        let p = self.palette;
+        let manifest = match crate::presets::manifest() {
+            Ok(m) => m,
+            Err(e) => {
+                ui.colored_label(p.error, "The presets could not be read.")
+                    .on_hover_text(e.to_string());
+                return;
+            }
+        };
+        let live = self.live(Control::SoundControls);
+        let reason = enablement(Control::SoundControls, self.phase)
+            .err()
+            .unwrap_or("");
+        let modified = any_modified(&self.controls, &self.advanced, &self.baseline);
+        let mut chosen: &'static str = self.preset_id;
+        let mut reset_all = false;
+        // `s124-UI2` C3: the "default" tag marks the way back, so it shows only when the shelf
+        // holds somewhere else to be (at one preset it would only repeat the pill's name).
+        let tag_default = |id: &str| id == manifest.default && manifest.presets.len() > 1;
+        egui::Frame::new()
+            .fill(p.raised)
+            .stroke(Stroke::new(1.0, Palette::with_alpha(p.control_border, 0.6)))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(egui::Margin::same(12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Preset").strong());
+                    if modified {
+                        ui.label(RichText::new("(modified)").color(p.text_muted));
+                    }
+                });
+                ui.add_enabled_ui(live, |ui| {
+                    if manifest.presets.len() <= 5 {
+                        ui.horizontal_wrapped(|ui| {
+                            for pr in &manifest.presets {
+                                let r = ui
+                                    .selectable_value(&mut chosen, pr.id.as_str(), &pr.name)
+                                    .on_hover_text(&pr.description);
+                                selected_outline(ui, &r, chosen == pr.id, &p);
+                                focus_ring(ui, &r, &p);
+                                if tag_default(&pr.id) {
+                                    ui.label(
+                                        RichText::new("default").color(p.text_muted).size(12.0),
+                                    );
+                                }
+                            }
+                        });
+                    } else {
+                        let shown = manifest
+                            .presets
+                            .iter()
+                            .find(|x| x.id == chosen)
+                            .map(|x| x.name.as_str())
+                            .unwrap_or("");
+                        let r = egui::ComboBox::from_id_salt("preset-combo")
+                            .selected_text(shown)
+                            .show_ui(ui, |ui| {
+                                for pr in &manifest.presets {
+                                    let tag = if tag_default(&pr.id) {
+                                        " · default"
+                                    } else {
+                                        ""
+                                    };
+                                    ui.selectable_value(
+                                        &mut chosen,
+                                        pr.id.as_str(),
+                                        format!("{}{tag}", pr.name),
+                                    );
+                                    ui.label(
+                                        RichText::new(&pr.description)
+                                            .color(p.text_muted)
+                                            .size(12.0),
+                                    );
+                                }
+                            });
+                        focus_ring(ui, &r.response, &p);
+                    }
+                })
+                .response
+                .on_disabled_hover_text(reason);
+                if let Some(pr) = manifest.presets.iter().find(|x| x.id == self.preset_id) {
                     ui.label(
-                        RichText::new("coming in the next update")
+                        RichText::new(&pr.description)
                             .color(p.text_muted)
                             .size(13.0),
                     );
-                });
+                }
+                if manifest.presets.len() == 1 {
+                    ui.label(
+                        // `s124-UI2` C2: `text_muted`, AA on the `raised` card in both palettes
+                        // (`text_faint` is a `bg`-only token: 3.69 : 1 on dark `raised`).
+                        RichText::new(ONE_PRESET_NOTE)
+                            .color(p.text_muted)
+                            .size(12.0),
+                    );
+                }
+                if modified {
+                    let b = ui
+                        .add_enabled(live, egui::Button::new("Reset to preset"))
+                        .on_hover_text("Put every control back to this preset's value.")
+                        .on_disabled_hover_text(reason);
+                    focus_ring(ui, &b, &p);
+                    reset_all = b.clicked();
+                }
+            });
+        if chosen != self.preset_id {
+            self.select_preset(chosen);
         }
+        if reset_all {
+            for k in KNOBS {
+                reset_knob(*k, &mut self.controls, &mut self.advanced, &self.baseline);
+            }
+            self.sync_seed_text();
+        }
+    }
+
+    /// Keep the Variation text field in step with the seed after a reset.
+    fn sync_seed_text(&mut self) {
+        self.seed_text = self
+            .controls
+            .seed
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+    }
+
+    /// A6 (`s124-UI` § 1.6): the ● before a control's label while it differs from the preset;
+    /// clicking it puts that one control back.
+    ///
+    /// The marker's slot is ALWAYS allocated — one fixed-size rect, one egui auto id — whether or
+    /// not the ● shows (lead ruling L-42, finding F-6). egui holds keyboard focus and a drag by the
+    /// widget's id, and a row's later widgets take their auto ids in order; a marker that only
+    /// allocated while modified shifted the control's id the moment it left its preset value, so
+    /// a keyboard user's second ← (or a mouse drag's next frame) went nowhere. The fixed slot also
+    /// keeps the label from jumping sideways when the ● appears.
+    fn knob_marker(&mut self, ui: &mut egui::Ui, knob: Knob) {
+        let modified = is_modified(knob, &self.controls, &self.advanced, &self.baseline);
+        let size = Vec2::new(MARKER_SLOT_WIDTH, ui.spacing().interact_size.y);
+        let sense = if modified {
+            Sense::click()
+        } else {
+            Sense::hover()
+        };
+        let (rect, r) = ui.allocate_exact_size(size, sense);
+        if !modified {
+            return;
+        }
+        let p = self.palette;
+        let enabled = ui.is_enabled();
+        r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, "●"));
+        // The painter of a disabled `Ui` already fades what it paints.
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "●",
+            TextStyle::Small.resolve(ui.style()),
+            p.accent_2,
+        );
+        let name = crate::presets::find(self.preset_id)
+            .map(|x| x.name.clone())
+            .unwrap_or_else(|_| self.preset_id.to_string());
+        let r = r.on_hover_text(format!("Changed from the {name} preset — click to reset"));
+        focus_ring(ui, &r, &p);
+        if r.clicked() {
+            reset_knob(knob, &mut self.controls, &mut self.advanced, &self.baseline);
+            if knob == Knob::Seed {
+                self.sync_seed_text();
+            }
+        }
+    }
+
+    /// S124 (`s124-UI` § 2.1–2.2): the Advanced controls inside "More", in the Music then "After
+    /// the music" split. Dependents are disabled with their reason inline, never refused later.
+    fn advanced_controls(&mut self, ui: &mut egui::Ui, live: bool, reason: &str) {
+        let p = self.palette;
+        let specs = match &self.adv_specs {
+            Ok(s) => s.clone(),
+            Err(e) => {
+                ui.colored_label(p.error, "These settings could not be built.")
+                    .on_hover_text(e.clone());
+                return;
+            }
+        };
+        section_label(ui, p, "Music");
+        ui.add_enabled_ui(live, |ui| {
+            // Expression.
+            ui.horizontal(|ui| {
+                self.knob_marker(ui, Knob::Expression);
+                let l = ui.label(&specs.expression.label);
+                let mut on = self.advanced.expression;
+                for (value, text) in [(true, "On"), (false, "Off")] {
+                    let r = ui
+                        .selectable_value(&mut on, value, text)
+                        .labelled_by(l.id)
+                        .on_hover_text(EverydaySpecs::help(&specs.expression));
+                    selected_outline(ui, &r, on == value, &p);
+                    focus_ring(ui, &r, &p);
+                }
+                self.advanced.expression = on;
+            });
+            // Expression detail: live only with Expression on.
+            let v2_ok = v2_enablement(&self.advanced);
+            ui.horizontal(|ui| {
+                self.knob_marker(ui, Knob::V2);
+                let l = ui.label(&specs.v2.label);
+                ui.add_enabled_ui(v2_ok.is_ok(), |ui| {
+                    let mut spec = self.advanced.v2.unwrap_or_default();
+                    // The three terms, each toggled on its own (`V2_TERMS` order).
+                    for (term, flag) in [
+                        ("e3", &mut spec.e3),
+                        ("e2", &mut spec.e2),
+                        ("ta", &mut spec.ta),
+                    ] {
+                        let r = ui
+                            .selectable_label(*flag, term)
+                            .labelled_by(l.id)
+                            .on_hover_text(EverydaySpecs::help(&specs.v2));
+                        describe_disabled(ui, &r, v2_ok);
+                        selected_outline(ui, &r, *flag, &p);
+                        focus_ring(ui, &r, &p);
+                        if r.clicked() {
+                            *flag = !*flag;
+                        }
+                    }
+                    self.advanced.v2 = if spec.is_empty() { None } else { Some(spec) };
+                })
+                .response
+                .on_disabled_hover_text(v2_ok.err().unwrap_or(""));
+            });
+            if let Err(why) = v2_ok {
+                ui.label(RichText::new(why).color(p.text_muted).size(12.0));
+            }
+            // Scan width.
+            let (tmin, tmax, tstep) = AdvancedSpecs::range(&specs.thickness, (0.01, 1.0, 0.01));
+            ui.horizontal(|ui| {
+                self.knob_marker(ui, Knob::Thickness);
+                let l = ui.label(&specs.thickness.label);
+                let mut t = self.advanced.thickness;
+                let r = ui
+                    .add(
+                        egui::Slider::new(&mut t, (tmin as f32)..=(tmax as f32))
+                            .step_by(tstep)
+                            .fixed_decimals(2),
+                    )
+                    .labelled_by(l.id)
+                    .on_hover_text(EverydaySpecs::help(&specs.thickness));
+                name_slider(&r, &specs.thickness.label, f64::from(t));
+                focus_ring(ui, &r, &p);
+                self.advanced.thickness = t;
+            });
+            // Scan detail.
+            let (smin, smax, _) = AdvancedSpecs::range(&specs.steps, (1.0, 200.0, 1.0));
+            ui.horizontal(|ui| {
+                self.knob_marker(ui, Knob::Steps);
+                let l = ui.label(&specs.steps.label);
+                let mut st = self.advanced.steps as u32;
+                let r = ui
+                    .add(egui::Slider::new(&mut st, (smin as u32)..=(smax as u32)).integer())
+                    .labelled_by(l.id)
+                    .on_hover_text(EverydaySpecs::help(&specs.steps));
+                name_slider(&r, &specs.steps.label, f64::from(st));
+                focus_ring(ui, &r, &p);
+                self.advanced.steps = st as usize;
+            });
+        })
+        .response
+        .on_disabled_hover_text(reason);
+
+        ui.add_space(6.0);
+        section_label(ui, p, "After the music");
+        ui.add_enabled_ui(live, |ui| {
+            let loop_ok = loop_enablement(&self.controls);
+            ui.horizontal(|ui| {
+                self.knob_marker(ui, Knob::Loop);
+                let l = ui.label(&specs.loop_cue.label);
+                ui.add_enabled_ui(loop_ok.is_ok(), |ui| {
+                    let mut on = self.advanced.loop_cue;
+                    for (value, text) in [(true, "On"), (false, "Off")] {
+                        let r = ui
+                            .selectable_value(&mut on, value, text)
+                            .labelled_by(l.id)
+                            .on_hover_text(EverydaySpecs::help(&specs.loop_cue));
+                        describe_disabled(ui, &r, loop_ok);
+                        selected_outline(ui, &r, on == value, &p);
+                        focus_ring(ui, &r, &p);
+                    }
+                    self.advanced.loop_cue = on;
+                })
+                .response
+                .on_disabled_hover_text(loop_ok.err().unwrap_or(""));
+            });
+            if let Err(why) = loop_ok {
+                ui.label(RichText::new(why).color(p.text_muted).size(12.0));
+            }
+        })
+        .response
+        .on_disabled_hover_text(reason);
     }
 
     fn transport(&mut self, ui: &mut egui::Ui) {
@@ -1233,6 +1712,15 @@ impl AudioHaxApp {
                         .monospace()
                         .color(p.text_muted),
                 );
+            }
+
+            // S124 (`s124-UI` § 1.5, P5): the held render was made with another preset.
+            let stale = self
+                .last_render
+                .as_ref()
+                .is_some_and(|(k, _)| k.preset != self.preset_id);
+            if stale && matches!(self.phase, Phase::ImageLoaded | Phase::Stopped) {
+                ui.label(RichText::new(STALE_PRESET_HINT).color(p.text_muted));
             }
 
             // Progress and the abandon-style Cancel (SH T-2).
@@ -1797,6 +2285,86 @@ fn caption(painter: &egui::Painter, p: Palette, pos: Pos2, text: &str) {
 
 /// First launch? Marks the flag so the Quick tour is offered once (UI § 6). Best effort: if the
 /// config directory cannot be written, the tour is simply offered again next time.
+/// S124: a preset's control baseline (its settings over clap's defaults).
+fn preset_baseline(
+    preset: &crate::presets::Preset,
+) -> Result<Baseline, crate::presets::PresetError> {
+    let args = crate::presets::preset_render_args(preset)?;
+    Ok(Baseline::from_request(&RenderRequest::from(&args)))
+}
+
+/// The CLI defaults as a baseline (used only if the manifest cannot be read).
+fn default_baseline() -> Baseline {
+    Baseline {
+        controls: Controls::default(),
+        advanced: AdvancedControls::default(),
+    }
+}
+
+/// F-6 (L-42): the width of the A6 marker's fixed slot, in points — wide enough for the small ●.
+const MARKER_SLOT_WIDTH: f32 = 12.0;
+
+/// AD5 (`s124-UI` § 2.6; lead ruling L-42, finding F-4): a disabled dependent exposes WHY it is
+/// disabled to `accesskit` as the control's description, so a screen-reader user hears the same
+/// reason the inline label shows. Nothing is written while the control is enabled.
+fn describe_disabled(ui: &egui::Ui, r: &egui::Response, enablement: Result<(), &str>) {
+    if let Err(why) = enablement {
+        let _ = ui
+            .ctx()
+            .accesskit_node_builder(r.id, |node| node.set_description(why));
+    }
+}
+
+/// S124: the per-viewer file holding the selected preset's id.
+const PRESET_SETTING_FILE: &str = "gui-preset";
+/// S124: the per-viewer file holding "More"'s open/closed state.
+const MORE_SETTING_FILE: &str = "gui-more-open";
+
+/// Read a tiny per-viewer setting from the config dir: a regular file of at most 64 bytes of
+/// UTF-8, trimmed. Anything else reads as absent (never an error, never a large read).
+fn read_setting(name: &str) -> Option<String> {
+    let dirs = directories::ProjectDirs::from("", "", "AudioHax")?;
+    let path = dirs.config_dir().join(name);
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > 64 {
+        return None;
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// Write a tiny per-viewer setting; failures are ignored (the default applies next launch).
+///
+/// The path gets the same regular-file check before `open()` that [`read_setting`] gives it (lead
+/// ruling L-42, finding F-5): this runs on the UI thread, and opening a FIFO for writing blocks
+/// until a reader appears, so a pipe (or a device, or a folder) at a settings path would freeze a
+/// click on "More". Anything there that is not a regular file is left alone and nothing is
+/// written; an absent file is created. Residual, as for `read_setting` and
+/// `mapping_loader::read_mappings_file`: a regular file swapped for a FIFO between the check and
+/// the `open()` still blocks (that needs someone writing in the viewer's own config folder during
+/// the click; the cure is a non-blocking open, which needs `libc` as a direct dependency).
+fn write_setting(name: &str, value: &str) {
+    if let Some(dirs) = directories::ProjectDirs::from("", "", "AudioHax") {
+        write_setting_in(dirs.config_dir(), name, value);
+    }
+}
+
+/// [`write_setting`] in an explicit folder (so the check can be tested without the viewer's
+/// config folder).
+fn write_setting_in(dir: &std::path::Path, name: &str, value: &str) {
+    let path = dir.join(name);
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        Err(_) => return,
+    }
+    let _ = std::fs::write(&path, format!("{value}\n"));
+}
+
 fn first_run_and_mark() -> bool {
     let Some(dirs) = directories::ProjectDirs::from("", "", "AudioHax") else {
         return false;
@@ -1810,9 +2378,71 @@ fn first_run_and_mark() -> bool {
     true
 }
 
+/// `s124-UI2` C1: solid scroll bars for the Sound panel. egui's default style floats the bar and
+/// paints it fully transparent until the pointer is over the area, so an overflowing panel (the
+/// "More" rows at the default window size) gave no sign that anything was below. A solid
+/// (non-floating) bar is painted opaque whenever the content overflows, and only then. Applies to
+/// `ui` and the widgets added to it after this call.
+fn visible_scroll_bars(ui: &mut egui::Ui) {
+    ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L-42 / F-5: `write_setting` writes a regular file (and creates an absent one) but leaves a
+    /// FIFO or a folder at the path alone — returning at once rather than blocking in `open()`.
+    #[test]
+    fn write_setting_never_opens_what_is_not_a_regular_file() {
+        let base = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base
+            .join("audiohax-settings-test-scratch")
+            .join(format!("w-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_setting_in(&dir, "fresh", "open");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fresh")).expect("created"),
+            "open\n"
+        );
+        write_setting_in(&dir, "fresh", "closed");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fresh")).expect("rewritten"),
+            "closed\n"
+        );
+        std::fs::create_dir_all(dir.join("a-folder")).expect("dir");
+        write_setting_in(&dir, "a-folder", "open");
+        assert!(dir.join("a-folder").is_dir(), "a folder is left alone");
+        #[cfg(unix)]
+        {
+            let fifo = dir.join("a-pipe");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if made {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let d = dir.clone();
+                std::thread::spawn(move || {
+                    write_setting_in(&d, "a-pipe", "open");
+                    let _ = tx.send(());
+                });
+                let done = rx.recv_timeout(Duration::from_secs(10));
+                if done.is_err() {
+                    // Unblock the stuck writer so the test process can exit.
+                    let _ = std::fs::read(&fifo);
+                }
+                assert!(done.is_ok(), "writing a setting blocked on a FIFO");
+            } else {
+                eprintln!("mkfifo unavailable: the FIFO case was not checked");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn run_frames(ctx: &egui::Context, app: &mut AudioHaxApp, n: usize) -> egui::FullOutput {
         let mut last = None;
@@ -2013,5 +2643,258 @@ mod tests {
             nodes.iter().any(|(_, l)| l == "Sound"),
             "drawer header: {nodes:?}"
         );
+    }
+
+    // ── S124 ─────────────────────────────────────────────────────────────────────────────────
+
+    /// Every accesskit node's label OR value text (egui puts a plain label's words in its
+    /// `TextRun` child's value, not in a label), as (role, text).
+    fn a11y_text(out: &egui::FullOutput) -> Vec<(egui::accesskit::Role, String)> {
+        out.platform_output
+            .accesskit_update
+            .as_ref()
+            .map(|u| {
+                u.nodes
+                    .iter()
+                    .map(|(_, n)| {
+                        let t = n
+                            .label()
+                            .map(|l| l.to_string())
+                            .or_else(|| n.value().map(|v| v.to_string()))
+                            .unwrap_or_default();
+                        (n.role(), t)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn s124_loaded(more_open: bool) -> (egui::Context, AudioHaxApp) {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = AudioHaxApp::new_headless(&ctx);
+        app.more_open = more_open;
+        run_frames(&ctx, &mut app, 1);
+        app.try_sample();
+        wait_until(&ctx, &mut app, |a| a.phase() == Phase::ImageLoaded);
+        (ctx, app)
+    }
+
+    /// P1/P2/P9 + AD1 + L-31/L-33: the preset shelf shows the one `default` preset with its
+    /// description and the "more are coming" note; "More" holds the five Advanced controls and
+    /// no sound-bank or mappings picker.
+    #[test]
+    fn s124_preset_panel_and_more_show_what_the_manifest_and_schema_hold() {
+        let (ctx, mut app) = s124_loaded(true);
+        let out = run_frames(&ctx, &mut app, 2);
+        let nodes = a11y_text(&out);
+        let any = |needle: &str| nodes.iter().any(|(_, l)| l.contains(needle));
+        assert_eq!(app.preset_id(), "default");
+        assert!(any("Default"), "preset pill: {nodes:?}");
+        assert!(any("AudioHax as it ships"), "description: {nodes:?}");
+        assert!(any(ONE_PRESET_NOTE), "one-preset note: {nodes:?}");
+        assert!(!any("(modified)"), "untouched controls are not modified");
+        use egui::accesskit::Role;
+        for slider in ["Scan width", "Scan detail"] {
+            assert!(
+                nodes
+                    .iter()
+                    .any(|(r, l)| *r == Role::Slider && l.contains(slider)),
+                "{slider}: {nodes:?}"
+            );
+        }
+        for label in ["Expression", "Expression detail", "Seamless loop"] {
+            assert!(any(label), "{label}: {nodes:?}");
+        }
+        for absent in ["sound bank", ".sf2", "mapping file", "Load a mapping"] {
+            assert!(
+                !any(absent),
+                "{absent} must not be in the window: {nodes:?}"
+            );
+        }
+        assert!(
+            !any("coming in the next update"),
+            "the S123 placeholder is gone"
+        );
+        // The untouched window's request is still the CLI default render.
+        assert_eq!(
+            app.request(),
+            request_with(&Controls::default(), &AdvancedControls::default())
+        );
+    }
+
+    /// Every painted shape, with `Shape::Vec` flattened.
+    fn painted(out: &egui::FullOutput) -> Vec<egui::epaint::Shape> {
+        fn flat(s: &egui::epaint::Shape, acc: &mut Vec<egui::epaint::Shape>) {
+            match s {
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|x| flat(x, acc)),
+                other => acc.push(other.clone()),
+            }
+        }
+        let mut acc = Vec::new();
+        for c in &out.shapes {
+            flat(&c.shape, &mut acc);
+        }
+        acc
+    }
+
+    /// Opaque, bar-shaped rectangles painted within 40 px of the window's right edge: a vertical
+    /// scroll bar's track or handle (a slider rail is horizontal; a separator is a line).
+    fn scroll_bars_at_right_edge(out: &egui::FullOutput, width: f32) -> usize {
+        painted(out)
+            .iter()
+            .filter(|s| match s {
+                egui::epaint::Shape::Rect(r) => {
+                    let w = r.rect.width();
+                    w > 2.0
+                        && w <= 12.0
+                        && r.rect.height() > 40.0
+                        && r.rect.max.x > width - 40.0
+                        && r.fill.a() > 0
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    /// Run `n` frames at `w`×`h` with no pointer anywhere (nothing is hovered).
+    fn frames_at(
+        ctx: &egui::Context,
+        app: &mut AudioHaxApp,
+        w: f32,
+        h: f32,
+        n: usize,
+    ) -> egui::FullOutput {
+        let mut last = None;
+        for _ in 0..n {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| app.draw(ui));
+            out.textures_delta.clear();
+            last = Some(out);
+        }
+        last.expect("at least one frame")
+    }
+
+    /// `s124-UI2` C1: at the window's own default size (1120×720) with "More" open, the Sound
+    /// panel overflows and its scroll bar is PAINTED with nothing hovered, so the rows below the
+    /// fold are announced. Same for the narrow window's drawer. CONTROL: a window tall enough
+    /// that nothing overflows paints no bar (the detector is not matching some other shape).
+    #[test]
+    fn s124_the_sound_panel_scroll_bar_shows_without_hover() {
+        let (ctx, mut app) = s124_loaded(true);
+        let out = frames_at(&ctx, &mut app, 1120.0, 720.0, 3);
+        assert!(
+            scroll_bars_at_right_edge(&out, 1120.0) >= 1,
+            "1120×720, More open: no visible scroll bar"
+        );
+        let out = frames_at(&ctx, &mut app, 960.0, 600.0, 3);
+        assert!(
+            scroll_bars_at_right_edge(&out, 960.0) >= 1,
+            "narrow drawer: no visible scroll bar"
+        );
+        // A fresh window (a bar that was shown animates out over several frames).
+        let (ctx, mut app) = s124_loaded(false);
+        let out = frames_at(&ctx, &mut app, 1120.0, 2400.0, 10);
+        assert_eq!(
+            scroll_bars_at_right_edge(&out, 1120.0),
+            0,
+            "CONTROL: nothing overflows, so no bar"
+        );
+    }
+
+    /// `s124-UI2` C2: "More presets are coming." is painted in `text_muted` (AA on the `raised`
+    /// card in both palettes, `theme.rs` `a8_*`), not `text_faint` (3.69 : 1 on dark `raised`).
+    #[test]
+    fn s124_the_one_preset_note_is_painted_in_text_muted() {
+        let (ctx, mut app) = s124_loaded(false);
+        let out = run_frames(&ctx, &mut app, 2);
+        let p = app.palette;
+        let colours: Vec<Color32> = painted(&out)
+            .iter()
+            .filter_map(|s| match s {
+                egui::epaint::Shape::Text(t) if t.galley.text() == ONE_PRESET_NOTE => {
+                    Some(t.override_text_color.unwrap_or_else(|| {
+                        t.galley
+                            .job
+                            .sections
+                            .first()
+                            .map(|s| s.format.color)
+                            .unwrap_or(t.fallback_color)
+                    }))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(colours, vec![p.text_muted], "the note's colour");
+        assert_ne!(p.text_muted, p.text_faint);
+    }
+
+    /// `s124-UI2` C3: with one preset on the shelf, the pill "Default" is not followed by a
+    /// redundant "default" tag (the tag marks the way back only when there is somewhere else).
+    #[test]
+    fn s124_a_one_preset_shelf_shows_no_default_tag() {
+        let (ctx, mut app) = s124_loaded(false);
+        let out = run_frames(&ctx, &mut app, 2);
+        let nodes = a11y_text(&out);
+        assert!(
+            nodes.iter().any(|(_, l)| l.contains("Default")),
+            "the pill: {nodes:?}"
+        );
+        assert!(
+            !nodes
+                .iter()
+                .any(|(_, l)| l == "default" || l.contains("· default")),
+            "no default tag on a one-preset shelf: {nodes:?}"
+        );
+    }
+
+    /// A6: a control off its preset value shows "(modified)" and "Reset to preset".
+    #[test]
+    fn s124_a_changed_control_marks_the_preset_modified() {
+        let (ctx, mut app) = s124_loaded(false);
+        app.controls.gain = 1.5;
+        let out = run_frames(&ctx, &mut app, 2);
+        let nodes = a11y_text(&out);
+        let any = |needle: &str| nodes.iter().any(|(_, l)| l.contains(needle));
+        assert!(any("(modified)"), "{nodes:?}");
+        assert!(any("Reset to preset"), "{nodes:?}");
+    }
+
+    /// P7: choosing a preset keeps the Variation and puts every other control at the preset's
+    /// value; an id that is not shipped changes nothing.
+    #[test]
+    fn s124_selecting_a_preset_keeps_the_variation() {
+        let (_ctx, mut app) = s124_loaded(false);
+        app.controls.seed = Some(42);
+        app.controls.gain = 2.0;
+        app.advanced.steps = 9;
+        app.select_preset("default");
+        assert_eq!(app.controls.seed, Some(42));
+        assert_eq!(app.controls.gain, 1.0);
+        assert_eq!(app.advanced.steps, 40);
+        app.controls.gain = 0.5;
+        app.select_preset("no-such-preset");
+        assert_eq!(app.controls.gain, 0.5);
+        assert_eq!(app.preset_id(), "default");
+    }
+
+    /// UI § 6: the Save fallback shows the designer's headline and a path field.
+    #[test]
+    fn s124_save_fallback_shows_the_designers_words() {
+        let (ctx, mut app) = s124_loaded(false);
+        assert!(!app.save_fallback_shown());
+        app.show_save_fallback("/nonexistent-dir/piece.wav".into());
+        let out = run_frames(&ctx, &mut app, 2);
+        let nodes = a11y_text(&out);
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, l)| l.contains("couldn't open a Save window")),
+            "{nodes:?}"
+        );
+        assert!(app.save_fallback_shown());
     }
 }

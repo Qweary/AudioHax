@@ -367,8 +367,10 @@ impl EngineObserver for SnapshotCollector {
 /// harmony plan is derived and `current_state()` is meaningful on tick 0.
 ///
 /// `mappings_path` is the path to `assets/mappings.json` (the engine needs a mapping
-/// table). Returns the wired engine + source on success; surfaces the loader error
-/// (e.g. a missing mappings file) to the caller rather than panicking.
+/// table). The file is read through the library's one bounded, validated loader
+/// ([`crate::mapping_loader::load_mappings_file`]), so a file the CLI would refuse is refused
+/// here too. Returns the wired engine + source on success; surfaces the loader's sentence
+/// (e.g. a missing or out-of-bounds mappings file) to the caller rather than panicking.
 ///
 /// NOTE: `set_features_global` derives the plan via `thread_rng`, so the engine's
 /// mode/plan are non-deterministic across calls — by design (S9). The SOURCE is fully
@@ -378,8 +380,19 @@ pub fn build_engine(
     steps: usize,
     instruments: usize,
 ) -> Result<(PipelineEngine, SyntheticSource), String> {
-    let mappings = crate::mapping_loader::load_mappings(mappings_path)
-        .map_err(|e| format!("loading mappings from {mappings_path}: {e}"))?;
+    let mappings = crate::mapping_loader::load_mappings_file(std::path::Path::new(mappings_path))
+        .map_err(|e| e.to_string())?;
+    Ok(build_engine_with(mappings, steps, instruments))
+}
+
+/// [`build_engine`] over a table the caller has already loaded (and validated) — for a
+/// front end that resolves its mappings itself, e.g. the `audiohax-tui` bin's
+/// `./assets/mappings.json`-else-built-in order.
+pub fn build_engine_with(
+    mappings: crate::mapping_loader::MappingTable,
+    steps: usize,
+    instruments: usize,
+) -> (PipelineEngine, SyntheticSource) {
     let config = EngineConfig {
         num_instruments: instruments.max(1),
         ..EngineConfig::default()
@@ -388,7 +401,7 @@ pub fn build_engine(
     let source = SyntheticSource::new(steps);
     // Feed whole-image features once so the plan is derived before the first tick.
     engine.set_features_global(&source.global_features());
-    Ok((engine, source))
+    (engine, source)
 }
 
 /// Advance the engine one step against `source`, send to `sink`, then return the
@@ -538,6 +551,25 @@ mod tests {
         assert!(sink.note_on(0, 60, 90).is_ok());
         assert!(sink.note_off(0, 60).is_ok());
         assert!(sink.program_change(0, 1).is_ok());
+    }
+
+    /// S124 (L-32): `build_engine` reads its file through the checked loader, so a file that
+    /// is not a mappings table is refused with the loader's sentence (naming the file), and
+    /// `build_engine_with` wires an already-loaded table the same way.
+    #[test]
+    fn build_engine_goes_through_the_checked_loader() {
+        let err = build_engine("Cargo.toml", 5, 3)
+            .err()
+            .expect("Cargo.toml is not a mappings file");
+        assert!(err.contains("Cargo.toml"), "names the file: {err}");
+        assert!(
+            err.contains("Nothing was rendered."),
+            "loader sentence: {err}"
+        );
+        let table = crate::mapping_loader::default_mappings().expect("embedded");
+        let (engine, source) = build_engine_with(table, 5, 3);
+        assert_eq!(source.step_count(), 5);
+        assert_eq!(engine.config().num_instruments, 3);
     }
 
     #[test]

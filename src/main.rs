@@ -56,13 +56,16 @@ mod image_source;
 #[cfg(feature = "midi-out")]
 mod midi_output;
 
-use audiohax::cli::{pipeline_to_engine_config, Cli, Command, OutputSink, PlayArgs, RenderArgs};
+use audiohax::cli::{
+    pipeline_to_engine_config, Cli, Command, OutputSink, PlayArgs, PresetArgs, RenderArgs,
+};
 use audiohax::engine::AudioSink;
 #[cfg(feature = "opencv")]
 use audiohax::engine::FeatureSource;
-use audiohax::mapping_loader::load_mappings;
-use audiohax::render::{CancelToken, PlayEvent, RenderError, RenderNote};
-use clap::Parser;
+use audiohax::mapping_loader::{resolve_cli_mappings_with_origin, MappingTable, MappingsOrigin};
+use audiohax::presets::ExplicitArgs;
+use audiohax::render::{CancelToken, PlayEvent, RenderError, RenderNote, RenderRequest};
+use clap::{CommandFactory, FromArgMatches};
 
 // ── OpenCV path imports (gated) ──────────────────────────────────────────────
 #[cfg(feature = "opencv")]
@@ -260,15 +263,20 @@ fn step_rect(
 fn run_render_wav(
     render_args: RenderArgs,
     wav_path: &std::path::Path,
+    explicit: &ExplicitArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use audiohax::render::{RenderError, RenderNote, RenderRequest};
     use audiohax::synth_sink::{write_stereo_wav, SoundFontSource};
 
+    // S124: the preset (if any) is laid under the typed flags first (L-30); it prints nothing.
     // The `--loop`/`--gain` refusal ran BEFORE `mappings.json` was read; keep it first.
-    let req = RenderRequest::from(&render_args);
+    let req = with_preset(
+        RenderRequest::from(&render_args),
+        &render_args.presets,
+        explicit,
+    )?;
     req.validate()?;
 
-    let mappings = load_mappings("assets/mappings.json")?;
+    let (mappings, origin) = resolve_mappings(&render_args.presets)?;
 
     // ── Acquire the feature source (same selection as `play`; opencv vs pure). ──
     // The pure-Rust acquisition happens inside `audiohax::render::render`.
@@ -367,7 +375,8 @@ fn run_render_wav(
         &mappings,
         font_src,
         &mut on_note,
-    )?;
+    )
+    .map_err(|e| name_mappings_in(e, &origin))?;
     #[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
     let out = {
         let default_image = std::path::PathBuf::from("assets/images/example.jpg");
@@ -378,7 +387,8 @@ fn run_render_wav(
             &mappings,
             font_src,
             &mut on_note,
-        )?
+        )
+        .map_err(|e| name_mappings_in(e, &origin))?
     };
 
     write_stereo_wav(wav_path, out.sample_rate, &out.interleaved)?;
@@ -399,19 +409,95 @@ fn run_render_wav(
     );
     Ok(())
 }
+/// S124 (lead ruling L-30): lay the chosen preset (if any) under `req`; a flag the user typed
+/// keeps its value. No preset ⇒ `req` unchanged. Prints nothing (`s124-01` LD-4).
+fn with_preset(
+    req: RenderRequest,
+    presets: &PresetArgs,
+    explicit: &ExplicitArgs,
+) -> Result<RenderRequest, Box<dyn std::error::Error>> {
+    let Some(id) = presets.preset.as_deref() else {
+        return Ok(req);
+    };
+    let preset = audiohax::presets::find(id).map_err(|e| e.to_string())?;
+    let args = audiohax::presets::preset_render_args(preset).map_err(|e| e.to_string())?;
+    Ok(req.overlay_preset(&RenderRequest::from(&args), explicit))
+}
+
+/// S124 (lead rulings L-29, L-32): the mappings for a `render`/`play` run, always through the
+/// library's bounded, validated loader. `--preset P` ⇒ P's (embedded) mappings; `--mappings FILE`
+/// ⇒ that file; neither ⇒ `./assets/mappings.json` if it exists, else the built-in copy.
+fn resolve_mappings(
+    presets: &PresetArgs,
+) -> Result<(MappingTable, MappingsOrigin), Box<dyn std::error::Error>> {
+    match presets.preset.as_deref() {
+        Some(id) => {
+            let preset = audiohax::presets::find(id).map_err(|e| e.to_string())?;
+            let table = audiohax::presets::resolve_mappings(preset).map_err(|e| e.to_string())?;
+            Ok((table, MappingsOrigin::Builtin))
+        }
+        None => Ok(resolve_cli_mappings_with_origin(
+            presets.mappings.as_deref(),
+        )?),
+    }
+}
+
+/// S124 (L-41): the MB-5 piece-length refusal comes from the library, which does not know which
+/// mappings were used; name them, and the fields that set a piece's tempo and length. Every other
+/// error passes through unchanged.
+///
+/// The named refusal is returned as a [`PlainRefusal`], so `main`'s `Error: …` line prints it as a
+/// sentence (like every mappings refusal) rather than as a quoted, re-escaped Debug string. Every
+/// other error keeps its existing form (`RenderError`'s Debug is pinned to the pre-S122 output).
+fn name_mappings_in(e: RenderError, origin: &MappingsOrigin) -> Box<dyn std::error::Error> {
+    match e {
+        RenderError::Refused(msg) if msg.starts_with(audiohax::render::PIECE_TOO_LONG_PREFIX) => {
+            let head = msg.split(" (The mappings in use").next().unwrap_or(&msg);
+            Box::new(PlainRefusal(format!(
+                "{head} {origin} sets this piece's tempo (`composition.affect.energy_tempo`, \
+                 `composition.affect.character_tempo`, `global.brightness_to_tempo_bpm`) and its \
+                 length (`composition.form_catalogue[].sections`)."
+            )))
+        }
+        other => Box::new(other),
+    }
+}
+
+/// A refusal whose `Debug` is its `Display` text, so returning it from `main` prints the sentence
+/// itself, unquoted (`MappingsError` does the same).
+struct PlainRefusal(String);
+
+impl std::fmt::Display for PlainRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::fmt::Debug for PlainRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PlainRefusal {}
+
 /// Build the in-process synth sink (rustysynth + cpal), honoring the `--soundfont` /
 /// `--reverb` / `--gain` A/B controls. This is the DEFAULT sink and — on a build
 /// WITHOUT the `midi-out` feature — the ONLY sink. Extracted (S59 Lane H) so the two
 /// `midi-out`-gated sink-selection arms below share one construction site instead of
 /// duplicating it; no flags ⇒ `SynthConfig::default()` + bundled font ⇒ byte-identical
 /// to the pre-extraction inline path.
+///
+/// S124: reverb and gain come from the RESOLVED request (`req`), so a preset's values reach the
+/// live synth; with no preset they are exactly `--reverb` / `--gain`.
 fn build_synth_sink(
     play_args: &PlayArgs,
+    req: &RenderRequest,
 ) -> Result<Box<dyn AudioSink>, Box<dyn std::error::Error>> {
     use audiohax::synth_sink::{SoundFontSource, SynthConfig, SynthSink};
     let synth_config = SynthConfig {
-        enable_reverb_and_chorus: play_args.audio.reverb.is_on(),
-        gain: play_args.audio.gain,
+        enable_reverb_and_chorus: req.reverb.is_on(),
+        gain: req.gain,
     };
     let font_src = match &play_args.audio.soundfont {
         Some(p) => SoundFontSource::Path(p.as_path()),
@@ -440,7 +526,14 @@ fn build_synth_sink(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── CLI (shared clap grammar) ───────────────────────────────────────────────
-    let cli = Cli::parse();
+    // S124 (L-30): `Cli::parse()` split into its own two steps, so the typed-flag set can be read
+    // from the matches (`value_source`) for the preset precedence. The error path is clap's
+    // `parse()` body verbatim (format against a fresh `Cli::command()`, then exit), so every clap
+    // message and exit code is unchanged.
+    let matches = Cli::command().get_matches();
+    let explicit = ExplicitArgs::from_matches(&matches);
+    let cli =
+        Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.format(&mut Cli::command()).exit());
 
     // Phase 1 wires the `play` subcommand (the others — render/analyze/modem — are
     // surfaced by the grammar but their adapter bodies are follow-on work; the modem
@@ -452,7 +545,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // (the A/B harness output). `render` without `--wav` keeps the Phase-1 message.
         Command::Render(r) => {
             if let Some(wav_path) = r.wav.clone() {
-                return run_render_wav(r, &wav_path);
+                return run_render_wav(r, &wav_path, &explicit);
             }
             println!(
                 "`render` without `--wav` is recognized but not yet wired; pass `--wav <PATH>` \
@@ -506,15 +599,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Mappings + engine config ────────────────────────────────────────────────
-    let mappings = load_mappings("assets/mappings.json")?;
+    // S124: the request is resolved first (a preset under the typed flags, L-30; prints nothing),
+    // so the lines below print the values the piece is actually made with.
+    let req = with_preset(
+        RenderRequest::from(&play_args),
+        &play_args.presets,
+        &explicit,
+    )?;
+    let (mappings, origin) = resolve_mappings(&play_args.presets)?;
     println!("Mappings loaded.");
 
-    let engine_config = pipeline_to_engine_config(&play_args.pipeline);
+    let engine_config = pipeline_to_engine_config(&req.pipeline);
     let instrument_count = engine_config.num_instruments;
     let bar_thickness_frac = engine_config.bar_thickness_frac;
     let ms_per_step = engine_config.ms_per_step;
-    let num_steps = play_args.pipeline.steps;
-    let jitter_percent = play_args.pipeline.jitter_percent;
+    let num_steps = req.pipeline.steps;
+    let jitter_percent = req.pipeline.jitter_percent;
     println!("Instrument count: {}", instrument_count);
     println!(
         "Scan bar thickness = {:.2}, scan-viz steps = {}, scan-viz ms/step = {}, jitter% = {}",
@@ -530,7 +630,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so the engine driver is identical behind the trait (design §3.C). S122: the seed /
     // cadence registers, per-voice programs, engine build, composer plan AND the shared event
     // timeline are all built by `audiohax::render::prepare_play*` on THIS thread, in one call.
-    let req = audiohax::render::RenderRequest::from(&play_args);
     let mut on_note = |note: RenderNote<'_>| -> Result<(), RenderError> {
         match note {
             RenderNote::ImageLoaded { width, height } => {
@@ -594,7 +693,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "opencv")]
     let plan =
-        audiohax::render::prepare_play_with_source(&req, &source, None, &mappings, &mut on_note)?;
+        audiohax::render::prepare_play_with_source(&req, &source, None, &mappings, &mut on_note)
+            .map_err(|e| name_mappings_in(e, &origin))?;
 
     // DEFAULT (pure) path: acquire + analyze with the pure-Rust `pure_analysis` module.
     #[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
@@ -606,7 +706,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             audiohax::render::ImageInput::Path(image),
             &mappings,
             &mut on_note,
-        )?
+        )
+        .map_err(|e| name_mappings_in(e, &origin))?
     };
 
     // ── Playback ────────────────────────────────────────────────────────────────
@@ -651,7 +752,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             // S31: honor the A/B controls. No flags ⇒ SynthConfig::default() + Bundled
             // font ⇒ byte-identical to the pre-S31 path (see `build_synth_sink`).
-            build_synth_sink(&play_args)?
+            build_synth_sink(&play_args, &req)?
         }
     };
 
@@ -666,7 +767,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  for external MIDI."
             );
         }
-        build_synth_sink(&play_args)?
+        build_synth_sink(&play_args, &req)?
     };
 
     // ── Graceful-shutdown wiring (BUG-01) ───────────────────────────────────────

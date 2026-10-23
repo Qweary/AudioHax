@@ -36,6 +36,12 @@ pub mod cli;
 pub mod engine;
 pub mod options_schema;
 
+// S124 slice 1 (lead ruling L-28) — the preset layer: the embedded manifest (`default` only in
+// slice 1), its validation (fields the build cannot honour are refused), `--preset`'s clap values,
+// and the typed-flag set that gives the user's flags precedence over a preset (L-30). Pure-Rust;
+// builds & unit-tests under `--no-default-features`.
+pub mod presets;
+
 // WS-4 Phase 3 (S10) — pure-Rust ratatui TUI front-end, a pure OBSERVER over the S9
 // engine seam. Builds & unit-tests under `cargo test --lib --no-default-features`.
 pub mod tui;

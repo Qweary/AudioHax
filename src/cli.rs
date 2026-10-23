@@ -259,6 +259,28 @@ pub struct PlayArgs {
     pub pipeline: PipelineArgs,
     #[command(flatten)]
     pub audio: AudioArgs,
+    #[command(flatten)]
+    pub presets: PresetArgs,
+}
+
+/// S124: `--preset` / `--mappings`, shared by `play` and `render` (flattened). NOT `global`, so
+/// the `analyze` / `modem` / `tui` help is unchanged. Mutually exclusive (lead ruling L-30).
+#[derive(Debug, Args, PartialEq, Clone, Default)]
+pub struct PresetArgs {
+    /// Start from a named preset. A preset uses the built-in tables and ignores
+    /// ./assets/mappings.json. Any option you also give on the command line overrides the
+    /// preset's value for that option. Cannot be combined with --mappings.
+    #[arg(
+        long,
+        value_name = "NAME",
+        value_parser = crate::presets::preset_value_parser(),
+        conflicts_with = "mappings"
+    )]
+    pub preset: Option<String>,
+    /// Read the composer's tables from this mappings file instead of ./assets/mappings.json or the
+    /// built-in copy. Cannot be combined with --preset.
+    #[arg(long, value_name = "FILE")]
+    pub mappings: Option<PathBuf>,
 }
 
 /// Args for `audiohax render`.
@@ -340,6 +362,8 @@ pub struct RenderArgs {
     pub pipeline: PipelineArgs,
     #[command(flatten)]
     pub audio: AudioArgs,
+    #[command(flatten)]
+    pub presets: PresetArgs,
 }
 
 /// Args for `audiohax analyze`.

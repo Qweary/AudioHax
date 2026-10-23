@@ -6,7 +6,7 @@
 //! is not, shows the returned reason on hover (disabled controls stay visible, so the layout never
 //! jumps).
 
-use crate::cli::{PipelineArgs, Toggle};
+use crate::cli::{PipelineArgs, Toggle, V2Spec};
 use crate::options_schema::{render_options_schema, OptionSpec, SchemaError, Tier};
 use crate::render::RenderRequest;
 
@@ -254,6 +254,276 @@ impl Controls {
     }
 }
 
+impl Controls {
+    /// S124: the four Everyday values a request carries (a preset's baseline, `s124-UI` § 1.6).
+    pub fn from_request(r: &RenderRequest) -> Self {
+        Controls {
+            seed: r.seed,
+            instruments: r.pipeline.instruments,
+            reverb: r.reverb.is_on(),
+            gain: r.gain,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S124 — the Advanced disclosure ("More", `s124-UI` § 2) and the preset baseline (§ 1.6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The Advanced rows the window draws behind "More": every `Advanced` row of
+/// [`crate::options_schema::GUI_TIERS`] EXCEPT `soundfont` (lead ruling L-31: no sound-bank picker
+/// until the operator answers and the `rustysynth` odd-chunk check has run, L-13).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdvancedSpecs {
+    /// `expression` → "Expression".
+    pub expression: OptionSpec,
+    /// `v2` → "Expression detail" (requires `expression=on`).
+    pub v2: OptionSpec,
+    /// `thickness` → "Scan width".
+    pub thickness: OptionSpec,
+    /// `steps` → "Scan detail".
+    pub steps: OptionSpec,
+    /// `loop` → "Seamless loop" (requires `gain=1`).
+    pub loop_cue: OptionSpec,
+}
+
+/// The ids of the schema's Advanced tier this window knows: the five it draws plus `soundfont`,
+/// which it deliberately does not draw (L-31).
+pub const ADVANCED_IDS: &[&str] = &[
+    "expression",
+    "v2",
+    "thickness",
+    "steps",
+    "loop",
+    "soundfont",
+];
+
+impl AdvancedSpecs {
+    /// Read the Advanced rows from the schema. Fails if the Advanced tier is not exactly
+    /// [`ADVANCED_IDS`] (a retiering must be reflected in this window, as for the Everyday four).
+    pub fn from_schema() -> Result<Self, EverydayError> {
+        let schema = render_options_schema()?;
+        let advanced: Vec<OptionSpec> = schema
+            .into_iter()
+            .filter(|o| o.tier == Tier::Advanced)
+            .collect();
+        let mut ids: Vec<String> = advanced.iter().map(|o| o.id.clone()).collect();
+        let take = |id: &str| advanced.iter().find(|o| o.id == id).cloned();
+        let mut want: Vec<String> = ADVANCED_IDS.iter().map(|s| s.to_string()).collect();
+        ids.sort();
+        want.sort();
+        match (
+            ids == want,
+            take("expression"),
+            take("v2"),
+            take("thickness"),
+            take("steps"),
+            take("loop"),
+        ) {
+            (true, Some(expression), Some(v2), Some(thickness), Some(steps), Some(loop_cue)) => {
+                Ok(AdvancedSpecs {
+                    expression,
+                    v2,
+                    thickness,
+                    steps,
+                    loop_cue,
+                })
+            }
+            _ => Err(EverydayError::Mismatch(ids)),
+        }
+    }
+
+    /// A row's `(min, max, step)` GUI bounds, or the fallback.
+    pub fn range(spec: &OptionSpec, fallback: (f64, f64, f64)) -> (f64, f64, f64) {
+        spec.bounds
+            .map(|b| (b.min, b.max, b.step))
+            .unwrap_or(fallback)
+    }
+}
+
+/// The values of the Advanced controls. Defaults are the CLI's, so an untouched "More" changes
+/// nothing about the request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdvancedControls {
+    /// Expression (`--expression on|off`).
+    pub expression: bool,
+    /// Expression detail (`--v2`); `None` = no term.
+    pub v2: Option<V2Spec>,
+    /// Scan width (`--thickness`).
+    pub thickness: f32,
+    /// Scan detail (`--steps`).
+    pub steps: usize,
+    /// Seamless loop (`--loop`).
+    pub loop_cue: bool,
+}
+
+impl Default for AdvancedControls {
+    fn default() -> Self {
+        let p = PipelineArgs::default();
+        AdvancedControls {
+            expression: false,
+            v2: None,
+            thickness: p.thickness,
+            steps: p.steps,
+            loop_cue: false,
+        }
+    }
+}
+
+impl AdvancedControls {
+    /// The Advanced values a request carries (a preset's baseline).
+    pub fn from_request(r: &RenderRequest) -> Self {
+        AdvancedControls {
+            expression: r.expression.is_on(),
+            v2: r.v2,
+            thickness: r.pipeline.thickness,
+            steps: r.pipeline.steps,
+            loop_cue: r.loop_cue,
+        }
+    }
+}
+
+/// The request the window renders and plays: the Everyday four ([`Controls::request`]) plus the
+/// Advanced values. A dependent control that is DISABLED does not reach the request (UI `s122-UI`
+/// § 4, `s124-UI` § 2.2: a dependency is shown as disabled-with-reason, never as a refusal after
+/// the press): Expression detail only with Expression on, Seamless loop only at Level 1.0 — the
+/// same two conditions [`crate::render::RenderRequest::validate`] / `compose` refuse on.
+pub fn request_with(controls: &Controls, adv: &AdvancedControls) -> RenderRequest {
+    let mut r = controls.request();
+    r.expression = if adv.expression {
+        Toggle::On
+    } else {
+        Toggle::Off
+    };
+    r.v2 = if adv.expression { adv.v2 } else { None };
+    r.pipeline.thickness = adv.thickness;
+    r.pipeline.steps = adv.steps;
+    r.loop_cue = adv.loop_cue && controls.gain == 1.0;
+    r
+}
+
+/// Is "Expression detail" live? `Err` carries the designer's inline reason (`s124-UI` § 2.2).
+pub fn v2_enablement(adv: &AdvancedControls) -> Result<(), &'static str> {
+    if adv.expression {
+        Ok(())
+    } else {
+        Err("Turn Expression on first — Expression detail builds on it.")
+    }
+}
+
+/// Is "Seamless loop" live? Numeric compare against unity (`gain=1` ≡ `1.0`).
+pub fn loop_enablement(controls: &Controls) -> Result<(), &'static str> {
+    if controls.gain == 1.0 {
+        Ok(())
+    } else {
+        Err("Seamless loop needs Level at 1.0.")
+    }
+}
+
+/// The values a preset defines for every control (`s124-UI` § 1.6, A6): what "modified" is
+/// measured against and what "Reset to preset" restores.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Baseline {
+    /// The Everyday four.
+    pub controls: Controls,
+    /// The Advanced values.
+    pub advanced: AdvancedControls,
+}
+
+impl Baseline {
+    /// A preset's baseline from its resolved request (the preset's settings over clap's
+    /// defaults). The seed baseline is always `None` (a preset never pins a seed).
+    pub fn from_request(r: &RenderRequest) -> Self {
+        Baseline {
+            controls: Controls {
+                seed: None,
+                ..Controls::from_request(r)
+            },
+            advanced: AdvancedControls::from_request(r),
+        }
+    }
+}
+
+/// One control the window marks as changed from the preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Knob {
+    /// Variation.
+    Seed,
+    /// Voices.
+    Instruments,
+    /// Room.
+    Reverb,
+    /// Level.
+    Gain,
+    /// Expression.
+    Expression,
+    /// Expression detail.
+    V2,
+    /// Scan width.
+    Thickness,
+    /// Scan detail.
+    Steps,
+    /// Seamless loop.
+    Loop,
+}
+
+/// Every knob, in the panel's order.
+pub const KNOBS: &[Knob] = &[
+    Knob::Seed,
+    Knob::Instruments,
+    Knob::Reverb,
+    Knob::Gain,
+    Knob::Expression,
+    Knob::V2,
+    Knob::Thickness,
+    Knob::Steps,
+    Knob::Loop,
+];
+
+/// Two GUI floats are "the same value" when they differ by less than half the finest slider step
+/// in the schema (0.01). NUMERIC, never string: a preset's `1.0` and a slider's `1` are equal
+/// (`s124-UI` § 1.6).
+fn same_f32(a: f32, b: f32) -> bool {
+    (a - b).abs() < 0.005
+}
+
+/// Does `knob` differ from the baseline?
+pub fn is_modified(knob: Knob, c: &Controls, a: &AdvancedControls, base: &Baseline) -> bool {
+    let (bc, ba) = (&base.controls, &base.advanced);
+    match knob {
+        Knob::Seed => c.seed != bc.seed,
+        Knob::Instruments => c.instruments != bc.instruments,
+        Knob::Reverb => c.reverb != bc.reverb,
+        Knob::Gain => !same_f32(c.gain, bc.gain),
+        Knob::Expression => a.expression != ba.expression,
+        Knob::V2 => a.v2 != ba.v2,
+        Knob::Thickness => !same_f32(a.thickness, ba.thickness),
+        Knob::Steps => a.steps != ba.steps,
+        Knob::Loop => a.loop_cue != ba.loop_cue,
+    }
+}
+
+/// Is any knob off the baseline?
+pub fn any_modified(c: &Controls, a: &AdvancedControls, base: &Baseline) -> bool {
+    KNOBS.iter().any(|k| is_modified(*k, c, a, base))
+}
+
+/// Put one knob back to the baseline.
+pub fn reset_knob(knob: Knob, c: &mut Controls, a: &mut AdvancedControls, base: &Baseline) {
+    let (bc, ba) = (&base.controls, &base.advanced);
+    match knob {
+        Knob::Seed => c.seed = bc.seed,
+        Knob::Instruments => c.instruments = bc.instruments,
+        Knob::Reverb => c.reverb = bc.reverb,
+        Knob::Gain => c.gain = bc.gain,
+        Knob::Expression => a.expression = ba.expression,
+        Knob::V2 => a.v2 = ba.v2,
+        Knob::Thickness => a.thickness = ba.thickness,
+        Knob::Steps => a.steps = ba.steps,
+        Knob::Loop => a.loop_cue = ba.loop_cue,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,5 +675,104 @@ mod tests {
         let mut cli_req = RenderRequest::from(&args);
         cli_req.event_dump = None;
         assert_eq!(Controls::default().request(), cli_req);
+    }
+
+    // ── S124 ─────────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn advanced_rows_are_the_five_drawn_plus_the_sound_bank_left_out() {
+        let a = AdvancedSpecs::from_schema().expect("schema Advanced tier is the known six");
+        assert_eq!(a.expression.label, "Expression");
+        assert_eq!(a.v2.label, "Expression detail");
+        assert_eq!(a.thickness.label, "Scan width");
+        assert_eq!(a.steps.label, "Scan detail");
+        assert_eq!(a.loop_cue.label, "Seamless loop");
+        // L-31: the window has no field for the sound bank at all.
+        assert!(ADVANCED_IDS.contains(&"soundfont"));
+    }
+
+    #[test]
+    fn untouched_more_and_default_preset_build_the_cli_default_request() {
+        use clap::Parser;
+        let cli =
+            crate::cli::Cli::try_parse_from(["audiohax", "render", "x.png", "--wav", "o.wav"])
+                .expect("parse");
+        let crate::cli::Command::Render(args) = cli.command else {
+            panic!("render subcommand");
+        };
+        let mut cli_req = RenderRequest::from(&args);
+        cli_req.event_dump = None;
+        assert_eq!(
+            request_with(&Controls::default(), &AdvancedControls::default()),
+            cli_req
+        );
+        // The default preset's baseline IS the untouched window (P2).
+        let d = crate::presets::default_preset().expect("default preset");
+        let preq = RenderRequest::from(&crate::presets::preset_render_args(d).expect("args"));
+        let base = Baseline::from_request(&preq);
+        assert_eq!(base.controls, Controls::default());
+        assert_eq!(base.advanced, AdvancedControls::default());
+        assert!(!any_modified(
+            &Controls::default(),
+            &AdvancedControls::default(),
+            &base
+        ));
+    }
+
+    #[test]
+    fn disabled_dependents_never_reach_the_request() {
+        let c = Controls::default();
+        let a = AdvancedControls {
+            expression: false,
+            v2: Some("all".parse().expect("v2")),
+            loop_cue: true,
+            ..AdvancedControls::default()
+        };
+        assert!(v2_enablement(&a).is_err());
+        let r = request_with(&c, &a);
+        assert_eq!(
+            r.v2, None,
+            "Expression detail is off while Expression is off"
+        );
+        assert!(r.loop_cue, "loop at unity Level");
+        r.validate().expect("never a refusal");
+        let louder = Controls { gain: 1.5, ..c };
+        assert!(loop_enablement(&louder).is_err());
+        let r = request_with(&louder, &a);
+        assert!(!r.loop_cue, "Seamless loop is off while Level is not 1.0");
+        r.validate().expect("never a refusal");
+        let on = AdvancedControls {
+            expression: true,
+            ..a
+        };
+        assert_eq!(request_with(&c, &on).v2, on.v2);
+        assert_eq!(request_with(&c, &on).expression, Toggle::On);
+    }
+
+    #[test]
+    fn a6_modified_is_numeric_and_reset_restores_the_preset_value() {
+        let base = Baseline {
+            controls: Controls::default(),
+            advanced: AdvancedControls::default(),
+        };
+        let mut c = Controls::default();
+        let mut a = AdvancedControls::default();
+        // A preset's 1.0 against a slider's 1 (and float noise below the finest step): not modified.
+        c.gain = 1.0000001;
+        a.thickness = 0.1000001;
+        assert!(!any_modified(&c, &a, &base));
+        c.gain = 1.05;
+        a.steps = 12;
+        assert!(is_modified(Knob::Gain, &c, &a, &base));
+        assert!(is_modified(Knob::Steps, &c, &a, &base));
+        assert!(!is_modified(Knob::Reverb, &c, &a, &base));
+        reset_knob(Knob::Gain, &mut c, &mut a, &base);
+        assert!(!is_modified(Knob::Gain, &c, &a, &base));
+        assert!(any_modified(&c, &a, &base), "steps still changed");
+        for k in KNOBS {
+            reset_knob(*k, &mut c, &mut a, &base);
+        }
+        assert!(!any_modified(&c, &a, &base));
+        assert_eq!(KNOBS.len(), 9, "four Everyday + five Advanced");
     }
 }

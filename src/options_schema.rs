@@ -28,12 +28,17 @@
 //! are therefore the GUI's slider range only; the CLI keeps accepting what it accepts. See
 //! `Swaram/expression-s113/s122-02P1-options-schema-report.md` § 5 for the evidence.
 //!
-//! **Presets (S123) attach ABOVE this table, not inside it.** A preset is a named map from option
-//! `id` (the clap long name, the one identifier across CLI, schema and GUI) to a clap value string.
-//! It is applied by turning each pair back into CLI tokens and parsing them with clap, so a preset
-//! can only ever name values the CLI would accept, and validated against [`render_options_schema`]
-//! (an id with no `OptionSpec` is a stale preset). Nothing here needs to change for that layer to
-//! exist; `Tier` deliberately has no `Preset` variant.
+//! **Presets (S124, `src/presets.rs`) attach ABOVE this table, not inside it.** A preset's
+//! `settings` map option `id`s (the clap long name, the one identifier across CLI, schema and GUI)
+//! to clap value strings. They are parsed by clap as a `render` invocation of their own, checked
+//! against [`render_options_schema`] (only `Everyday`/`Advanced` ids; numeric values inside the
+//! row's [`Bounds`]), and applied by `RenderRequest::overlay_preset`, where an option the user typed
+//! keeps the user's value (clap's `value_source`). They are NOT spliced into the user's own tokens:
+//! clap refuses a repeated flag, so "the user's flag beats the preset's" cannot be said that way.
+//! Parsing through clap bounds a preset's option NAMES and TYPES, not its values (clap accepts NaN
+//! and negatives on five flags, above); the bounds check is what bounds the values. `Tier`
+//! deliberately has no `Preset` variant; the `preset` and `mappings` options themselves are
+//! `Hidden` rows.
 //!
 //! Pure: depends only on `clap` + `serde` (both non-optional), so this module builds and unit-tests
 //! under `cargo test --lib --no-default-features`.
@@ -185,6 +190,12 @@ const fn row(id: &'static str, tier: Tier, reason: &'static str) -> TierRow {
 
 /// THE curation table: one row per `render` argument, globals included. PROVISIONAL tiers and
 /// labels from the UI Designer (`s122-UI-schema-tiering.md`, adopted by lead ruling S122-P1 (1)).
+/// The UI Designer's `gui_help` for Scan detail (`steps`), verbatim from the S124 round-3 addendum.
+/// It claims only what held across 1..200 on both tracked pictures: the length does not change
+/// and the notes do. It names no direction for the note count, because the count rose over part
+/// of that range and fell over another.
+const STEPS_GUI_HELP: &str = "How finely the picture is read as it becomes music. Changing it changes which notes come through. It does not change how long the piece lasts; the picture's shape sets that.";
+
 /// Labels, groups and `gui_help` are the designer's strings; tiers are the designer's except where a
 /// measurement overrides (none did). To retier, edit the row here and nothing else.
 pub const GUI_TIERS: &[TierRow] = &[
@@ -263,14 +274,17 @@ pub const GUI_TIERS: &[TierRow] = &[
         group: Some("Music"),
         label: Some("Scan detail"),
         bounds: Some(Bounds { min: 1.0, max: 200.0, step: 1.0 }),
+        gui_help: Some(STEPS_GUI_HELP),
         ..row(
             "steps",
             Tier::Advanced,
             "RELABELLED per s121-01 §3.5: it sets feature-extraction sampling, NOT the piece's step \
              count (re-measured S122-P1: steps 1..200 change the bytes while the piece stays 36 / 42 \
              / 48 steps on three images). Live, so not Hidden. The designer marked the clap help \
-             misleading; no replacement string was supplied, so gui_help is None (OWED). GUI bound \
-             1..=200 is GUI-ONLY and provisional; the CLI renders 0..=10000 (0 == 1).",
+             misleading; gui_help is the designer's S124 round-2 string (the earlier one said the \
+             number of notes does not change, which was measured false: 193 / 217 / 221 events at \
+             steps 8 / 40 / 64 on example.jpg, seed 7). GUI bound 1..=200 is GUI-ONLY and \
+             provisional; the CLI renders 0..=10000 (0 == 1).",
         )
     },
     TierRow {
@@ -358,6 +372,22 @@ pub const GUI_TIERS: &[TierRow] = &[
             "event-dump",
             Tier::Hidden,
             "Diagnostic; developer surface only, under Details (designer row 14).",
+        )
+    },
+    // ── Presets (S124) ───────────────────────────────────────────────────────────────────────
+    row(
+        "preset",
+        Tier::Hidden,
+        "Drawn by the window's preset panel, above the controls (UI s124-UI § 1), not as a schema \
+         control: a preset is a presentation layer over the tiers, not a tier.",
+    ),
+    TierRow {
+        accept: Some(".json"),
+        ..row(
+            "mappings",
+            Tier::Hidden,
+            "User-file ingestion, CLI only in the first release (lead ruling L-33: no 'load your \
+             own mappings' in the window).",
         )
     },
     // ── Globals (reach `render` via `global = true`) ─────────────────────────────────────────
@@ -599,13 +629,14 @@ mod tests {
         }
     }
 
-    /// The enumeration the UI Designer counted independently (15 render args + 2 globals). If this
-    /// changes, forcing test 1 already told you which row to add; update this count with it.
+    /// The enumeration the UI Designer counted independently (15 render args + 2 globals), plus
+    /// S124's `preset` and `mappings` (17). If this changes, forcing test 1 already told you which
+    /// row to add; update this count with it.
     #[test]
     fn render_arg_count_matches_designer_enumeration() {
         let s = render_options_schema().expect("schema builds");
         let globals = s.iter().filter(|o| o.global).count();
-        assert_eq!(s.len() - globals, 15, "render args (non-global)");
+        assert_eq!(s.len() - globals, 17, "render args (non-global)");
         assert_eq!(globals, 2, "globals reaching render");
         let mut ids: Vec<&str> = s.iter().map(|o| o.id.as_str()).collect();
         ids.sort_unstable();
@@ -621,7 +652,9 @@ mod tests {
                 "jitter-percent",
                 "json",
                 "loop",
+                "mappings",
                 "ms-per-step",
+                "preset",
                 "reverb",
                 "seed",
                 "soundfont",
@@ -665,10 +698,11 @@ mod tests {
         }
     }
 
-    /// I/O args stay Hidden (s121-01 §5.3).
+    /// I/O args stay Hidden (s121-01 §5.3); so do S124's `preset` (drawn by the preset panel) and
+    /// `mappings` (CLI-only user file, L-33).
     #[test]
     fn io_args_stay_hidden() {
-        for id in ["wav", "event-dump", "config", "json"] {
+        for id in ["wav", "event-dump", "config", "json", "preset", "mappings"] {
             let r = GUI_TIERS.iter().find(|r| r.id == id).expect("row exists");
             assert_eq!(r.tier, Tier::Hidden, "{id} is I/O, not a setting");
         }
@@ -736,6 +770,16 @@ mod tests {
                 save: false
             }
         );
+        // S124: `--preset` carries clap possible values (the manifest's ids), so it is an Enum;
+        // `--mappings` is an open-file pick of a `.json`.
+        assert_eq!(get("preset").kind, OptionKind::Enum(vec!["default".into()]));
+        assert_eq!(
+            get("mappings").kind,
+            OptionKind::FilePick {
+                accept: ".json".into(),
+                save: false
+            }
+        );
         assert_eq!(get("instruments").default.as_deref(), Some("4"));
         assert_eq!(get("ms-per-step").default.as_deref(), Some("250"));
         assert_eq!(get("seed").default, None);
@@ -752,6 +796,16 @@ mod tests {
         let seed = get("seed");
         assert!(seed.help.starts_with("S41: deterministic composition seed"));
         assert!(seed.gui_help.is_some());
+        // Scan detail's designer help (S124 round 3) is landed; the clauses measured false
+        // ("or how many notes play", round 1; "and more of them", round 2) are gone; clap's own
+        // help is unchanged beside it.
+        let steps = get("steps");
+        assert_eq!(steps.gui_help.as_deref(), Some(STEPS_GUI_HELP));
+        assert!(STEPS_GUI_HELP.contains("Changing it changes which notes come through."));
+        assert!(STEPS_GUI_HELP.contains("It does not change how long the piece lasts"));
+        assert!(!STEPS_GUI_HELP.contains("how many notes play"));
+        assert!(!STEPS_GUI_HELP.contains("more of them"));
+        assert_ne!(steps.help, STEPS_GUI_HELP);
     }
 
     /// Every `requires` entry names a live option and a value clap would accept for it.

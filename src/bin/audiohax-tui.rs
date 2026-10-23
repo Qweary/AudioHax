@@ -40,11 +40,16 @@ fn main() -> Result<()> {
     use clap::Parser;
     let cli = Cli::parse();
 
-    // ── Build the engine + synthetic source (all logic lives in the lib) ──
+    // ── Build the engine + synthetic source ──
+    // S124 (lead rulings L-29, L-32): the mappings come through the library's bounded, validated
+    // loader — `./assets/mappings.json` if it exists (as before), else the built-in copy. The
+    // engine is then built by the library's `tui::build_engine_with` (the same wiring
+    // `tui::build_engine` uses for a path).
+    let mappings = audiohax::mapping_loader::resolve_cli_mappings(None)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+        .context("building the TUI engine")?;
     let (mut engine, source) =
-        tui::build_engine("assets/mappings.json", cli.args.steps, cli.args.instruments)
-            .map_err(|e| anyhow::anyhow!(e))
-            .context("building the TUI engine")?;
+        tui::build_engine_with(mappings, cli.args.steps, cli.args.instruments);
     let ms_per_step = engine.config().ms_per_step;
     let total_steps = source_step_count(&source);
 

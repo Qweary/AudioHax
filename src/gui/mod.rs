@@ -39,13 +39,16 @@ pub mod state;
 pub mod text;
 pub mod theme;
 
-use crate::mapping_loader::{parse_mappings, MappingTable};
+use crate::mapping_loader::{MappingTable, MappingsError};
 use crate::synth_sink::SoundFontSource;
 
 /// `assets/mappings.json`, compiled in (lead ruling L-8). The GUI performs NO working-directory
 /// read of the mappings (SH M-1); the file in the repository stays the single source of truth, so
 /// a GUI render equals a CLI render of the same inputs.
-pub const EMBEDDED_MAPPINGS_JSON: &str = include_str!("../../assets/mappings.json");
+///
+/// S124 (L-28): the embedded copy moved to the LIBRARY ([`crate::mapping_loader::DEFAULT_MAPPINGS_JSON`])
+/// so the CLI, the TUI and the `default` preset share it; this name is kept as a re-export.
+pub use crate::mapping_loader::DEFAULT_MAPPINGS_JSON as EMBEDDED_MAPPINGS_JSON;
 
 /// The "Try a sample" picture: `assets/images/example.jpg` (the CLI's own default image),
 /// compiled in so it works from any directory.
@@ -54,10 +57,11 @@ pub const SAMPLE_IMAGE: &[u8] = include_bytes!("../../assets/images/example.jpg"
 /// The display name used for the sample picture.
 pub const SAMPLE_NAME: &str = "example.jpg (sample)";
 
-/// Parse the compiled-in mappings with the library's own parser. A failure here is a build
-/// defect (the shipped file does not parse), caught by a unit test.
-pub fn embedded_mappings() -> Result<MappingTable, serde_json::Error> {
-    parse_mappings(EMBEDDED_MAPPINGS_JSON)
+/// Parse the compiled-in mappings with the library's own parser, through the library's one
+/// validation chokepoint (S124, L-32). A failure here is a build defect (the shipped file does not
+/// parse or validate), caught by a unit test.
+pub fn embedded_mappings() -> Result<MappingTable, MappingsError> {
+    crate::mapping_loader::default_mappings()
 }
 
 /// The SoundFont every GUI render and every GUI live-synth play uses: the bundled one, and only
