@@ -57,6 +57,30 @@ cargo run --release -- render assets/images/example.jpg --wav out.wav --seed 42
 ./play assets/images/example.jpg --seed 42          # ...and the same seed when playing live
 ```
 
+### Run the desktop app
+
+AudioHax also has a desktop window — open a picture, press Play, and hear it, with a few simple controls. The window is behind the optional `gui` feature, so you ask for it explicitly.
+
+**One-time setup** is the same as the Quick Start above: clone the repo and fetch the SoundFont (it is built into the binary and is not stored in git).
+
+On **Linux**, install the one audio build dependency first:
+
+```sh
+sudo apt-get install -y libasound2-dev     # Debian/Ubuntu; ALSA audio
+```
+
+(Windows and macOS need nothing extra.)
+
+Then launch the window:
+
+```sh
+cargo run --release --features gui --bin audiohax-gui
+```
+
+The first build takes a few minutes; after that it opens straight away. Drop a picture onto the window (or use **File ▸ Open**), press **Play**, and **Save WAV** keeps your piece.
+
+> **Note (Linux):** the Open and Save file windows use your desktop's file portal. On a minimal setup without one, drag a picture onto the window instead of using Open, and type a path when Save asks for one.
+
 ---
 
 ## Prerequisites
@@ -93,6 +117,8 @@ sound. (Those are only relevant to the optional routes below.)
   cargo run --release --bin modem_encode -- out.wav secret.txt --compress
   cargo run --release --bin modem_decode -- out.wav recovered
   ```
+  `audiohax modem …` appears in `--help` but is not wired yet: it prints a pointer and exits
+  without writing anything. Use the `modem_encode` / `modem_decode` bins above.
 
 ### Optional: route into an external synth/DAW for studio-grade effects
 
@@ -110,6 +136,13 @@ The image→music mapping lives in [`assets/mappings.json`](assets/mappings.json
 plain JSON you can edit: hue → musical mode (Phrygian/Lydian/Ionian/…), saturation →
 harmonic complexity, brightness → tempo, and more. Change a value, re-run `./play`, and
 the same image speaks differently.
+
+Where the mappings come from: `--mappings <file>` if you give it; otherwise
+`./assets/mappings.json` in the directory you run from, if it exists; otherwise a copy built
+into the binary. If something is at that path but cannot be read (a broken link, a folder),
+you get an error rather than the built-in copy. `--preset default` always uses the built-in
+copy. Every mappings file is checked before anything is composed (size, tempo range, section
+count, MIDI program numbers), and a file that fails says which value is wrong.
 
 ---
 
