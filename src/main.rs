@@ -639,7 +639,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Completed scanning image (pure-Rust). Steps: {}", steps)
             }
             RenderNote::GlobalFeatures(g) => println!("Global features: {:?}", g),
-            RenderNote::EngineMode(mode) => println!("Engine mode: {}", mode),
+            // A mode name is free text from the mappings file (`global.hue_to_mode`), so it is
+            // shown escaped: a file cannot put terminal control sequences on the console (the
+            // security review's SH3-1). An ordinary mode name prints exactly as before.
+            RenderNote::EngineMode(mode) => println!(
+                "Engine mode: {}",
+                audiohax::mapping_loader::escape_controls(mode)
+            ),
             // Render-only notes, and the expression read-back (CLI `play` never arms it).
             RenderNote::Planned { .. }
             | RenderNote::EventDumpArming

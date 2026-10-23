@@ -163,8 +163,11 @@ fn render_music_state(frame: &mut Frame, area: Rect, snapshot: &EngineSnapshot) 
     let lines = vec![
         Line::from(vec![
             Span::styled("mode: ", Style::default().fg(Color::Gray)),
+            // The mode name is free text from the mappings file, and ratatui draws a span's
+            // control characters into the frame as they are, so it is shown escaped (the
+            // security review's SH3-1). An ordinary mode name is drawn exactly as before.
             Span::styled(
-                snapshot.mode.clone(),
+                crate::mapping_loader::escape_controls(&snapshot.mode),
                 Style::default().fg(Color::LightGreen),
             ),
             Span::raw("    "),

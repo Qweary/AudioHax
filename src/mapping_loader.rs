@@ -346,20 +346,39 @@ pub enum MappingsError {
     },
 }
 
-/// MB-8: `text` with every control character (C0, DEL, C1 — so ESC, BEL and the 8-bit CSI)
-/// written as its Rust escape (`\u{1b}`, `\u{7}`, `\u{9b}`, `\n`). Everything else, quotes,
-/// backslashes and non-ASCII letters included, is kept exactly as written, so an ordinary message
-/// reads unchanged. Used on text a mappings file can put into an error message.
-fn escape_controls(text: &str) -> String {
+/// MB-8: `text` with every character that can drive or reorder a terminal written as its Rust
+/// escape: control characters (C0, DEL, C1 — so ESC, BEL and the 8-bit CSI: `\u{1b}`, `\u{7}`,
+/// `\u{9b}`, `\n`) and the bidi and format characters (overrides and isolates U+202A–202E and
+/// U+2066–2069, zero-width and direction marks, U+061C, U+FEFF, U+2028/2029: `\u{202e}` …).
+/// The set is the one `str::escape_debug` escapes (as the file-name and field escaping here
+/// do, the security review's SH3-2), less two things: quotes and backslashes are kept as
+/// written, and so is a combining mark (`char::escape_debug` would escape the accent in a
+/// decomposed `é` or the virama inside a Hindi word). An ordinary message reads unchanged.
+/// Used on text a mappings file can put on a terminal: serde's error message, and a mode name
+/// a front end prints (`play`'s "Engine mode" line, the TUI's mode).
+pub fn escape_controls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if c.is_control() {
+        if c.is_control() || !kept_as_written(c) {
             out.extend(c.escape_debug());
         } else {
             out.push(c);
         }
     }
     out
+}
+
+/// Whether [`escape_controls`] keeps `c` as written: a quote or backslash, or a character that
+/// `str::escape_debug` leaves alone when it is not the first in its string (`str::escape_debug`
+/// escapes a combining mark only at the start; it is probed second so it never is).
+fn kept_as_written(c: char) -> bool {
+    if matches!(c, '"' | '\'' | '\\') {
+        return true;
+    }
+    let mut probe = String::with_capacity(5);
+    probe.push(' ');
+    probe.push(c);
+    probe.escape_debug().eq([' ', c])
 }
 
 impl std::fmt::Debug for MappingsError {
@@ -1094,12 +1113,36 @@ mod tests {
     /// SH2-1 / MB-8: `escape_controls` escapes ESC, BEL, the 8-bit CSI, DEL and a newline, and
     /// keeps quotes, backslashes, backticks and non-ASCII letters exactly as written.
     #[test]
-    fn escape_controls_escapes_only_control_characters() {
+    fn escape_controls_escapes_control_characters_and_keeps_plain_text() {
         assert_eq!(
             escape_controls("a\u{1b}[2Jb\u{7}c\u{9b}d\u{7f}e\nf"),
             "a\\u{1b}[2Jb\\u{7}c\\u{9b}d\\u{7f}e\\nf"
         );
         let plain = "unknown variant `q\"u\\o'te é`, expected `x`";
+        assert_eq!(escape_controls(plain), plain);
+    }
+
+    /// SH3-2 / MB-8: the bidi and format characters `str::escape_debug` escapes are escaped too
+    /// (overrides and isolates, zero-width and direction marks, the Arabic letter mark, the BOM,
+    /// line and paragraph separators), so a file cannot reorder or hide text in a message.
+    /// Ordinary text stays as written: non-ASCII letters, a combining accent, a Devanagari virama,
+    /// an emoji with its presentation selector, quotes, backslashes and backticks.
+    #[test]
+    fn escape_controls_escapes_bidi_and_format_characters() {
+        for c in [
+            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}', '\u{200b}', '\u{200e}', '\u{200f}', '\u{61c}', '\u{feff}',
+            '\u{2028}', '\u{2029}',
+        ] {
+            let shown = escape_controls(&format!("a{c}b"));
+            assert_eq!(
+                shown,
+                format!("a\\u{{{:x}}}b", c as u32),
+                "U+{:04X} must be escaped",
+                c as u32
+            );
+        }
+        let plain = "Dorian é e\u{301} हिन्दी ✔\u{fe0f} \"q\" 'q' a\\b `k` Ünïcödé";
         assert_eq!(escape_controls(plain), plain);
     }
 

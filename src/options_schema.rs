@@ -190,11 +190,14 @@ const fn row(id: &'static str, tier: Tier, reason: &'static str) -> TierRow {
 
 /// THE curation table: one row per `render` argument, globals included. PROVISIONAL tiers and
 /// labels from the UI Designer (`s122-UI-schema-tiering.md`, adopted by lead ruling S122-P1 (1)).
-/// The UI Designer's `gui_help` for Scan detail (`steps`), verbatim from the S124 round-3 addendum.
-/// It claims only what held across 1..200 on both tracked pictures: the length does not change
-/// and the notes do. It names no direction for the note count, because the count rose over part
-/// of that range and fell over another.
-const STEPS_GUI_HELP: &str = "How finely the picture is read as it becomes music. Changing it changes which notes come through. It does not change how long the piece lasts; the picture's shape sets that.";
+/// The `gui_help` for Scan detail (`steps`): the UI Designer's S124 round-3 string with the
+/// operator's own edit to sentence 2 ("can change", S124 round 4). Measured over every value
+/// 1..200 with seed 7 on both tracked pictures (`s124-06C-round3-delta-seal.md` § 5): the plan
+/// length never changed. The notes changed on some single steps and not on others: 159 of the
+/// 199 on example.jpg, 65 of the 199 on AudioHaxImg1.jpg, where every value from 177 to 200
+/// gave the same WAV, byte for byte. Hence "can change". It names no direction for the note
+/// count, because the count rose over part of that range and fell over another.
+const STEPS_GUI_HELP: &str = "How finely the picture is read as it becomes music. Changing it can change which notes come through. It does not change how long the piece lasts; the picture's shape sets that.";
 
 /// Labels, groups and `gui_help` are the designer's strings; tiers are the designer's except where a
 /// measurement overrides (none did). To retier, edit the row here and nothing else.
@@ -279,9 +282,11 @@ pub const GUI_TIERS: &[TierRow] = &[
             "steps",
             Tier::Advanced,
             "RELABELLED per s121-01 §3.5: it sets feature-extraction sampling, NOT the piece's step \
-             count (re-measured S122-P1: steps 1..200 change the bytes while the piece stays 36 / 42 \
-             / 48 steps on three images). Live, so not Hidden. The designer marked the clap help \
-             misleading; gui_help is the designer's S124 round-2 string (the earlier one said the \
+             count (re-measured S122-P1: the piece stays 36 / 42 / 48 steps on three images; S124 \
+             key C: over 1..200 some steps change the bytes and some do not; 177..200 give the same \
+             WAV on AudioHaxImg1.jpg). Live, so not Hidden. The designer marked the clap help \
+             misleading; gui_help is the designer's S124 round-3 string with the operator's \
+             \"can change\" (round 4; the round-1 string said the \
              number of notes does not change, which was measured false: 193 / 217 / 221 events at \
              steps 8 / 40 / 64 on example.jpg, seed 7). GUI bound 1..=200 is GUI-ONLY and \
              provisional; the CLI renders 0..=10000 (0 == 1).",
@@ -796,12 +801,19 @@ mod tests {
         let seed = get("seed");
         assert!(seed.help.starts_with("S41: deterministic composition seed"));
         assert!(seed.gui_help.is_some());
-        // Scan detail's designer help (S124 round 3) is landed; the clauses measured false
-        // ("or how many notes play", round 1; "and more of them", round 2) are gone; clap's own
-        // help is unchanged beside it.
+        // Scan detail's help (S124 round 4): the clauses measured false ("or how many notes
+        // play", round 1; "and more of them", round 2; "changes which notes", round 3) are gone,
+        // sentences 1 and 3 are the designer's round-3 text, and clap's own help is unchanged
+        // beside it.
         let steps = get("steps");
         assert_eq!(steps.gui_help.as_deref(), Some(STEPS_GUI_HELP));
-        assert!(STEPS_GUI_HELP.contains("Changing it changes which notes come through."));
+        assert_eq!(
+            STEPS_GUI_HELP,
+            "How finely the picture is read as it becomes music. Changing it can change which \
+             notes come through. It does not change how long the piece lasts; the picture's \
+             shape sets that."
+        );
+        assert!(!STEPS_GUI_HELP.contains("Changing it changes"));
         assert!(STEPS_GUI_HELP.contains("It does not change how long the piece lasts"));
         assert!(!STEPS_GUI_HELP.contains("how many notes play"));
         assert!(!STEPS_GUI_HELP.contains("more of them"));

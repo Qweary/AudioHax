@@ -6,12 +6,18 @@
 //!    and `audiohax-tui` (a cwd-planted `./assets/mappings.json` needs no flag at all).
 //! 2. The 10-minute piece refusal prints as a plain sentence (`Error: This piece would last …`),
 //!    not as a quoted Debug string, so a file name is escaped once, not twice.
+//! 3. Text from a file the loader ACCEPTS is escaped too where a front end prints it: a mode name
+//!    in `global.hue_to_mode` is free text, and `play` prints it and the TUI draws it (the
+//!    security review's SH3-1). Bidi and format characters are escaped as well as controls (SH3-2).
 //!
 //! Every binary run happens in its own private directory under `CARGO_TARGET_TMPDIR`.
 
 use audiohax::mapping_loader::{
     load_checked, load_mappings_file, MappingsOrigin, DEFAULT_MAPPINGS_JSON,
 };
+use audiohax::tui::{self, NullSink};
+use ratatui::backend::TestBackend;
+use ratatui::Terminal;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -27,6 +33,14 @@ const IMG: &str = concat!(
 /// ESC `[2J` (clear screen), ESC `[31m` (red), BEL, and the 8-bit CSI (U+009B) — the three
 /// terminal-control characters the review named.
 const HOSTILE: &str = "x\u{1b}[2J\u{1b}[31mred\u{7}bell\u{9b}31mcsi";
+
+/// A mode name the loader accepts (mode names are free text) carrying an OSC window-title set,
+/// BEL, a colour change, the 8-bit CSI and a right-to-left override: the review's SH3-1 file
+/// (M1) with SH3-2's RLO added.
+const HOSTILE_MODE: &str = "Dorian\u{1b}]0;TITLE\u{7}\u{1b}[31m\u{9b}31m\u{202e}RLO";
+
+/// The same mode name as the front ends must show it.
+const HOSTILE_MODE_SHOWN: &str = "Dorian\\u{1b}]0;TITLE\\u{7}\\u{1b}[31m\\u{9b}31m\\u{202e}RLO";
 
 fn scratch(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -69,6 +83,23 @@ fn all_tempi(bpm: f64) -> String {
     serde_json::to_string(&v).expect("ser")
 }
 
+/// The shipped table with every `global.hue_to_mode` value set to `mode` and the valence
+/// projection (`composition.affect.mode_valence_cuts`) removed, so the hue's mode is the one used.
+fn with_every_mode(mode: &str) -> String {
+    let mut v = shipped();
+    for (_, m) in v["global"]["hue_to_mode"]
+        .as_object_mut()
+        .expect("hue_to_mode")
+    {
+        *m = json!(mode);
+    }
+    v["composition"]["affect"]
+        .as_object_mut()
+        .expect("affect")
+        .remove("mode_valence_cuts");
+    serde_json::to_string(&v).expect("ser")
+}
+
 fn plant(cwd: &Path, body: &str) {
     std::fs::create_dir_all(cwd.join("assets")).expect("assets dir");
     std::fs::write(cwd.join("assets/mappings.json"), body).expect("plant");
@@ -86,6 +117,23 @@ fn assert_no_raw_controls(what: &str, msg: &str) {
     );
 }
 
+/// Nothing that drives or reorders a terminal survives: no control character (a newline is
+/// allowed) and none of the bidi or format characters the review named.
+fn assert_no_raw_terminal_text(what: &str, msg: &str) {
+    assert_no_raw_controls(what, msg);
+    let raw: Vec<char> = msg
+        .chars()
+        .filter(|c| {
+            matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200b}'
+                | '\u{200e}' | '\u{200f}' | '\u{61c}' | '\u{feff}' | '\u{2028}' | '\u{2029}')
+        })
+        .collect();
+    assert!(
+        raw.is_empty(),
+        "{what}: raw bidi/format characters {raw:?} reached the text: {msg:?}"
+    );
+}
+
 /// The three hostile characters are shown, escaped.
 fn assert_shown_escaped(what: &str, msg: &str) {
     for shown in ["\\u{1b}[2J", "\\u{1b}[31m", "\\u{7}", "\\u{9b}"] {
@@ -98,6 +146,7 @@ fn assert_shown_escaped(what: &str, msg: &str) {
 
 struct Out {
     rc: Option<i32>,
+    stdout: String,
     stderr: String,
 }
 
@@ -122,6 +171,7 @@ fn run_in(exe: &str, cwd: &Path, args: &[&str], secs: u64) -> Out {
     let o = child.wait_with_output().expect("output");
     Out {
         rc: o.status.code(),
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
     }
 }
@@ -169,7 +219,10 @@ fn ordinary_text_in_the_same_message_is_not_mangled() {
     assert!(msg.contains("expected one of"), "{msg}");
 }
 
-/// A raw 0x9B byte (not valid UTF-8) is refused as "not UTF-8 text" and nothing of it is echoed.
+/// A raw 0x9B byte (not valid UTF-8) is refused as "not UTF-8 text" before serde sees it, and
+/// that refusal names only the file. This guards the UTF-8 check in `read_mappings_file`, NOT
+/// the escaping: `NotUtf8` carries no text from the file, so this test passes with the escaping
+/// removed (the security review's mutant A). The escaping's guards are the other tests here.
 #[test]
 fn a_raw_csi_byte_is_refused_as_not_utf8_and_not_echoed() {
     let d = scratch("raw9b");
@@ -269,4 +322,79 @@ fn the_ten_minute_refusal_prints_as_a_sentence_not_a_quoted_string() {
         );
     }
     assert!(!d.join("slow.wav").exists(), "no WAV");
+}
+
+/// SH3-1 on `play`: a file the loader ACCEPTS, planted in the cwd (no flag), whose every
+/// `hue_to_mode` value is [`HOSTILE_MODE`]. `play` prints the mode before it opens a sink, so a
+/// MIDI port that does not exist ends the run after the mode line, with no audio. The line shows
+/// the mode escaped, and nothing on stdout or stderr drives or reorders the terminal.
+#[test]
+fn an_accepted_mode_name_is_printed_escaped_by_play() {
+    let cwd = scratch("mode-play");
+    plant(&cwd, &with_every_mode(HOSTILE_MODE));
+    let o = run_in(
+        BIN,
+        &cwd,
+        &[
+            "play",
+            IMG,
+            "--output",
+            "midi",
+            "--midi-port",
+            "NO_SUCH_PORT_S124",
+        ],
+        240,
+    );
+    assert!(
+        o.stdout.contains("Mappings loaded."),
+        "the planted file was accepted: {:?} / {:?}",
+        o.stdout,
+        o.stderr
+    );
+    assert!(
+        o.stdout
+            .contains(&format!("Engine mode: {HOSTILE_MODE_SHOWN}\n")),
+        "the mode line shows the planted mode, escaped: {:?}",
+        o.stdout
+    );
+    assert_no_raw_terminal_text("play stdout", &o.stdout);
+    assert_no_raw_terminal_text("play stderr", &o.stderr);
+}
+
+/// SH3-1 in the TUI: the same planted file, loaded the way `audiohax-tui` loads a cwd file,
+/// driven through every step of the TUI's engine and drawn with `tui::render` (the bin's draw
+/// call) onto a test backend. The drawn screen shows the mode escaped and holds no raw control,
+/// bidi or format character in any cell.
+#[test]
+fn an_accepted_mode_name_is_drawn_escaped_by_the_tui() {
+    let cwd = scratch("mode-tui");
+    plant(&cwd, &with_every_mode(HOSTILE_MODE));
+    let mappings = load_mappings_file(&cwd.join("assets/mappings.json")).expect("accepted");
+    let (mut engine, source) = tui::build_engine_with(mappings, 40, 4);
+    let mut sink = NullSink;
+    let mut terminal = Terminal::new(TestBackend::new(160, 30)).expect("test backend");
+    let mut hostile_frames = 0;
+    for _ in 0..40 {
+        let snap = tui::drive_one_tick(&mut engine, &source, &mut sink).expect("tick");
+        terminal.draw(|f| tui::render(f, &snap)).expect("draw");
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert_no_raw_terminal_text("tui screen", &screen);
+        if snap.mode == HOSTILE_MODE {
+            hostile_frames += 1;
+            assert!(
+                screen.contains(HOSTILE_MODE_SHOWN),
+                "the mode is drawn, escaped: {screen:?}"
+            );
+        }
+    }
+    assert!(
+        hostile_frames > 0,
+        "the planted mode reached the engine (else this test proves nothing)"
+    );
 }
