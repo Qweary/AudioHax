@@ -33,6 +33,7 @@ use crate::composition::ImageUnderstanding;
 use crate::engine::{AudioSink, AudioSinkError, FeatureSource, GlobalFeatures, PipelineEngine};
 use crate::mapping_loader::{rebuild_mapping_table, MappingTable};
 use crate::pure_analysis::{AnalysisError, PureAnalysisSource};
+use crate::shrink::{Shrink, ShrinkError};
 use crate::synth_sink::{SoundFontSource, TimedMidiEvent};
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -201,7 +202,9 @@ pub enum ImageInput<'a> {
 /// file at its historical point (before synthesis) and propagate an I/O error from there.
 #[derive(Debug)]
 pub enum RenderNote<'a> {
-    /// The image decoded (pixel dimensions).
+    /// The image decoded (pixel dimensions). S125: always the DECODED picture's size; with a
+    /// shrink this is the size before the shrink, and the note comes after the shrink has been
+    /// checked against the floor and before it is applied (`crate::shrink`).
     ImageLoaded {
         /// Width in pixels.
         width: u32,
@@ -319,6 +322,9 @@ pub enum RenderError {
     /// SoundFont load, synthesis or loop fold failed.
     #[error(transparent)]
     Synth(#[from] AudioSinkError),
+    /// S125: the requested shrink cannot be applied (it would take a side under the floor).
+    #[error(transparent)]
+    Shrink(#[from] ShrinkError),
     /// An I/O error raised by a caller's note handler (e.g. writing the event dump).
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -330,6 +336,9 @@ impl std::fmt::Debug for RenderError {
             RenderError::Refused(s) | RenderError::Dump(s) => std::fmt::Debug::fmt(s, f),
             RenderError::Analysis(e) => std::fmt::Debug::fmt(e, f),
             RenderError::Synth(e) => std::fmt::Debug::fmt(e, f),
+            // S125: a shrink refusal is a plain sentence (UI4 § 3.3), so `main`'s `Error: …` line
+            // prints the sentence itself, unquoted.
+            RenderError::Shrink(e) => std::fmt::Display::fmt(e, f),
             RenderError::Io(e) => std::fmt::Debug::fmt(e, f),
         }
     }
@@ -353,8 +362,22 @@ pub fn render(
     font: SoundFontSource<'_>,
     notes: &mut NoteSink<'_>,
 ) -> Result<RenderOutput, RenderError> {
+    render_shrunk(req, Shrink::Full, image, mappings, font, notes)
+}
+
+/// S125: [`render`] from a shrunk copy of the picture ([`acquire_shrunk`]). `Shrink::Full` is
+/// [`render`] exactly (no resize call). The CLI's `render --wav --shrink` and the window's Render
+/// and Save WAV come through here.
+pub fn render_shrunk(
+    req: &RenderRequest,
+    shrink: Shrink,
+    image: ImageInput<'_>,
+    mappings: &MappingTable,
+    font: SoundFontSource<'_>,
+    notes: &mut NoteSink<'_>,
+) -> Result<RenderOutput, RenderError> {
     req.validate()?;
-    let (source, understanding) = acquire(&req.pipeline, image, notes)?;
+    let (source, understanding) = acquire_shrunk(&req.pipeline, shrink, image, notes)?;
     render_with_source(req, &source, Some(&understanding), mappings, font, notes)
 }
 
@@ -588,7 +611,19 @@ pub fn prepare_play(
     mappings: &MappingTable,
     notes: &mut NoteSink<'_>,
 ) -> Result<PlayPlan, RenderError> {
-    let (source, understanding) = acquire(&req.pipeline, image, notes)?;
+    prepare_play_shrunk(req, Shrink::Full, image, mappings, notes)
+}
+
+/// S125: [`prepare_play`] from a shrunk copy of the picture ([`acquire_shrunk`]). `Shrink::Full` is
+/// [`prepare_play`] exactly (no resize call).
+pub fn prepare_play_shrunk(
+    req: &RenderRequest,
+    shrink: Shrink,
+    image: ImageInput<'_>,
+    mappings: &MappingTable,
+    notes: &mut NoteSink<'_>,
+) -> Result<PlayPlan, RenderError> {
+    let (source, understanding) = acquire_shrunk(&req.pipeline, shrink, image, notes)?;
     prepare_play_with_source(req, &source, Some(&understanding), mappings, notes)
 }
 
@@ -762,6 +797,25 @@ pub fn acquire(
     image: ImageInput<'_>,
     notes: &mut NoteSink<'_>,
 ) -> Result<(PureAnalysisSource, ImageUnderstanding), RenderError> {
+    acquire_shrunk(pipeline, Shrink::Full, image, notes)
+}
+
+/// S125 (UI4 § 1, SH5 C-3): [`acquire`] from a shrunk copy of the picture. The ONE place a shrink is
+/// applied, for the CLI and the window alike: after the decode (the gate has already applied the
+/// ORIGINAL picture's caps, so a shrink never raises one), before both `understand_image_pure` and
+/// `PureAnalysisSource::extract`, so both analyse the same pixels.
+///
+/// The floor is checked first ([`crate::shrink::check`]): an infeasible level is refused with
+/// [`RenderError::Shrink`] before anything is reported or analysed. Then
+/// [`RenderNote::ImageLoaded`] reports the decoded size, and [`crate::shrink::apply`] makes the
+/// smaller copy and drops the full-size buffer. `Shrink::Full` makes no resize call, so the
+/// default is byte-identical to the pre-S125 `acquire`.
+pub fn acquire_shrunk(
+    pipeline: &PipelineArgs,
+    shrink: Shrink,
+    image: ImageInput<'_>,
+    notes: &mut NoteSink<'_>,
+) -> Result<(PureAnalysisSource, ImageUnderstanding), RenderError> {
     use crate::pure_analysis::{
         load_pure_image, load_pure_image_bytes, understand_image_pure, PureImageSource,
     };
@@ -774,10 +828,12 @@ pub fn acquire(
         ImageInput::Path(p) => load_pure_image(&PureImageSource::UserPath(p.to_path_buf()))?,
         ImageInput::Bytes(b) => load_pure_image_bytes(b)?,
     };
+    crate::shrink::check(img.width(), img.height(), shrink)?;
     notes(RenderNote::ImageLoaded {
         width: img.width(),
         height: img.height(),
     })?;
+    let img = crate::shrink::apply(img, shrink)?;
     // S37: the plan-first composer reads the SAME analyze_global_pure stats that
     // global_features() exposes — derive the understanding off the same `img` here so it
     // is live at the engine-build site without changing the source-extraction path.

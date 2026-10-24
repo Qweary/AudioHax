@@ -10,36 +10,48 @@
 //!    [`decode_for_display`] for the on-screen picture (D-1).
 //!
 //! All of this runs on the worker thread (see [`super::job`]); none of it runs on the UI thread.
-//! The library's own decode uses the `image` crate's default limits; that is safe only because
-//! [`probe`] has already refused anything over the pixel cap on the same bytes (SH B-2).
+//!
+//! S125 (D-45, `s125-SH5` A-P2, lead ruling L-61): the read, the format and size checks and the
+//! limited decode are no longer duplicated here. They are the library's ONE picture gate,
+//! [`crate::picture_gate`], which the CLI goes through too, under its own policy. The window passes
+//! [`WINDOW_POLICY`] (its formats and limits, unchanged since S123, plus its own 16 px floor),
+//! re-exports the gate's numbers, and maps the gate's refusals onto [`Refusal`] so the window's
+//! wording is unchanged. The library's in-memory decode, which the window uses, applies the same
+//! window limits.
 
+use crate::picture_gate::{self as gate, Admitted, PictureRefusal, Policy};
 use image::ImageFormat;
-use std::io::{Cursor, Read};
+use std::io::Read;
 use std::path::Path;
 
 /// B-1: the most bytes read from a picture file into memory (256 MiB). It bounds the read
 /// before the format is known (a video renamed `.jpg`); it is NOT the decompression-bomb
-/// defence, which is [`MAX_PIXELS`].
-pub const MAX_IMAGE_BYTES: u64 = 268_435_456;
+/// defence, which is [`MAX_PIXELS`]. B-2: the largest side admitted (stops absurd headers
+/// early; admits ordinary panoramas). B-2: the largest pixel count admitted (50 MP; about
+/// 1.25 GiB and 75 s of analysis on the measured laptop, SH § 3.2). All three are the library
+/// gate's, so the window and the CLI share one set of numbers (SH5 A-P2).
+pub use crate::picture_gate::{MAX_IMAGE_BYTES, MAX_PIXELS, MAX_SIDE};
 
 /// B-2: the smallest side admitted. Both known analyzer panic classes are at sides of 1–2 px
-/// (SH HL-1), and 16 makes every Voices value the window offers (1..=16) renderable.
+/// (SH HL-1), and 16 makes every Voices value the window offers (1..=16) renderable. This floor
+/// is the WINDOW's product bound (SH5 B-4); the library gate has none (lead ruling L-60).
 pub const MIN_SIDE: u32 = 16;
-
-/// B-2: the largest side admitted (stops absurd headers early; admits ordinary panoramas).
-pub const MAX_SIDE: u32 = 32_768;
-
-/// B-2: the largest pixel count admitted (50 MP). At about 25 B/px of analysis this caps one
-/// job at about 1.25 GiB and about 75 s on the measured laptop (SH § 3.2). It is also the time
-/// bound: the analysis cost is linear in pixels and cannot be interrupted.
-pub const MAX_PIXELS: u64 = 50_000_000;
 
 /// D-1: the long side of the ON-SCREEN copy of the picture. Display only; the engine always gets
 /// the full original bytes.
 pub const DISPLAY_MAX_SIDE: u32 = 2048;
 
-/// B-2: the allocation limit for any decode the window performs itself (512 MiB).
-pub const DISPLAY_DECODE_MAX_ALLOC: u64 = 512 * 1024 * 1024;
+/// B-2: the allocation limit for any decode the window performs itself (512 MiB; the library
+/// gate's [`gate::DECODE_MAX_ALLOC`]).
+pub const DISPLAY_DECODE_MAX_ALLOC: u64 = gate::DECODE_MAX_ALLOC;
+
+/// The window's policy for the one library gate: [`Policy::WINDOW`] (its five formats and its
+/// upper limits, unchanged since S123) plus its own [`MIN_SIDE`] floor. The CLI has its own
+/// policy ([`Policy::CLI`], operator A.2/A.4); the window's does not follow it.
+pub const WINDOW_POLICY: Policy = Policy {
+    min_side: MIN_SIDE,
+    ..Policy::WINDOW
+};
 
 /// Why a picture was refused before the library saw it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -106,42 +118,62 @@ pub fn read_bounded(path: &Path) -> Result<Vec<u8>, Refusal> {
 /// OPENED handle is then checked again (`read_opened`), so a path swapped for something else
 /// between the check and the open is refused before any read. The `take(cap + 1)` read
 /// (`read_capped`) stays as the memory guard against a file that grows after both checks.
+///
+/// S125: the body is the library gate's [`gate::read_bounded_with_cap`] (SH5 A-C6), so the CLI
+/// reads under the same three checks.
 pub fn read_bounded_with_cap(path: &Path, cap: u64) -> Result<Vec<u8>, Refusal> {
-    let meta = std::fs::metadata(path).map_err(|e| Refusal::Io(e.to_string()))?;
-    if !meta.is_file() {
-        return Err(Refusal::NotARegularFile);
-    }
-    if meta.len() > cap {
-        return Err(Refusal::FileTooBig { cap });
-    }
-    let file = std::fs::File::open(path).map_err(|e| Refusal::Io(e.to_string()))?;
-    read_opened(file, cap)
+    gate::read_bounded_with_cap(path, cap).map_err(refusal_from_gate)
 }
 
-/// The opened handle's own type and size (fstat), then the capped read.
+/// The opened handle's own type and size (fstat), then the capped read (the gate's).
+#[cfg_attr(not(test), allow(dead_code))]
 fn read_opened(file: std::fs::File, cap: u64) -> Result<Vec<u8>, Refusal> {
-    let meta = file.metadata().map_err(|e| Refusal::Io(e.to_string()))?;
-    if !meta.is_file() {
-        return Err(Refusal::NotARegularFile);
-    }
-    if meta.len() > cap {
-        return Err(Refusal::FileTooBig { cap });
-    }
-    read_capped(file, cap)
+    gate::read_opened(file, cap).map_err(refusal_from_gate)
 }
 
 /// Read at most `cap + 1` bytes from `source`, then refuse if it held more than `cap`. The
 /// `take` bounds MEMORY: however much `source` could yield, no more than `cap + 1` is read.
+/// (The gate's.)
+#[cfg_attr(not(test), allow(dead_code))]
 fn read_capped(source: impl Read, cap: u64) -> Result<Vec<u8>, Refusal> {
-    let mut bytes = Vec::new();
-    source
-        .take(cap.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|e| Refusal::Io(e.to_string()))?;
-    if bytes.len() as u64 > cap {
-        return Err(Refusal::FileTooBig { cap });
+    gate::read_capped(source, cap).map_err(refusal_from_gate)
+}
+
+/// The window's wording for a library gate refusal. Every value here is exactly the
+/// [`Refusal`] the window produced before S125 for the same input (the window's tests pin
+/// them), so moving the checks into the library changed no message the window shows.
+fn refusal_from_gate(r: PictureRefusal) -> Refusal {
+    match r {
+        PictureRefusal::NotARegularFile => Refusal::NotARegularFile,
+        PictureRefusal::FileTooBig { cap } => Refusal::FileTooBig { cap },
+        PictureRefusal::Io(e) => Refusal::Io(e),
+        PictureRefusal::Unrecognised(_) => {
+            Refusal::NotAnImage("the picture format could not be determined".into())
+        }
+        PictureRefusal::RiffNotAPicture => {
+            Refusal::NotAnImage("a RIFF file (sound, video or SoundFont), not a picture".into())
+        }
+        PictureRefusal::WebP => Refusal::UnsupportedFormat(format!("{:?}", ImageFormat::WebP)),
+        PictureRefusal::UnsupportedFormat(f) => Refusal::UnsupportedFormat(format!("{f:?}")),
+        PictureRefusal::Image(e) => Refusal::NotAnImage(e),
+        PictureRefusal::TooSmall { width, height, .. } => Refusal::TooSmall { width, height },
+        PictureRefusal::SideTooLarge { width, height, .. } => {
+            Refusal::SideTooLarge { width, height }
+        }
+        PictureRefusal::TooManyPixels {
+            width,
+            height,
+            pixels,
+            ..
+        } => Refusal::TooManyPixels {
+            width,
+            height,
+            pixels,
+        },
+        // Only the decode produces this; `decode_for_display` reports it as a display decode
+        // failure. Here (a header check) it cannot occur, so it reads as not a usable picture.
+        r @ PictureRefusal::SizeMismatch { .. } => Refusal::NotAnImage(r.to_string()),
     }
-    Ok(bytes)
 }
 
 /// A picture that passed every header check.
@@ -164,70 +196,41 @@ pub struct Probe {
 /// header-only read for WebP: a 52-byte extended WebP declaring a 65535² canvas makes it request
 /// about 17 GiB, and an allocation failure aborts the process (no `catch_unwind` can catch it).
 /// Because this check runs BEFORE `into_dimensions`, a WebP file never reaches that decoder.
-/// Re-admitting WebP needs a hand-parsed RIFF/VP8/VP8L/VP8X size check first (L-16 (a)).
+/// Re-admitting WebP needs a hand-parsed RIFF/VP8/VP8L/VP8X size check first (L-16 (a)), and
+/// even that cannot bound a lossless WebP (`s125-SH5` HL-1).
+///
+/// S125: this IS the library gate's allowlist ([`gate::allowed_format`]), which the CLI now
+/// uses too (SH5 A-P2/A-C3).
 pub fn allowed_format(format: ImageFormat) -> bool {
-    matches!(
-        format,
-        ImageFormat::Png
-            | ImageFormat::Jpeg
-            | ImageFormat::Gif
-            | ImageFormat::Bmp
-            | ImageFormat::Tiff
-    )
+    gate::allowed_format(format)
 }
 
 /// B-2: `width × height` in `u64`. A `u32` product would wrap at 65536² (to 0), which the side
-/// cap happens to stop today; computing it here, in one tested place, keeps the pixel cap honest
-/// if the order of the checks ever changes.
+/// cap happens to stop today; computing it in one tested place keeps the pixel cap honest if
+/// the order of the checks ever changes. (The gate's [`gate::pixel_count`].)
 pub fn pixel_count(width: u32, height: u32) -> u64 {
-    u64::from(width) * u64::from(height)
+    gate::pixel_count(width, height)
 }
 
-/// B-2: the three dimension caps, with the pixel count from [`pixel_count`].
+/// B-2: the three dimension caps, in the order floor ([`MIN_SIDE`]), side, pixels: the gate's
+/// [`gate::check_dimensions`] with the window's floor.
 pub fn check_dimensions(width: u32, height: u32) -> Result<(), Refusal> {
-    if width.min(height) < MIN_SIDE {
-        return Err(Refusal::TooSmall { width, height });
-    }
-    if width.max(height) > MAX_SIDE {
-        return Err(Refusal::SideTooLarge { width, height });
-    }
-    let pixels = pixel_count(width, height);
-    if pixels > MAX_PIXELS {
-        return Err(Refusal::TooManyPixels {
-            width,
-            height,
-            pixels,
-        });
-    }
-    Ok(())
+    gate::check_dimensions(width, height, &WINDOW_POLICY).map_err(refusal_from_gate)
 }
 
 /// B-2 + B-3: sniff the format FROM THE BYTES, apply the allowlist, and only then read the
 /// dimensions from the header and apply the caps. For every format on the allowlist the
 /// dimension read is header-only (`s123-SH2` § 4: 0 ms and ≤ 11 MiB for PNG, JPEG, GIF, TIFF
 /// and BMP); that is exactly why WebP is off the allowlist (see [`allowed_format`]).
+///
+/// S125: this is the library gate's [`gate::admit`] under [`WINDOW_POLICY`] (the window's
+/// formats, limits and [`MIN_SIDE`] floor), with no extension fallback.
 pub fn probe(bytes: &[u8]) -> Result<Probe, Refusal> {
-    let reader = image::io::Reader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|e| Refusal::NotAnImage(e.to_string()))?;
-    let format = reader
-        .format()
-        .ok_or_else(|| Refusal::NotAnImage("the picture format could not be determined".into()))?;
-    if !allowed_format(format) {
-        // `image 0.24` guesses WebP from the 4-byte "RIFF" prefix alone (its own TODO in
-        // `io/free_functions.rs`). A RIFF file that is not "RIFF....WEBP" (a WAV, an AVI, a
-        // SoundFont) is not a picture at all, and says so.
-        if format == ImageFormat::WebP && bytes.get(8..12) != Some(b"WEBP".as_slice()) {
-            return Err(Refusal::NotAnImage(
-                "a RIFF file (sound, video or SoundFont), not a picture".into(),
-            ));
-        }
-        return Err(Refusal::UnsupportedFormat(format!("{format:?}")));
-    }
-    let (width, height) = reader
-        .into_dimensions()
-        .map_err(|e| Refusal::NotAnImage(e.to_string()))?;
-    check_dimensions(width, height)?;
+    let Admitted {
+        format,
+        width,
+        height,
+    } = gate::admit(bytes, None, &WINDOW_POLICY).map_err(refusal_from_gate)?;
     Ok(Probe {
         width,
         height,
@@ -249,17 +252,20 @@ pub struct DisplayImage {
 /// D-1: decode the SAME guarded bytes for display, with explicit limits (B-2's "any decode the
 /// GUI performs itself"), then shrink so the long side is at most [`DISPLAY_MAX_SIDE`]. Call only
 /// after [`probe`] accepted the bytes. Runs on the worker.
+///
+/// S125: the decode is the library gate's [`gate::decode`] (the same limits: each side at most
+/// [`MAX_SIDE`], at most [`DISPLAY_DECODE_MAX_ALLOC`]), which also refuses a picture whose
+/// decoded size differs from its header (SH5 A-C5).
 pub fn decode_for_display(bytes: &[u8], probe: &Probe) -> Result<DisplayImage, Refusal> {
-    let mut reader = image::io::Reader::new(Cursor::new(bytes));
-    reader.set_format(probe.format);
-    let mut limits = image::io::Limits::default();
-    limits.max_image_width = Some(MAX_SIDE);
-    limits.max_image_height = Some(MAX_SIDE);
-    limits.max_alloc = Some(DISPLAY_DECODE_MAX_ALLOC);
-    reader.limits(limits);
-    let decoded = reader
-        .decode()
-        .map_err(|e| Refusal::DisplayDecode(e.to_string()))?;
+    let admitted = Admitted {
+        format: probe.format,
+        width: probe.width,
+        height: probe.height,
+    };
+    let decoded = gate::decode(bytes, &admitted, &WINDOW_POLICY).map_err(|r| match r {
+        PictureRefusal::Image(e) => Refusal::DisplayDecode(e),
+        other => Refusal::DisplayDecode(other.to_string()),
+    })?;
     let (w, h) = (decoded.width(), decoded.height());
     let shown = if w.max(h) > DISPLAY_MAX_SIDE {
         // `thumbnail` keeps the aspect ratio and fits inside the box.

@@ -213,6 +213,16 @@ pub const GUI_TIERS: &[TierRow] = &[
              designer's tier is '—', which this three-tier enum records as Hidden).",
         )
     },
+    TierRow {
+        group: Some("Picture"),
+        label: Some("Shrink picture"),
+        ..row(
+            "shrink",
+            Tier::Hidden,
+            "Drawn by the window's picture strip (s125-UI4 § 2), not as a schema control: it \
+             changes the picture, not the sound, and a preset may not set it.",
+        )
+    },
     // ── Music ────────────────────────────────────────────────────────────────────────────────
     TierRow {
         group: Some("Music"),
@@ -635,13 +645,13 @@ mod tests {
     }
 
     /// The enumeration the UI Designer counted independently (15 render args + 2 globals), plus
-    /// S124's `preset` and `mappings` (17). If this changes, forcing test 1 already told you which
-    /// row to add; update this count with it.
+    /// S124's `preset` and `mappings` (17), plus S125's `shrink` (18). If this changes, forcing
+    /// test 1 already told you which row to add; update this count with it.
     #[test]
     fn render_arg_count_matches_designer_enumeration() {
         let s = render_options_schema().expect("schema builds");
         let globals = s.iter().filter(|o| o.global).count();
-        assert_eq!(s.len() - globals, 17, "render args (non-global)");
+        assert_eq!(s.len() - globals, 18, "render args (non-global)");
         assert_eq!(globals, 2, "globals reaching render");
         let mut ids: Vec<&str> = s.iter().map(|o| o.id.as_str()).collect();
         ids.sort_unstable();
@@ -662,6 +672,7 @@ mod tests {
                 "preset",
                 "reverb",
                 "seed",
+                "shrink",
                 "soundfont",
                 "steps",
                 "thickness",
@@ -840,6 +851,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// S125 (UI4 § 3, SH5 C-1/C-2): the `shrink` row is Hidden (out of the Everyday four, out of
+    /// "More", out of the inert-knob forcing test, and so out of every preset), in the Picture
+    /// group, labelled as the window labels it. Its values are clap's closed four, its default is
+    /// 100, and its help states the library's floor (SK12: the "16 px" cannot drift from the
+    /// constant). Its liveness is forced separately (`tests/shrink_s125.rs`, SK13).
+    #[test]
+    fn s125_the_shrink_row_is_hidden_closed_and_states_the_floor() {
+        let s = render_options_schema().expect("schema builds");
+        let o = s.iter().find(|o| o.id == "shrink").expect("shrink row");
+        assert_eq!(o.tier, Tier::Hidden);
+        assert_eq!(o.group.as_deref(), Some("Picture"));
+        assert_eq!(o.label, "Shrink picture");
+        assert_eq!(
+            o.kind,
+            OptionKind::Enum(vec!["100".into(), "75".into(), "50".into(), "25".into()])
+        );
+        assert_eq!(o.default.as_deref(), Some("100"));
+        let floor = format!(
+            "Each side must stay at least {} px;",
+            crate::shrink::SHRINK_MIN_SIDE
+        );
+        assert!(o.help.contains(&floor), "help {:?} lacks {floor:?}", o.help);
+        assert!(!crate::presets::PRESET_SETTING_IDS.contains(&"shrink"));
     }
 
     #[test]

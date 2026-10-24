@@ -261,6 +261,8 @@ pub struct PlayArgs {
     pub audio: AudioArgs,
     #[command(flatten)]
     pub presets: PresetArgs,
+    #[command(flatten)]
+    pub shrink: ShrinkArgs,
 }
 
 /// S124: `--preset` / `--mappings`, shared by `play` and `render` (flattened). NOT `global`, so
@@ -364,6 +366,24 @@ pub struct RenderArgs {
     pub audio: AudioArgs,
     #[command(flatten)]
     pub presets: PresetArgs,
+    #[command(flatten)]
+    pub shrink: ShrinkArgs,
+}
+
+/// S125 (operator D-51, lead rulings L-54/L-56): `--shrink`, shared by `play` and `render`
+/// (flattened, like [`PresetArgs`]). NOT `global`, so the `analyze` / `modem` / `tui` help is
+/// unchanged. Not read from the config file and not settable by a preset: a shrink happens only
+/// when the user types it (`s125-UI4` § 3, SH5 C-2). The doc comment below is the help text
+/// (UI4 § 3.1, verbatim); its "16 px" is held to [`crate::shrink::SHRINK_MIN_SIDE`] by a test.
+#[derive(Debug, Args, PartialEq, Clone, Copy, Default)]
+pub struct ShrinkArgs {
+    /// Make the music from a smaller copy of the picture: 75, 50 or 25 (percent of each side),
+    /// or 100 for the whole picture (the default). A smaller picture takes less time to turn into
+    /// music, but it has less detail, so the music is different: the piece won't match the
+    /// full-size one, and its notes, tempo and length can all change. Each side must stay at least
+    /// 16 px; a shrink that would go below that is refused.
+    #[arg(long, value_name = "PERCENT", value_enum, default_value_t = crate::shrink::Shrink::Full)]
+    pub shrink: crate::shrink::Shrink,
 }
 
 /// Args for `audiohax analyze`.

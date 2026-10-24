@@ -277,6 +277,15 @@ fn run_render_wav(
     req.validate()?;
 
     let (mappings, origin) = resolve_mappings(&render_args.presets)?;
+    let shrink = render_args.shrink.shrink;
+
+    // S125 (UI4 § 3.3): the OpenCV analysis cannot shrink; refuse loudly, never ignore the flag.
+    #[cfg(feature = "opencv")]
+    if !shrink.is_full() {
+        return Err(Box::new(PlainRefusal(
+            audiohax::shrink::ShrinkError::Unsupported.to_string(),
+        )));
+    }
 
     // ── Acquire the feature source (same selection as `play`; opencv vs pure). ──
     // The pure-Rust acquisition happens inside `audiohax::render::render`.
@@ -358,9 +367,14 @@ fn run_render_wav(
                  folded {} ms of ring-out onto the head",
                 total_steps, grid_ms_per_step, period_ms, period_frames, folded_ms,
             ),
+            // S125 (UI4 § 3.2): the shrink notice, on stderr, once, after the shrink was checked
+            // and before the analysis. Stdout is unchanged (`render --wav` never printed this
+            // note). No notice at 100 %.
+            RenderNote::ImageLoaded { width, height } => {
+                print_shrink_notice(shrink, width, height)
+            }
             // `render --wav` never printed the acquisition lines or the play-path mode line.
-            RenderNote::ImageLoaded { .. }
-            | RenderNote::ImageScanned { .. }
+            RenderNote::ImageScanned { .. }
             | RenderNote::GlobalFeatures(_)
             | RenderNote::EngineMode(_) => {}
         }
@@ -381,8 +395,9 @@ fn run_render_wav(
     let out = {
         let default_image = std::path::PathBuf::from("assets/images/example.jpg");
         let image = render_args.image.as_deref().unwrap_or(&default_image);
-        audiohax::render::render(
+        audiohax::render::render_shrunk(
             &req,
+            shrink,
             audiohax::render::ImageInput::Path(image),
             &mappings,
             font_src,
@@ -409,6 +424,23 @@ fn run_render_wav(
     );
     Ok(())
 }
+/// S125 (UI4 § 3.2): print the `--shrink` notice on stderr for a picture of `width × height`, using
+/// the library's one size function. Nothing at 100 % (stdout and stderr unchanged by default).
+#[cfg(all(not(feature = "opencv"), feature = "pure-analysis"))]
+fn print_shrink_notice(shrink: audiohax::shrink::Shrink, width: u32, height: u32) {
+    if !shrink.is_full() {
+        let to = audiohax::shrink::shrunk_size(width, height, shrink);
+        eprintln!(
+            "{}",
+            audiohax::shrink::cli_notice(shrink, (width, height), to)
+        );
+    }
+}
+
+/// The OpenCV build refuses `--shrink` before any image work, so there is no notice to print.
+#[cfg(not(all(not(feature = "opencv"), feature = "pure-analysis")))]
+fn print_shrink_notice(_shrink: audiohax::shrink::Shrink, _width: u32, _height: u32) {}
+
 /// S124 (lead ruling L-30): lay the chosen preset (if any) under `req`; a flag the user typed
 /// keeps its value. No preset ⇒ `req` unchanged. Prints nothing (`s124-01` LD-4).
 fn with_preset(
@@ -607,6 +639,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &explicit,
     )?;
     let (mappings, origin) = resolve_mappings(&play_args.presets)?;
+    let shrink = play_args.shrink.shrink;
+    // S125 (UI4 § 3.3): the OpenCV analysis cannot shrink; refuse loudly, never ignore the flag.
+    #[cfg(feature = "opencv")]
+    if !shrink.is_full() {
+        return Err(Box::new(PlainRefusal(
+            audiohax::shrink::ShrinkError::Unsupported.to_string(),
+        )));
+    }
     println!("Mappings loaded.");
 
     let engine_config = pipeline_to_engine_config(&req.pipeline);
@@ -633,7 +673,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut on_note = |note: RenderNote<'_>| -> Result<(), RenderError> {
         match note {
             RenderNote::ImageLoaded { width, height } => {
-                println!("Image loaded from source (pure-Rust): {}x{}", width, height)
+                println!("Image loaded from source (pure-Rust): {}x{}", width, height);
+                // S125 (UI4 § 3.2): the shrink notice, on stderr; nothing at 100 %.
+                print_shrink_notice(shrink, width, height);
             }
             RenderNote::ImageScanned { steps } => {
                 println!("Completed scanning image (pure-Rust). Steps: {}", steps)
@@ -707,8 +749,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let plan = {
         let default_image = std::path::PathBuf::from("assets/images/example.jpg");
         let image = play_args.image.as_deref().unwrap_or(&default_image);
-        audiohax::render::prepare_play(
+        audiohax::render::prepare_play_shrunk(
             &req,
+            shrink,
             audiohax::render::ImageInput::Path(image),
             &mappings,
             &mut on_note,

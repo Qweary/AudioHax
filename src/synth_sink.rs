@@ -533,15 +533,41 @@ pub fn fold_loop_tail(
 /// `Bundled` parses the `include_bytes!`-embedded GM SF2; `Path` reads the file off
 /// disk; `Bytes` parses a caller-supplied buffer. All three go through
 /// `SoundFont::new(&mut impl Read)`. Parse/IO failures map to [`engine::AudioSinkError`].
+///
+/// S125 (`s125-SH5` PR-1, `s125-SH6` SH6-1/SH6-2/SH6-3, lead rulings L-61/L-68): every source first
+/// passes [`sf2_prewalk`], which refuses the shapes `rustysynth 1.3.6` cannot read safely and
+/// hands every other file to `rustysynth` unchanged.
+///
+/// * A regular file (and `Bundled`/`Bytes`) is walked by seeking, then rewound; `rustysynth` then
+///   reads it exactly as before.
+/// * A `Path` that is NOT a regular file (a FIFO, `/dev/stdin`, a process substitution) cannot be
+///   rewound, so the walk reads it forward into memory, holding only the bytes the stream really
+///   delivers, and `rustysynth` then reads those bytes followed by the rest of the stream (SH6-1:
+///   the walk is no longer skipped there). No size cap is added.
 fn load_soundfont(font: SoundFontSource<'_>) -> Result<SoundFont, AudioSinkError> {
+    use std::io::{Read, Seek, SeekFrom};
     match font {
         SoundFontSource::Bundled => {
             let mut cursor = std::io::Cursor::new(BUNDLED_SF2);
+            let len = BUNDLED_SF2.len() as u64;
+            sf2_prewalk(&mut Sf2Seekable {
+                r: &mut cursor,
+                len,
+            })
+            .map_err(|why| AudioSinkError::msg(format!("bundled soundfont refused: {why}")))?;
+            cursor.set_position(0);
             SoundFont::new(&mut cursor)
                 .map_err(|e| AudioSinkError::msg(format!("bundled soundfont parse failed: {e}")))
         }
         SoundFontSource::Bytes(bytes) => {
             let mut cursor = std::io::Cursor::new(bytes);
+            let len = bytes.len() as u64;
+            sf2_prewalk(&mut Sf2Seekable {
+                r: &mut cursor,
+                len,
+            })
+            .map_err(|why| AudioSinkError::msg(format!("this SoundFont was refused: {why}")))?;
+            cursor.set_position(0);
             SoundFont::new(&mut cursor)
                 .map_err(|e| AudioSinkError::msg(format!("soundfont buffer parse failed: {e}")))
         }
@@ -549,12 +575,317 @@ fn load_soundfont(font: SoundFontSource<'_>) -> Result<SoundFont, AudioSinkError
             let file = std::fs::File::open(path).map_err(|e| {
                 AudioSinkError::msg(format!("opening soundfont {}: {e}", path.display()))
             })?;
-            let mut reader = std::io::BufReader::new(file);
-            SoundFont::new(&mut reader).map_err(|e| {
+            let regular_len = file
+                .metadata()
+                .ok()
+                .filter(|m| m.is_file())
+                .map(|m| m.len());
+            let refused = |why: String| {
+                AudioSinkError::msg(format!(
+                    "the SoundFont {} was refused: {why}",
+                    path.display()
+                ))
+            };
+            let parse_failed = |e: rustysynth::SoundFontError| {
                 AudioSinkError::msg(format!("parsing soundfont {}: {e}", path.display()))
-            })
+            };
+            match regular_len {
+                Some(len) => {
+                    let mut reader = std::io::BufReader::new(file);
+                    let walked = sf2_prewalk(&mut Sf2Seekable {
+                        r: &mut reader,
+                        len,
+                    });
+                    reader.seek(SeekFrom::Start(0)).map_err(|e| {
+                        AudioSinkError::msg(format!("parsing soundfont {}: {e}", path.display()))
+                    })?;
+                    walked.map_err(refused)?;
+                    SoundFont::new(&mut reader).map_err(parse_failed)
+                }
+                None => {
+                    let mut stream = Sf2Streamed {
+                        r: std::io::BufReader::new(file),
+                        buf: Vec::new(),
+                        eof: false,
+                    };
+                    sf2_prewalk(&mut stream).map_err(refused)?;
+                    let Sf2Streamed { r, buf, .. } = stream;
+                    let mut reader = std::io::Cursor::new(buf).chain(r);
+                    SoundFont::new(&mut reader).map_err(parse_failed)
+                }
+            }
         }
     }
+}
+
+/// Where [`sf2_prewalk`] reads from: random access by absolute offset.
+trait Sf2Source {
+    /// Fill `out` from absolute offset `pos`; `false` if those bytes do not exist.
+    fn read_at(&mut self, pos: u64, out: &mut [u8]) -> bool;
+    /// Whether the source holds at least `end` bytes.
+    fn holds(&mut self, end: u64) -> bool;
+}
+
+/// A seekable source of known length (a regular file, a byte buffer). Reads only what it is
+/// asked for; never buffers the file.
+struct Sf2Seekable<'a, R: std::io::Read + std::io::Seek> {
+    r: &'a mut R,
+    len: u64,
+}
+
+impl<R: std::io::Read + std::io::Seek> Sf2Source for Sf2Seekable<'_, R> {
+    fn read_at(&mut self, pos: u64, out: &mut [u8]) -> bool {
+        pos.saturating_add(out.len() as u64) <= self.len
+            && self.r.seek(std::io::SeekFrom::Start(pos)).is_ok()
+            && self.r.read_exact(out).is_ok()
+    }
+    fn holds(&mut self, end: u64) -> bool {
+        end <= self.len
+    }
+}
+
+/// A forward-only stream (a FIFO, `/dev/stdin`): every byte read is kept in `buf`, so the same
+/// bytes can be handed to `rustysynth` afterwards. It only ever holds what the stream really
+/// delivered, so a chunk that claims 4 GiB costs what the stream sends, never the claim.
+struct Sf2Streamed<R: std::io::Read> {
+    r: R,
+    buf: Vec<u8>,
+    eof: bool,
+}
+
+impl<R: std::io::Read> Sf2Streamed<R> {
+    /// Read forward until `buf` holds `end` bytes or the stream ends.
+    fn fill(&mut self, end: u64) {
+        let mut chunk = [0u8; 64 * 1024];
+        while !self.eof && (self.buf.len() as u64) < end {
+            let want = (end - self.buf.len() as u64).min(chunk.len() as u64) as usize;
+            match self.r.read(&mut chunk[..want]) {
+                Ok(0) => self.eof = true,
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => self.eof = true,
+            }
+        }
+    }
+}
+
+impl<R: std::io::Read> Sf2Source for Sf2Streamed<R> {
+    fn read_at(&mut self, pos: u64, out: &mut [u8]) -> bool {
+        let end = pos.saturating_add(out.len() as u64);
+        self.fill(end);
+        if end > self.buf.len() as u64 {
+            return false;
+        }
+        out.copy_from_slice(&self.buf[pos as usize..end as usize]);
+        true
+    }
+    fn holds(&mut self, end: u64) -> bool {
+        self.fill(end);
+        self.buf.len() as u64 >= end
+    }
+}
+
+/// S125 (`s125-SH5` PR-1, `s123-SH` S-2(b), `s125-SH6` SH6-2/SH6-3; lead rulings L-13, L-61, L-68):
+/// a byte-neutral RIFF pre-walk run before `rustysynth 1.3.6` sees a SoundFont.
+///
+/// `rustysynth`'s `BinaryReader::read_wave_data` allocates `size / 2` `i16`s for the `smpl`
+/// chunk and then `read_exact`s `size` bytes into them, so an ODD `smpl` size writes one byte
+/// past the allocation (undefined behaviour). It, and the `INFO` string, `sm24`, `pmod` and `imod`
+/// readers, also allocate `size` bytes BEFORE reading, so a tiny file that claims a 4 GiB chunk
+/// asks for 4 GiB, and an allocation failure aborts the process. And `Zone::new` copies
+/// `next.generator_index − this.generator_index` generators per zone with no bound, so bag
+/// indices that go down and up again make a 423 KB file request GiBs (SH6-2), and an index past
+/// the end panics (SH6-3).
+///
+/// This walk follows `SoundFont::new`'s own reading order and byte consumption exactly (the
+/// `INFO`, `sdta` and `pdta` lists, in that order; `ifil`/`iver` consume 4 bytes whatever their
+/// declared size, as `SoundFontVersion::new` does). It refuses ONLY:
+///
+/// * an odd `smpl` size;
+/// * a chunk whose reader would allocate its declared size, when the file does not hold that many
+///   bytes after the chunk header;
+/// * in `pdta`, the index shapes `rustysynth` turns into an unbounded copy or a panic, none of
+///   which a valid SoundFont has: `ibag`/`pbag` zones that would copy more generators in total
+///   than the `igen`/`pgen` list holds, or that point past it; an `inst`/`phdr` zone range that
+///   ends past the `ibag`/`pbag` zone count.
+///
+/// Anything else it does not understand (a wrong FourCC, a truncated header, an unknown chunk, a
+/// size that is not a whole number of records) it leaves to `rustysynth`, so every SoundFont that
+/// loads today loads identically and every other error keeps its current text. `Ok(())` means
+/// "hand it to rustysynth".
+fn sf2_prewalk(src: &mut impl Sf2Source) -> Result<(), String> {
+    fn fourcc(b: &[u8; 4]) -> String {
+        b.iter()
+            .map(|&c| {
+                if c.is_ascii_graphic() || c == b' ' {
+                    c as char
+                } else {
+                    '?'
+                }
+            })
+            .collect()
+    }
+    let read4 = |src: &mut dyn Sf2Source, pos: u64| -> Option<[u8; 4]> {
+        let mut b = [0u8; 4];
+        src.read_at(pos, &mut b).then_some(b)
+    };
+    let src: &mut dyn Sf2Source = src;
+    // Header: "RIFF", size (ignored by rustysynth), "sfbk".
+    let (Some(riff), Some(form)) = (read4(src, 0), read4(src, 8)) else {
+        return Ok(());
+    };
+    if &riff != b"RIFF" || &form != b"sfbk" {
+        return Ok(());
+    }
+    let mut pos: u64 = 12;
+
+    // The pdta records the index checks need (the last chunk of each id wins, as in rustysynth).
+    let mut pdta: std::collections::HashMap<[u8; 4], Vec<u8>> = std::collections::HashMap::new();
+
+    // The three lists, in rustysynth's order. For each sub-chunk: (consumed bytes, whether its
+    // reader allocates `size` before reading). An id rustysynth itself refuses stops the walk.
+    for list in [b"INFO", b"sdta", b"pdta"] {
+        let (Some(id), Some(end), Some(kind)) =
+            (read4(src, pos), read4(src, pos + 4), read4(src, pos + 8))
+        else {
+            return Ok(());
+        };
+        if &id != b"LIST" || &kind != list {
+            return Ok(());
+        }
+        let end = u64::from(u32::from_le_bytes(end));
+        // rustysynth's ReadCounter starts after the list's size field; the list type counts.
+        let base = pos + 8;
+        let mut counted: u64 = 4;
+        while counted < end {
+            let at = base + counted;
+            let (Some(cid), Some(size)) = (read4(src, at), read4(src, at + 4)) else {
+                return Ok(());
+            };
+            let size = u64::from(u32::from_le_bytes(size));
+            let data_at = at + 8;
+            let (consumed, allocates) = match (list, &cid) {
+                (b"INFO", b"ifil") | (b"INFO", b"iver") => (4, false),
+                (b"INFO", b"isng" | b"INAM" | b"irom" | b"ICRD" | b"IENG" | b"IPRD" | b"ICOP")
+                | (b"INFO", b"ICMT" | b"ISFT") => (size, true),
+                (b"sdta", b"smpl") => {
+                    if size % 2 == 1 {
+                        return Err(format!(
+                            "its sample chunk ('smpl') has an odd size ({size} bytes); \
+                             AudioHax cannot load such a SoundFont safely"
+                        ));
+                    }
+                    (size, true)
+                }
+                (b"sdta", b"sm24") => (size, true),
+                (b"pdta", b"pmod" | b"imod") => (size, true),
+                (b"pdta", b"phdr" | b"pbag" | b"pgen" | b"inst" | b"ibag" | b"igen" | b"shdr") => {
+                    (size, false)
+                }
+                _ => return Ok(()),
+            };
+            if allocates && !src.holds(data_at.saturating_add(size)) {
+                return Err(format!(
+                    "its '{}' chunk claims {size} bytes but the file ends before them",
+                    fourcc(&cid)
+                ));
+            }
+            if list == b"pdta" && matches!(&cid, b"phdr" | b"pbag" | b"inst" | b"ibag") {
+                // Only records whose bytes are really there (rustysynth stops at EOF too).
+                if src.holds(data_at.saturating_add(size)) {
+                    let mut data = vec![0u8; size as usize];
+                    if src.read_at(data_at, &mut data) {
+                        pdta.insert(cid, data);
+                    }
+                }
+            }
+            if list == b"pdta" && matches!(&cid, b"pgen" | b"igen") {
+                pdta.insert(cid, size.to_le_bytes().to_vec());
+            }
+            counted = counted.saturating_add(8).saturating_add(consumed);
+        }
+        pos = base + counted;
+    }
+    sf2_check_indices(&pdta)
+}
+
+/// SH6-2/SH6-3: the `pdta` index rules (see [`sf2_prewalk`]). Each rule runs only when the lists
+/// it compares have the record sizes `rustysynth` accepts; otherwise `rustysynth` refuses the
+/// file itself.
+fn sf2_check_indices(pdta: &std::collections::HashMap<[u8; 4], Vec<u8>>) -> Result<(), String> {
+    // u16 at `offset` of every `record`-byte record, or None if the size is not a whole number
+    // of records (rustysynth's own `size % record != 0` refusal).
+    let u16s = |id: &[u8; 4], record: usize, offset: usize| -> Option<Vec<u32>> {
+        let d = pdta.get(id)?;
+        if d.is_empty() || d.len() % record != 0 {
+            return None;
+        }
+        Some(
+            d.chunks_exact(record)
+                .map(|r| u32::from(u16::from_le_bytes([r[offset], r[offset + 1]])))
+                .collect(),
+        )
+    };
+    // rustysynth's generator count: size / 4 − 1 (the last record is the terminator).
+    let generators = |id: &[u8; 4]| -> Option<u64> {
+        let size = u64::from_le_bytes(pdta.get(id)?.as_slice().try_into().ok()?);
+        (size >= 4 && size % 4 == 0).then(|| size / 4 - 1)
+    };
+    let name = |b: &[u8; 4]| String::from_utf8_lossy(b).into_owned();
+
+    // Bags against generators. `Zone::new` copies `next − this` generators for every positive
+    // step (a step that goes down copies none). So: no positive step may end past the generator
+    // count (that index panics, SH6-3), and the positive steps together may not copy more than
+    // the generator count (a valid font copies exactly `last − first` ≤ the count; SH6-2's bomb
+    // copies 65,535 per zone). This is the property SH6-2 names ("the copies total ≤ the
+    // generator count"), checked directly, so a malformed but harmless step that goes down is
+    // left to rustysynth, as before.
+    for (bag, gen) in [(b"ibag", b"igen"), (b"pbag", b"pgen")] {
+        let (Some(idx), Some(count)) = (u16s(bag, 4, 0), generators(gen)) else {
+            continue;
+        };
+        let mut copies: u64 = 0;
+        for pair in idx.windows(2) {
+            if pair[1] > pair[0] {
+                if u64::from(pair[1]) > count {
+                    return Err(format!(
+                        "its zone list ('{}') points to generator {}, but its generator list \
+                         ('{}') has only {count}",
+                        name(bag),
+                        pair[1],
+                        name(gen)
+                    ));
+                }
+                copies += u64::from(pair[1] - pair[0]);
+            }
+        }
+        if copies > count {
+            return Err(format!(
+                "its zone list ('{}') would copy {copies} generators, but its generator list \
+                 ('{}') has only {count}; a valid SoundFont never copies more than it has",
+                name(bag),
+                name(gen)
+            ));
+        }
+    }
+    // Instruments/presets against zones: a range that ends past the zone count.
+    for (list, record, offset, bag) in [(b"inst", 22, 20, b"ibag"), (b"phdr", 38, 24, b"pbag")] {
+        let (Some(starts), Some(bags)) = (u16s(list, record, offset), u16s(bag, 4, 0)) else {
+            continue;
+        };
+        let zones = bags.len().saturating_sub(1) as u32;
+        for pair in starts.windows(2) {
+            if pair[1] > pair[0] && pair[1] > zones {
+                return Err(format!(
+                    "its '{}' list points to zone {}, but its zone list ('{}') has only {zones}",
+                    name(list),
+                    pair[1],
+                    name(bag)
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build the f32 cpal output stream whose callback owns the synthesizer + consumer

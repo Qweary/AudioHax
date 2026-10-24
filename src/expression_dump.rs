@@ -578,9 +578,25 @@ fn state() -> &'static Mutex<State> {
 }
 
 /// Is the dump recording? One `Relaxed` load — this is the whole cost on the default path.
+#[cfg(not(test))]
 #[inline]
 pub fn is_armed() -> bool {
     ARMED.load(Ordering::Relaxed)
+}
+
+// TEST BUILD ONLY (S125 05F). The lib test binary runs renders on other threads in parallel
+// with this module's unit tests, and every hook gates only on `ARMED`, so a render could write
+// into a unit test's armed dump. In the unit-test build the dump also records only on the
+// thread that armed it. Non-test builds (the binaries, and the lib as integration tests link it)
+// compile the `cfg(not(test))` `is_armed` above, unchanged.
+#[cfg(test)]
+thread_local! {
+    static ARMED_ON_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub fn is_armed() -> bool {
+    ARMED_ON_THIS_THREAD.with(|a| a.get()) && ARMED.load(Ordering::Relaxed)
 }
 
 /// Arm the dump for one render. Clears any previous state.
@@ -597,11 +613,15 @@ pub fn arm(cue: &str, image: &str, seed: Option<u64>, expression_armed: bool) {
             ..State::default()
         };
     }
+    #[cfg(test)]
+    ARMED_ON_THIS_THREAD.with(|a| a.set(true));
     ARMED.store(true, Ordering::Relaxed);
 }
 
 /// Stop recording.
 pub fn disarm() {
+    #[cfg(test)]
+    ARMED_ON_THIS_THREAD.with(|a| a.set(false));
     ARMED.store(false, Ordering::Relaxed);
 }
 
@@ -1666,6 +1686,32 @@ mod tests {
             (pearson(&[1.0, 2.0, 3.0, 4.0], &[4.0, 3.0, 2.0, 1.0]).unwrap() + 1.0).abs() < 1e-9
         );
         assert!(pearson(&[1.0, 1.0, 1.0, 1.0], &[1.0, 2.0, 3.0, 4.0]).is_none());
+    }
+
+    /// A hook fired on ANOTHER thread must not write into this test's armed dump. The lib test
+    /// binary runs renders (`chord_engine`, `render`, `gui::job` tests) in parallel with these
+    /// tests, and `guard()` serialises only this module; with the process-global flag alone,
+    /// their hooks landed in this module's `State` (S125 05F).
+    #[test]
+    fn a_hook_on_another_thread_does_not_write_into_this_tests_dump() {
+        let _g = guard();
+        arm("unit", "none", Some(102), true);
+        begin_step(0, 0);
+        record_step_frame(&meta("Melody", 0, 8, "PhraseStart"), &[onset(0)]);
+        std::thread::spawn(|| {
+            begin_step(5, 2500);
+            note_velocity_detail(90.0, 8.0, 90);
+            record_step_frame(
+                &meta("Melody", 5, 8, "Interior"),
+                &[onset(0), onset(100), onset(200)],
+            );
+        })
+        .join()
+        .expect("foreign thread");
+        let d = snapshot().expect("snapshot");
+        disarm();
+        assert_eq!(d.counters.frames, 1, "only this thread's frame is recorded");
+        assert_eq!(d.events.len(), 1);
     }
 
     /// Disarmed, every hook is a no-op and the snapshot never grows. The default render path

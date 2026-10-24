@@ -7,6 +7,7 @@
 use super::ingest::{Refusal, MAX_PIXELS, MAX_SIDE};
 use crate::pure_analysis::AnalysisError;
 use crate::render::RenderError;
+use crate::shrink::{shrunk_size, Shrink};
 
 /// N-1: the most characters of a MIDI port name shown in a label.
 pub const PORT_NAME_MAX: usize = 64;
@@ -73,6 +74,87 @@ pub fn suggest_wav_name(image_name: Option<&str>) -> String {
     } else {
         format!("{cleaned}.wav")
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S125 ITEM 3 — "Shrink picture" (`s125-UI4-shrink-final-spec.md` §§ 2, 5; every string verbatim)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// UI4 § 2.2: the control's label (also its accessible name).
+pub const SHRINK_LABEL: &str = "Shrink picture";
+
+/// UI4 § 2.2: the hover text on the closed control.
+pub const SHRINK_HOVER: &str = "Make the music from a smaller copy of the picture. A smaller \
+    picture means a shorter wait, and different music.";
+
+/// UI4 § 2.2: the caption (and hover, and accessible description) of a level the 16 px floor
+/// disables.
+pub const SHRINK_DISABLED_CAPTION: &str = "Too small to shrink this far.";
+
+/// UI4 § 2.3: the notice's body, under its headline ([`shrink_notice_headline`]).
+pub const SHRINK_NOTICE_BODY: &str = "Less detail means different music: this piece won't match \
+    the full-size one. Notes, tempo and length can all change.";
+
+/// UI4 § 2.4 (SHOULD): the one muted line beside "Still working…" while Shrink is at Full size.
+pub const SHRINK_WAIT_POINTER: &str =
+    "Shrink picture (above the picture) shortens the wait next time. It changes the music.";
+
+/// UI4 § 2.2: the closed control's text for a level (the name only; the size is in the notice).
+pub fn shrink_closed_text(s: Shrink) -> &'static str {
+    match s {
+        Shrink::Full => "Full size",
+        Shrink::Percent75 => "75%",
+        Shrink::Percent50 => "50%",
+        Shrink::Percent25 => "25%",
+    }
+}
+
+/// UI4 § 2.2: the caption under a level's row in the open control (when the level is enabled).
+pub fn shrink_caption(s: Shrink) -> &'static str {
+    match s {
+        Shrink::Full => "The whole picture. The longest wait.",
+        Shrink::Percent75 => "A shorter wait. Different music.",
+        Shrink::Percent50 => "A much shorter wait. Different music.",
+        Shrink::Percent25 => "The shortest wait. Different music.",
+    }
+}
+
+/// UI4 § 2.2: a row's first line for a `width × height` picture, e.g. `Full size · 6000 × 4000`,
+/// `50% · 3000 × 2000`. The size is the library's ([`shrunk_size`]); `×` is U+00D7.
+pub fn shrink_row_line(s: Shrink, width: u32, height: u32) -> String {
+    let (w, h) = shrunk_size(width, height, s);
+    format!("{} · {w} × {h}", shrink_closed_text(s))
+}
+
+/// UI4 § 2.3: the notice's headline for a `width × height` picture, e.g. `Shrunk to 50% (3000 ×
+/// 2000).` `None` at Full size (no notice).
+pub fn shrink_notice_headline(s: Shrink, width: u32, height: u32) -> Option<String> {
+    if s.is_full() {
+        return None;
+    }
+    let (w, h) = shrunk_size(width, height, s);
+    Some(format!("Shrunk to {}% ({w} × {h}).", s.percent()))
+}
+
+/// UI4 § 2.1: the picture strip's readout, the file name (already sanitised for display) then the
+/// ORIGINAL size: `marina-sunset.jpg · 6000 × 4000`, or the size alone when there is no name.
+pub fn picture_readout(name: Option<&str>, width: u32, height: u32) -> String {
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => format!("{n} · {width} × {height}"),
+        None => format!("{width} × {height}"),
+    }
+}
+
+/// UI4 § 5.6: the suggested Save WAV name for a shrunk piece: [`suggest_wav_name`]'s stem (cleaned
+/// and capped first, so [`SUGGESTED_STEM_MAX`] still bounds the user-derived part) with
+/// `-shrunk-<pct>` appended. At Full size it is exactly [`suggest_wav_name`].
+pub fn suggest_wav_name_shrunk(image_name: Option<&str>, shrink: Shrink) -> String {
+    let base = suggest_wav_name(image_name);
+    if shrink.is_full() {
+        return base;
+    }
+    let stem = base.strip_suffix(".wav").unwrap_or(&base);
+    format!("{stem}-shrunk-{}.wav", shrink.percent())
 }
 
 /// Every user-facing failure the window can report, one row of UI § 7 each.
@@ -232,6 +314,9 @@ pub fn from_render_error(e: &RenderError) -> UserError {
         }
         RenderError::Refused(s) if s.starts_with("--loop:") => ErrorKind::LoopRingsTooLong,
         RenderError::Refused(s) if s.starts_with("--v2 requires") => ErrorKind::ExpressionFirst,
+        // S125: unreachable from the window (it disables every level the floor refuses); the raw
+        // sentence goes under Details if it ever happens.
+        RenderError::Shrink(_) => ErrorKind::Other,
         RenderError::Refused(_) | RenderError::Dump(_) | RenderError::Io(_) => ErrorKind::Other,
     };
     UserError::new(kind, raw)

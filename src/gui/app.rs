@@ -16,10 +16,14 @@ use super::state::{
     Controls, EverydaySpecs, Knob, OutputKind, Phase, KNOBS,
 };
 use super::text::{
-    sanitize, sanitize_full, suggest_wav_name, ErrorKind, UserError, FILE_NAME_MAX, PORT_NAME_MAX,
+    picture_readout, sanitize, sanitize_full, shrink_caption, shrink_closed_text,
+    shrink_notice_headline, shrink_row_line, suggest_wav_name_shrunk, ErrorKind, UserError,
+    FILE_NAME_MAX, PORT_NAME_MAX, SHRINK_DISABLED_CAPTION, SHRINK_HOVER, SHRINK_LABEL,
+    SHRINK_NOTICE_BODY, SHRINK_WAIT_POINTER,
 };
 use super::theme::{focus_ring, selected_outline, Palette};
 use crate::render::{CancelToken, RenderOutput, RenderRequest};
+use crate::shrink::{fits, shrunk_size, Shrink};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Id, Key, KeyboardShortcut, Layout,
     Modifiers, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextStyle, TextureHandle,
@@ -75,13 +79,16 @@ pub enum OutputSel {
     Midi(usize, String),
 }
 
-/// What identifies a rendered piece: the picture loaded, the preset, and the request.
+/// What identifies a rendered piece: the picture loaded, the preset, the request, and (S125) the
+/// shrink it was made at.
 #[derive(Debug, Clone, PartialEq)]
 struct PieceKey {
     image_seq: u64,
     /// S124: the preset the piece was made with (its mappings are part of the piece).
     preset: &'static str,
     request: RenderRequest,
+    /// S125 (UI4 § 5.3, H7): a shrink is part of the piece, so Save WAV re-renders when it differs.
+    shrink: Shrink,
 }
 
 /// S124 (`s124-UI` § 6): the Save fallback shown when no Save window could be opened.
@@ -94,6 +101,24 @@ pub const ONE_PRESET_NOTE: &str = "More presets are coming.";
 
 /// S124 (`s124-UI` § 1.5 / P5): the hint shown while the held render was made with another preset.
 pub const STALE_PRESET_HINT: &str = "Re-render to hear the new preset.";
+
+/// S125 (`s125-UI4` § 5.3): the hint while the held render was made at another shrink. Wording:
+/// `s125-UI6` C-3 (§12 A-2): a different shrink makes different music, not the same piece resized.
+pub const STALE_SHRINK_HINT: &str = "Re-render to hear the music from the chosen picture size.";
+
+/// S125 (`s125-UI4` § 5.3): the hint while the held render differs in BOTH preset and shrink.
+pub const STALE_BOTH_HINT: &str = "Re-render to hear your changes.";
+
+/// S125 (`s125-UI4` § 5.3): which stale hint the transport shows, from what differs between the held
+/// render and the controls now. `None` when neither differs.
+pub fn stale_hint(preset_differs: bool, shrink_differs: bool) -> Option<&'static str> {
+    match (preset_differs, shrink_differs) {
+        (true, false) => Some(STALE_PRESET_HINT),
+        (false, true) => Some(STALE_SHRINK_HINT),
+        (true, true) => Some(STALE_BOTH_HINT),
+        (false, false) => None,
+    }
+}
 
 /// The picture on screen.
 struct Picture {
@@ -160,6 +185,10 @@ pub struct AudioHaxApp {
     persist: bool,
     /// The typed-path Save fallback, while shown (`s124-UI` § 6).
     save_fallback: Option<String>,
+    // ── S125 ──
+    /// "Shrink picture" (`s125-UI4`). Reset to Full size whenever a picture opens; never persisted
+    /// (§ 5.4); not part of the preset machinery (§ 5.1).
+    shrink: Shrink,
 }
 
 impl AudioHaxApp {
@@ -249,6 +278,7 @@ impl AudioHaxApp {
             more_open: false,
             persist: false,
             save_fallback: None,
+            shrink: Shrink::Full,
         }
     }
 
@@ -286,15 +316,13 @@ impl AudioHaxApp {
             ..base.controls
         };
         self.advanced = base.advanced;
-        if let Some(pic) = self.picture.as_ref() {
-            let pr = pic.loaded.image.probe();
+        if let Some((w, h)) = self.analysed_size() {
             let schema_max = self
                 .specs
                 .as_ref()
                 .map(|s| s.voices_schema_max())
                 .unwrap_or(16);
-            self.controls
-                .clamp_voices(voices_max(schema_max, pr.width, pr.height));
+            self.controls.clamp_voices(voices_max(schema_max, w, h));
         }
         if self.persist {
             write_setting(PRESET_SETTING_FILE, self.preset_id);
@@ -355,6 +383,68 @@ impl AudioHaxApp {
         self.load(LoadSource::Path(path));
     }
 
+    /// The shrink the controls show (S125).
+    ///
+    /// TEST SEAM (S125): read-only.
+    #[doc(hidden)]
+    pub fn shrink(&self) -> Shrink {
+        self.shrink
+    }
+
+    /// Choose a shrink level, as picking it in the "Shrink picture" control does: only while that
+    /// control is live (the sound controls' rule, UI4 § 5.5) and only a level the open picture
+    /// allows (the 16 px floor, § 4). Anything else changes nothing. Voices is re-clamped to the
+    /// shrunk size (§ 5.7). The preset, its baseline and the Variation are untouched (§ 5.1, § 5.2).
+    ///
+    /// TEST SEAM (S125): a headless test (and the window-only screenshot harness) cannot click.
+    #[doc(hidden)]
+    pub fn set_shrink(&mut self, level: Shrink) {
+        if !self.live(Control::SoundControls) {
+            return;
+        }
+        let Some(pr) = self.picture.as_ref().map(|p| p.loaded.image.probe()) else {
+            return;
+        };
+        if !fits(pr.width, pr.height, level) {
+            return;
+        }
+        self.shrink = level;
+        if let Some((w, h)) = self.analysed_size() {
+            let schema_max = self
+                .specs
+                .as_ref()
+                .map(|s| s.voices_schema_max())
+                .unwrap_or(16);
+            self.controls.clamp_voices(voices_max(schema_max, w, h));
+        }
+    }
+
+    /// The size the engine analyses the open picture at: its own size, shrunk by the chosen level
+    /// through the library's one size function (UI4 § 1, § 5.7).
+    fn analysed_size(&self) -> Option<(u32, u32)> {
+        self.picture.as_ref().map(|p| {
+            let pr = p.loaded.image.probe();
+            shrunk_size(pr.width, pr.height, self.shrink)
+        })
+    }
+
+    /// Is at least one shrink level allowed for the open picture (UI4 § 2.4's condition)?
+    fn any_shrink_level_enabled(&self) -> bool {
+        self.picture.as_ref().is_some_and(|p| {
+            let pr = p.loaded.image.probe();
+            Shrink::ALL
+                .iter()
+                .any(|s| !s.is_full() && fits(pr.width, pr.height, *s))
+        })
+    }
+
+    /// The admitted picture as the engine gets it: at the chosen shrink (S125).
+    fn engine_image(&self) -> Option<super::job::GuardedImage> {
+        self.picture
+            .as_ref()
+            .map(|p| p.loaded.image.clone().with_shrink(self.shrink))
+    }
+
     fn live(&self, c: Control) -> bool {
         self.controller.is_some() && enablement(c, self.phase).is_ok()
     }
@@ -372,16 +462,18 @@ impl AudioHaxApp {
             image_seq: p.seq,
             preset: self.preset_id,
             request: self.request(),
+            shrink: self.shrink,
         })
     }
 
+    /// The scan geometry the engine uses: from the ANALYSED size (UI4 § 5.7), so at a shrink the
+    /// bar's thickness, stripes, unreached region and axis are the shrunk picture's.
     fn geometry(&self) -> Option<ScanGeometry> {
-        self.picture.as_ref().map(|p| {
-            let probe = p.loaded.image.probe();
+        self.analysed_size().map(|(width, height)| {
             let req = self.request();
             ScanGeometry {
-                width: probe.width,
-                height: probe.height,
+                width,
+                height,
                 thickness: req.pipeline.thickness,
                 steps: req.pipeline.steps,
                 voices: req.pipeline.instruments,
@@ -437,10 +529,9 @@ impl AudioHaxApp {
         if !self.live(Control::Render) {
             return;
         }
-        let Some(pic) = self.picture.as_ref() else {
+        let Some(image) = self.engine_image() else {
             return;
         };
-        let image = pic.loaded.image.clone();
         let request = self.request();
         if let Some(c) = self.controller.as_mut() {
             c.submit(JobKind::Render {
@@ -457,7 +548,7 @@ impl AudioHaxApp {
         if !self.live(Control::Play) {
             return;
         }
-        let Some(pic) = self.picture.as_ref() else {
+        let Some(image) = self.engine_image() else {
             return;
         };
         let output = match &self.output {
@@ -483,7 +574,6 @@ impl AudioHaxApp {
                 }
             }
         };
-        let image = pic.loaded.image.clone();
         let request = self.request();
         if let Some(c) = self.controller.as_mut() {
             c.submit(JobKind::Play {
@@ -521,7 +611,7 @@ impl AudioHaxApp {
         let Some(pic) = self.picture.as_ref() else {
             return;
         };
-        let suggested = suggest_wav_name(
+        let suggested = suggest_wav_name_shrunk(
             pic.loaded
                 .path
                 .as_ref()
@@ -531,6 +621,7 @@ impl AudioHaxApp {
                         .unwrap_or_default()
                 })
                 .as_deref(),
+            self.shrink,
         );
         let mut dialog = rfd::FileDialog::new()
             .add_filter("WAV audio", &["wav"])
@@ -644,7 +735,8 @@ impl AudioHaxApp {
         let Some(pic) = self.picture.as_ref() else {
             return;
         };
-        let image = pic.loaded.image.clone();
+        // S125: the piece for the shrink shown NOW (it is part of the key, UI4 § 5.6).
+        let image = pic.loaded.image.clone().with_shrink(key.shrink);
         let current = self
             .last_render
             .as_ref()
@@ -755,6 +847,8 @@ impl AudioHaxApp {
         );
         let texture = ctx.load_texture("audiohax-picture", color, TextureOptions::LINEAR);
         self.image_seq += 1;
+        // S125 (UI4 § 5.4): every newly opened picture starts at Full size.
+        self.shrink = Shrink::Full;
         let probe = loaded.image.probe();
         let schema_max = self
             .specs
@@ -1253,12 +1347,8 @@ impl AudioHaxApp {
             });
             // Voices: bounded by the picture (L-14).
             let vmax = self
-                .picture
-                .as_ref()
-                .map(|pic| {
-                    let pr = pic.loaded.image.probe();
-                    voices_max(specs.voices_schema_max(), pr.width, pr.height)
-                })
+                .analysed_size()
+                .map(|(w, h)| voices_max(specs.voices_schema_max(), w, h))
                 .unwrap_or(specs.voices_schema_max());
             let mut voices = self.controls.instruments as u32;
             ui.horizontal(|ui| {
@@ -1660,6 +1750,9 @@ impl AudioHaxApp {
 
     fn transport(&mut self, ui: &mut egui::Ui) {
         let p = self.palette;
+        // S125 ITEM 3 round 2 (`s125-UI6` C-1, L-82): the shrink pointer is drawn on its own line
+        // under the row, so it can never push `Cancel` or `Save WAV…` out of the window.
+        let mut show_pointer = false;
         ui.horizontal(|ui| {
             let busy_render = self.phase == Phase::Rendering;
             let render_text = if busy_render {
@@ -1715,12 +1808,15 @@ impl AudioHaxApp {
             }
 
             // S124 (`s124-UI` § 1.5, P5): the held render was made with another preset.
+            // S125 (`s125-UI4` § 5.3): or at another shrink, or both.
             let stale = self
                 .last_render
                 .as_ref()
-                .is_some_and(|(k, _)| k.preset != self.preset_id);
-            if stale && matches!(self.phase, Phase::ImageLoaded | Phase::Stopped) {
-                ui.label(RichText::new(STALE_PRESET_HINT).color(p.text_muted));
+                .and_then(|(k, _)| stale_hint(k.preset != self.preset_id, k.shrink != self.shrink));
+            if let Some(hint) = stale {
+                if matches!(self.phase, Phase::ImageLoaded | Phase::Stopped) {
+                    ui.label(RichText::new(hint).color(p.text_muted));
+                }
             }
 
             // Progress and the abandon-style Cancel (SH T-2).
@@ -1744,6 +1840,16 @@ impl AudioHaxApp {
                         .unwrap_or(false);
                     if long && !waiting {
                         ui.label(RichText::new("Still working…").color(p.text_muted));
+                        // S125 (`s125-UI4` § 2.4, SHOULD): point at the shrink while a long render
+                        // or Play preparation runs at Full size, if any level is allowed.
+                        let rendering_or_preparing =
+                            self.phase == Phase::Rendering || preparing_play;
+                        if rendering_or_preparing
+                            && self.shrink.is_full()
+                            && self.any_shrink_level_enabled()
+                        {
+                            show_pointer = true;
+                        }
                         let r = ui.button("Cancel").on_hover_text(
                             "Stop waiting for this one. It finishes in the background; a new \
                              picture waits until it has.",
@@ -1770,19 +1876,191 @@ impl AudioHaxApp {
                 }
             });
         });
+        if show_pointer {
+            ui.label(
+                RichText::new(SHRINK_WAIT_POINTER)
+                    .color(p.text_muted)
+                    .size(13.0),
+            );
+        }
+    }
+
+    /// S125 (`s125-UI4` § 2.1–§ 2.2): the picture strip at the top of the stage: the file name and
+    /// the ORIGINAL size on the left, "Shrink picture" and its four-level control on the right. In a
+    /// narrow window the control drops to a second line under the name.
+    fn picture_strip(&mut self, ui: &mut egui::Ui) {
+        let p = self.palette;
+        let Some(pic) = self.picture.as_ref() else {
+            return;
+        };
+        let probe = pic.loaded.image.probe();
+        let (w, h) = (probe.width, probe.height);
+        let name = sanitize(&pic.loaded.name, FILE_NAME_MAX);
+        let readout = picture_readout(Some(&name), w, h);
+        let narrow = ui.ctx().content_rect().width() < NARROW_WIDTH;
+        let live = self.live(Control::SoundControls);
+        let reason = enablement(Control::SoundControls, self.phase)
+            .err()
+            .unwrap_or("");
+        let mut chosen = self.shrink;
+        // The label and the control. `rtl`: added right to left (control first, then its label).
+        let control = |ui: &mut egui::Ui, chosen: &mut Shrink, rtl: bool| {
+            ui.add_enabled_ui(live, |ui| {
+                let label = |ui: &mut egui::Ui| {
+                    ui.label(RichText::new(SHRINK_LABEL).color(p.text).size(13.0))
+                };
+                let l = if rtl { None } else { Some(label(ui)) };
+                let closed = shrink_closed_text(*chosen);
+                let ir = egui::ComboBox::from_id_salt("shrink-picture")
+                    .selected_text(closed)
+                    .show_ui(ui, |ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                        for level in Shrink::ALL {
+                            let ok = fits(w, h, level);
+                            let caption = if ok {
+                                shrink_caption(level)
+                            } else {
+                                SHRINK_DISABLED_CAPTION
+                            };
+                            let mut job = egui::text::LayoutJob::default();
+                            let line = egui::TextFormat {
+                                font_id: FontId::proportional(14.0),
+                                color: p.text,
+                                ..Default::default()
+                            };
+                            job.append(&shrink_row_line(level, w, h), 0.0, line.clone());
+                            job.append("\n", 0.0, line);
+                            job.append(
+                                caption,
+                                0.0,
+                                egui::TextFormat {
+                                    font_id: FontId::proportional(12.0),
+                                    // `s125-UI6` C-2 (AA): the selected row's caption takes `text`
+                                    // (5.09 : 1 dark; `text_muted` there was 2.55 : 1).
+                                    color: if *chosen == level {
+                                        p.text
+                                    } else {
+                                        p.text_muted
+                                    },
+                                    ..Default::default()
+                                },
+                            );
+                            let r =
+                                ui.add_enabled(ok, egui::Button::selectable(*chosen == level, job));
+                            let r = r.on_disabled_hover_text(SHRINK_DISABLED_CAPTION);
+                            focus_ring(ui, &r, &p);
+                            if ok && r.clicked() {
+                                *chosen = level;
+                            }
+                        }
+                    });
+                let l = l.unwrap_or_else(|| label(ui));
+                let enabled = ui.is_enabled();
+                let r = ir
+                    .response
+                    .labelled_by(l.id)
+                    .on_hover_text(SHRINK_HOVER)
+                    .on_disabled_hover_text(reason);
+                r.widget_info(|| {
+                    let mut info = egui::WidgetInfo::labeled(
+                        egui::WidgetType::ComboBox,
+                        enabled,
+                        SHRINK_LABEL,
+                    );
+                    info.current_text_value = Some(closed.to_string());
+                    info
+                });
+                focus_ring(ui, &r, &p);
+            });
+        };
+        if narrow {
+            ui.label(RichText::new(&readout).color(p.text_muted).size(13.0));
+            ui.horizontal(|ui| control(ui, &mut chosen, false));
+        } else {
+            ui.horizontal(|ui| {
+                ui.set_min_height(28.0);
+                ui.label(RichText::new(&readout).color(p.text_muted).size(13.0));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    control(ui, &mut chosen, true)
+                });
+            });
+        }
+        if chosen != self.shrink {
+            self.set_shrink(chosen);
+        }
+    }
+
+    /// S125 (`s125-UI4` § 2.3): the notice, shown for as long as a shrink is chosen. A state
+    /// indicator: no dismissal, no animation. Returns whether it was drawn.
+    fn shrink_notice(&self, ui: &mut egui::Ui) -> bool {
+        let p = self.palette;
+        let Some(pr) = self.picture.as_ref().map(|pic| pic.loaded.image.probe()) else {
+            return false;
+        };
+        let Some(headline) = shrink_notice_headline(self.shrink, pr.width, pr.height) else {
+            return false;
+        };
+        let shown = egui::Frame::new()
+            .fill(p.raised)
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(egui::Margin {
+                left: 15,
+                right: 12,
+                top: 8,
+                bottom: 8,
+            })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(headline).color(p.text).size(13.0).strong());
+                ui.label(
+                    RichText::new(SHRINK_NOTICE_BODY)
+                        .color(p.text_muted)
+                        .size(13.0),
+                );
+            });
+        // The 3 px `accent_2` edge ("differs from the default"), down the notice's left side.
+        let r = shown.response.rect;
+        ui.painter().rect_filled(
+            Rect::from_min_size(r.min, Vec2::new(3.0, r.height())),
+            CornerRadius {
+                nw: 6,
+                ne: 0,
+                sw: 6,
+                se: 0,
+            },
+            p.accent_2,
+        );
+        true
     }
 
     fn stage(&mut self, ui: &mut egui::Ui) {
         let p = self.palette;
+        if self.picture.is_none() {
+            let avail = ui.available_rect_before_wrap();
+            self.empty_state(ui, avail);
+            return;
+        }
+        // S125 (`s125-UI4` § 2.1): the strip, then the notice while a shrink is chosen; the picture
+        // fits into what is left.
+        self.picture_strip(ui);
+        ui.add_space(8.0);
+        if self.shrink_notice(ui) {
+            ui.add_space(8.0);
+        }
         let avail = ui.available_rect_before_wrap();
         let Some(pic) = self.picture.as_ref() else {
-            self.empty_state(ui, avail);
             return;
         };
         let probe = pic.loaded.image.probe();
         let texture_id = pic.texture.id();
+        // S125 (UI4 § 5.7): the overlay is the ANALYSED picture's (its axis included, which a shrink
+        // can flip on a near-square picture), mapped onto the displayed picture. At Full size the
+        // geometry is the picture's own, exactly as before.
+        let geom_now = self.geometry();
         // Leave room past the trailing edge for the coda park and its caption.
-        let vertical = probe.width > probe.height;
+        let vertical = geom_now
+            .map(|g| g.vertical())
+            .unwrap_or(probe.width > probe.height);
         let reserve = if self.show_scan_bar { 34.0 } else { 0.0 };
         let box_rect = if vertical {
             Rect::from_min_max(avail.min, Pos2::new(avail.max.x - reserve, avail.max.y))
@@ -1812,16 +2090,26 @@ impl AudioHaxApp {
         if !self.show_scan_bar {
             return;
         }
-        let Some(geom) = self.geometry() else {
+        let Some(geom) = geom_now else {
             return;
+        };
+        // Picture pixels → screen. At Full size the analysed picture IS the probed one and the
+        // scale is the fit scale; at a shrink each axis maps `displayed / shrunk`.
+        let (sx, sy) = if (geom.width, geom.height) == (probe.width, probe.height) {
+            (scale, scale)
+        } else {
+            (
+                img_rect.width() / geom.width.max(1) as f32,
+                img_rect.height() / geom.height.max(1) as f32,
+            )
         };
         let to_screen = |r: PxRect| -> Rect {
             Rect::from_min_size(
                 Pos2::new(
-                    img_rect.min.x + r.x as f32 * scale,
-                    img_rect.min.y + r.y as f32 * scale,
+                    img_rect.min.x + r.x as f32 * sx,
+                    img_rect.min.y + r.y as f32 * sy,
                 ),
-                Vec2::new(r.w as f32 * scale, r.h as f32 * scale),
+                Vec2::new(r.w as f32 * sx, r.h as f32 * sy),
             )
         };
         // Case 3: the part of the picture the piece never reaches.
@@ -2896,5 +3184,282 @@ mod tests {
             "{nodes:?}"
         );
         assert!(app.save_fallback_shown());
+    }
+
+    // ── S125 ITEM 3: "Shrink picture" (`s125-UI4-shrink-final-spec.md`) ─────────────────────
+
+    /// Open `w × h` (a structured PNG built in the test) as a dropped buffer named `name`.
+    fn s125_open(ctx: &egui::Context, app: &mut AudioHaxApp, w: u32, h: u32, name: &str) {
+        let bytes = crate::gui::ingest::fixtures::structured(w, h, image::ImageFormat::Png);
+        let seq = app.image_seq;
+        app.load(LoadSource::Bytes {
+            bytes,
+            name: name.to_string(),
+        });
+        wait_until(ctx, app, |a| {
+            a.phase() == Phase::ImageLoaded && a.image_seq == seq + 1
+        });
+    }
+
+    fn s125_texts(ctx: &egui::Context, app: &mut AudioHaxApp) -> Vec<String> {
+        let out = run_frames(ctx, app, 2);
+        a11y_text(&out).into_iter().map(|(_, t)| t).collect()
+    }
+
+    /// SK8 + SK16: the notice appears the moment a level is chosen (before any render), with the
+    /// interpolated percent and size and UI4's body; it stays; it is gone at Full size and when a
+    /// new picture opens (which resets the level to Full). A fresh window starts at Full size.
+    #[test]
+    fn s125_sk8_the_notice_is_a_state_shown_before_any_render() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = AudioHaxApp::new_headless(&ctx);
+        assert_eq!(
+            app.shrink(),
+            Shrink::Full,
+            "a fresh window starts at Full size"
+        );
+        run_frames(&ctx, &mut app, 1);
+        s125_open(&ctx, &mut app, 120, 80, "pic.png");
+        let t = s125_texts(&ctx, &mut app);
+        assert!(!t.iter().any(|l| l.contains("Shrunk to")), "{t:?}");
+        assert!(
+            t.iter().any(|l| l == "pic.png · 120 × 80"),
+            "the strip readout: {t:?}"
+        );
+        app.set_shrink(Shrink::Percent50);
+        let t = s125_texts(&ctx, &mut app);
+        assert!(t.iter().any(|l| l == "Shrunk to 50% (60 × 40)."), "{t:?}");
+        assert!(t.iter().any(|l| l == SHRINK_NOTICE_BODY), "{t:?}");
+        assert!(
+            app.last_render.is_none(),
+            "the notice came before any render"
+        );
+        assert_eq!(app.phase(), Phase::ImageLoaded);
+        // It stays, frame after frame, with no dismissal.
+        let t = s125_texts(&ctx, &mut app);
+        assert!(t.iter().any(|l| l == "Shrunk to 50% (60 × 40)."));
+        app.set_shrink(Shrink::Full);
+        let t = s125_texts(&ctx, &mut app);
+        assert!(
+            !t.iter().any(|l| l.contains("Shrunk to")),
+            "gone at Full: {t:?}"
+        );
+        // A new picture resets to Full size.
+        app.set_shrink(Shrink::Percent25);
+        assert_eq!(app.shrink(), Shrink::Percent25);
+        s125_open(&ctx, &mut app, 120, 80, "pic.png");
+        assert_eq!(
+            app.shrink(),
+            Shrink::Full,
+            "a newly opened picture starts at Full size"
+        );
+        let t = s125_texts(&ctx, &mut app);
+        assert!(!t.iter().any(|l| l.contains("Shrunk to")), "{t:?}");
+    }
+
+    /// SK17 (accessibility half): the control is a combo box named "Shrink picture" whose value is
+    /// the closed text.
+    #[test]
+    fn s125_the_control_is_findable_by_role_and_name() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = AudioHaxApp::new_headless(&ctx);
+        run_frames(&ctx, &mut app, 1);
+        s125_open(&ctx, &mut app, 120, 80, "pic.png");
+        app.set_shrink(Shrink::Percent75);
+        let out = run_frames(&ctx, &mut app, 2);
+        let found = out
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .map(|u| {
+                u.nodes.iter().any(|(_, n)| {
+                    n.role() == egui::accesskit::Role::ComboBox
+                        && n.label() == Some(SHRINK_LABEL)
+                        && n.value() == Some("75%")
+                })
+            })
+            .unwrap_or(false);
+        assert!(found, "no ComboBox named {SHRINK_LABEL:?} with value 75%");
+    }
+
+    /// SK5: a level whose smaller side would fall under 16 cannot be chosen. 40×30: 75 % (30×23)
+    /// can, 50 % and 25 % cannot. 20×20: no shrink level can.
+    #[test]
+    fn s125_sk5_levels_under_the_floor_cannot_be_chosen() {
+        let ctx = egui::Context::default();
+        let mut app = AudioHaxApp::new_headless(&ctx);
+        run_frames(&ctx, &mut app, 1);
+        s125_open(&ctx, &mut app, 40, 30, "small.png");
+        assert!(app.any_shrink_level_enabled());
+        for s in [Shrink::Percent50, Shrink::Percent25] {
+            app.set_shrink(s);
+            assert_eq!(app.shrink(), Shrink::Full, "{s:?} was chosen on 40x30");
+        }
+        app.set_shrink(Shrink::Percent75);
+        assert_eq!(app.shrink(), Shrink::Percent75);
+        assert_eq!(app.analysed_size(), Some((30, 23)));
+        s125_open(&ctx, &mut app, 20, 20, "tiny.png");
+        assert!(!app.any_shrink_level_enabled());
+        for s in [Shrink::Percent75, Shrink::Percent50, Shrink::Percent25] {
+            app.set_shrink(s);
+            assert_eq!(app.shrink(), Shrink::Full, "{s:?} was chosen on 20x20");
+        }
+        // The window still draws (combo shown, every shrink row disabled) without error.
+        run_frames(&ctx, &mut app, 2);
+        assert!(app.error.is_none(), "{:?}", app.error);
+    }
+
+    /// SK17 (lock half): while rendering, the shrink cannot change (the sound controls' rule).
+    #[test]
+    fn s125_sk17_the_shrink_is_locked_while_rendering() {
+        let ctx = egui::Context::default();
+        let mut app = AudioHaxApp::new_headless(&ctx);
+        run_frames(&ctx, &mut app, 1);
+        s125_open(&ctx, &mut app, 120, 80, "pic.png");
+        app.render();
+        assert_eq!(app.phase(), Phase::Rendering);
+        app.set_shrink(Shrink::Percent50);
+        assert_eq!(app.shrink(), Shrink::Full, "changed while rendering");
+        wait_until(&ctx, &mut app, |a| a.phase() == Phase::ImageLoaded);
+        app.set_shrink(Shrink::Percent50);
+        assert_eq!(app.shrink(), Shrink::Percent50, "live again when idle");
+    }
+
+    /// SK14: preset and shrink are independent; the Variation is kept.
+    #[test]
+    fn s125_sk14_preset_and_shrink_are_independent() {
+        let ctx = egui::Context::default();
+        let mut app = AudioHaxApp::new_headless(&ctx);
+        run_frames(&ctx, &mut app, 1);
+        s125_open(&ctx, &mut app, 120, 80, "pic.png");
+        app.controls.seed = Some(7);
+        app.set_shrink(Shrink::Percent50);
+        let baseline = app.baseline;
+        assert_eq!(
+            app.controls.seed,
+            Some(7),
+            "a shrink change keeps the Variation"
+        );
+        assert_eq!(app.preset_id(), "default");
+        assert_eq!(app.baseline, baseline);
+        app.select_preset("default");
+        assert_eq!(
+            app.shrink(),
+            Shrink::Percent50,
+            "a preset change keeps the shrink"
+        );
+        assert_eq!(app.controls.seed, Some(7));
+        // "Reset to preset" resets the KNOBS only, and the shrink is not one of them.
+        for k in KNOBS {
+            reset_knob(*k, &mut app.controls, &mut app.advanced, &app.baseline);
+        }
+        assert_eq!(
+            app.shrink(),
+            Shrink::Percent50,
+            "Reset to preset changed the shrink"
+        );
+    }
+
+    /// SK18: the overlay is the ANALYSED picture's. At 25 % on 120×80 the geometry is 30×20 (bar
+    /// thickness from the shrunk side); on a near-square 101×100 the axis flips at 25 % (25×25 is
+    /// not strictly wider than tall), as the analyser's own rule says it must.
+    #[test]
+    fn s125_sk18_the_overlay_uses_the_analysed_size() {
+        let ctx = egui::Context::default();
+        let mut app = AudioHaxApp::new_headless(&ctx);
+        run_frames(&ctx, &mut app, 1);
+        s125_open(&ctx, &mut app, 120, 80, "pic.png");
+        let full = app.geometry().expect("geometry");
+        assert_eq!((full.width, full.height), (120, 80));
+        app.set_shrink(Shrink::Percent25);
+        let g = app.geometry().expect("geometry");
+        assert_eq!((g.width, g.height), (30, 20));
+        assert_eq!(g.scan_rect(0).w, 3, "bar = round(30 · 0.10)");
+        run_frames(&ctx, &mut app, 2);
+        s125_open(&ctx, &mut app, 101, 100, "square-ish.png");
+        assert!(
+            app.geometry().expect("g").vertical(),
+            "101x100 scans left to right"
+        );
+        app.set_shrink(Shrink::Percent25);
+        let g = app.geometry().expect("g");
+        assert_eq!((g.width, g.height), (25, 25));
+        assert!(!g.vertical(), "25x25 scans top to bottom");
+        run_frames(&ctx, &mut app, 2);
+        assert!(app.error.is_none(), "{:?}", app.error);
+    }
+
+    /// SK15 + SK9 (window half): after a Render at Full, choosing 50 % shows UI4's shrink hint;
+    /// Save WAV then saves the 50 % piece (not the held one), byte-identical to the library's
+    /// `render_shrunk` at 50 %; and the window's request is the CLI's `render --seed 7` request, so
+    /// the window and `audiohax render --wav … --shrink 50 --seed 7` make the same piece (the CLI =
+    /// library half is `tests/shrink_s125.rs`).
+    #[test]
+    fn s125_sk15_stale_hint_then_save_wav_saves_the_shown_shrink() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = AudioHaxApp::new_headless(&ctx);
+        run_frames(&ctx, &mut app, 1);
+        s125_open(&ctx, &mut app, 120, 80, "pic.png");
+        app.controls.seed = Some(7);
+        let cli = match <crate::cli::Cli as clap::Parser>::try_parse_from([
+            "audiohax", "render", "--seed", "7",
+        ])
+        .expect("parse")
+        .command
+        {
+            crate::cli::Command::Render(r) => RenderRequest::from(&r),
+            _ => unreachable!("render"),
+        };
+        assert_eq!(app.request(), cli, "the window's request is the CLI's");
+        app.render();
+        wait_until(&ctx, &mut app, |a| a.phase() == Phase::ImageLoaded);
+        let held = app.rendered_audio().expect("held").0.to_vec();
+        let t = s125_texts(&ctx, &mut app);
+        assert!(!t.iter().any(|l| l == STALE_SHRINK_HINT), "{t:?}");
+        app.set_shrink(Shrink::Percent50);
+        let t = s125_texts(&ctx, &mut app);
+        assert!(t.iter().any(|l| l == STALE_SHRINK_HINT), "{t:?}");
+        assert!(!t.iter().any(|l| l == STALE_PRESET_HINT), "{t:?}");
+
+        let dir = crate::gui::test_scratch_dir("s125-save");
+        let path = dir.join("shrunk.wav");
+        let _ = std::fs::remove_file(&path);
+        app.save_chosen_path(path.clone());
+        wait_until(&ctx, &mut app, |a| {
+            a.phase() == Phase::ImageLoaded && path.exists()
+        });
+        let bytes = app
+            .picture
+            .as_ref()
+            .expect("pic")
+            .loaded
+            .image
+            .bytes()
+            .to_vec();
+        let lib = crate::render::render_shrunk(
+            &cli,
+            Shrink::Percent50,
+            crate::render::ImageInput::Bytes(&bytes),
+            &crate::gui::embedded_mappings().expect("mappings"),
+            crate::synth_sink::SoundFontSource::Bundled,
+            &mut |_| Ok(()),
+        )
+        .expect("library");
+        assert_ne!(
+            lib.interleaved, held,
+            "control: 50 % is not the held Full piece"
+        );
+        let want = dir.join("want.wav");
+        crate::synth_sink::write_stereo_wav(&want, lib.sample_rate, &lib.interleaved)
+            .expect("write");
+        assert_eq!(
+            std::fs::read(&path).expect("saved"),
+            std::fs::read(&want).expect("want"),
+            "Save WAV did not save the 50 % piece"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -89,15 +89,25 @@ pub enum PureImageSource {
 /// Load an image from a pure source into a `PureImage` (JPEG/PNG via the `image`
 /// crate; `jpeg-decoder` is already a transitive dep). Replaces
 /// `image_source::load_image_from_source` on the default path.
+///
+/// S125 (D-45; operator A.5, Q6 "a"; lead ruling L-80): every picture passes
+/// [`crate::picture_gate`] under [`Policy::CLI`](crate::picture_gate::Policy::CLI), because this
+/// path arm is the CLI's front-end (the window decodes through [`load_pure_image_bytes`]). Its
+/// route, [`open_and_decode`](crate::picture_gate::open_and_decode), is `image::open` as it was
+/// before S125, step for step (the file streamed, the format from the file extension, the `image`
+/// crate's default decode limits), except that a WebP picture is refused before any WebP decoder
+/// exists. A refusal is `AnalysisError::Decode("<path>: <reason>")`, the same shape every load
+/// error already had, and an error a picture produced before S125 keeps its exact text.
 pub fn load_pure_image(src: &PureImageSource) -> Result<PureImage, AnalysisError> {
+    use crate::picture_gate::{open_and_decode, Policy};
     let path = match src {
         PureImageSource::Preselected(name) => {
             std::path::Path::new("assets").join("images").join(name)
         }
         PureImageSource::UserPath(p) => p.clone(),
     };
-    let dynimg = image::open(&path)
-        .map_err(|e| AnalysisError::Decode(format!("{}: {e}", path.display())))?;
+    let dynimg = open_and_decode(&path, &Policy::CLI)
+        .map_err(|r| AnalysisError::Decode(format!("{}: {r}", path.display())))?;
     let rgb = dynimg.to_rgb8();
     if rgb.width() == 0 || rgb.height() == 0 {
         return Err(AnalysisError::EmptyImage("load_pure_image"));
@@ -109,9 +119,19 @@ pub fn load_pure_image(src: &PureImageSource) -> Result<PureImage, AnalysisError
 /// S122 Phase 0) into a `PureImage`. Same decode → `to_rgb8` → empty-check as
 /// [`load_pure_image`]; the only difference is that the format is sniffed from the bytes
 /// (`image::load_from_memory`) instead of taken from a file extension.
+///
+/// S125 (D-45, `s125-SH5` A-P1): the same [`crate::picture_gate`] as [`load_pure_image`],
+/// minus the file read, under [`Policy::WINDOW`](crate::picture_gate::Policy::WINDOW): this
+/// in-memory arm is the window's front-end (`gui::job`), and the CLI never uses it. Format
+/// sniffed from the bytes, the window's five formats, its size caps, and a limited decode whose
+/// size must match the header. No smallest-side floor here; the window adds its own 16 px floor
+/// in `gui::ingest::probe` before it calls this.
 pub fn load_pure_image_bytes(bytes: &[u8]) -> Result<PureImage, AnalysisError> {
-    let dynimg = image::load_from_memory(bytes)
-        .map_err(|e| AnalysisError::Decode(format!("<in-memory image>: {e}")))?;
+    use crate::picture_gate::{admit, decode, PictureRefusal, Policy};
+    let policy = Policy::WINDOW;
+    let refused = |r: PictureRefusal| AnalysisError::Decode(format!("<in-memory image>: {r}"));
+    let admitted = admit(bytes, None, &policy).map_err(refused)?;
+    let dynimg = decode(bytes, &admitted, &policy).map_err(refused)?;
     let rgb = dynimg.to_rgb8();
     if rgb.width() == 0 || rgb.height() == 0 {
         return Err(AnalysisError::EmptyImage("load_pure_image_bytes"));
@@ -300,6 +320,14 @@ fn hue_histogram_pure<I: Iterator<Item = Rgb<u8>>>(pixels: I, bins: usize) -> Ve
 fn to_gray<V: GenericImageView<Pixel = Rgb<u8>>>(view: &V) -> GrayImage {
     let (w, h) = view.dimensions();
     let mut g = GrayImage::new(w, h);
+    // S125 (D-45, panic class b): `image 0.24`'s pixel iterator does not stop on a 0-px-wide
+    // view that is 2+ rows tall; it wraps to row 1 and indexes (0, 1), which panics. The 3×3
+    // grid in `analyze_regions_pure` passes such a cell here when the picture is 1–2 px wide and
+    // at least 4 px tall. A view with no pixels has nothing to convert: return the empty image
+    // the loop below already returns for every other 0-pixel view.
+    if w == 0 || h == 0 {
+        return g;
+    }
     for (x, y, px) in view.pixels() {
         let r = px[0] as f32;
         let gg = px[1] as f32;
@@ -418,6 +446,16 @@ fn shape_complexity_pure(gray: &GrayImage) -> f32 {
     }
     let level = imageproc::contrast::otsu_level(gray);
     let binary: GrayImage = imageproc::contrast::threshold(gray, level);
+    // S125 (D-45, panic class a): `imageproc 0.23.1`'s `connected_components` sizes its
+    // union-find at w*h elements but numbers labels from 1, so it fails `i < self.count` on the
+    // one input that needs label w*h: a single foreground pixel. For w*h >= 2 the second pixel
+    // in scan order has (0,0) as its W or N neighbour, so label w*h is never reached and the
+    // library call below keeps its exact result. Count the 1×1 case directly: one foreground
+    // pixel is one component; a background pixel is none.
+    if (w as u64) * (h as u64) == 1 {
+        let count = u32::from(binary.get_pixel(0, 0)[0] != 0);
+        return (count as f32) / 1000.0;
+    }
     use imageproc::region_labelling::{connected_components, Connectivity};
     // Background colour is Luma([0]) (same u8 pixel type as the input); foreground
     // blobs get distinct labels 1..=N (the OUTPUT pixels are u32 labels).
@@ -481,6 +519,9 @@ fn analyze_regions_pure(img: &RgbImage, grid: (u32, u32)) -> Vec<RegionStats> {
                 ((i + 1) * per).min(n)
             };
             // Guard against a zero-width cell when n < parts (degenerate tiny image).
+            // NOTE (S125): this does NOT prevent one; for n < 3 a cell can still be 0 px wide or
+            // tall after the clamps below and `crop_imm`. `to_gray` and `edge_density_pure`
+            // accept such a cell. Changing these bounds would change pictures that render today.
             let end = end.max(start + 1).min(n.max(start + 1));
             out.push((start, end.min(n)));
         }

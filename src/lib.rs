@@ -42,6 +42,10 @@ pub mod options_schema;
 // builds & unit-tests under `--no-default-features`.
 pub mod presets;
 
+// S125 ITEM 3 (operator D-51, D-56) — "Shrink picture" / `--shrink`: the ONE size function, floor
+// and resize the CLI and the window share. Pure except its `apply` (pure-analysis builds only).
+pub mod shrink;
+
 // WS-4 Phase 3 (S10) — pure-Rust ratatui TUI front-end, a pure OBSERVER over the S9
 // engine seam. Builds & unit-tests under `cargo test --lib --no-default-features`.
 pub mod tui;
@@ -49,6 +53,9 @@ pub mod tui;
 // WS-4 Phase 2 (S11) Lane A — pure-Rust image+imageproc feature analyzer that
 // implements engine::FeatureSource. Feature-gated so the bare
 // `--no-default-features` lib (music + modem) stays dependency-free.
+// S125 (D-45, SH5 Part A): the one gate every user picture passes through.
+#[cfg(feature = "pure-analysis")]
+pub mod picture_gate;
 #[cfg(feature = "pure-analysis")]
 pub mod pure_analysis; // Lane A — image+imageproc; implements engine::FeatureSource
 

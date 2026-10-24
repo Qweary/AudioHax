@@ -36,9 +36,10 @@ use crate::engine::AudioSink;
 use crate::mapping_loader::MappingTable;
 use crate::pure_analysis::PureAnalysisSource;
 use crate::render::{
-    acquire, play, prepare_play_with_source, render, render_with_source, CancelToken, ImageInput,
-    PlayEvent, PlayPlan, RenderError, RenderOutput, RenderRequest,
+    acquire_shrunk, play, prepare_play_with_source, render_shrunk, render_with_source, CancelToken,
+    ImageInput, PlayEvent, PlayPlan, RenderError, RenderOutput, RenderRequest,
 };
+use crate::shrink::Shrink;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -138,10 +139,15 @@ pub fn run_guarded<T>(f: impl FnOnce() -> Result<T, UserError>) -> Result<T, Job
 
 /// Picture bytes that passed [`probe`]: the ONLY form in which the window hands a picture to the
 /// library (B-1/B-2: the probe and the decode see the same bytes).
+///
+/// S125: it also carries the shrink the music is made at ([`Self::with_shrink`]; `Shrink::Full`
+/// unless set). The probe, and so every admission cap, is always the ORIGINAL picture's (SH5 C-3):
+/// the shrink is applied by the library after the decode, in `render::acquire_shrunk`.
 #[derive(Debug, Clone)]
 pub struct GuardedImage {
     bytes: Arc<[u8]>,
     probe: Probe,
+    shrink: Shrink,
 }
 
 impl GuardedImage {
@@ -151,7 +157,20 @@ impl GuardedImage {
         Ok(GuardedImage {
             bytes: bytes.into(),
             probe,
+            shrink: Shrink::Full,
         })
+    }
+
+    /// The same admitted picture, to be made into music at `shrink` (S125). The bytes are shared,
+    /// not copied, so the analysis cache still recognises the picture.
+    pub fn with_shrink(mut self, shrink: Shrink) -> Self {
+        self.shrink = shrink;
+        self
+    }
+
+    /// The shrink the music is made at.
+    pub fn shrink(&self) -> Shrink {
+        self.shrink
     }
 
     /// TEST SEAM ONLY: wrap bytes WITHOUT the probe, to prove C-1 catches today's analyzer
@@ -165,6 +184,7 @@ impl GuardedImage {
                 height,
                 format: image::ImageFormat::Png,
             },
+            shrink: Shrink::Full,
         }
     }
 
@@ -345,8 +365,9 @@ pub fn run_render(
     mappings: &MappingTable,
 ) -> Result<RenderOutput, UserError> {
     // C-2 (b): the note callback does nothing at all.
-    render(
+    render_shrunk(
         request,
+        image.shrink(),
         ImageInput::Bytes(image.bytes()),
         mappings,
         super::gui_font_source(),
@@ -368,6 +389,8 @@ struct Analysed {
     /// count all change the extracted features. Keyed on the whole `PipelineArgs` so that any
     /// later field `acquire` starts to read also invalidates the entry.
     pipeline: PipelineArgs,
+    /// S125 (SH5 C-7): the shrink it was analysed at. A different level is a different analysis.
+    shrink: Shrink,
     source: PureAnalysisSource,
     understanding: ImageUnderstanding,
 }
@@ -387,13 +410,14 @@ pub struct AnalysisCache {
     analyses: usize,
 }
 
-/// `render::acquire` over the admitted bytes (decode, understand, extract). Its notes are
-/// dropped, as every GUI job drops them (C-2 (b)).
+/// `render::acquire_shrunk` over the admitted bytes (decode, shrink, understand, extract). Its
+/// notes are dropped, as every GUI job drops them (C-2 (b)).
 fn analyse(
     pipeline: &PipelineArgs,
+    shrink: Shrink,
     bytes: &[u8],
 ) -> Result<(PureAnalysisSource, ImageUnderstanding), RenderError> {
-    acquire(pipeline, ImageInput::Bytes(bytes), &mut |_| Ok(()))
+    acquire_shrunk(pipeline, shrink, ImageInput::Bytes(bytes), &mut |_| Ok(()))
 }
 
 impl AnalysisCache {
@@ -413,18 +437,20 @@ impl AnalysisCache {
         pipeline: &PipelineArgs,
         image: &GuardedImage,
     ) -> Result<(&PureAnalysisSource, &ImageUnderstanding), RenderError> {
-        let hit = self
-            .entry
-            .as_ref()
-            .is_some_and(|e| Arc::ptr_eq(&e.image, &image.bytes) && e.pipeline == *pipeline);
+        let hit = self.entry.as_ref().is_some_and(|e| {
+            Arc::ptr_eq(&e.image, &image.bytes)
+                && e.pipeline == *pipeline
+                && e.shrink == image.shrink
+        });
         if !hit {
             // Drop the old entry BEFORE analysing, so two analyses never sit in memory at once.
             self.entry = None;
-            let (source, understanding) = analyse(pipeline, image.bytes())?;
+            let (source, understanding) = analyse(pipeline, image.shrink, image.bytes())?;
             self.analyses += 1;
             self.entry = Some(Analysed {
                 image: image.bytes.clone(),
                 pipeline: pipeline.clone(),
+                shrink: image.shrink,
                 source,
                 understanding,
             });
@@ -823,7 +849,7 @@ mod tests {
     use super::super::ingest::fixtures::{solid, structured};
     use super::*;
     use crate::gui::state::Controls;
-    use crate::render::prepare_play;
+    use crate::render::{prepare_play, render};
     use image::ImageFormat;
 
     /// The library's own `render()` and `prepare_play()`, uncached: the reference.
@@ -912,6 +938,82 @@ mod tests {
         assert_ne!(plan4, plan3);
     }
 
+    /// S125 (SH5 C-7 / forcing row S7; UI4 § 5.3): the cache keys on the shrink. Full, then 50 %,
+    /// then Full again on the same picture are three analyses, each byte-identical to the library's
+    /// own `render_shrunk`; a cache that served the full-size analysis to the 50 % request would
+    /// play the wrong piece with no error, and the potency check below shows the two differ.
+    #[test]
+    fn s125_the_cache_keys_on_the_shrink_and_matches_the_library() {
+        let bytes = structured(96, 64, ImageFormat::Png);
+        let full = GuardedImage::admit(bytes.clone()).expect("admit");
+        assert_eq!(
+            full.shrink(),
+            Shrink::Full,
+            "admitted pictures start at Full size"
+        );
+        let half = full.clone().with_shrink(Shrink::Percent50);
+        assert_eq!(
+            half.probe(),
+            full.probe(),
+            "the probe stays the ORIGINAL picture's"
+        );
+        let m = mappings();
+        let req = Controls {
+            seed: Some(7),
+            ..Controls::default()
+        }
+        .request();
+        let lib = |s: Shrink| {
+            crate::render::render_shrunk(
+                &req,
+                s,
+                ImageInput::Bytes(&bytes),
+                &m,
+                crate::synth_sink::SoundFontSource::Bundled,
+                &mut |_| Ok(()),
+            )
+            .expect("library render")
+        };
+        let lib_full = lib(Shrink::Full);
+        let lib_half = lib(Shrink::Percent50);
+        let mut cache = AnalysisCache::default();
+        assert_same_render(
+            &cache.render(&req, &full, &m).expect("full"),
+            &lib_full,
+            "Full",
+        );
+        assert_eq!(cache.analyses(), 1);
+        assert_same_render(
+            &cache.render(&req, &half, &m).expect("50%"),
+            &lib_half,
+            "50%",
+        );
+        assert_eq!(cache.analyses(), 2, "a shrink change is a new analysis");
+        assert_same_render(
+            &cache.render(&req, &half, &m).expect("50% again"),
+            &lib_half,
+            "50% hit",
+        );
+        assert_eq!(cache.analyses(), 2, "same shrink: a hit");
+        assert_same_render(
+            &cache.render(&req, &full, &m).expect("back to Full"),
+            &lib_full,
+            "back to Full",
+        );
+        assert_eq!(cache.analyses(), 3);
+        // The uncached window path agrees too.
+        assert_same_render(
+            &run_render(&req, &half, &m).expect("run"),
+            &lib_half,
+            "run_render",
+        );
+        // And Full through the shrink entry is the pre-S125 `render`, byte for byte.
+        let (plain, _) = library(&req, &bytes, &m);
+        assert_same_render(&lib_full, &plain, "render_shrunk(Full) == render");
+        // Potency: the 50 % piece is a different piece.
+        assert_ne!(lib_full.interleaved, lib_half.interleaved);
+    }
+
     #[test]
     fn a_different_picture_with_the_same_bytes_is_still_a_new_analysis() {
         // Identity is the loaded picture (its `Arc`), not the byte content: a re-load is analysed
@@ -992,8 +1094,44 @@ mod tests {
         crate::gui::embedded_mappings().expect("embedded mappings parse")
     }
 
+    /// SH T1/T2 (C-1). RE-AIMED in S125 (lead ruling L-61, `s125-SH5` B-5): this test used the
+    /// analyser's 1×1 / 1×50 / 2×100 panics as its panic source, and D-45 cured them. The panic is
+    /// now INJECTED inside the guarded job: once before any work, and once after a real render
+    /// has run inside the same job. What it proves is unchanged: a panic inside a job comes back
+    /// as `JobError::Panicked` carrying its message, and the same thread then renders normally.
+    /// If `run_guarded`'s `catch_unwind` is removed, the panic escapes and this test fails.
     #[test]
     fn t1_t2_today_s_analyzer_panics_are_caught() {
+        install_panic_hook();
+        let req = Controls::default().request();
+        let m = mappings();
+        let ok = GuardedImage::admit(structured(64, 48, ImageFormat::Png)).expect("admit");
+
+        let before_work: Result<RenderOutput, JobError> =
+            run_guarded(|| panic!("t1 injected panic before any work"));
+        match before_work {
+            Err(JobError::Panicked(d)) => assert!(d.contains("t1 injected panic"), "{d}"),
+            other => panic!("expected a caught panic, got {other:?}"),
+        }
+
+        let after_a_render: Result<RenderOutput, JobError> = run_guarded(|| {
+            let out = run_render(&req, &ok, &m)?;
+            assert!(!out.interleaved.is_empty());
+            panic!("t2 injected panic after a real render")
+        });
+        match after_a_render {
+            Err(JobError::Panicked(d)) => assert!(d.contains("t2 injected panic"), "{d}"),
+            other => panic!("expected a caught panic, got {other:?}"),
+        }
+
+        // …and the process is alive, and a normal render still works on this thread.
+        assert!(run_guarded(|| run_render(&req, &ok, &m)).is_ok());
+    }
+
+    /// `s125-SH5` B-5 (ii): the three pictures T1/T2 used to panic on (D-45 classes a and b) now
+    /// come back from the window's render path as a typed error, never as `Panicked`.
+    #[test]
+    fn t1_t2_the_pictures_that_used_to_panic_now_return_a_typed_error() {
         install_panic_hook();
         let req = Controls::default().request();
         let m = mappings();
@@ -1003,15 +1141,13 @@ mod tests {
             (2, 100, [20, 200, 20]),
         ] {
             let img = GuardedImage::unchecked(solid(w, h, rgb, ImageFormat::Png), w, h);
-            let r = run_guarded(|| run_render(&req, &img, &m));
-            assert!(
-                matches!(r, Err(JobError::Panicked(_))),
-                "{w}x{h}: expected a caught panic, got {r:?}"
-            );
+            match run_guarded(|| run_render(&req, &img, &m)) {
+                Err(JobError::Failed(u)) => {
+                    assert_eq!(u.kind, ErrorKind::TooManyVoices, "{w}x{h}: {u:?}")
+                }
+                other => panic!("{w}x{h}: expected a typed error, got {other:?}"),
+            }
         }
-        // …and the process is alive, and a normal render still works on this thread.
-        let ok = GuardedImage::admit(structured(64, 48, ImageFormat::Png)).expect("admit");
-        assert!(run_guarded(|| run_render(&req, &ok, &m)).is_ok());
     }
 
     #[test]
@@ -1146,23 +1282,35 @@ mod tests {
         assert_eq!(rendered, 1, "only the wanted job's result arrives");
     }
 
+    /// W-2. RE-AIMED in S125 (lead ruling L-61, `s125-SH5` B-5): the panic used to come from the
+    /// analyser on a 1×1 picture, which D-45 cured. It is now INJECTED through the controller's
+    /// wake callback, which the worker calls inside the guarded job when the job emits its first
+    /// event. It fires once. The assertions are unchanged, plus one: the reported crash carries
+    /// the injected message, so it cannot be some other failure.
     #[test]
     fn w2_a_panicking_job_is_reported_and_the_next_job_gets_a_fresh_worker() {
         install_panic_hook();
-        let mut c = Controller::new(mappings(), || {});
-        let bad = GuardedImage::unchecked(solid(1, 1, [255, 255, 255], ImageFormat::Png), 1, 1);
+        let armed = Arc::new(AtomicBool::new(true));
+        let trigger = armed.clone();
+        let mut c = Controller::new(mappings(), move || {
+            if trigger.swap(false, Ordering::SeqCst) {
+                panic!("w2 injected panic inside a worker job");
+            }
+        });
+        let img = GuardedImage::admit(structured(64, 48, ImageFormat::Png)).expect("admit");
         c.submit(JobKind::Render {
             request: Controls::default().request(),
-            image: bad,
+            image: img,
             save_to: None,
         });
-        let ev = drain_until_done(&mut c, Duration::from_secs(30));
+        let ev = drain_until_done(&mut c, Duration::from_secs(60));
+        assert!(!armed.load(Ordering::SeqCst), "the injected panic fired");
         assert!(ev.iter().any(|e| matches!(
             e,
             Event::Failed(UserError {
                 kind: ErrorKind::Crashed,
-                ..
-            })
+                details,
+            }) if details.contains("w2 injected panic")
         )));
         assert!(c.worker.is_none(), "the panicked worker was retired");
         let ok = GuardedImage::admit(structured(64, 48, ImageFormat::Png)).expect("admit");
