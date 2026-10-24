@@ -3462,4 +3462,100 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── S125 FINAL SEAL, lane 05Z: UI6 C-1 (lead ruling L-82) pinned by layout ──────────────
+
+    /// The bounds of the first accesskit node whose label or value is exactly `text` (and, if
+    /// given, whose role is `role`), as (x0, y0, x1, y1) in points.
+    fn s125_bounds(
+        out: &egui::FullOutput,
+        text: &str,
+        role: Option<egui::accesskit::Role>,
+    ) -> Option<(f64, f64, f64, f64)> {
+        let u = out.platform_output.accesskit_update.as_ref()?;
+        u.nodes.iter().find_map(|(_, n)| {
+            let t = n
+                .label()
+                .map(|l| l.to_string())
+                .or_else(|| n.value().map(|v| v.to_string()));
+            let role_ok = role.map(|r| n.role() == r).unwrap_or(true);
+            if role_ok && t.as_deref() == Some(text) {
+                n.bounds().map(|b| (b.x0, b.y0, b.x1, b.y1))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// UI6 C-1 (`s125-UI6` C-1; L-82; built by 02R3 in round 2 of ITEM 3): while a long render runs
+    /// at Full size with a shrink level allowed, the § 2.4 pointer ("Shrink picture (above the
+    /// picture) shortens the wait next time. …") is drawn on its OWN line UNDER the transport row,
+    /// and `Cancel` and `Save WAV…` stay inside the window, at the default 1120 px and at a narrow
+    /// 1000 px. Before C-1 the pointer was drawn inside the row and pushed both buttons off the
+    /// window (UI6's finding). Until this test, C-1 was checked only by live captures on a private
+    /// Xvfb (02R3); a revert of C-1 left every test green. Headless: no display, no input.
+    #[test]
+    fn s125_c1_the_shrink_pointer_is_under_the_row_and_pushes_nothing_off() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = AudioHaxApp::new_headless(&ctx);
+        run_frames(&ctx, &mut app, 1);
+        // Large enough that a debug-build render outlasts STILL_WORKING_AFTER (3 s) by far.
+        s125_open(&ctx, &mut app, 1600, 1200, "big.png");
+        assert!(app.shrink().is_full());
+        assert!(
+            app.any_shrink_level_enabled(),
+            "the pointer needs an allowed level"
+        );
+        app.render();
+        let t0 = Instant::now();
+        loop {
+            let out = frames_at(&ctx, &mut app, 1120.0, 720.0, 1);
+            if s125_bounds(&out, SHRINK_WAIT_POINTER, None).is_some() {
+                break;
+            }
+            assert_eq!(
+                app.phase(),
+                Phase::Rendering,
+                "the render ended before the pointer could be checked: use a larger picture"
+            );
+            assert!(
+                t0.elapsed() < Duration::from_secs(60),
+                "no pointer after 60 s"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for (w, h) in [(1120.0f32, 720.0f32), (1000.0, 700.0)] {
+            let out = frames_at(&ctx, &mut app, w, h, 3);
+            assert_eq!(app.phase(), Phase::Rendering, "still rendering at {w}");
+            let pointer = s125_bounds(&out, SHRINK_WAIT_POINTER, None)
+                .unwrap_or_else(|| panic!("{w}x{h}: the pointer is gone"));
+            let still = s125_bounds(&out, "Still working…", None)
+                .unwrap_or_else(|| panic!("{w}x{h}: no 'Still working…'"));
+            let button = Some(egui::accesskit::Role::Button);
+            let cancel = s125_bounds(&out, "Cancel", button)
+                .unwrap_or_else(|| panic!("{w}x{h}: no Cancel button"));
+            let save = s125_bounds(&out, "Save WAV…", button)
+                .unwrap_or_else(|| panic!("{w}x{h}: no Save WAV… button"));
+            // Its own line, under the row (the row holds "Still working…" and Cancel).
+            assert!(
+                pointer.1 >= cancel.3 - 0.5 && pointer.1 >= still.3 - 0.5,
+                "{w}x{h}: the pointer {pointer:?} is not under the row (Cancel {cancel:?}, \
+                 Still working {still:?})"
+            );
+            // Nothing pushed off the window, and nothing overlapping the pointer.
+            let wf = f64::from(w);
+            for (name, b) in [("Cancel", cancel), ("Save WAV…", save)] {
+                assert!(
+                    b.0 >= 0.0 && b.2 <= wf + 0.5,
+                    "{w}x{h}: {name} {b:?} is outside the window"
+                );
+            }
+            assert!(
+                pointer.2 <= wf + 0.5,
+                "{w}x{h}: the pointer {pointer:?} runs off the window"
+            );
+        }
+        app.cancel_job();
+    }
 }
