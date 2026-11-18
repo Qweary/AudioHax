@@ -269,11 +269,12 @@ impl std::fmt::Display for MappingsOrigin {
         match self {
             MappingsOrigin::Builtin => write!(f, "The built-in mappings"),
             // MB-8: a path is shown escaped, so a file name cannot put terminal escapes on the
-            // user's console.
+            // user's console, reorder the sentence or hide text (S125b: the frozen set in
+            // `text_escape`, not std's `escape_debug`, so it is the same on every toolchain).
             MappingsOrigin::File(p) => write!(
                 f,
                 "The mappings file `{}`",
-                p.display().to_string().escape_debug()
+                escape_quoted(&p.display().to_string())
             ),
         }
     }
@@ -346,40 +347,15 @@ pub enum MappingsError {
     },
 }
 
-/// MB-8: `text` with every character that can drive or reorder a terminal written as its Rust
-/// escape: control characters (C0, DEL, C1 — so ESC, BEL and the 8-bit CSI: `\u{1b}`, `\u{7}`,
-/// `\u{9b}`, `\n`) and the bidi and format characters (overrides and isolates U+202A–202E and
-/// U+2066–2069, zero-width and direction marks, U+061C, U+FEFF, U+2028/2029: `\u{202e}` …).
-/// The set is the one `str::escape_debug` escapes (as the file-name and field escaping here
-/// do, the security review's SH3-2), less two things: quotes and backslashes are kept as
-/// written, and so is a combining mark (`char::escape_debug` would escape the accent in a
-/// decomposed `é` or the virama inside a Hindi word). An ordinary message reads unchanged.
-/// Used on text a mappings file can put on a terminal: serde's error message, and a mode name
-/// a front end prints (`play`'s "Engine mode" line, the TUI's mode).
-pub fn escape_controls(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if c.is_control() || !kept_as_written(c) {
-            out.extend(c.escape_debug());
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// Whether [`escape_controls`] keeps `c` as written: a quote or backslash, or a character that
-/// `str::escape_debug` leaves alone when it is not the first in its string (`str::escape_debug`
-/// escapes a combining mark only at the start; it is probed second so it never is).
-fn kept_as_written(c: char) -> bool {
-    if matches!(c, '"' | '\'' | '\\') {
-        return true;
-    }
-    let mut probe = String::with_capacity(5);
-    probe.push(' ');
-    probe.push(c);
-    probe.escape_debug().eq([' ', c])
-}
+/// MB-8: `text` with every character that can drive or reorder a terminal, or hide text,
+/// written as an escape (`\u{1b}`, `\u{202e}`, `\u{fe0f}`, `\n`). Since S125b (lead ruling L-94)
+/// the set is the frozen one in [`crate::text_escape`] (Unicode 17.0.0 tables; equal to what
+/// rustc 1.99.1's `str::escape_debug` escapes), no longer whatever the building toolchain's std
+/// escapes. Quotes, backslashes and combining marks are kept as written. Re-exported here so its
+/// callers (serde's error message below, `play`'s "Engine mode" line, the TUI's mode) keep their
+/// path.
+pub use crate::text_escape::escape_controls;
+use crate::text_escape::escape_quoted;
 
 impl std::fmt::Debug for MappingsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -558,7 +534,7 @@ pub fn validate_mappings(
     b2t.sort();
     for (k, v) in b2t {
         bpm(
-            format!("global.brightness_to_tempo_bpm.{}", k.escape_debug()),
+            format!("global.brightness_to_tempo_bpm.{}", escape_quoted(k)),
             f64::from(*v),
         )?;
     }
@@ -579,7 +555,7 @@ pub fn validate_mappings(
     let mut ct: Vec<_> = comp.affect.character_tempo.iter().collect();
     ct.sort_by(|a, b| a.0.cmp(b.0));
     for (name, w) in ct {
-        let base = format!("composition.affect.character_tempo.{}", name.escape_debug());
+        let base = format!("composition.affect.character_tempo.{}", escape_quoted(name));
         bpm(format!("{base}.bpm_min"), f64::from(w.bpm_min))?;
         bpm(format!("{base}.bpm_max"), f64::from(w.bpm_max))?;
         if w.bpm_min > w.bpm_max {
@@ -599,7 +575,7 @@ pub fn validate_mappings(
                 format!("composition.form_catalogue[{i}].sections"),
                 format!(
                     "(form `{}`) has {} sections; the limit is {MAX_SECTIONS_PER_FORM}",
-                    form.id.escape_debug(),
+                    escape_quoted(&form.id),
                     form.sections.len()
                 ),
             ));
@@ -682,7 +658,7 @@ fn check_numbers_finite(v: &serde_json::Value, path: &mut String) -> Result<(), 
                 if !path.is_empty() {
                     path.push('.');
                 }
-                path.push_str(&k.escape_debug().to_string());
+                path.push_str(&escape_quoted(k));
                 check_numbers_finite(&map[k], path)?;
                 path.truncate(len);
             }
@@ -1122,18 +1098,34 @@ mod tests {
         assert_eq!(escape_controls(plain), plain);
     }
 
-    /// SH3-2 / MB-8: the bidi and format characters `str::escape_debug` escapes are escaped too
-    /// (overrides and isolates, zero-width and direction marks, the Arabic letter mark, the BOM,
-    /// line and paragraph separators), so a file cannot reorder or hide text in a message.
-    /// Ordinary text stays as written: non-ASCII letters, a combining accent, a Devanagari virama,
-    /// an emoji with its presentation selector, quotes, backslashes and backticks.
+    /// S125b (L-94): characters of the frozen set beyond SH3-2's list, tested through
+    /// `escape_controls`: variation selectors, CGJ, Hangul fillers, a Mongolian FVS, a Khmer
+    /// inherent vowel, a tag, NBSP, soft hyphen, private use, unassigned.
+    const S125B_INVISIBLE: [u32; 16] = [
+        0xfe0e, 0xfe0f, 0xfe00, 0xe0100, 0xe01ef, 0x34f, 0x115f, 0x3164, 0xffa0, 0x180b, 0x17b4,
+        0xe0067, 0xa0, 0xad, 0xe000, 0x378,
+    ];
+
+    /// SH3-2 / MB-8: the bidi and format characters are escaped too (overrides and isolates,
+    /// zero-width and direction marks, the Arabic letter mark, the BOM, line and paragraph
+    /// separators), so a file cannot reorder or hide text in a message; and (S125b, L-94) so are
+    /// the other invisible characters of the frozen set: variation selectors, the combining
+    /// grapheme joiner, Hangul fillers, Mongolian free variation selectors, Khmer inherent
+    /// vowels, tag characters, a no-break space and a soft hyphen, private-use and unassigned
+    /// code points.
     #[test]
     fn escape_controls_escapes_bidi_and_format_characters() {
         for c in [
             '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
             '\u{2068}', '\u{2069}', '\u{200b}', '\u{200e}', '\u{200f}', '\u{61c}', '\u{feff}',
             '\u{2028}', '\u{2029}',
-        ] {
+        ]
+        .into_iter()
+        .chain(
+            S125B_INVISIBLE
+                .iter()
+                .map(|&v| char::from_u32(v).expect("a scalar value")),
+        ) {
             let shown = escape_controls(&format!("a{c}b"));
             assert_eq!(
                 shown,
@@ -1142,8 +1134,155 @@ mod tests {
                 c as u32
             );
         }
-        let plain = "Dorian é e\u{301} हिन्दी ✔\u{fe0f} \"q\" 'q' a\\b `k` Ünïcödé";
+    }
+
+    /// S125b (L-94; SH9 T-C): ordinary text stays as written on every toolchain: non-ASCII
+    /// letters, a combining accent (also at the start), a Devanagari virama, an emoji with a
+    /// skin-tone modifier, a flag, CJK, quotes, backslashes and backticks, and two letters NEW in
+    /// Unicode 17.0 (U+A7CF LATIN SMALL LETTER PHARYNGEAL VOICED FRICATIVE, U+10940 SIDETIC
+    /// LETTER N01), which a table generated from an older UCD would escape as unassigned. (The
+    /// emoji with its presentation selector moved to the variation-selector test: the selector
+    /// is escaped.)
+    #[test]
+    fn escape_controls_keeps_plain_text_as_written() {
+        let plain =
+            "Dorian é e\u{301} हिन्दी ✔ 👍🏽 🇫🇷 雅楽 \"q\" 'q' a\\b `k` Ünïcödé \u{a7cf} \u{10940}";
         assert_eq!(escape_controls(plain), plain);
+        assert_eq!(escape_controls("\u{301}e"), "\u{301}e");
+    }
+
+    /// S125b (L-94; SH9 T-V): variation selectors are escaped on EVERY toolchain. Before the
+    /// cure, a binary built with rustc 1.96.0 printed `✔\u{fe0f}` raw and one built with 1.99.1
+    /// escaped it; an invisible run of selectors after a visible word could hide a payload.
+    #[test]
+    fn variation_selectors_are_escaped_on_every_toolchain() {
+        assert_eq!(escape_controls("✔\u{fe0f}"), "✔\\u{fe0f}");
+        assert_eq!(escape_controls("✔\u{fe0e}"), "✔\\u{fe0e}");
+        assert_eq!(
+            escape_controls("Dorian\u{e0100}\u{e0101}"),
+            "Dorian\\u{e0100}\\u{e0101}"
+        );
+        assert_eq!(escape_controls("\u{1820}\u{180b}"), "\u{1820}\\u{180b}");
+    }
+
+    /// The hostile text the key and path tests put in a name, and how it must be shown.
+    const HOSTILE_NAME: &str = "k\u{202e}\u{fe0f}\u{3164}\u{1b}[31m\"'\\";
+    const HOSTILE_NAME_SHOWN: &str = "k\\u{202e}\\u{fe0f}\\u{3164}\\u{1b}[31m\\\"\\'\\\\";
+
+    /// Assert `msg` shows the hostile name escaped and carries none of its raw characters.
+    fn assert_shown_escaped(msg: &str) {
+        assert!(msg.contains(HOSTILE_NAME_SHOWN), "{msg}");
+        for raw in ['\u{202e}', '\u{fe0f}', '\u{3164}', '\u{1b}'] {
+            assert!(!msg.contains(raw), "U+{:04X} raw in {msg:?}", raw as u32);
+        }
+    }
+
+    /// S125b (L-94; SH9 test 5): a mappings KEY that carries a bidi override, a variation
+    /// selector, a Hangul filler and ESC is shown escaped in every `Invalid` field path that
+    /// names it: the number walker, the brightness map, the character tempo window, and a form id.
+    #[test]
+    fn a_hostile_mappings_key_is_shown_escaped() {
+        let msg = refusal(|v| v["composition"][HOSTILE_NAME] = serde_json::json!(1e39));
+        assert!(msg.contains("composition.k"), "{msg}");
+        assert_shown_escaped(&msg);
+
+        let msg = refusal(|v| {
+            v["global"]["brightness_to_tempo_bpm"][HOSTILE_NAME] = serde_json::json!(0)
+        });
+        assert!(msg.contains("global.brightness_to_tempo_bpm.k"), "{msg}");
+        assert_shown_escaped(&msg);
+
+        let msg = refusal(|v| {
+            v["composition"]["affect"]["character_tempo"][HOSTILE_NAME] =
+                serde_json::json!({"bpm_min": 200.0, "bpm_max": 50.0})
+        });
+        assert!(
+            msg.contains("composition.affect.character_tempo.k"),
+            "{msg}"
+        );
+        assert_shown_escaped(&msg);
+
+        let msg = refusal(|v| {
+            let form = &mut v["composition"]["form_catalogue"][0];
+            let one = form["sections"][0].clone();
+            form["sections"] = serde_json::Value::Array(vec![one; 33]);
+            form["id"] = serde_json::json!(HOSTILE_NAME);
+        });
+        assert!(msg.contains("(form `k"), "{msg}");
+        assert_shown_escaped(&msg);
+    }
+
+    /// S125b (L-94; SH9 test 5): a mappings FILE NAME that carries the same characters is shown
+    /// escaped in the `MappingsOrigin` sentence every error starts with.
+    #[test]
+    fn a_hostile_file_name_is_shown_escaped() {
+        let origin = MappingsOrigin::File(format!("{HOSTILE_NAME}.json").into());
+        let e = MappingsError::NotUtf8 { origin };
+        let m = e.to_string();
+        assert!(m.starts_with("The mappings file `k"), "{m}");
+        assert_shown_escaped(&m);
+    }
+
+    /// S125b (SH11 C-3, L-98): a name or key that STARTS with a combining mark (U+0301) is shown as
+    /// written at all five `escape_quoted` sites: the file name, the number walker's key, the
+    /// brightness key, the character_tempo key and the form id. This pins the accepted policy (H2:
+    /// combining marks are shown, at the start too) and is the behavioural guard against a site
+    /// going back to `str::escape_debug`, which escapes a LEADING grapheme extender on every
+    /// measured toolchain (1.96.0 and 1.99.1).
+    #[test]
+    fn a_leading_combining_mark_is_shown_as_written_at_every_quoted_site() {
+        const NAME: &str = "\u{301}k";
+        let m = MappingsError::NotUtf8 {
+            origin: MappingsOrigin::File(format!("{NAME}.json").into()),
+        };
+        let m = m.to_string();
+        assert!(m.starts_with("The mappings file `\u{301}k.json`"), "{m:?}");
+
+        let msg = refusal(|v| v["composition"][NAME] = serde_json::json!(1e39));
+        assert!(msg.contains("`composition.\u{301}k`"), "walker: {msg:?}");
+
+        let msg = refusal(|v| v["global"]["brightness_to_tempo_bpm"][NAME] = serde_json::json!(0));
+        assert!(
+            msg.contains("`global.brightness_to_tempo_bpm.\u{301}k`"),
+            "brightness: {msg:?}"
+        );
+
+        let msg = refusal(|v| {
+            v["composition"]["affect"]["character_tempo"][NAME] =
+                serde_json::json!({"bpm_min": 200.0, "bpm_max": 50.0})
+        });
+        assert!(
+            msg.contains("`composition.affect.character_tempo.\u{301}k`"),
+            "character_tempo: {msg:?}"
+        );
+
+        let msg = refusal(|v| {
+            let form = &mut v["composition"]["form_catalogue"][0];
+            let one = form["sections"][0].clone();
+            form["sections"] = serde_json::Value::Array(vec![one; 33]);
+            form["id"] = serde_json::json!(NAME);
+        });
+        assert!(msg.contains("(form `\u{301}k`)"), "form id: {msg:?}");
+    }
+
+    /// S125b (L-94): no escaping site in this file goes back to std. On rustc 1.99.1 std's
+    /// `str::escape_debug` escapes exactly the frozen set (at every position but the first), so a
+    /// site put back on `escape_debug` would pass every behavioural test above on that toolchain
+    /// (demonstrated at seal); this scan reads it on every toolchain. Comments are skipped.
+    #[test]
+    fn no_escaping_site_here_uses_std_escape_debug() {
+        let src = include_str!("mapping_loader.rs");
+        let code = &src[..src
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("the test module marker")];
+        for (n, line) in code.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for f in ["escape_debug", "escape_default", "escape_unicode"] {
+                assert!(!line.contains(f), "line {}: `{f}` in `{line}`", n + 1);
+            }
+        }
     }
 
     /// H14 / MB-8: a file name carrying a terminal escape is shown escaped.
