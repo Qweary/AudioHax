@@ -1,0 +1,11 @@
+# S125b (lead ruling L-95): every build of this repository, in CI and on a rustup machine, uses
+# one named compiler, so a release binary is reproducible from its commit and the identity
+# measurements are about a known toolchain. Bump it deliberately, together with the `toolchain:`
+# input of the `dtolnay/rust-toolchain` step in .github/workflows/ci.yml (keep that action pinned to
+# a full commit SHA; never replace the SHA with a version or branch ref).
+# .github/workflows/toolchain-drift.yml runs the tests weekly on floating stable, so a std change is
+# seen before a bump.
+# Override for one command with `cargo +<toolchain> …` or `RUSTUP_TOOLCHAIN=<toolchain>`.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]

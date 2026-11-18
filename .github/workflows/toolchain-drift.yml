@@ -1,0 +1,82 @@
+name: Toolchain drift
+
+# S125b (lead rulings L-95, L-98; SH11 C-4): run the whole test suite on FLOATING stable, weekly and
+# on demand, so a std change that matters is SEEN. Example: std starting to escape a character that
+# the frozen set in src/text_escape.rs prints as written (`std_never_escapes_what_we_show`).
+#
+# This is its own workflow, never triggered by push or pull_request, so it can never block a merge.
+# It deliberately has NO continue-on-error: a red here is a failed run, and GitHub sends its
+# failure notification.
+#
+# NOTE: GitHub disables scheduled workflows in a public repository after 60 days without repository
+# activity. In a quiet period this canary stops by itself. A disabled workflow cannot be triggered,
+# not even with "Run workflow": it must be RE-ENABLED first (Actions tab -> this workflow -> Enable
+# workflow, or `gh workflow enable toolchain-drift.yml`).
+#
+# rust-toolchain.toml pins 1.99.1 for every other cargo call. Here RUSTUP_TOOLCHAIN=stable (job env)
+# overrides that file for every cargo/rustc call, and the commands also say `+stable` explicitly.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The same pinned SoundFont as ci.yml (L-98).
+env:
+  SF2_COMMIT: 97049183643d5fc5a9322a69c5b09efb667c6c3a
+  SF2_SHA256: 9575028c7a1f589f5770fccc8cff2734566af40cd26ed836944e9a5152688cfe
+
+jobs:
+  toolchain-drift:
+    name: test on floating stable
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux audio build deps (ALSA)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Cache default SoundFont (31 MB)
+        id: sf2-cache
+        uses: actions/cache@v4
+        with:
+          path: assets/soundfonts/default.sf2
+          key: soundfont-generaluser-gs-sha256-${{ env.SF2_SHA256 }}
+
+      - name: Fetch default SoundFont (embedded via include_bytes! at build time)
+        if: steps.sf2-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          curl -fL -o assets/soundfonts/default.sf2 \
+            "https://raw.githubusercontent.com/mrbumpy409/GeneralUser-GS/${SF2_COMMIT}/GeneralUser-GS.sf2"
+
+      - name: Verify the SoundFont's sha256 (fail on mismatch)
+        shell: bash
+        run: |
+          f=assets/soundfonts/default.sf2
+          if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum "$f" | cut -d' ' -f1)
+          else got=$(shasum -a 256 "$f" | cut -d' ' -f1); fi
+          echo "default.sf2 sha256 = $got"
+          if [ "$got" != "$SF2_SHA256" ]; then
+            echo "::error::default.sf2 sha256 $got is not the pinned $SF2_SHA256"
+            exit 1
+          fi
+
+      # The action is pinned to a full commit SHA (SH11 C-1); the toolchain input floats on purpose.
+      - name: Install Rust toolchain (floating stable)
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master on 2026-11-18
+        with:
+          toolchain: stable
+
+      - name: Which toolchain this run tested
+        run: rustc +stable --version --verbose && cargo +stable --version
+
+      - name: Test on floating stable (every test binary; nothing hides behind fail-fast)
+        run: cargo +stable test --locked --no-fail-fast

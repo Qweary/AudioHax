@@ -14,6 +14,17 @@ on:
   pull_request:
     branches: [master]
 
+# S125b (SH11 C-2): the workflow only reads the repository; no step needs a write scope or a secret.
+permissions:
+  contents: read
+
+# S125b (L-98): the SoundFont embedded by include_bytes! is fetched from a PINNED upstream commit and
+# must have exactly this sha256 (GeneralUser GS v2.0.3, upstream commit 97049183… "Update SoundFont to
+# v2.0.3 and documentation to r5"; the same file the licensing review examined). A mismatch fails the job.
+env:
+  SF2_COMMIT: 97049183643d5fc5a9322a69c5b09efb667c6c3a
+  SF2_SHA256: 9575028c7a1f589f5770fccc8cff2734566af40cd26ed836944e9a5152688cfe
+
 # Cancel superseded runs on the same ref (nice-to-have).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -50,21 +61,37 @@ jobs:
         uses: actions/cache@v4
         with:
           path: assets/soundfonts/default.sf2
-          key: soundfont-generaluser-gs-v2-raw.githubusercontent.com-mrbumpy409-GeneralUser-GS-main
+          # The key carries the pinned sha256, so a different file can never be served from this cache.
+          key: soundfont-generaluser-gs-sha256-${{ env.SF2_SHA256 }}
 
       - name: Fetch default SoundFont (embedded via include_bytes! at build time)
         if: steps.sf2-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           curl -fL -o assets/soundfonts/default.sf2 \
-            https://raw.githubusercontent.com/mrbumpy409/GeneralUser-GS/main/GeneralUser-GS.sf2
-          # sanity: non-empty file so the build never fails on a truncated fetch
-          test -s assets/soundfonts/default.sf2
+            "https://raw.githubusercontent.com/mrbumpy409/GeneralUser-GS/${SF2_COMMIT}/GeneralUser-GS.sf2"
 
-      - name: Install Rust toolchain (stable + clippy)
-        uses: dtolnay/rust-toolchain@stable
+      # Runs on a cache hit too: the bytes that get embedded are checked every time.
+      - name: Verify the SoundFont's sha256 (fail on mismatch)
+        shell: bash
+        run: |
+          f=assets/soundfonts/default.sf2
+          if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum "$f" | cut -d' ' -f1)
+          else got=$(shasum -a 256 "$f" | cut -d' ' -f1); fi
+          echo "default.sf2 sha256 = $got"
+          if [ "$got" != "$SF2_SHA256" ]; then
+            echo "::error::default.sf2 sha256 $got is not the pinned $SF2_SHA256"
+            exit 1
+          fi
+
+      # S125b (L-95, SH11 C-1): the PINNED toolchain, the same version as rust-toolchain.toml (which every
+      # cargo step below obeys). Bump the two together. The action is pinned to a full commit SHA (its
+      # branches are rewritten by the owner's automation), and the version is an explicit input.
+      - name: Install Rust toolchain (pinned 1.99.1 + clippy + rustfmt)
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master on 2026-11-18; installs toolchain 1.99.1
         with:
-          components: clippy
+          toolchain: 1.99.1
+          components: clippy, rustfmt
 
       - name: Cache cargo registry + target (per-OS, keyed on Cargo.lock)
         uses: Swatinem/rust-cache@v2
