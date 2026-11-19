@@ -400,11 +400,30 @@ fn is_webp(head: &[u8]) -> bool {
     head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP".as_slice())
 }
 
+/// The refusal for a failed `File::open` of `path`: the folder sentence when the path is a folder,
+/// otherwise the operating system's words for `e`, unchanged. Used on Windows only, where opening
+/// a folder fails (`std` opens without `FILE_FLAG_BACKUP_SEMANTICS`, and Windows answers
+/// `ERROR_ACCESS_DENIED`); on Linux and macOS a folder opens and its handle is refused instead, and
+/// an unreadable folder keeps the operating system's words, as at `369938d`. The path is looked at
+/// again after the open failed, so a path swapped in between can change which words are given;
+/// it is refused either way.
+fn open_refusal(path: &Path, e: std::io::Error) -> PictureRefusal {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => PictureRefusal::NotARegularFile,
+        _ => PictureRefusal::Io(e.to_string()),
+    }
+}
+
 /// The CLI's whole route for a picture file ([`Policy::CLI`]; lead ruling L-80): `369938d`'s
 /// `image::open`, step for step, except that WebP is refused before any WebP decoder exists.
 ///
 /// 1. `File::open` (the operating system's words on failure, as `image::open` gave them). A folder
 ///    is refused ([`PictureRefusal::NotARegularFile`]); `369938d` refused it too, in other words.
+///    On Windows, opening a folder this way fails before the handle can be checked ("Access is
+///    denied. (os error 5)"), so there, when the open fails and the path is a folder, the refusal
+///    is the folder sentence and NOT the operating system's words that `image::open` gave. Every
+///    other open failure, on every system, keeps the operating system's words (see
+///    [`open_refusal`]).
 /// 2. The format is the file EXTENSION's (`ImageFormat::from_path`, the `image` crate's words on
 ///    failure), exactly as `image::open` chose it. The bytes are not sniffed: a file named for one
 ///    format and holding another is refused by that format's decoder, as at `369938d`.
@@ -421,7 +440,13 @@ fn is_webp(head: &[u8]) -> bool {
 ///    file whose header claims a huge picture).
 pub fn open_and_decode(path: &Path, policy: &Policy) -> Result<DynamicImage, PictureRefusal> {
     let io = |e: std::io::Error| PictureRefusal::Io(e.to_string());
-    let mut file = std::fs::File::open(path).map_err(io)?;
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        if cfg!(windows) {
+            open_refusal(path, e)
+        } else {
+            io(e)
+        }
+    })?;
     let meta = file.metadata().map_err(io)?;
     if meta.is_dir() {
         return Err(PictureRefusal::NotARegularFile);
@@ -573,5 +598,31 @@ mod tests {
             assert!(Policy::CLI.allows(f), "{f:?}");
             assert!(!Policy::WINDOW.allows(f), "{f:?}");
         }
+    }
+
+    /// The Windows fallback's mapping, exercised on every system: a failed open of a FOLDER is the
+    /// folder sentence; a failed open of a regular file (a genuine "permission denied") or of a
+    /// missing path keeps the operating system's words exactly.
+    #[test]
+    fn a_failed_open_is_the_folder_sentence_only_for_a_folder() {
+        let d = std::env::temp_dir().join(format!("audiohax-open-refusal-{}", std::process::id()));
+        let folder = d.join("holiday.png");
+        std::fs::create_dir_all(&folder).expect("mkdir");
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            open_refusal(&folder, denied()),
+            PictureRefusal::NotARegularFile
+        );
+        let file = d.join("locked.png");
+        std::fs::write(&file, b"not opened").expect("write");
+        assert_eq!(
+            open_refusal(&file, denied()),
+            PictureRefusal::Io(denied().to_string())
+        );
+        let missing = d.join("missing.png");
+        let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let words = gone.to_string();
+        assert_eq!(open_refusal(&missing, gone), PictureRefusal::Io(words));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
