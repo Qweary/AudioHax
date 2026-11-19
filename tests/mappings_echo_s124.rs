@@ -285,41 +285,54 @@ fn no_raw_control_reaches_stderr_from_render_or_the_tui() {
 }
 
 /// The 10-minute refusal is a plain sentence on `render` and on `play`: no surrounding quotes,
-/// and a file name holding a double quote is escaped ONCE (by the file-name escaping), not twice.
+/// and a file name holding a quote is escaped ONCE (by the file-name escaping), not twice.
+///
+/// `escape_quoted` gives `"` and `'` the same one-backslash escape (`\"`, `\'`). `"` cannot be
+/// in a file name on Windows (os error 123, S125b CI), so there the property is checked through
+/// `'` alone; on every other OS through both. A second escaping pass would put another backslash
+/// in front of the first, so `slow\\` (two backslashes after the stem) is the twice-escaped
+/// mark for either quote.
 #[test]
 fn the_ten_minute_refusal_prints_as_a_sentence_not_a_quoted_string() {
     let d = scratch("cap");
-    let name = "slow\"1.json";
-    std::fs::write(d.join(name), all_tempi(1.0)).expect("write");
-    for args in [
-        vec!["render", IMG, "--wav", "slow.wav", "--mappings", name],
-        vec!["play", IMG, "--output", "midi", "--mappings", name],
-    ] {
-        let o = run_in(BIN, &d, &args, 240);
-        assert_eq!(o.rc, Some(1), "{args:?}: {}", o.stderr);
-        assert!(
-            o.stderr.starts_with("Error: This piece would last "),
-            "{args:?}: plain sentence, no opening quote: {:?}",
-            o.stderr
-        );
-        assert!(
-            o.stderr
-                .contains("The mappings file `slow\\\"1.json` sets this piece's tempo"),
-            "{args:?}: file name escaped once: {:?}",
-            o.stderr
-        );
-        assert!(
-            !o.stderr.contains("slow\\\\\\\"1.json"),
-            "{args:?}: escaped twice: {:?}",
-            o.stderr
-        );
-        assert!(
-            o.stderr
-                .trim_end()
-                .ends_with("`composition.form_catalogue[].sections`)."),
-            "{args:?}: no closing quote: {:?}",
-            o.stderr
-        );
+    // (file name, the name as the refusal must show it: escaped once)
+    let mut names: Vec<(&str, &str)> = vec![("slow'1.json", "slow\\'1.json")];
+    if !cfg!(windows) {
+        names.push(("slow\"1.json", "slow\\\"1.json"));
+    }
+    for (name, shown) in names {
+        std::fs::write(d.join(name), all_tempi(1.0)).expect("write");
+        for args in [
+            vec!["render", IMG, "--wav", "slow.wav", "--mappings", name],
+            vec!["play", IMG, "--output", "midi", "--mappings", name],
+        ] {
+            let o = run_in(BIN, &d, &args, 240);
+            assert_eq!(o.rc, Some(1), "{args:?}: {}", o.stderr);
+            assert!(
+                o.stderr.starts_with("Error: This piece would last "),
+                "{args:?}: plain sentence, no opening quote: {:?}",
+                o.stderr
+            );
+            assert!(
+                o.stderr.contains(&format!(
+                    "The mappings file `{shown}` sets this piece's tempo"
+                )),
+                "{args:?}: file name escaped once: {:?}",
+                o.stderr
+            );
+            assert!(
+                !o.stderr.contains("slow\\\\"),
+                "{args:?}: escaped twice: {:?}",
+                o.stderr
+            );
+            assert!(
+                o.stderr
+                    .trim_end()
+                    .ends_with("`composition.form_catalogue[].sections`)."),
+                "{args:?}: no closing quote: {:?}",
+                o.stderr
+            );
+        }
     }
     assert!(!d.join("slow.wav").exists(), "no WAV");
 }

@@ -166,6 +166,19 @@ fn decode_err(r: Result<PureImage, AnalysisError>) -> String {
     }
 }
 
+/// The words this OS gives for opening a path that does not exist, as the CLI shows them. They
+/// are the platform's own: on Linux and macOS `No such file or directory (os error 2)` (pinned
+/// literally there, which is the text the identity goldens record), on Windows `The system
+/// cannot find the file specified. (os error 2)`.
+fn not_found_words(missing: &Path) -> String {
+    let words = std::fs::File::open(missing)
+        .expect_err("the path does not exist")
+        .to_string();
+    #[cfg(unix)]
+    assert_eq!(words, "No such file or directory (os error 2)");
+    words
+}
+
 /// Refuse in-process through `load_pure_image_bytes`, within 50 ms; return the text.
 fn refused_fast(bytes: &[u8]) -> String {
     let t0 = Instant::now();
@@ -619,10 +632,8 @@ fn r1_reads_under_each_policy() {
             .expect_err("refused before")
             .to_string(),
     );
-    check(
-        &d.join("nope.png"),
-        "No such file or directory (os error 2)",
-    );
+    let nope = d.join("nope.png");
+    check(&nope, &not_found_words(&nope));
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -678,10 +689,7 @@ fn errors_pinned_by_the_identity_goldens_keep_their_exact_text() {
     let missing = d.join("nope.png");
     assert_eq!(
         decode_err(load_pure_image(&PureImageSource::UserPath(missing.clone()))),
-        format!(
-            "{}: No such file or directory (os error 2)",
-            missing.display()
-        )
+        format!("{}: {}", missing.display(), not_found_words(&missing))
     );
     let notapng = d.join("notapng.png");
     std::fs::write(&notapng, b"not a png\n").expect("write");

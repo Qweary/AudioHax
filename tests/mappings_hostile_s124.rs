@@ -87,9 +87,19 @@ fn assert_no_debug_text(msg: &str) {
     }
 }
 
-/// Assert the refusal names the file (as the user typed it) and the field.
+/// The file's name as a refusal shows it. The loader writes a path through `escape_quoted`, which
+/// writes a backslash as `\\` (so it stays distinguishable from the sentence's punctuation). A
+/// scratch path holds no quote and no control character, so on Linux and macOS (no backslash) this
+/// is the path exactly as typed; on Windows every separator is shown doubled (`C:\\…\\x.json`).
+/// That doubling is today's behaviour, pinned here, not a ruling that it is the right text for a
+/// Windows path.
+fn shown(path: &Path) -> String {
+    path.display().to_string().replace('\\', "\\\\")
+}
+
+/// Assert the refusal names the file (as typed, shown by [`shown`]) and the field.
 fn assert_names(msg: &str, path: &Path, field: &str) {
-    let shown = path.display().to_string();
+    let shown = shown(path);
     assert!(
         msg.contains(&format!("`{shown}`")),
         "the message must name the file `{shown}`: {msg}"
@@ -232,7 +242,7 @@ fn h3_section_count_is_capped_at_32_and_named() {
         msg.contains("the limit is 1 MiB") || msg.contains("the limit is 32"),
         "{msg}"
     );
-    assert!(msg.contains(&format!("`{}`", p.display())), "{msg}");
+    assert!(msg.contains(&format!("`{}`", shown(&p))), "{msg}");
 }
 
 // ── H5 + the S124 addendum: the tempo window is [1, 400] BPM inclusive ──────────────────────
@@ -581,7 +591,7 @@ fn h15_deep_nesting_is_refused_not_a_stack_overflow() {
         }
     })
     .expect_err("a 100,000-deep array is not a mappings file");
-    assert!(msg.contains(&format!("`{}`", p.display())), "{msg}");
+    assert!(msg.contains(&format!("`{}`", shown(&p))), "{msg}");
 }
 
 /// L-32: the unknown-key policy stays PERMISSIVE in slice 1 (the security review HL-9: the shipped file
